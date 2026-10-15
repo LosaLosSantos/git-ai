@@ -1,0 +1,16 @@
+listen_addr = "127.0.0.1:2305"
+
+[[virtual_storage]]
+  name = "dummy"
+
+[[virtual_storage.node]]
+  storage = "dummy"
+  address = "tcp://dummy"
+  token = "dummy"
+
+[database]
+  # The following variables are defined in .gitlab-ci.yml.
+  host = '${PGHOST}'
+  dbname = '${POSTGRES_DB}'
+  user = '${PGUSER}'
+  sslmode = 'disable'

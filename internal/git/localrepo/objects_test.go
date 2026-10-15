@@ -1,0 +1,581 @@
+package localrepo
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/helper/text"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRepo_ReadObject(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, repoPath := setupRepo(t)
+	blobID := gittest.WriteBlob(t, cfg, repoPath, []byte("content"))
+
+	for _, tc := range []struct {
+		desc    string
+		oid     git.ObjectID
+		content string
+		error   error
+	}{
+		{
+			desc:  "invalid object",
+			oid:   gittest.DefaultObjectHash.ZeroOID,
+			error: InvalidObjectError(gittest.DefaultObjectHash.ZeroOID.String()),
+		},
+		{
+			desc:    "valid object",
+			oid:     blobID,
+			content: "content",
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			content, err := repo.ReadObject(ctx, tc.oid)
+			require.Equal(t, tc.error, err)
+			require.Equal(t, tc.content, string(content))
+		})
+	}
+}
+
+func TestRepo_ReadObjectWithLimit_catfileReuse(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	blobID := gittest.WriteBlob(t, cfg, repoPath, []byte("0123456789"))
+
+	// Use a custom function for setting up a repo, so we get visibility into the
+	// catfile cache.
+	setupRepo := func(t *testing.T) (*Repo, *gittest.CountingCommandFactory) {
+		gitCmdFactory := gittest.NewCountingCommandFactory(t, cfg)
+
+		catfileCache := catfile.NewCache(cfg)
+		t.Cleanup(catfileCache.Stop)
+
+		repo := New(testhelper.NewLogger(t), config.NewLocator(cfg), gitCmdFactory, catfileCache, repoProto)
+		return repo, gitCmdFactory
+	}
+
+	t.Run("fully consumed read leaves the process cacheable", func(t *testing.T) {
+		repo, gitCmdFactory := setupRepo(t)
+
+		for i := 0; i < 2; i++ {
+			content, err := repo.ReadObjectWithLimit(ctx, blobID, 100)
+			require.NoError(t, err)
+			require.Equal(t, "0123456789", string(content))
+		}
+
+		gitCmdFactory.RequireCommandCount(t, "cat-file", 1)
+	})
+
+	t.Run("truncated read makes the process dirty", func(t *testing.T) {
+		repo, gitCmdFactory := setupRepo(t)
+
+		// The process is dirty and gets torn down instead of cached, so every read must
+		// spawn a fresh cat-file process.
+		for i := 0; i < 2; i++ {
+			content, err := repo.ReadObjectWithLimit(ctx, blobID, 4)
+			require.NoError(t, err)
+			require.Equal(t, "0123", string(content))
+		}
+
+		gitCmdFactory.RequireCommandCount(t, "cat-file", 2)
+	})
+
+	t.Run("limit equal to object size still makes the process dirty", func(t *testing.T) {
+		repo, gitCmdFactory := setupRepo(t)
+
+		// Since the limit was equal to the actual object size, we couldn't read
+		// the trailing newline, and therefore the process is also marked dirty.
+		for i := 0; i < 2; i++ {
+			content, err := repo.ReadObjectWithLimit(ctx, blobID, 10)
+			require.NoError(t, err)
+			require.Equal(t, "0123456789", string(content))
+		}
+
+		gitCmdFactory.RequireCommandCount(t, "cat-file", 2)
+	})
+}
+
+func TestRepoReadObjectInfo(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, repoPath := setupRepo(t)
+	blobID := gittest.WriteBlob(t, cfg, repoPath, []byte("content"))
+	objectHash, err := repo.ObjectHash(ctx)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		desc               string
+		oid                git.ObjectID
+		content            string
+		expectedErr        error
+		expectedObjectInfo catfile.ObjectInfo
+	}{
+		{
+			desc:        "missing object",
+			oid:         git.ObjectID("abcdefg"),
+			expectedErr: InvalidObjectError("abcdefg"),
+		},
+		{
+			desc:    "valid object",
+			oid:     blobID,
+			content: "content",
+			expectedObjectInfo: catfile.ObjectInfo{
+				Oid:    blobID,
+				Type:   "blob",
+				Size:   7,
+				Format: objectHash.Format,
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			info, err := repo.ReadObjectInfo(ctx, git.Revision(tc.oid))
+			require.Equal(t, tc.expectedErr, err)
+			if tc.expectedErr == nil {
+				require.Equal(t, tc.expectedObjectInfo, *info)
+			}
+		})
+	}
+}
+
+func TestRepo_ReadObject_catfileCount(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	gitCmdFactory := gittest.NewCountingCommandFactory(t, cfg)
+	catfileCache := catfile.NewCache(cfg)
+	t.Cleanup(catfileCache.Stop)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := New(testhelper.NewLogger(t), config.NewLocator(cfg), gitCmdFactory, catfileCache, repoProto)
+
+	blobID := gittest.WriteBlob(t, cfg, repoPath, []byte("content"))
+
+	for i := 0; i < 10; i++ {
+		content, err := repo.ReadObject(ctx, blobID)
+		require.NoError(t, err)
+		require.Equal(t, "content", string(content))
+	}
+
+	gitCmdFactory.RequireCommandCount(t, "cat-file", 1)
+}
+
+func TestWalkObjects(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg, repo, repoPath := setupRepo(t)
+
+	// This blob is not expected to be encountered during walk as the tree referencing it is missing.
+	unexpectedBlob := gittest.WriteBlob(t, cfg, repoPath, []byte("we should not see this blob during the walk"))
+	// Create a commit which has a tree missing from the object database. We expect the commit to be reported with the tree reported as missing.
+	missingTree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{
+		OID:  unexpectedBlob,
+		Mode: "100644",
+		Path: "this tree will be deleted so this path should not be output",
+	}})
+	rootCommit1 := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(missingTree))
+
+	// Create a commit with a blob missing from the tree. We expect the commit and tree be reported with the blob reported as missing.
+	missingBlob := gittest.WriteBlob(t, cfg, repoPath, []byte("pruned blob"))
+	rootCommit2Tree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{
+		OID:  missingBlob,
+		Mode: "100644",
+		Path: "missing_blob",
+	}})
+	rootCommit2 := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(rootCommit2Tree))
+
+	// This commit is deleted and is expected to be reported as missing when it's encountered during the walk.
+	missingRootCommit := gittest.WriteCommit(t, cfg, repoPath)
+
+	// Create a commit with two parents. We expect both parents to be included.
+	mergeCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(gittest.DefaultObjectHash.EmptyTreeOID), gittest.WithParents(rootCommit1, rootCommit2, missingRootCommit))
+
+	// This commit is missing its only parent. Walking this we expect the commit to be reported but the parent reported as missing.
+	commitMissingParent := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(gittest.DefaultObjectHash.EmptyTreeOID), gittest.WithParents(missingRootCommit))
+
+	// This tag is referencing a missing commit. We expect the tag to be reported and the commit reported as missing.
+	tagMissingParent := gittest.WriteTag(t, cfg, repoPath, "refs/tags/tag-missing-parent", missingRootCommit.Revision(), gittest.WriteTagConfig{
+		Message: "tag missing parent",
+	})
+
+	// Create a hierarchy with some files and subdirectories to see they are reported expectedly.
+	blob1 := gittest.WriteBlob(t, cfg, repoPath, []byte("blob 1"))
+	blob2 := gittest.WriteBlob(t, cfg, repoPath, []byte("blob 2"))
+	blob3 := gittest.WriteBlob(t, cfg, repoPath, []byte("blob 3"))
+	leafCommitSubtree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{
+		{
+			OID:  blob2,
+			Mode: "100644",
+			Path: "blob2",
+		},
+		{
+			OID:  blob3,
+			Mode: "100644",
+			Path: "blob3",
+		},
+	})
+	leafCommitTree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{
+		{
+			OID:  leafCommitSubtree,
+			Mode: "040000",
+			Path: "subtree",
+		},
+		{
+			OID:  blob1,
+			Mode: "100644",
+			Path: "blob1",
+		},
+		// Add a duplicate blob into the tree to assert we only see it returned once.
+		{
+			OID:  blob1,
+			Mode: "100644",
+			Path: "duplicate_blob1",
+		},
+	})
+
+	// Create two commits that diverge from the same parent. When walking one, we don't expect to get the other one reported.
+	leafCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(leafCommitTree), gittest.WithParents(mergeCommit))
+	divergedCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(gittest.DefaultObjectHash.EmptyTreeOID), gittest.WithParents(mergeCommit))
+	divergedTag := gittest.WriteTag(t, cfg, repoPath, "refs/tags/diverged-tag", divergedCommit.Revision(), gittest.WriteTagConfig{
+		Message: "diverged tag",
+	})
+
+	// Remove the objects that we use for testing missing objects.
+	for _, removedOID := range []string{
+		missingBlob.String(),
+		missingTree.String(),
+		missingRootCommit.String(),
+	} {
+		require.NoError(t, os.Remove(filepath.Join(repoPath, "objects", removedOID[:2], removedOID[2:])))
+	}
+
+	for _, tc := range []struct {
+		desc                 string
+		heads                []git.ObjectID
+		expectedOutput       []string
+		expectedErrorMessage string
+	}{
+		{
+			desc: "no heads",
+		},
+		{
+			desc: "missing start points",
+			heads: []git.ObjectID{
+				missingBlob,
+				missingRootCommit,
+			},
+			expectedOutput: []string{
+				"?" + missingBlob.String(),
+				"?" + missingRootCommit.String(),
+			},
+		},
+		{
+			desc: "duplicate missing start point",
+			heads: []git.ObjectID{
+				missingBlob,
+				missingBlob,
+			},
+			expectedOutput: []string{
+				"?" + missingBlob.String(),
+			},
+		},
+		{
+			desc: "commit missing parent commit",
+			heads: []git.ObjectID{
+				commitMissingParent,
+			},
+			expectedOutput: []string{
+				commitMissingParent.String(),
+				gittest.DefaultObjectHash.EmptyTreeOID.String() + " ",
+				"?" + missingRootCommit.String(),
+			},
+		},
+		{
+			desc: "annotated tag missing referenced commit",
+			heads: []git.ObjectID{
+				tagMissingParent,
+			},
+			expectedOutput: []string{
+				tagMissingParent.String() + " refs/tags/tag-missing-parent",
+				"?" + missingRootCommit.String(),
+			},
+		},
+		{
+			desc: "duplicate start point",
+			heads: []git.ObjectID{
+				tagMissingParent,
+				tagMissingParent,
+			},
+			expectedOutput: []string{
+				tagMissingParent.String() + " refs/tags/tag-missing-parent",
+				"?" + missingRootCommit.String(),
+			},
+		},
+		{
+			desc: "diverged tag and commit are not reported",
+			heads: []git.ObjectID{
+				leafCommit,
+			},
+			expectedOutput: []string{
+				leafCommit.String(),
+				leafCommitTree.String() + " ",
+				blob1.String() + " blob1",
+				leafCommitSubtree.String() + " subtree",
+				blob2.String() + " subtree/blob2",
+				blob3.String() + " subtree/blob3",
+				mergeCommit.String(),
+				gittest.DefaultObjectHash.EmptyTreeOID.String() + " ",
+				"?" + missingRootCommit.String(),
+				rootCommit2.String(),
+				rootCommit2Tree.String() + " ",
+				"?" + missingBlob.String(),
+				rootCommit1.String(),
+				"?" + missingTree.String(),
+			},
+		},
+		{
+			desc: "walk the leaf commit and diverged tag",
+			heads: []git.ObjectID{
+				leafCommit,
+				divergedTag,
+			},
+			expectedOutput: []string{
+				divergedTag.String() + " refs/tags/diverged-tag",
+				divergedCommit.String(),
+				leafCommit.String(),
+				leafCommitTree.String() + " ",
+				blob1.String() + " blob1",
+				leafCommitSubtree.String() + " subtree",
+				blob2.String() + " subtree/blob2",
+				blob3.String() + " subtree/blob3",
+				mergeCommit.String(),
+				gittest.DefaultObjectHash.EmptyTreeOID.String() + " ",
+				"?" + missingRootCommit.String(),
+				rootCommit2.String(),
+				rootCommit2Tree.String() + " ",
+				"?" + missingBlob.String(),
+				rootCommit1.String(),
+				"?" + missingTree.String(),
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			var heads []string
+			for _, head := range tc.heads {
+				heads = append(heads, head.String())
+			}
+
+			var output bytes.Buffer
+			err := repo.WalkObjects(ctx, strings.NewReader(strings.Join(heads, "\n")), &output)
+			if tc.expectedErrorMessage != "" {
+				require.Equal(t, tc.expectedErrorMessage, err.Error())
+				return
+			}
+			require.NoError(t, err)
+
+			var actualOutput []string
+			if output.Len() > 0 {
+				actualOutput = strings.Split(strings.TrimSpace(output.String()), "\n")
+			}
+			require.ElementsMatch(t, tc.expectedOutput, actualOutput)
+		})
+	}
+}
+
+func TestPackAndUnpackObjects(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg, repo, repoPath := setupRepo(t)
+
+	commit1 := gittest.WriteCommit(t, cfg, repoPath)
+	commit2 := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(commit1))
+	commit3 := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(commit2))
+
+	require.ElementsMatch(t,
+		[]git.ObjectID{
+			gittest.DefaultObjectHash.EmptyTreeOID,
+			commit1,
+			commit2,
+			commit3,
+		},
+		gittest.ListObjects(t, cfg, repoPath),
+	)
+
+	var emptyPack bytes.Buffer
+	require.NoError(t,
+		repo.PackObjects(ctx, strings.NewReader(""),
+			&emptyPack,
+		),
+	)
+
+	var oneCommitPack bytes.Buffer
+	require.NoError(t,
+		repo.PackObjects(ctx, strings.NewReader(
+			strings.Join([]string{commit1.String()}, "\n"),
+		),
+			&oneCommitPack,
+		),
+	)
+
+	var twoCommitPack bytes.Buffer
+	require.NoError(t,
+		repo.PackObjects(ctx, strings.NewReader(
+			strings.Join([]string{commit1.String(), commit2.String()}, "\n"),
+		),
+			&twoCommitPack,
+		),
+	)
+
+	var incompletePack bytes.Buffer
+	require.NoError(t,
+		repo.PackObjects(ctx, strings.NewReader(
+			strings.Join([]string{commit1.String(), commit3.String()}, "\n"),
+		),
+			&incompletePack,
+		),
+	)
+
+	for _, tc := range []struct {
+		desc                 string
+		pack                 []byte
+		expectedObjects      []git.ObjectID
+		expectedErrorMessage string
+	}{
+		{
+			desc: "empty pack",
+			pack: emptyPack.Bytes(),
+		},
+		{
+			desc: "one commit",
+			pack: oneCommitPack.Bytes(),
+			expectedObjects: []git.ObjectID{
+				commit1,
+			},
+		},
+		{
+			desc: "two commits",
+			pack: twoCommitPack.Bytes(),
+			expectedObjects: []git.ObjectID{
+				commit1, commit2,
+			},
+		},
+		{
+			desc: "incomplete pack",
+			pack: incompletePack.Bytes(),
+			expectedObjects: []git.ObjectID{
+				commit1, commit3,
+			},
+		},
+		{
+			desc:                 "no pack",
+			expectedErrorMessage: "unpack objects: exit status 128",
+		},
+		{
+			desc:                 "broken pack",
+			pack:                 []byte("invalid pack"),
+			expectedErrorMessage: "unpack objects: exit status 128",
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, repo, repoPath := setupRepo(t)
+			require.Empty(t, gittest.ListObjects(t, cfg, repoPath))
+
+			err := repo.UnpackObjects(ctx, bytes.NewReader(tc.pack))
+			if tc.expectedErrorMessage != "" {
+				require.EqualError(t, err, tc.expectedErrorMessage)
+			} else {
+				require.NoError(t, err)
+			}
+			require.ElementsMatch(t, tc.expectedObjects, gittest.ListObjects(t, cfg, repoPath))
+		})
+	}
+}
+
+func TestListObjects(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg, repo, repoPath := setupRepo(t)
+
+	t.Run("no objects", func(t *testing.T) {
+		output := &bytes.Buffer{}
+
+		require.NoError(t, repo.ListObjects(ctx, output))
+		require.Empty(t, output.String())
+	})
+
+	t.Run("objects", func(t *testing.T) {
+		output := &bytes.Buffer{}
+
+		blobID := gittest.WriteBlob(t, cfg, repoPath, []byte("content"))
+		treeID := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{
+			{OID: blobID, Mode: "100644", Path: "file-1"},
+		})
+		commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTree(treeID))
+		tagID := gittest.WriteTag(t, cfg, repoPath, "tag-1", commitID.Revision(), gittest.WriteTagConfig{Message: "annotated tag"})
+
+		// In order to assert that duplicates are not returned in the output, we'll pack the
+		// loose objects, and then write a duplicate blob as a loose object. We expect that the blob
+		// is still returned only once even if it exists in the repository multiple times.
+		looseBlobPath := filepath.Join(repoPath, "objects", blobID[:2].String(), blobID[2:].String())
+
+		// Make a copy of the loose blob first so we can recover it after it has been repacked.
+		looseBlobCopyPath := looseBlobPath + ".copy"
+		require.NoError(t, os.Link(looseBlobPath, looseBlobCopyPath))
+
+		// Pack the objects. We expect the loose blob to be gone.
+		gittest.Exec(t, cfg, "-C", repoPath, "repack", "-ald")
+		require.NoFileExists(t, looseBlobPath)
+
+		// Rename the copy of the blob in its original location.
+		require.NoError(t, os.Rename(looseBlobCopyPath, looseBlobPath))
+
+		require.NoError(t, repo.ListObjects(ctx, output))
+
+		// First check that we have all the expected objects. The ordering is not stable so we
+		// only check the correct elements exist.
+		objectIDs := strings.Split(text.ChompBytes(output.Bytes()), "\n")
+		require.ElementsMatch(t, objectIDs, []string{
+			blobID.String(),
+			commitID.String(),
+			treeID.String(),
+			tagID.String(),
+		})
+
+		// Now that we know the ordering from the parsed output of ListObjects,
+		// check that the output matches exactly what we expect, and doens't have
+		// for example extra or missing whitespace at the end.
+		require.Equal(t, strings.Join(objectIDs, "\n")+"\n", output.String())
+	})
+}

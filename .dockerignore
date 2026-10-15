@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Build artifacts (except _build/bin which we need)
+_build/cache
+_build/deps
+_build/licenses
+_build/proto*
+_build/reports
+_build/tools
+_build/cover
+_build/testrepos
+_build/NOTICE
+_build/*.gem
+
+# Documentation and examples
+doc/
+*.md
+REVIEWING.md
+STYLE.md
+LICENSE
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+*_test.go
+testdata/
+
+# CI/CD
+.gitlab-ci.yml
+.gitlab/
+
+# Ruby
+Gemfile*
+.bundle/
+vendor/
+
+# Misc
+.DS_Store
+tmp/

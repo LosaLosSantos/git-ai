@@ -1,0 +1,5 @@
+---
+- name: Remove SSH keys from known hosts
+  command: "ssh-keygen -R {{ item }}"
+  loop: "{{ groups['gitaly'] | list + groups['client'] }}"
+  listen: remove hostkeys

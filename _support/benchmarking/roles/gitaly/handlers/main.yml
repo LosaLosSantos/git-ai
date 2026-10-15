@@ -1,0 +1,7 @@
+---
+- name: Load Gitaly service
+  systemd:
+    name: gitaly
+    state: stopped
+    daemon_reload: true
+  listen: load service

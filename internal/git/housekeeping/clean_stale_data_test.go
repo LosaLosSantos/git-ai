@@ -1,0 +1,495 @@
+package housekeeping
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	Delete entryFinalState = iota
+	Keep
+)
+
+type mockDirEntry struct {
+	fs.DirEntry
+	isDir bool
+	name  string
+	fi    fs.FileInfo
+}
+
+func (m mockDirEntry) Name() string {
+	return m.name
+}
+
+func (m mockDirEntry) IsDir() bool {
+	return m.isDir
+}
+
+func (m mockDirEntry) Info() (fs.FileInfo, error) {
+	return m.fi, nil
+}
+
+type mockFileInfo struct {
+	fs.FileInfo
+	modTime time.Time
+}
+
+func (m mockFileInfo) ModTime() time.Time {
+	return m.modTime
+}
+
+func TestIsStaleTemporaryObject(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		dirEntry      fs.DirEntry
+		expectIsStale bool
+	}{
+		{
+			name: "regular_file",
+			dirEntry: mockDirEntry{
+				name: "objects",
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-1 * time.Hour),
+				},
+			},
+			expectIsStale: false,
+		},
+		{
+			name: "directory",
+			dirEntry: mockDirEntry{
+				name:  "tmp",
+				isDir: true,
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-1 * time.Hour),
+				},
+			},
+			expectIsStale: false,
+		},
+		{
+			name: "recent time file",
+			dirEntry: mockDirEntry{
+				name: "tmp_DELETEME",
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-1 * time.Hour),
+				},
+			},
+			expectIsStale: false,
+		},
+		{
+			name: "recent time file",
+			dirEntry: mockDirEntry{
+				name: "tmp_DELETEME",
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-23 * time.Hour),
+				},
+			},
+			expectIsStale: false,
+		},
+		{
+			name: "very old temp file",
+			dirEntry: mockDirEntry{
+				name: "tmp_DELETEME",
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-25 * time.Hour),
+				},
+			},
+			expectIsStale: true,
+		},
+		{
+			name: "very old temp file",
+			dirEntry: mockDirEntry{
+				name: "tmp_DELETEME",
+				fi: mockFileInfo{
+					modTime: time.Now().Add(-8 * 24 * time.Hour),
+				},
+			},
+			expectIsStale: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isStale, err := isStaleTemporaryObject(tc.dirEntry)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectIsStale, isStale)
+		})
+	}
+}
+
+func TestPruneEmptyConfigSections(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	configPath := filepath.Join(repoPath, "config")
+
+	for _, tc := range []struct {
+		desc                    string
+		configData              string
+		expectedData            string
+		expectedSkippedSections int
+	}{
+		{
+			desc:         "empty",
+			configData:   "",
+			expectedData: "",
+		},
+		{
+			desc:         "newline only",
+			configData:   "\n",
+			expectedData: "\n",
+		},
+		{
+			desc:         "no stripping",
+			configData:   "[foo]\nbar = baz\n",
+			expectedData: "[foo]\nbar = baz\n",
+		},
+		{
+			desc:         "no stripping with missing newline",
+			configData:   "[foo]\nbar = baz",
+			expectedData: "[foo]\nbar = baz",
+		},
+		{
+			desc:         "multiple sections",
+			configData:   "[foo]\nbar = baz\n[bar]\nfoo = baz\n",
+			expectedData: "[foo]\nbar = baz\n[bar]\nfoo = baz\n",
+		},
+		{
+			desc:         "missing newline",
+			configData:   "[foo]\nbar = baz",
+			expectedData: "[foo]\nbar = baz",
+		},
+		{
+			desc:         "single comment",
+			configData:   "# foobar\n",
+			expectedData: "# foobar\n",
+		},
+		{
+			// This is not correct, but we really don't want to start parsing
+			// the config format completely. So we err on the side of caution
+			// and just say this is fine.
+			desc:                    "empty section with comment",
+			configData:              "[foo]\n# comment\n[bar]\n[baz]\n",
+			expectedData:            "[foo]\n# comment\n",
+			expectedSkippedSections: 1,
+		},
+		{
+			desc:         "empty section",
+			configData:   "[foo]\n",
+			expectedData: "",
+		},
+		{
+			desc:                    "empty sections",
+			configData:              "[foo]\n[bar]\n[baz]\n",
+			expectedData:            "",
+			expectedSkippedSections: 2,
+		},
+		{
+			desc:                    "empty sections with missing newline",
+			configData:              "[foo]\n[bar]\n[baz]",
+			expectedData:            "",
+			expectedSkippedSections: 2,
+		},
+		{
+			desc:         "trailing empty section",
+			configData:   "[foo]\nbar = baz\n[foo]\n",
+			expectedData: "[foo]\nbar = baz\n",
+		},
+		{
+			desc:                    "mixed keys and sections",
+			configData:              "[empty]\n[nonempty]\nbar = baz\nbar = baz\n[empty]\n",
+			expectedData:            "[nonempty]\nbar = baz\nbar = baz\n",
+			expectedSkippedSections: 1,
+		},
+		{
+			desc: "real world example",
+			configData: `[core]
+        repositoryformatversion = 0
+        filemode = true
+        bare = true
+[uploadpack]
+        allowAnySHA1InWant = true
+[remote "tmp-8be1695862b62390d1f873f9164122e4"]
+[remote "tmp-d97f78c39fde4b55e0d0771dfc0501ef"]
+[remote "tmp-23a2471e7084e1548ef47bbc9d6afff6"]
+[remote "tmp-6ef9759bb14db34ca67de4681f0a812a"]
+[remote "tmp-992cb6a0ea428a511cc2de3cde051227"]
+[remote "tmp-a720c2b6794fdbad50f36f0a4e9501ff"]
+[remote "tmp-4b4f6d68031aa1288613f40b1a433278"]
+[remote "tmp-fc12da796c907e8ea5faed134806acfb"]
+[remote "tmp-49e1fbb6eccdb89059a7231eef785d03"]
+[remote "tmp-e504bbbed5d828cd96b228abdef4b055"]
+[remote "tmp-36e856371fdacb7b4909240ba6bc0b34"]
+[remote "tmp-9a1bc23bb2200b9426340a5ba934f5ba"]
+[remote "tmp-49ead30f732995498e0585b569917c31"]
+[remote "tmp-8419f1e1445ccd6e1c60aa421573447c"]
+[remote "tmp-f7a91ec9415f984d3747cf608b0a7e9c"]
+        prune = true
+[remote "tmp-ea77d1e5348d07d693aa2bf8a2c98637"]
+[remote "tmp-3f190ab463b804612cb007487e0cbb4d"]`,
+			expectedData: `[core]
+        repositoryformatversion = 0
+        filemode = true
+        bare = true
+[uploadpack]
+        allowAnySHA1InWant = true
+[remote "tmp-f7a91ec9415f984d3747cf608b0a7e9c"]
+        prune = true
+`,
+			expectedSkippedSections: 15,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(configPath, []byte(tc.configData), mode.File))
+
+			skippedSections, err := PruneEmptyConfigSections(ctx, repo)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedSkippedSections, skippedSections)
+
+			require.Equal(t, tc.expectedData, string(testhelper.MustReadFile(t, configPath)))
+		})
+	}
+}
+
+func TestRemoveGitLabFullPathConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	configPath := filepath.Join(repoPath, "config")
+
+	for _, tc := range []struct {
+		desc         string
+		configData   string
+		expectedData string
+		cleanupCount int
+	}{
+		{
+			desc:         "config file is empty",
+			configData:   "",
+			expectedData: "",
+		},
+		{
+			desc:         "config file contains newline only",
+			configData:   "\n",
+			expectedData: "\n",
+		},
+		{
+			desc:         "config file doesn't include gitlab.fullpath",
+			configData:   "[foo]\nbar = baz\n",
+			expectedData: "[foo]\nbar = baz\n",
+		},
+		{
+			desc:         "config file includes gitlab.fullpath",
+			cleanupCount: 1,
+			configData: `
+[foo]
+	bar = baz
+[gitlab]
+	fullpath = foo/bar
+`,
+			expectedData: `
+[foo]
+	bar = baz
+`,
+		},
+		{
+			desc:         "config file includes gitlab.fullpath and other gitlab.* configs",
+			cleanupCount: 1,
+			configData: `
+[foo]
+	bar = baz
+[gitlab]
+	fullpath = foo/bar
+	something = else
+`,
+			expectedData: `
+[foo]
+	bar = baz
+[gitlab]
+	something = else
+`,
+		},
+		{
+			desc: "config file includes gitlab.* configs except for gitlab.fullpath",
+			configData: `
+[foo]
+	bar = baz
+[gitlab]
+	something = else
+`,
+			expectedData: `
+[foo]
+	bar = baz
+[gitlab]
+	something = else
+`,
+		},
+		{
+			desc:         "config file includes empty gitlab.fullpath",
+			cleanupCount: 1,
+			configData: `
+[foo]
+	bar = baz
+[gitlab]
+	fullpath =
+	something = else
+`,
+			expectedData: `
+[foo]
+	bar = baz
+[gitlab]
+	something = else
+`,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(configPath, []byte(tc.configData), mode.File))
+
+			cleanupCount, err := removeGitLabFullPathConfig(ctx, repo, &transaction.MockManager{})
+			require.NoError(t, err)
+
+			require.Equal(t, tc.cleanupCount, cleanupCount)
+			require.Equal(t, tc.expectedData, string(testhelper.MustReadFile(t, configPath)))
+		})
+	}
+}
+
+func TestFindTemporaryObjectDirectories(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	_, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+
+	objectsPath := filepath.Join(repoPath, "objects")
+
+	for _, tc := range []struct {
+		desc                string
+		setup               func(t *testing.T)
+		expectedDirectories []string
+	}{
+		{
+			desc: "no temporary directories",
+			setup: func(t *testing.T) {
+				// Create some regular directories that should not be cleaned
+				require.NoError(t, os.MkdirAll(filepath.Join(objectsPath, "ab"), 0o755))
+				require.NoError(t, os.MkdirAll(filepath.Join(objectsPath, "cd"), 0o755))
+			},
+			expectedDirectories: nil,
+		},
+		{
+			desc: "recent temporary directory",
+			setup: func(t *testing.T) {
+				tmpDir := filepath.Join(objectsPath, "tmp_objdir_recent")
+				require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+				// Set recent modification time (within grace period)
+				recentTime := time.Now().Add(-1 * time.Hour)
+				require.NoError(t, os.Chtimes(tmpDir, recentTime, recentTime))
+			},
+			expectedDirectories: nil,
+		},
+		{
+			desc: "stale temporary directory",
+			setup: func(t *testing.T) {
+				tmpDir := filepath.Join(objectsPath, "tmp_objdir_stale")
+				require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+				// Set old modification time (beyond grace period)
+				staleTime := time.Now().Add(-deleteTempObjectDirectoriesOlderThanDuration - 1*time.Hour)
+				require.NoError(t, os.Chtimes(tmpDir, staleTime, staleTime))
+			},
+			expectedDirectories: []string{filepath.Join(objectsPath, "tmp_objdir_stale")},
+		},
+		{
+			desc: "multiple temporary directories with mixed ages",
+			setup: func(t *testing.T) {
+				// Recent directory (should not be cleaned)
+				recentDir := filepath.Join(objectsPath, "tmp_objdir_recent_multi")
+				require.NoError(t, os.MkdirAll(recentDir, 0o755))
+				recentTime := time.Now().Add(-1 * time.Hour)
+				require.NoError(t, os.Chtimes(recentDir, recentTime, recentTime))
+
+				// Stale directory (should be cleaned)
+				staleDir1 := filepath.Join(objectsPath, "tmp_objdir_stale_1")
+				require.NoError(t, os.MkdirAll(staleDir1, 0o755))
+				staleTime1 := time.Now().Add(-deleteTempObjectDirectoriesOlderThanDuration - 1*time.Hour)
+				require.NoError(t, os.Chtimes(staleDir1, staleTime1, staleTime1))
+
+				// Another stale directory (should be cleaned)
+				staleDir2 := filepath.Join(objectsPath, "tmp_objdir_stale_2")
+				require.NoError(t, os.MkdirAll(staleDir2, 0o755))
+				staleTime2 := time.Now().Add(-deleteTempObjectDirectoriesOlderThanDuration - 2*time.Hour)
+				require.NoError(t, os.Chtimes(staleDir2, staleTime2, staleTime2))
+
+				// Regular directory with tmp_obj_ prefix but it's a file (should be ignored)
+				tmpFile := filepath.Join(objectsPath, "tmp_objdir_file")
+				require.NoError(t, os.WriteFile(tmpFile, []byte("test"), 0o644))
+				require.NoError(t, os.Chtimes(tmpFile, staleTime1, staleTime1))
+
+				// Directory without tmp_obj_ prefix (should be ignored)
+				regularDir := filepath.Join(objectsPath, "regular_dir")
+				require.NoError(t, os.MkdirAll(regularDir, 0o755))
+				require.NoError(t, os.Chtimes(regularDir, staleTime1, staleTime1))
+			},
+			expectedDirectories: []string{
+				filepath.Join(objectsPath, "tmp_objdir_stale_1"),
+				filepath.Join(objectsPath, "tmp_objdir_stale_2"),
+			},
+		},
+		{
+			desc: "temporary directory with nested content",
+			setup: func(t *testing.T) {
+				tmpDir := filepath.Join(objectsPath, "tmp_objdir_with_content")
+				require.NoError(t, os.MkdirAll(tmpDir, 0o755))
+
+				// Create nested directories and files
+				nestedDir := filepath.Join(tmpDir, "ab")
+				require.NoError(t, os.MkdirAll(nestedDir, 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(nestedDir, "1234567890abcdef"), []byte("object"), 0o644))
+				require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "somefile"), []byte("content"), 0o644))
+
+				// Set stale time
+				staleTime := time.Now().Add(-deleteTempObjectDirectoriesOlderThanDuration - 1*time.Hour)
+				require.NoError(t, os.Chtimes(tmpDir, staleTime, staleTime))
+			},
+			expectedDirectories: []string{filepath.Join(objectsPath, "tmp_objdir_with_content")},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			// Clean up objects directory for each test
+			require.NoError(t, os.RemoveAll(objectsPath))
+			require.NoError(t, os.MkdirAll(objectsPath, 0o755))
+
+			tc.setup(t)
+
+			directories, err := FindTemporaryObjectDirectories(ctx, repoPath)
+			require.NoError(t, err)
+
+			require.ElementsMatch(t, tc.expectedDirectories, directories)
+		})
+	}
+}

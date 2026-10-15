@@ -1,0 +1,35 @@
+[Unit]
+Description=Gitaly
+After=syslog.target network.target remote-fs.target nss-lookup.target mock-gitlab-api.service
+Requires=mock-gitlab-api.service
+
+[Service]
+ExecStart=/opt/gitaly/bin/gitaly /var/opt/gitaly/config.toml
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
+WorkingDirectory=/var/opt/gitaly
+Environment="BUNDLE_PATH=/src/gitaly/.ruby"
+User=git
+Group=git
+LimitAS=infinity
+LimitCORE=0
+LimitCPU=infinity
+LimitDATA=infinity
+LimitFSIZE=infinity
+LimitLOCKS=infinity
+LimitMEMLOCK=64
+LimitMSGQUEUE=838860800
+LimitNICE=0
+LimitNOFILE=15000
+LimitNPROC=infinity
+LimitRSS=infinity
+LimitRTPRIO=0
+LimitSIGPENDING=62793
+LimitSTACK=10485760
+
+{% for key, val in target_instance['environment'].items() %}
+Environment="{{ key }}={{ val }}"
+{% endfor %}
+
+[Install]
+WantedBy=

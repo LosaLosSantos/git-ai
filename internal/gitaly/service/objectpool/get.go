@@ -1,0 +1,43 @@
+package objectpool
+
+import (
+	"context"
+	"errors"
+
+	"github.com/feder-cr/open_scion/internal/git/objectpool"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+func (s *server) GetObjectPool(ctx context.Context, in *gitalypb.GetObjectPoolRequest) (*gitalypb.GetObjectPoolResponse, error) {
+	repository := in.GetRepository()
+	if err := s.locator.ValidateRepository(ctx, repository); err != nil {
+		return nil, structerr.NewInvalidArgument("%w", err)
+	}
+
+	repo := s.localRepoFactory.Build(repository)
+	objectPool, err := objectpool.FromRepo(ctx, s.logger, s.locator, s.gitCmdFactory, s.catfileCache, s.txManager, s.housekeepingManager, repo)
+	if err != nil && !errors.Is(err, objectpool.ErrAlternateObjectDirNotExist) {
+		s.logger.
+			WithError(err).
+			WithField("storage", repository.GetStorageName()).
+			WithField("relative_path", repository.GetRelativePath()).
+			WarnContext(ctx, "alternates file does not point to valid git repository")
+	}
+
+	if objectPool == nil {
+		return &gitalypb.GetObjectPoolResponse{}, nil
+	}
+
+	objectPoolProto := objectPool.ToProto()
+	if tx := storage.ExtractTransaction(ctx); tx != nil {
+		// The object pool's relative path is pointing to the transaction's snapshot. Return
+		// the original relative path in the response.
+		objectPoolProto.Repository = tx.OriginalRepository(objectPoolProto.GetRepository())
+	}
+
+	return &gitalypb.GetObjectPoolResponse{
+		ObjectPool: objectPoolProto,
+	}, nil
+}

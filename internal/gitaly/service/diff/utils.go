@@ -1,0 +1,69 @@
+package diff
+
+import (
+	"context"
+	"errors"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/gitaly/diff"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+type requestWithLeftRightCommitIDs interface {
+	GetRepository() *gitalypb.Repository
+	GetLeftCommitId() string
+	GetRightCommitId() string
+}
+
+func validateRequest(ctx context.Context, locator storage.Locator, in requestWithLeftRightCommitIDs) error {
+	if err := locator.ValidateRepository(ctx, in.GetRepository()); err != nil {
+		return err
+	}
+	if in.GetLeftCommitId() == "" {
+		return errors.New("empty LeftCommitId")
+	}
+	if in.GetRightCommitId() == "" {
+		return errors.New("empty RightCommitId")
+	}
+
+	return nil
+}
+
+func (s *server) eachDiff(ctx context.Context, repo *localrepo.Repo, objectHash git.ObjectHash, subCmd gitcmd.Command, limits diff.Limits, callback func(*diff.Diff) error) error {
+	diffConfig := gitcmd.ConfigPair{Key: "diff.noprefix", Value: "false"}
+
+	cmd, err := repo.Exec(ctx, subCmd, gitcmd.WithConfig(diffConfig), gitcmd.WithSetupStdout())
+	if err != nil {
+		return structerr.NewInternal("cmd: %w", err)
+	}
+
+	diffParser := diff.NewDiffParser(objectHash, cmd, limits)
+
+	for diffParser.Parse() {
+		if err := callback(diffParser.Diff()); err != nil {
+			return err
+		}
+	}
+
+	if err := diffParser.Err(); err != nil {
+		return structerr.NewInternal("parse failure: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return structerr.NewFailedPrecondition("%w", err)
+	}
+
+	return nil
+}
+
+func logPaths(paths [][]byte) []string {
+	result := make([]string, len(paths))
+	for i, p := range paths {
+		result[i] = string(p)
+	}
+	return result
+}

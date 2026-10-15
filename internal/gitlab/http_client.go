@@ -1,0 +1,383 @@
+package gitlab
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/open_scion/internal/gitlab/client"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/open_scion/internal/prometheus/metrics"
+	"github.com/feder-cr/open_scion/internal/version"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+var glIDRegex = regexp.MustCompile(`\A[0-9]+\z`)
+
+// HTTPClient is an HTTP client used to talk to the internal GitLab Rails API.
+type HTTPClient struct {
+	*client.GitlabNetClient
+	latencyMetric metrics.HistogramVec
+	logger        log.Logger
+}
+
+func withOriginalRemoteIP(ctx context.Context) context.Context {
+	remoteIP := metadata.GetValue(ctx, "remote_ip")
+	if remoteIP == "" {
+		return ctx
+	}
+
+	return context.WithValue(ctx, client.OriginalRemoteIPContextKey{}, remoteIP)
+}
+
+// NewHTTPClient creates an HTTP client to talk to the Rails internal API
+func NewHTTPClient(
+	logger log.Logger,
+	gitlabCfg config.Gitlab,
+	tlsCfg config.TLS,
+	promCfg gitalycfgprom.Config,
+) (*HTTPClient, error) {
+	url, err := url.PathUnescape(gitlabCfg.URL)
+	if err != nil {
+		return nil, err
+	}
+
+	var opts []client.HTTPClientOpt
+	if tlsCfg.CertPath != "" && tlsCfg.KeyPath != "" ||
+		tlsCfg.Key != "" {
+		cert, err := tlsCfg.Certificate()
+		if err != nil {
+			return nil, fmt.Errorf("getting certificate: %w", err)
+		}
+		opts = append(opts, client.WithClientCert(&cert))
+	}
+
+	httpClient, err := client.NewHTTPClientWithOpts(
+		url,
+		gitlabCfg.RelativeURLRoot,
+		gitlabCfg.HTTPSettings.CAFile,
+		gitlabCfg.HTTPSettings.CAPath,
+		gitlabCfg.HTTPSettings.ReadTimeout,
+		opts,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("building new HTTP client for GitLab API: %w", err)
+	}
+
+	if httpClient == nil {
+		return nil, fmt.Errorf("%s is not a valid url", gitlabCfg.URL)
+	}
+
+	secret := gitlabCfg.Secret
+
+	// Fallback to reading secret from specified file if not configured directly.
+	if secret == "" {
+		secretData, err := os.ReadFile(gitlabCfg.SecretFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading secret file: %w", err)
+		}
+		secret = string(secretData)
+	}
+
+	gitlabnetClient, err := client.NewGitlabNetClient(logger, gitlabCfg.HTTPSettings.User, gitlabCfg.HTTPSettings.Password, secret, httpClient)
+	if err != nil {
+		return nil, fmt.Errorf("instantiating gitlab net client: %w", err)
+	}
+
+	gitlabnetClient.SetUserAgent("gitaly/" + version.GetVersion())
+
+	return &HTTPClient{
+		GitlabNetClient: gitlabnetClient,
+		latencyMetric: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "gitaly_gitlab_api_latency_seconds",
+				Help:    "Latency between posting to GitLab's `/internal/` APIs and receiving a response",
+				Buckets: promCfg.GRPCLatencyBuckets,
+			},
+			[]string{"endpoint"},
+		),
+		logger: logger.WithField("component", "gitlab_http_client"),
+	}, nil
+}
+
+// Describe describes Prometheus metrics exposed by the HTTPClient.
+func (c *HTTPClient) Describe(descs chan<- *prometheus.Desc) {
+	prometheus.DescribeByCollect(c, descs)
+}
+
+// Collect collects Prometheus metrics exposed by the HTTPClient.
+func (c *HTTPClient) Collect(metrics chan<- prometheus.Metric) {
+	c.latencyMetric.Collect(metrics)
+}
+
+// allowedRequest is a request for the internal gitlab api /allowed endpoint
+type allowedRequest struct {
+	Action        string   `json:"action,omitempty"`
+	GLRepository  string   `json:"gl_repository,omitempty"`
+	Project       string   `json:"project,omitempty"`
+	Changes       string   `json:"changes,omitempty"`
+	Protocol      string   `json:"protocol,omitempty"`
+	RelativePath  string   `json:"relative_path,omitempty"`
+	Env           string   `json:"env,omitempty"`
+	Username      string   `json:"username,omitempty"`
+	KeyID         string   `json:"key_id,omitempty"`
+	UserID        string   `json:"user_id,omitempty"`
+	PushOptions   []string `json:"push_options,omitempty"`
+	ClientContext []byte   `json:"gitaly_client_context_bin,omitempty"`
+}
+
+func (a *allowedRequest) parseAndSetGLID(glID string) error {
+	var value string
+
+	switch {
+	case strings.HasPrefix(glID, "username-"):
+		a.Username = strings.TrimPrefix(glID, "username-")
+		return nil
+	case strings.HasPrefix(glID, "key-"):
+		a.KeyID = strings.TrimPrefix(glID, "key-")
+		value = a.KeyID
+	case strings.HasPrefix(glID, "user-"):
+		a.UserID = strings.TrimPrefix(glID, "user-")
+		value = a.UserID
+	}
+
+	if !glIDRegex.MatchString(value) {
+		return fmt.Errorf("gl_id=%q is invalid", glID)
+	}
+
+	return nil
+}
+
+// allowedResponse is a response for the internal gitlab api's /allowed endpoint with a subset
+// of fields
+type allowedResponse struct {
+	Status  bool   `json:"status"`
+	Message string `json:"message"`
+}
+
+// Allowed checks if a ref change for a given repository is allowed through the gitlab internal api /allowed endpoint
+func (c *HTTPClient) Allowed(ctx context.Context, params AllowedParams) (bool, string, error) {
+	ctx = withOriginalRemoteIP(ctx)
+	defer prometheus.NewTimer(c.latencyMetric.WithLabelValues("allowed")).ObserveDuration()
+
+	gitObjDirVars, err := marshallGitObjectDirs(params.GitObjectDirectory, params.GitAlternateObjectDirectories)
+	if err != nil {
+		return false, "", fmt.Errorf("when getting git object directories json encoded string: %w", err)
+	}
+
+	req := allowedRequest{
+		Action:        "git-receive-pack",
+		GLRepository:  params.GLRepository,
+		Changes:       params.Changes,
+		Protocol:      params.GLProtocol,
+		Project:       strings.Replace(params.RepoPath, "'", "", -1),
+		RelativePath:  params.RelativePath,
+		Env:           gitObjDirVars,
+		PushOptions:   params.PushOptions,
+		ClientContext: params.ClientContext,
+	}
+
+	if err := req.parseAndSetGLID(params.GLID); err != nil {
+		return false, "", fmt.Errorf("setting gl_id: %w", err)
+	}
+
+	resp, err := c.Post(ctx, "/allowed", &req)
+	if err != nil {
+		return false, "", err
+	}
+	defer c.finalizeResponse(resp)
+
+	var response allowedResponse
+
+	switch resp.StatusCode {
+	case http.StatusOK,
+		http.StatusMultipleChoices:
+
+		mtype, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+		if err != nil {
+			return false, "", fmt.Errorf("/allowed endpoint respond with unsupported content type: %w", err)
+		}
+
+		if mtype != "application/json" {
+			return false, "", fmt.Errorf("/allowed endpoint respond with unsupported content type: %s", mtype)
+		}
+
+		if err = json.NewDecoder(resp.Body).Decode(&response); err != nil {
+			return false, "", fmt.Errorf("decoding response from /allowed endpoint: %w", err)
+		}
+	default:
+		return false, "", fmt.Errorf("gitlab api is not accessible: %d", resp.StatusCode)
+	}
+
+	return response.Status, response.Message, nil
+}
+
+type preReceiveResponse struct {
+	ReferenceCounterIncreased bool `json:"reference_counter_increased"`
+}
+
+// PreReceive increases the reference counter for a push for a given gl_repository through the gitlab internal API /pre_receive endpoint
+func (c *HTTPClient) PreReceive(ctx context.Context, glRepository string) (bool, error) {
+	ctx = withOriginalRemoteIP(ctx)
+	defer prometheus.NewTimer(c.latencyMetric.WithLabelValues("pre-receive")).ObserveDuration()
+
+	resp, err := c.Post(ctx, "/pre_receive", map[string]string{"gl_repository": glRepository})
+	if err != nil {
+		return false, fmt.Errorf("http post to gitlab api /pre_receive endpoint: %w", err)
+	}
+
+	defer c.finalizeResponse(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("pre-receive call failed with status: %d", resp.StatusCode)
+	}
+
+	mtype, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return false, fmt.Errorf("/pre_receive endpoint respond with unsupported content type: %w", err)
+	}
+
+	if mtype != "application/json" {
+		return false, fmt.Errorf("/pre_receive endpoint respond with unsupported content type: %s", mtype)
+	}
+
+	var result preReceiveResponse
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("decoding response from /pre_receive endpoint: %w", err)
+	}
+
+	return result.ReferenceCounterIncreased, nil
+}
+
+// postReceiveResponse is the response the GitLab internal api provides on a successful /post_receive call
+type postReceiveResponse struct {
+	ReferenceCounterDecreased bool                 `json:"reference_counter_decreased"`
+	Messages                  []PostReceiveMessage `json:"messages"`
+}
+
+// PostReceive decreases the reference counter for a push for a given gl_repository through the gitlab internal API /post_receive endpoint
+func (c *HTTPClient) PostReceive(ctx context.Context, glRepository, glID, changes string, clientCtx []byte, pushOptions ...string) (bool, []PostReceiveMessage, error) {
+	ctx = withOriginalRemoteIP(ctx)
+	defer prometheus.NewTimer(c.latencyMetric.WithLabelValues("post-receive")).ObserveDuration()
+
+	resp, err := c.Post(ctx, "/post_receive", map[string]interface{}{"gl_repository": glRepository, "identifier": glID, "changes": changes, "gitaly_client_context_bin": clientCtx, "push_options": pushOptions})
+	if err != nil {
+		return false, nil, fmt.Errorf("http post to gitlab api /post_receive endpoint: %w", err)
+	}
+
+	defer c.finalizeResponse(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		return false, nil, fmt.Errorf("post-receive call failed with status: %d", resp.StatusCode)
+	}
+
+	mtype, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return false, nil, fmt.Errorf("/post_receive endpoint respond with invalid content type: %w", err)
+	}
+
+	if mtype != "application/json" {
+		return false, nil, fmt.Errorf("/post_receive endpoint respond with unsupported content type: %s", mtype)
+	}
+
+	var result postReceiveResponse
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, nil, fmt.Errorf("decoding response from /post_receive endpoint: %w", err)
+	}
+
+	return result.ReferenceCounterDecreased, result.Messages, nil
+}
+
+// Check performs an HTTP request to the internal/check API endpoint to verify
+// the connection and tokens. It returns basic information of the installed
+// GitLab
+func (c *HTTPClient) Check(ctx context.Context) (*CheckInfo, error) {
+	ctx = withOriginalRemoteIP(ctx)
+	defer prometheus.NewTimer(c.latencyMetric.WithLabelValues("check")).ObserveDuration()
+
+	resp, err := c.Get(ctx, "/check")
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET to GitLab endpoint /check failed: %w", err)
+	}
+
+	defer c.finalizeResponse(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Check HTTP request failed with status: %d", resp.StatusCode)
+	}
+
+	var info CheckInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("failed to decode response from /check endpoint: %w", err)
+	}
+
+	return &info, nil
+}
+
+// ObjectPoolMembers queries the GitLab internal API /gitaly/object_pool_members to list
+// member repositories for the given pool disk paths. The returned map is keyed by the disk
+// path as passed in; missing pools are returned as empty slices.
+func (c *HTTPClient) ObjectPoolMembers(ctx context.Context, diskPaths []string, storage string, upstreamOnly bool) (map[string][]ObjectPoolMember, error) {
+	ctx = withOriginalRemoteIP(ctx)
+
+	query := url.Values{}
+	for _, diskPath := range diskPaths {
+		query.Add("disk_paths[]", diskPath)
+	}
+	query.Set("storage", storage)
+	if upstreamOnly {
+		query.Set("upstream_only", "true")
+	}
+
+	resp, err := c.Get(ctx, fmt.Sprintf("/gitaly/object_pool_members?%s", query.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("get: %w", err)
+	}
+
+	defer c.finalizeResponse(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get: %d", resp.StatusCode)
+	}
+
+	members := make(map[string][]ObjectPoolMember)
+	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+		return nil, fmt.Errorf("decode response body: %w", err)
+	}
+
+	return members, nil
+}
+
+func (c *HTTPClient) finalizeResponse(resp *http.Response) {
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		c.logger.WithError(err).WithField("request_uri", resp.Request.RequestURI).Error("discard body error for the request")
+	}
+	if err := resp.Body.Close(); err != nil {
+		c.logger.WithError(err).WithField("request_uri", resp.Request.RequestURI).Error("close body error for the request")
+	}
+}
+
+// marshallGitObjectDirs generates a json encoded string containing GIT_OBJECT_DIRECTORY_RELATIVE, and GIT_ALTERNATE_OBJECT_DIRECTORIES_RELATIVE
+func marshallGitObjectDirs(gitObjectDirRel string, gitAltObjectDirsRel []string) (string, error) {
+	envString, err := json.Marshal(map[string]interface{}{
+		"GIT_OBJECT_DIRECTORY_RELATIVE":             gitObjectDirRel,
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES_RELATIVE": gitAltObjectDirsRel,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return string(envString), nil
+}

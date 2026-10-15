@@ -1,0 +1,65 @@
+package praefect
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/praefect/config"
+	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+)
+
+const (
+	defaultDialTimeout        = 10 * time.Second
+	paramVirtualStorage       = "virtual-storage"
+	paramRelativePath         = "relative-path"
+	paramReplicaPath          = "replica-path"
+	paramAuthoritativeStorage = "authoritative-storage"
+)
+
+func getNodeAddress(cfg config.Config) (string, error) {
+	switch {
+	case cfg.SocketPath != "":
+		return "unix:" + cfg.SocketPath, nil
+	case cfg.ListenAddr != "":
+		return "tcp://" + cfg.ListenAddr, nil
+	case cfg.TLSListenAddr != "":
+		return "tls://" + cfg.TLSListenAddr, nil
+	default:
+		return "", errors.New("no Praefect address configured")
+	}
+}
+
+func openDB(conf config.DB, errOut io.Writer) (*sql.DB, func(), error) {
+	ctx := context.Background()
+
+	openDBCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	db, err := glsql.OpenDB(openDBCtx, conf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sql open: %w", err)
+	}
+
+	clean := func() {
+		if err := db.Close(); err != nil {
+			fmt.Fprintf(errOut, "sql close: %v\n", err)
+		}
+	}
+
+	return db, clean, nil
+}
+
+type requiredParameterError string
+
+func (p requiredParameterError) Error() string {
+	return fmt.Sprintf("%q is a required parameter", string(p))
+}
+
+type unexpectedPositionalArgsError struct{ Command string }
+
+func (err unexpectedPositionalArgsError) Error() string {
+	return fmt.Sprintf("%s doesn't accept positional arguments", err.Command)
+}

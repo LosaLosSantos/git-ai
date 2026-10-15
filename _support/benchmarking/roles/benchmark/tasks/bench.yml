@@ -1,0 +1,147 @@
+---
+- name: Set target variables for current iteration
+  set_fact:
+    target_host: "{{ current_gitaly }}"
+    target_name: "{{ hostvars[current_gitaly]['gitaly_name'] }}"
+    target_internal_ip: "{{ hostvars[current_gitaly]['internal'] }}"
+
+- name: Create benchmark results directory on Gitaly node
+  file:
+    path: "/tmp/{{ run_name }}"
+    state: directory
+    mode: "0755"
+    owner: git
+    group: git
+  delegate_to: "{{ target_host }}"
+
+- name: Create benchmark results directory on client node
+  file:
+    path: "/tmp/{{ run_name }}"
+    state: directory
+    mode: "0755"
+    owner: git
+    group: git
+
+# Clear the page cache so all runs start with a cold cache
+- name: Clear kernel page cache
+  shell: sync && echo 3 > /proc/sys/vm/drop_caches
+  when: clear_page_cache | bool
+  delegate_to: "{{ target_host }}"
+
+# Create new Gitaly process for each run for easy log collection
+- name: Start Gitaly service
+  systemd:
+    name: gitaly
+    state: restarted
+  delegate_to: "{{ target_host }}"
+
+- name: Wait for Gitaly to start up
+  shell: sleep 5
+  delegate_to: "{{ target_host }}"
+  changed_when: false  # Sleeping doesn't change anything
+
+- name: Load repositories config
+  include_vars:
+    file: "{{ playbook_dir }}/experiments/{{ gitaly_benchmarking_experiment_name }}/config.yml"
+    name: config
+
+- name: Create benchmark-gitaly directory
+  file:
+    path: /opt/benchmark-gitaly
+    state: directory
+    mode: '0700'
+    owner: git
+    group: git
+    
+- name: Copy repositories config
+  copy:
+    content: "{{ config['repositories'] | to_nice_json }}"
+    dest: /opt/benchmark-gitaly/repositories.json
+    mode: "0644"
+    owner: git
+    group: git
+
+- name: Copy workload configuration to client node
+  copy:
+    src: "{{ playbook_dir }}/experiments/{{ gitaly_benchmarking_experiment_name }}/k6-benchmark.js"
+    dest: /opt/benchmark-gitaly/k6-benchmark.js
+    mode: "0644"
+    owner: git
+    group: git
+
+# We run this task as async and poll 0 to make it non-blocking.
+# It will be allowed to run up to `workload_wait_duration` before
+# being treated as failed.
+- name: Run k6
+  command:
+    argv:
+      - k6
+      - run
+      - --verbose
+      - --summary-mode=full
+      - --summary-export=/tmp/{{ run_name }}/k6-summary-{{ target_name }}.json
+      - --console-output=/tmp/{{ run_name }}/k6-console-{{ target_name }}.txt
+      - --log-output=file=/tmp/{{ run_name }}/k6-log-{{ target_name }}.txt
+      - k6-benchmark.js
+    chdir: /opt/benchmark-gitaly
+  environment:
+    GITALY_ADDRESS: "{{ target_internal_ip }}:8075"
+    GITALY_PROTO_DIR: "/src/gitaly/proto"
+    RUN_NAME: "{{ run_name }}"
+    WORKLOAD_DURATION: "{{ workload_duration }}"
+    FETCHER_CONCURRENCY: "{{ (config.fetcher | default({})).concurrency | default('') }}"
+    FETCHER_DURATION: "{{ (config.fetcher | default({})).duration | default('') }}"
+    FETCHER_MODE: "{{ (config.fetcher | default({})).mode | default('') }}"
+  async: "{{ workload_wait_duration }}"
+  poll: 0
+  register: workload_wait
+
+# The setup-complete file is created by the k6 setup() function as a hacky way to
+# synchronise this.
+- name: Wait until k6 setup completes
+  ansible.builtin.wait_for:
+    path: "/tmp/{{ run_name }}-setup-complete"
+    sleep: 5
+    timeout: 60
+
+- name: Profile system with perf and libbpf-tools
+  command:
+    argv:
+      - /usr/local/bin/profile-gitaly
+      - "-d{{ profile_duration }}"
+      - "-o/tmp/{{ run_name }}"
+      - "-rbenchmark"
+      - "-gbenchmark"
+  when: profile | bool
+  delegate_to: "{{ target_host }}"
+
+- name: Wait for workload generator to exit
+  async_status:
+    jid: "{{ workload_wait.ansible_job_id }}"
+  register: workload_result
+  until: workload_result.finished
+  retries: 100
+  delay: 10
+
+- name: Process Gitaly logs
+  command:
+    argv:
+      - /usr/local/bin/process-gitaly-logs
+      - "/tmp/{{ run_name }}"
+  delegate_to: "{{ target_host }}"
+
+- name: Copy Gitaly logs and profiles
+  synchronize:
+    src: "{{ target_host }}:/tmp/{{ run_name }}/"
+    dest: "/tmp/{{ run_name }}/{{ target_name }}/"
+    mode: pull
+    private_key: /root/.ssh/id_ed25519
+    set_remote_user: false
+    recursive: true
+  delegate_to: "{{ groups['client'][0] }}" # required to copy between two remote hosts
+
+- name: Delete run folder from the Gitaly node
+  file:
+    path: "/tmp/{{ run_name }}"
+    state: absent
+  delegate_to: "{{ target_host }}"

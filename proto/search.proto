@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// SearchService searches the contents of a repository at a revision. Results
+// for a full commit ID are immutable, so the server may cache them as derived
+// data.
+service SearchService {
+
+  // SearchCode streams the lines of files at revision that match query.
+  rpc SearchCode(SearchCodeRequest) returns (stream SearchCodeResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+}
+
+// SearchCodeRequest is a request for the SearchCode RPC.
+message SearchCodeRequest {
+  // repository is the repository to search.
+  Repository repository = 1 [(target_repository)=true];
+  // revision is the commit-ish to search at.
+  bytes revision = 2;
+  // query is the text to search for: a fixed string, or a regular expression
+  // (POSIX extended syntax) when regex is set.
+  string query = 3;
+  // regex interprets query as a regular expression.
+  bool regex = 4;
+  // case_sensitive makes matching case sensitive (default: insensitive).
+  bool case_sensitive = 5;
+  // paths limits the search to these path prefixes (empty: whole tree).
+  repeated bytes paths = 6;
+  // max_results bounds the number of matching lines; 0 means the server
+  // default, and the server caps it at its configured maximum.
+  uint32 max_results = 7;
+  // context_lines is the number of lines of context before and after each
+  // match (capped by the server).
+  uint32 context_lines = 8;
+}
+
+// SearchCodeResponse carries a batch of matches.
+message SearchCodeResponse {
+  // Match is one matching line.
+  message Match {
+    // path is the file path.
+    bytes path = 1;
+    // line_number is 1-based.
+    int32 line_number = 2;
+    // line is the matching line without its trailing newline.
+    bytes line = 3;
+    // preceding_lines are the context lines before the match, in file order.
+    repeated bytes preceding_lines = 4;
+    // following_lines are the context lines after the match, in file order.
+    repeated bytes following_lines = 5;
+  }
+
+  // commit_id is the resolved revision. Only set on the first message.
+  string commit_id = 1;
+  // matches is a batch of matches, ordered by path then line.
+  repeated Match matches = 2;
+  // truncated is set on the last message when results were cut at
+  // max_results or by the server's time budget.
+  bool truncated = 3;
+}

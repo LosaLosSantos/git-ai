@@ -1,0 +1,373 @@
+package client
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net/url"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/grpc/dnsresolver"
+	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
+	gitalyx509 "github.com/feder-cr/open_scion/internal/x509"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	grpccorrelation "gitlab.com/gitlab-org/labkit/correlation/grpc"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	expcredentials "google.golang.org/grpc/experimental/credentials"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
+)
+
+type connectionType int
+
+const (
+	invalidConnection connectionType = iota
+	tcpConnection
+	tlsConnection
+	unixConnection
+	dnsConnection
+	dnsPlusTLSConnection
+)
+
+var (
+	defaultServiceConfig     *gitalypb.ServiceConfig
+	defaultServiceConfigJSON string
+)
+
+func init() {
+	defaultServiceConfig, defaultServiceConfigJSON = initDefaultServiceConfig()
+}
+
+func getConnectionType(rawAddress string) connectionType {
+	u, err := url.Parse(rawAddress)
+	if err != nil {
+		return invalidConnection
+	}
+
+	switch u.Scheme {
+	case "tls":
+		return tlsConnection
+	case "unix":
+		return unixConnection
+	case "tcp":
+		return tcpConnection
+	case "dns":
+		return dnsConnection
+	case "dns+tls":
+		return dnsPlusTLSConnection
+	default:
+		return invalidConnection
+	}
+}
+
+// extractHostFromDNSURL extracts the target host from a DNS URL for use in TLS ServerName.
+// For URLs like dns://[authority_host]:[authority_port]/[host]:[port], it returns the host portion.
+func extractHostFromDNSURL(rawAddress string) (string, error) {
+	u, err := url.Parse(rawAddress)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse DNS URL: %w", err)
+	}
+
+	path := u.Path
+	if path == "" {
+		path = u.Opaque
+	}
+
+	// Remove leading slash if present
+	if len(path) > 0 && path[0] == '/' {
+		path = path[1:]
+	}
+
+	// Parse the target to extract host and port
+	host, _, err := dnsresolver.ParseTarget(path, "50051")
+	if err != nil {
+		return "", fmt.Errorf("failed to parse DNS target: %w", err)
+	}
+
+	return host, nil
+}
+
+// Handshaker is an interface that allows for wrapping the transport credentials
+// with a custom handshake.
+type Handshaker interface {
+	// ClientHandshake wraps the provided credentials and returns new credentials.
+	ClientHandshake(credentials.TransportCredentials) credentials.TransportCredentials
+}
+
+type dialConfig struct {
+	handshaker Handshaker
+	grpcOpts   []grpc.DialOption
+	creds      credentials.TransportCredentials
+}
+
+// DialOption is an option that can be passed to NewClient.
+type DialOption func(*dialConfig)
+
+// WithHandshaker sets up the given handshaker so that it's passed as the transport credentials
+// which would be otherwise set. The transport credentials returned by handshaker are then set
+// instead.
+func WithHandshaker(handshaker Handshaker) DialOption {
+	return func(cfg *dialConfig) {
+		cfg.handshaker = handshaker
+	}
+}
+
+// WithGrpcOptions will set up the given gRPC dial options so that they will be used when calling
+// `grpc.NewClient()`.
+func WithGrpcOptions(opts []grpc.DialOption) DialOption {
+	return func(cfg *dialConfig) {
+		cfg.grpcOpts = append(cfg.grpcOpts, opts...)
+	}
+}
+
+// WithTransportCredentials sets up the given credentials. By default, non-TLS connections will use
+// insecure credentials whereas TLS connections will use the x509 system certificate pool. This
+// option allows callers to override these defaults.
+func WithTransportCredentials(creds credentials.TransportCredentials) DialOption {
+	return func(cfg *dialConfig) {
+		cfg.creds = creds
+	}
+}
+
+// WithRetryPolicy sets a custom retry policy for accessor RPCs. By default, accessor RPCs are
+// retried with a policy of 4 max attempts, 400ms initial backoff, 1400ms max backoff, 2x multiplier,
+// and UNAVAILABLE as the retryable status code. This option allows callers to override these defaults.
+func WithRetryPolicy(policy *gitalypb.MethodConfig_RetryPolicy) DialOption {
+	return WithGrpcOptions(
+		[]grpc.DialOption{
+			grpc.WithDefaultServiceConfig(serviceConfig(policy)),
+		},
+	)
+}
+
+// New creates a dormant connection to a Gitaly node serving at the given address. New is used by the public 'client'
+// package and the expected behavior is mostly documented there.
+func New(_ context.Context, rawAddress string, opts ...DialOption) (*grpc.ClientConn, error) {
+	var dialCfg dialConfig
+	for _, opt := range opts {
+		opt(&dialCfg)
+	}
+
+	// copy to avoid potentially mutating the backing array of the passed slice
+	connOpts := cloneOpts(dialCfg.grpcOpts)
+
+	var canonicalAddress string
+	var err error
+	var secure bool
+	var tlsServerName string
+
+	connType := getConnectionType(rawAddress)
+
+	switch connType {
+	case invalidConnection:
+		return nil, fmt.Errorf("invalid connection string: %q", rawAddress)
+	case tlsConnection:
+		canonicalAddress, err = extractHostFromRemoteURL(rawAddress) // Ensure the form: "host:port" ...
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract host for 'tls' connection: %w", err)
+		}
+
+		secure = true
+	case tcpConnection:
+		canonicalAddress, err = extractHostFromRemoteURL(rawAddress) // Ensure the form: "host:port" ...
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract host for 'tcp' connection: %w", err)
+		}
+	case dnsConnection:
+		err = dnsresolver.ValidateURL(rawAddress)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse target for 'dns' connection: %w", err)
+		}
+		canonicalAddress = rawAddress // DNS Resolver will handle this
+	case dnsPlusTLSConnection:
+		err = dnsresolver.ValidateURL(rawAddress)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse target for 'dns+tls' connection: %w", err)
+		}
+		canonicalAddress = rawAddress // DNS Resolver will handle this
+		secure = true
+
+		// Extract the host from the DNS URL to use as TLS ServerName
+		tlsServerName, err = extractHostFromDNSURL(rawAddress)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract host for TLS ServerName: %w", err)
+		}
+	case unixConnection:
+		canonicalAddress = rawAddress
+	}
+
+	transportCredentials := dialCfg.creds
+	if transportCredentials == nil {
+		if !secure {
+			transportCredentials = insecure.NewCredentials()
+		} else {
+			certPool, err := gitalyx509.SystemCertPool()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get system certificate pool for 'tls' connection: %w", err)
+			}
+
+			transportCredentials = expcredentials.NewTLSWithALPNDisabled(&tls.Config{
+				RootCAs:    certPool,
+				MinVersion: tls.VersionTLS12,
+			})
+		}
+	}
+
+	if dialCfg.handshaker != nil {
+		transportCredentials = dialCfg.handshaker.ClientHandshake(transportCredentials)
+	}
+
+	connOpts = append([]grpc.DialOption{
+		grpc.WithTransportCredentials(transportCredentials),
+		// grpc.KeepaliveParams must be specified at least as large as what is allowed by the
+		// server-side grpc.KeepaliveEnforcementPolicy
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                20 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		// grpc.WithDisableServiceConfig ignores the service config provided by resolvers
+		// when they resolve the target. gRPC provides this feature to inject service
+		// config from external sources (DNS TXT record, for example). Gitaly doesn't need
+		// this feature. When we implement a custom client-side load balancer, this feature
+		// can even break the balancer. So, we should better disable it.
+		// For more information, please visit
+		// - https://github.com/grpc/proposal/blob/master/A2-service-configs-in-dns.md
+		grpc.WithDisableServiceConfig(),
+		// grpc.WithDefaultServiceConfig sets the recommended client-side load balancing
+		// configuration to client dial. By default, gRPC clients don't support client-side load
+		// balancing. After the connection to a host is established for the first time, that
+		// client always sticks to that host. In all Gitaly clients, the connection is cached
+		// somehow, usually one connection per host. It means they always stick to the same
+		// host until the process restarts. This is not a problem in pure Gitaly environment.
+		// In a cluster with more than one Praefect node, this behavior may cause serious
+		// workload skew, especially after a fail-over event.
+		//
+		// This option configures the load balancing strategy to `round_robin`. This is a
+		// built-in strategy grpc-go provides. When combining with service discovery via DNS,
+		// a client can distribute its requests to all discovered nodes in a round-robin
+		// fashion. The client can detect the connectivity changes, such as a node goes
+		// down/up again. It evicts subsequent requests accordingly.
+		//
+		// For more information:
+		// https://gitlab.com/groups/gitlab-org/-/epics/8971#note_1207008162
+		grpc.WithDefaultServiceConfig(defaultServiceConfigJSON),
+	}, connOpts...)
+
+	// https://github.com/grpc/grpc-go/issues/8207 prevents Unix connections from working
+	// correctly if the http_proxy or https_proxy environment variables are set. Explicitly
+	// provide the grpc.WithNoProxy() option to workaround this bug.
+	if connType == unixConnection {
+		connOpts = append(connOpts, grpc.WithNoProxy())
+	}
+
+	if tlsServerName != "" {
+		connOpts = append(connOpts, grpc.WithAuthority(tlsServerName))
+	}
+
+	conn, err := grpc.NewClient(canonicalAddress, connOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial %q connection: %w", canonicalAddress, err)
+	}
+
+	return conn, nil
+}
+
+// StreamInterceptor returns the stream interceptors that should be configured for a client.
+func StreamInterceptor() grpc.DialOption {
+	return grpc.WithChainStreamInterceptor(
+		grpccorrelation.StreamClientCorrelationInterceptor(),
+	)
+}
+
+// UnaryInterceptor returns the unary interceptors that should be configured for a client.
+func UnaryInterceptor() grpc.DialOption {
+	return grpc.WithChainUnaryInterceptor(
+		grpccorrelation.UnaryClientCorrelationInterceptor(),
+	)
+}
+
+func cloneOpts(opts []grpc.DialOption) []grpc.DialOption {
+	clone := make([]grpc.DialOption, len(opts))
+	copy(clone, opts)
+	return clone
+}
+
+func serviceConfig(retryPolicy *gitalypb.MethodConfig_RetryPolicy) string {
+	serviceConfig := proto.Clone(defaultServiceConfig).(*gitalypb.ServiceConfig)
+
+	if retryPolicy != nil {
+		serviceConfig.MethodConfig[0].RetryPolicy = retryPolicy
+	}
+
+	configJSON, err := protojson.Marshal(serviceConfig)
+	if err != nil {
+		panic("fail to convert service config from protobuf to json")
+	}
+
+	return string(configJSON)
+}
+
+func initDefaultServiceConfig() (*gitalypb.ServiceConfig, string) {
+	// Compile the list of retryable methods. Only RPCs marked as accessors are safe to
+	// retry. Mutators are not safe to retry as they may not be idempotent.
+	var retryableMethods []*gitalypb.MethodConfig_Name
+	for _, methodInfo := range protoregistry.GitalyProtoPreregistered.Methods() {
+		if methodInfo.Operation != protoregistry.OpAccessor {
+			continue
+		}
+
+		retryableMethods = append(retryableMethods, &gitalypb.MethodConfig_Name{
+			Service: fmt.Sprintf("%s.%s", methodInfo.Package(), methodInfo.Service()),
+			Method:  methodInfo.Method(),
+		})
+	}
+	serviceConfig := gitalypb.ServiceConfig{
+		LoadBalancingConfig: []*gitalypb.LoadBalancingConfig{{
+			Policy: &gitalypb.LoadBalancingConfig_RoundRobin{},
+		}},
+		MethodConfig: []*gitalypb.MethodConfig{
+			{
+				Name: retryableMethods,
+				RetryPolicy: &gitalypb.MethodConfig_RetryPolicy{
+					MaxAttempts:          4,
+					InitialBackoff:       durationpb.New(time.Millisecond * 400),
+					MaxBackoff:           durationpb.New(time.Millisecond * 1400),
+					BackoffMultiplier:    2,
+					RetryableStatusCodes: []string{"UNAVAILABLE"},
+				},
+			},
+		},
+	}
+
+	configJSON, err := protojson.Marshal(&serviceConfig)
+	if err != nil {
+		panic("fail to convert service config from protobuf to json")
+	}
+
+	serviceConfigJSON := string(configJSON)
+
+	return &serviceConfig, serviceConfigJSON
+}
+
+// HealthCheckDialer uses provided dialer as an actual dialer, but issues a health check request to the remote
+// to verify the connection was set properly and could be used with no issues.
+func HealthCheckDialer(base Dialer) Dialer {
+	return func(ctx context.Context, address string, dialOptions []grpc.DialOption) (*grpc.ClientConn, error) {
+		cc, err := base(ctx, address, dialOptions)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, err := healthpb.NewHealthClient(cc).Check(ctx, &healthpb.HealthCheckRequest{}); err != nil {
+			_ = cc.Close()
+			return nil, err
+		}
+
+		return cc, nil
+	}
+}

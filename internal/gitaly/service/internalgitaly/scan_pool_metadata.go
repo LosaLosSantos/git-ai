@@ -1,0 +1,102 @@
+package internalgitaly
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"path/filepath"
+
+	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/relational"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/walk"
+	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+func (s *server) ScanPoolMetadata(req *gitalypb.ScanPoolMetadataRequest, stream gitalypb.InternalGitaly_ScanPoolMetadataServer) error {
+	ctx := stream.Context()
+	storageName := req.GetStorageName()
+
+	storagePath, err := s.locator.GetStorageByName(ctx, storageName)
+	if err != nil {
+		return structerr.NewInvalidArgument("get storage: %w", err)
+	}
+
+	processPoolMember := processPoolMemberFunc(ctx, storagePath, storageName, s.poolStore, s.logger, stream)
+
+	if err := walk.FindRepositories(ctx, s.locator, storageName, processPoolMember); err != nil {
+		return structerr.NewInternal("%w", err)
+	}
+
+	return nil
+}
+
+func processPoolMemberFunc(
+	ctx context.Context,
+	storagePath, storageName string,
+	poolStore relational.PoolStore,
+	logger log.Logger,
+	stream gitalypb.InternalGitaly_ScanPoolMetadataServer,
+) func(relPath string, _ fs.FileInfo) error {
+	invalidPools := make(map[string]bool)
+
+	return func(relPath string, fi fs.FileInfo) error {
+		repoPath := filepath.Join(storagePath, relPath)
+
+		altInfo, err := stats.AlternatesInfoForRepository(repoPath)
+		if err != nil {
+			return fmt.Errorf("read alternates for %q: %w", relPath, err)
+		}
+
+		if !altInfo.Exists || len(altInfo.ObjectDirectories) == 0 {
+			return nil
+		}
+
+		absPoolPaths := altInfo.AbsoluteObjectDirectories()
+		if len(absPoolPaths) == 0 {
+			return nil
+		}
+
+		poolObjectDir := absPoolPaths[0]
+		poolRepoPath := filepath.Dir(poolObjectDir)
+
+		poolDiskPath, err := filepath.Rel(storagePath, poolRepoPath)
+		if err != nil {
+			return fmt.Errorf("compute relative path for pool %q (repo %q): %w", poolRepoPath, relPath, err)
+		}
+		poolDiskPath = filepath.ToSlash(poolDiskPath)
+
+		// We could encounter the same invalid pool multiple times.
+		if invalidPools[poolDiskPath] {
+			recordBrokenPool(ctx, poolStore, logger, storageName, relPath, poolDiskPath)
+			return nil
+		}
+
+		if err := storage.ValidateGitDirectory(poolRepoPath); err != nil {
+			invalidPools[poolDiskPath] = true
+			recordBrokenPool(ctx, poolStore, logger, storageName, relPath, poolDiskPath)
+			return nil
+		}
+
+		return stream.Send(&gitalypb.ScanPoolMetadataResponse{
+			RelativePath: relPath,
+			PoolDiskPath: poolDiskPath,
+		})
+	}
+}
+
+func recordBrokenPool(ctx context.Context, poolStore relational.PoolStore, logger log.Logger, storageName, memberRelPath, poolDiskPath string) {
+	if poolStore == nil {
+		return
+	}
+
+	if err := poolStore.RecordBrokenPool(ctx, storageName, memberRelPath, poolDiskPath); err != nil {
+		logger.WithError(err).WithFields(log.Fields{
+			"storage":     storageName,
+			"pool_member": memberRelPath,
+			"pool":        poolDiskPath,
+		}).Warn("failed to record broken pool")
+	}
+}

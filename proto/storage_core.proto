@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// StorageCoreService administers the Graft storage core: the repository state
+// kept in a strongly consistent database plus object storage, with the local
+// git repositories of the nodes as caches (doc/graft/STORAGE.md). Its RPCs are
+// for operators; agents may not call them.
+service StorageCoreService {
+
+  // ImportRepository registers a local repository that the storage core does
+  // not know yet: its changelog history and reviews with the registration,
+  // then one pack with every object reachable from its references, then
+  // changeset 1 with all its references. A failed or interrupted import is
+  // resumed by calling it again. On a repository that is already tracked it
+  // brings the changelog entries and reviews written in the local files since
+  // the import into the database (the step of switching from shadow to
+  // authoritative mode) and leaves the references alone. It fails with
+  // FailedPrecondition when the storage core is off.
+  rpc ImportRepository(ImportRepositoryRequest) returns (ImportRepositoryResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+  // GetStorageState returns how the storage core sees the repository and how
+  // far this node's local copy is.
+  rpc GetStorageState(GetStorageStateRequest) returns (GetStorageStateResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // VerifyRepository compares the local references with the database and
+  // optionally checks the connectivity of the local repository. In
+  // authoritative mode the local repository is caught up first.
+  rpc VerifyRepository(VerifyRepositoryRequest) returns (VerifyRepositoryResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+}
+
+// ImportRepositoryRequest is the request of ImportRepository.
+message ImportRepositoryRequest {
+  // repository is the local repository to import.
+  Repository repository = 1 [(target_repository)=true];
+}
+
+// ImportRepositoryResponse is the response of ImportRepository.
+message ImportRepositoryResponse {
+  // sequence is the changeset sequence of the import (1).
+  uint64 sequence = 1;
+  // references is the number of references imported, HEAD included.
+  uint32 references = 2;
+  // pack_bytes is the size of the uploaded pack.
+  int64 pack_bytes = 3;
+  // changelog_entries is the number of changelog entries imported.
+  uint32 changelog_entries = 4;
+  // reviews is the number of reviews imported.
+  uint32 reviews = 5;
+}
+
+// GetStorageStateRequest is the request of GetStorageState.
+message GetStorageStateRequest {
+  // repository is the repository to describe.
+  Repository repository = 1 [(target_repository)=true];
+}
+
+// GetStorageStateResponse is the response of GetStorageState.
+message GetStorageStateResponse {
+  // mode is the storage core mode of this node: "off", "shadow" or
+  // "authoritative".
+  string mode = 1;
+  // tracked is true when the database knows the repository.
+  bool tracked = 2;
+  // repository_id is the database ID of the repository (0 when untracked).
+  int64 repository_id = 3;
+  // head_sequence is the sequence of the repository's last changeset.
+  uint64 head_sequence = 4;
+  // applied_sequence is how far this node's local copy is; 0 when it has no
+  // watermark (shadow mode, or never synchronized).
+  uint64 applied_sequence = 5;
+  // node_id is this node's name in the database.
+  string node_id = 6;
+}
+
+// VerifyRepositoryRequest is the request of VerifyRepository.
+message VerifyRepositoryRequest {
+  // repository is the repository to verify.
+  Repository repository = 1 [(target_repository)=true];
+  // check_connectivity also runs a connectivity check of the local repository.
+  bool check_connectivity = 2;
+}
+
+// VerifyRepositoryResponse is the response of VerifyRepository.
+message VerifyRepositoryResponse {
+  // ReferenceDivergence is a reference whose local value differs from the
+  // database.
+  message ReferenceDivergence {
+    // reference is the fully qualified reference name (or HEAD).
+    bytes reference = 1;
+    // local_target is the local value: a hex object ID, "ref:<name>" for a
+    // symbolic reference, empty when the reference is absent locally.
+    string local_target = 2;
+    // database_target is the database value, in the same format.
+    string database_target = 3;
+  }
+
+  // head_sequence is the database sequence the references were compared at.
+  uint64 head_sequence = 1;
+  // divergences lists every reference that differs; empty when consistent.
+  repeated ReferenceDivergence divergences = 2;
+  // connectivity_ok is true when the connectivity check ran and passed.
+  bool connectivity_ok = 3;
+  // connectivity_error describes a failed connectivity check.
+  string connectivity_error = 4;
+}

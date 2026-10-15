@@ -1,0 +1,6 @@
+---
+- hosts: client
+  roles:
+    - benchmark
+  gather_facts: false
+  become: true

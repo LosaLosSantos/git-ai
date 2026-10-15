@@ -1,0 +1,561 @@
+package localrepo
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/archive"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCreateSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	equalError := func(tb testing.TB, expected error) func(error) {
+		return func(actual error) {
+			tb.Helper()
+			testhelper.RequireGrpcError(tb, expected, actual)
+		}
+	}
+
+	ignoreContent := func(tb testing.TB, path string, content []byte) any {
+		return nil
+	}
+
+	type setupData struct {
+		repo          *Repo
+		expectedState testhelper.DirectoryState
+		requireError  func(error)
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		setup func(t *testing.T) setupData
+	}{
+		{
+			desc: "repository contains symlink",
+			setup: func(t *testing.T) setupData {
+				_, repo, repoPath := setupRepo(t)
+
+				// Make packed-refs into a symlink so the RPC returns an error.
+				packedRefsFile := filepath.Join(repoPath, "packed-refs")
+				require.NoError(t, os.Symlink("HEAD", packedRefsFile))
+
+				return setupData{
+					repo: repo,
+					requireError: equalError(t, structerr.NewInternal(
+						"building snapshot failed: open %s: too many levels of symbolic links",
+						packedRefsFile,
+					)),
+				}
+			},
+		},
+		{
+			desc: "repository snapshot success",
+			setup: func(t *testing.T) setupData {
+				cfg, repo, repoPath := setupRepo(t)
+
+				// Write commit and perform `git-repack` to generate a packfile and index in the
+				// repository.
+				treeID := gittest.WriteTree(t, cfg, repoPath, nil)
+				commitID := gittest.WriteCommit(t, cfg, repoPath,
+					gittest.WithBranch("master"),
+					gittest.WithTree(treeID),
+				)
+				gittest.Exec(t, cfg, "-C", repoPath, "repack")
+
+				// The only entries in the pack directory should be the generated packfile and its
+				// corresponding index.
+				packEntries, err := os.ReadDir(filepath.Join(repoPath, "objects/pack"))
+				require.NoError(t, err)
+				index := packEntries[0].Name()
+				packfile := packEntries[1].Name()
+
+				// Unreachable objects should also be included in the snapshot.
+				unreachableCommitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("unreachable"))
+
+				// The shallow file, used if the repository is a shallow clone, is also included in snapshots.
+				require.NoError(t, os.WriteFile(filepath.Join(repoPath, "shallow"), nil, mode.File))
+
+				// Custom Git hooks are not included in snapshots.
+				require.NoError(t, os.MkdirAll(filepath.Join(repoPath, "hooks"), mode.Directory))
+
+				// Create a file in the objects directory that does not match the regex.
+				require.NoError(t, os.WriteFile(
+					filepath.Join(repoPath, "objects/this-should-not-be-included"),
+					nil,
+					mode.File,
+				))
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"shallow": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+				}
+				expected[fmt.Sprintf("objects/%s/%s", treeID[0:2], treeID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[fmt.Sprintf("objects/%s/%s", commitID[0:2], commitID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[fmt.Sprintf("objects/%s/%s", unreachableCommitID[0:2], unreachableCommitID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[filepath.Join("objects/pack", index)] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[filepath.Join("objects/pack", packfile)] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+
+				// Generate packed-refs file, but also keep around the loose reference.
+				gittest.Exec(t, cfg, "-C", repoPath, "pack-refs", "--all", "--no-prune")
+				for _, ref := range gittest.FilesOrReftables(
+					[]string{"packed-refs", "refs/", "refs/heads/", "refs/heads/master", "refs/tags/"},
+					append([]string{"refs/", "refs/heads", "reftable/", "reftable/tables.list"}, reftableFiles(t, repoPath)...),
+				) {
+					m := archive.TarFileMode
+					ref, isDir := strings.CutSuffix(ref, "/")
+					if isDir {
+						m |= archive.ExecuteMode | fs.ModeDir
+					}
+					expected[ref] = testhelper.DirectoryEntry{
+						Mode:         m,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+		{
+			desc: "MVCC repository includes manifest cache",
+			setup: func(t *testing.T) setupData {
+				cfg := testcfg.Build(t)
+				repoProto, repoPath := gittest.CreateMVCCRepository(t, ctx, cfg)
+				repo := NewTestRepo(t, cfg, repoProto)
+
+				commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+				// A transient lock file from an in-flight manifest publish must never be
+				// carried into the snapshot: it would wedge publishes on the extracted copy.
+				require.NoError(t, os.WriteFile(filepath.Join(repoPath, "mvcc", "manifest.lock"), nil, mode.File))
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					// With the MVCC reference backend, "refs/heads" is a stub file advising
+					// that the repository uses the MVCC format.
+					"refs": {
+						Mode: archive.TarFileMode | archive.ExecuteMode | fs.ModeDir,
+					},
+					"refs/heads": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"mvcc/manifest": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"mvcc/manifests": {
+						Mode: archive.TarFileMode | archive.ExecuteMode | fs.ModeDir,
+					},
+					"mvcc/refs": {
+						Mode: archive.TarFileMode | archive.ExecuteMode | fs.ModeDir,
+					},
+					"mvcc/pack": {
+						Mode: archive.TarFileMode | archive.ExecuteMode | fs.ModeDir,
+					},
+				}
+
+				// The manifests and reftable artifacts are content-addressed, so enumerate
+				// them from disk rather than hardcoding hashes.
+				for _, dir := range []string{"mvcc/manifests", "mvcc/refs"} {
+					entries, err := os.ReadDir(filepath.Join(repoPath, dir))
+					require.NoError(t, err)
+					require.NotEmpty(t, entries)
+					for _, entry := range entries {
+						expected[filepath.Join(dir, entry.Name())] = testhelper.DirectoryEntry{
+							Mode:         archive.TarFileMode,
+							ParseContent: ignoreContent,
+						}
+					}
+				}
+
+				for _, oid := range []string{
+					commitID.String(),
+					gittest.DefaultObjectHash.EmptyTreeOID.String(),
+				} {
+					expected[fmt.Sprintf("objects/%s/%s", oid[0:2], oid[2:])] = testhelper.DirectoryEntry{
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+		{
+			desc: "config file only includes repository format entries",
+			setup: func(t *testing.T) setupData {
+				cfg, repo, repoPath := setupRepo(t)
+
+				// Add config entries that should NOT appear in the snapshot.
+				gittest.Exec(t, cfg, "-C", repoPath, "config", "receive.fsckObjects", "true")
+				gittest.Exec(t, cfg, "-C", repoPath, "config", "core.bare", "true")
+				gittest.Exec(t, cfg, "-C", repoPath, "config", "remote.origin.url", "https://example.com/repo.git")
+
+				// Add an extensions entry that SHOULD appear.
+				gittest.Exec(t, cfg, "-C", repoPath, "config", "extensions.noop", "true")
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode: archive.TarFileMode,
+						ParseContent: func(tb testing.TB, path string, content []byte) any {
+							tb.Helper()
+
+							configContent := string(content)
+
+							// Verify the expected entries are present.
+							require.Contains(tb, configContent, "repositoryformatversion")
+							require.Contains(tb, configContent, "[extensions")
+							require.Contains(tb, configContent, "noop = true")
+
+							// In SHA256 mode, objectformat must be present.
+							if gittest.ObjectHashIsSHA256() {
+								require.Contains(tb, configContent, "objectformat = sha256")
+							}
+
+							// In reftable mode, refstorage must be present.
+							if testhelper.IsReftableEnabled() {
+								require.Contains(tb, configContent, "refstorage = reftable")
+							}
+
+							// Verify excluded entries are absent.
+							require.NotContains(tb, configContent, "fsckObjects")
+							require.NotContains(tb, configContent, "bare")
+							require.NotContains(tb, configContent, "remote")
+
+							return nil
+						},
+					},
+				}
+
+				for _, ref := range gittest.FilesOrReftables(
+					[]string{"refs/", "refs/heads/", "refs/tags/"},
+					append([]string{"refs/", "refs/heads", "reftable/", "reftable/tables.list"}, reftableFiles(t, repoPath)...),
+				) {
+					m := archive.TarFileMode
+					ref, isDir := strings.CutSuffix(ref, "/")
+					if isDir {
+						m |= archive.ExecuteMode | fs.ModeDir
+					}
+					expected[ref] = testhelper.DirectoryEntry{
+						Mode:         m,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+		{
+			desc: "alternate object database does not exist",
+			setup: func(t *testing.T) setupData {
+				_, repo, repoPath := setupRepo(t)
+
+				altFile, err := repo.InfoAlternatesPath(ctx)
+				require.NoError(t, err)
+
+				// Write a non-existent object database to the repository's alternates file. The RPC
+				// should skip over the alternates database and continue generating the snapshot.
+				altObjectDir := filepath.Join(repoPath, "does-not-exist")
+				require.NoError(t, os.WriteFile(
+					altFile,
+					[]byte(fmt.Sprintf("%s\n", altObjectDir)),
+					mode.File,
+				))
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+				}
+
+				for _, ref := range gittest.FilesOrReftables(
+					[]string{"refs/", "refs/heads/", "refs/tags/"},
+					append([]string{"refs/", "refs/heads", "reftable/", "reftable/tables.list"}, reftableFiles(t, repoPath)...),
+				) {
+					m := archive.TarFileMode
+					ref, isDir := strings.CutSuffix(ref, "/")
+					if isDir {
+						m |= archive.ExecuteMode | fs.ModeDir
+					}
+					expected[ref] = testhelper.DirectoryEntry{
+						Mode:         m,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+		{
+			desc: "alternate file with bad permissions",
+			setup: func(t *testing.T) setupData {
+				_, repo, repoPath := setupRepo(t)
+
+				altFile, err := repo.InfoAlternatesPath(ctx)
+				require.NoError(t, err)
+
+				// Write an object database with bad permissions to the repository's alternates
+				// file. The RPC should skip over the alternates database and continue generating
+				// the snapshot.
+				altObjectDir := filepath.Join(repoPath, "alt-object-dir")
+				require.NoError(t, os.WriteFile(altFile, []byte(fmt.Sprintf("%s\n", altObjectDir)), 0o000))
+
+				setupData := setupData{
+					repo: repo,
+					requireError: func(actual error) {
+						require.ErrorIs(t, actual, ErrSnapshotAlternates)
+						require.Regexp(t, "add alternates: error getting alternate object directories: open .+/objects/info/alternates: permission denied$", actual.Error())
+					},
+				}
+
+				return setupData
+			},
+		},
+		{
+			desc: "alternate object database is absolute path",
+			setup: func(t *testing.T) setupData {
+				cfg, repo, repoPath := setupRepo(t)
+
+				altFile, err := repo.InfoAlternatesPath(ctx)
+				require.NoError(t, err)
+
+				altObjectDir := filepath.Join(cfg.Storages[0].Path, gittest.NewObjectPoolName(t), "objects")
+				treeID := gittest.WriteTree(t, cfg, repoPath, nil)
+				commitID := gittest.WriteCommit(t, cfg, repoPath,
+					gittest.WithTree(treeID),
+					gittest.WithAlternateObjectDirectory(altObjectDir),
+				)
+
+				// We haven't yet written the alternates file, and thus we shouldn't be able to find
+				// this commit yet.
+				gittest.RequireObjectNotExists(t, cfg, repoPath, commitID)
+
+				// Write the alternates file and validate that the object is now reachable.
+				require.NoError(t, os.WriteFile(
+					altFile,
+					[]byte(fmt.Sprintf("%s\n", altObjectDir)),
+					mode.File,
+				))
+				gittest.RequireObjectExists(t, cfg, repoPath, commitID)
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+				}
+				expected[fmt.Sprintf("objects/%s/%s", treeID[0:2], treeID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[fmt.Sprintf("objects/%s/%s", commitID[0:2], commitID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+
+				for _, ref := range gittest.FilesOrReftables(
+					[]string{"refs/", "refs/heads/", "refs/tags/"},
+					append([]string{"refs/", "refs/heads", "reftable/", "reftable/tables.list"}, reftableFiles(t, repoPath)...),
+				) {
+					m := archive.TarFileMode
+					ref, isDir := strings.CutSuffix(ref, "/")
+					if isDir {
+						m |= archive.ExecuteMode | fs.ModeDir
+					}
+					expected[ref] = testhelper.DirectoryEntry{
+						Mode:         m,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+		{
+			desc: "alternate object database is relative path",
+			setup: func(t *testing.T) setupData {
+				cfg, repo, repoPath := setupRepo(t)
+
+				altFile, err := repo.InfoAlternatesPath(ctx)
+				require.NoError(t, err)
+
+				altObjectDir := filepath.Join(cfg.Storages[0].Path, gittest.NewObjectPoolName(t), "objects")
+				treeID := gittest.WriteTree(t, cfg, repoPath, nil)
+				commitID := gittest.WriteCommit(t, cfg, repoPath,
+					gittest.WithTree(treeID),
+					gittest.WithAlternateObjectDirectory(altObjectDir),
+				)
+
+				// We haven't yet written the alternates file, and thus we shouldn't be able to find
+				// this commit yet.
+				gittest.RequireObjectNotExists(t, cfg, repoPath, commitID)
+
+				// Write the alternates file and validate that the object is now reachable.
+				relAltObjectDir, err := filepath.Rel(filepath.Join(repoPath, "objects"), altObjectDir)
+				require.NoError(t, err)
+				require.NoError(t, os.WriteFile(
+					altFile,
+					[]byte(fmt.Sprintf("%s\n", relAltObjectDir)),
+					mode.File,
+				))
+				gittest.RequireObjectExists(t, cfg, repoPath, commitID)
+
+				expected := testhelper.DirectoryState{
+					"HEAD": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+					"config": {
+						Mode:         archive.TarFileMode,
+						ParseContent: ignoreContent,
+					},
+				}
+
+				expected[fmt.Sprintf("objects/%s/%s", treeID[0:2], treeID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+				expected[fmt.Sprintf("objects/%s/%s", commitID[0:2], commitID[2:])] = testhelper.DirectoryEntry{
+					Mode:         archive.TarFileMode,
+					ParseContent: ignoreContent,
+				}
+
+				for _, ref := range gittest.FilesOrReftables(
+					[]string{"refs/", "refs/heads/", "refs/tags/"},
+					append([]string{"refs/", "refs/heads", "reftable/", "reftable/tables.list"}, reftableFiles(t, repoPath)...),
+				) {
+					m := archive.TarFileMode
+					ref, isDir := strings.CutSuffix(ref, "/")
+					if isDir {
+						m |= archive.ExecuteMode | fs.ModeDir
+					}
+					expected[ref] = testhelper.DirectoryEntry{
+						Mode:         m,
+						ParseContent: ignoreContent,
+					}
+				}
+
+				return setupData{
+					repo:          repo,
+					expectedState: expected,
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			setup := tc.setup(t)
+
+			var data bytes.Buffer
+			err := setup.repo.CreateSnapshot(ctx, &data)
+			if setup.requireError != nil {
+				setup.requireError(err)
+				return
+			}
+			require.NoError(t, err)
+
+			testhelper.RequireTarState(t, &data, setup.expectedState)
+		})
+	}
+}
+
+func reftableFiles(t *testing.T, repoPath string) []string {
+	var files []string
+
+	root := filepath.Join(repoPath, "reftable")
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		if strings.HasSuffix(path, ".ref") {
+			files = append(files, filepath.Join("reftable", filepath.Base(path)))
+		}
+
+		return nil
+	})
+	require.NoError(t, err)
+
+	return files
+}

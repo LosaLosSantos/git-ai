@@ -1,0 +1,28 @@
+INHERITABLE_LABELS = %w[
+  type::bug
+  type::feature
+  type::maintenance
+  feature::addition
+  security
+  performance
+  Deliverable
+  group::gitaly::cluster
+  group::gitaly::git
+  group::gitaly
+]
+
+def inherited_labels
+  gitlab.api
+    .merge_request_closes_issues( gitlab.mr_json['project_id'], gitlab.mr_json['iid'])
+    .flat_map { |i| i.labels }
+    .compact
+    .uniq
+    .select { |label| INHERITABLE_LABELS.include?(label) }
+end
+
+GITALY_TEAM = gitlab.api.all_group_members("gl-gitaly").flat_map{ |i| i.username }
+
+required_labels = []
+required_labels << "group::gitaly" if GITALY_TEAM.include?(gitlab.mr_author)
+
+helper.labels_to_add.concat(required_labels | inherited_labels)

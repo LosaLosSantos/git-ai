@@ -1,0 +1,466 @@
+package diff
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"strings"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/helper/chunk"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"google.golang.org/protobuf/proto"
+)
+
+const (
+	numStatDelimiter = 0
+)
+
+var statusTypeMap = map[byte]gitalypb.ChangedPaths_Status{
+	'M': gitalypb.ChangedPaths_MODIFIED,
+	'D': gitalypb.ChangedPaths_DELETED,
+	'T': gitalypb.ChangedPaths_TYPE_CHANGE,
+	'C': gitalypb.ChangedPaths_COPIED,
+	'A': gitalypb.ChangedPaths_ADDED,
+	'R': gitalypb.ChangedPaths_RENAMED,
+}
+
+var diffFilterMap = map[gitalypb.FindChangedPathsRequest_DiffStatus]byte{
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_ADDED:       'A',
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_MODIFIED:    'M',
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_DELETED:     'D',
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_TYPE_CHANGE: 'T',
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_COPIED:      'C',
+	gitalypb.FindChangedPathsRequest_DIFF_STATUS_RENAMED:     'R',
+}
+
+// changedPathsRequestToString converts the given FindChangedPathsRequest to a string that can be passed to git-diff-tree(1). Note
+// that this function expects that all revisions have already been resolved to their respective object IDs.
+func changedPathsRequestToString(r *gitalypb.FindChangedPathsRequest_Request) (string, error) {
+	switch t := r.GetType().(type) {
+	case *gitalypb.FindChangedPathsRequest_Request_CommitRequest_:
+		return strings.Join(append([]string{t.CommitRequest.GetCommitRevision()}, t.CommitRequest.GetParentCommitRevisions()...), " "), nil
+	case *gitalypb.FindChangedPathsRequest_Request_TreeRequest_:
+		return t.TreeRequest.GetLeftTreeRevision() + " " + t.TreeRequest.GetRightTreeRevision(), nil
+	}
+
+	// This shouldn't happen
+	return "", fmt.Errorf("unknown FindChangedPathsRequest type")
+}
+
+func (s *server) FindChangedPaths(in *gitalypb.FindChangedPathsRequest, stream gitalypb.DiffService_FindChangedPathsServer) error {
+	if err := s.validateFindChangedPathsRequestParams(stream.Context(), in); err != nil {
+		return err
+	}
+
+	diffChunker := chunk.New(&findChangedPathsSender{stream: stream})
+
+	includeCommitID := true
+	requests := make([]string, len(in.GetRequests()))
+	for i, request := range in.GetRequests() {
+		str, err := changedPathsRequestToString(request)
+		if err != nil {
+			return err
+		}
+		requests[i] = str
+
+		// Check if all requests are of type CommitRequest to determine if we should include commit IDs
+		if _, ok := request.GetType().(*gitalypb.FindChangedPathsRequest_Request_CommitRequest_); !ok {
+			includeCommitID = false
+		}
+	}
+
+	diffFilter := "AMDTCR"
+	if len(in.GetDiffFilters()) > 0 {
+		seenStatus := make(map[gitalypb.FindChangedPathsRequest_DiffStatus]struct{})
+		var filter string
+
+		for _, status := range in.GetDiffFilters() {
+			filterStatus, ok := diffFilterMap[status]
+			if !ok {
+				return structerr.NewInvalidArgument("invalid diff filter requested")
+			}
+
+			// Filter out repeated statuses.
+			if _, ok := seenStatus[status]; !ok {
+				filter += string(filterStatus)
+				seenStatus[status] = struct{}{}
+			}
+		}
+		diffFilter = filter
+	}
+
+	flags := []gitcmd.Option{
+		gitcmd.Flag{Name: "-z"},
+		gitcmd.Flag{Name: "--stdin"},
+		gitcmd.Flag{Name: "-r"},
+		// By default, git-diff-tree(1) does not report changes in the root commit.
+		// By adding below flag we ask Git to behave as when comparing to an empty
+		// tree in that case.
+		gitcmd.Flag{Name: "--root"},
+		gitcmd.Flag{Name: "--diff-filter=" + diffFilter},
+	}
+
+	if !includeCommitID {
+		flags = append(flags, gitcmd.Flag{Name: "--no-commit-id"})
+	}
+
+	if in.GetFindRenames() {
+		flags = append(flags, gitcmd.Flag{Name: "--find-renames=30%"})
+	} else {
+		flags = append(flags, gitcmd.Flag{Name: "--no-renames"})
+	}
+
+	switch in.GetMergeCommitDiffMode() {
+	case gitalypb.FindChangedPathsRequest_MERGE_COMMIT_DIFF_MODE_INCLUDE_MERGES, gitalypb.FindChangedPathsRequest_MERGE_COMMIT_DIFF_MODE_UNSPECIFIED:
+		// By default, git diff-tree --stdin does not show differences
+		// for merge commits. With this flag, it shows differences to
+		// that commit from all of its parents.
+		flags = append(flags, gitcmd.Flag{Name: "-m"})
+	case gitalypb.FindChangedPathsRequest_MERGE_COMMIT_DIFF_MODE_ALL_PARENTS:
+		// This flag changes the way a merge commit is displayed (which
+		// means it is useful only when the command is given one
+		// <tree-ish>, or --stdin). It shows the differences from each
+		// of the parents to the merge result simultaneously instead of
+		// showing pairwise diff between a parent and the result one at
+		// a time (which is what the -m option does). Furthermore, it
+		// lists only files which were modified from all parents.
+		flags = append(flags, gitcmd.Flag{Name: "-c"})
+	}
+
+	repo := s.localRepoFactory.Build(in.GetRepository())
+
+	cmd, err := repo.Exec(stream.Context(), gitcmd.Command{
+		Name:  "diff-tree",
+		Flags: flags,
+	}, gitcmd.WithStdin(strings.NewReader(strings.Join(requests, "\n")+"\n")), gitcmd.WithSetupStdout())
+	if err != nil {
+		return structerr.NewInternal("cmd err: %w", err)
+	}
+
+	if err := parsePaths(bufio.NewReader(cmd), func(cp *gitalypb.ChangedPaths) error {
+		if err := diffChunker.Send(cp); err != nil {
+			return fmt.Errorf("send diff chunk: %w", err)
+		}
+		return nil
+	}, includeCommitID); err != nil {
+		return fmt.Errorf("parsing err: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return structerr.NewFailedPrecondition("cmd wait err: %w", err)
+	}
+
+	return diffChunker.Flush()
+}
+
+func parsePaths(reader *bufio.Reader, callback func(cp *gitalypb.ChangedPaths) error, includeCommitID bool) error {
+	var currentCommitID string
+	for {
+		// Read up to the first colon. If commit_ids were requested,
+		// these are parsed and included in the response.
+		beforePathEntry, err := reader.ReadBytes(':')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return err
+			}
+		}
+
+		if includeCommitID && len(beforePathEntry) > 0 {
+			// Remove the trailing colon and trim whitespace and null bytes
+			commitLine := strings.Trim(strings.TrimSpace(string(beforePathEntry[:len(beforePathEntry)-1])), "\x00")
+			if len(commitLine) == git.ObjectHashSHA1.EncodedLen() || len(commitLine) == git.ObjectHashSHA256.EncodedLen() {
+				currentCommitID = commitLine
+			}
+		}
+
+		paths, err := nextPath(reader, currentCommitID)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return fmt.Errorf("next path err: %w", err)
+		}
+
+		for _, path := range paths {
+			if err := callback(path); err != nil {
+				return fmt.Errorf("err executing callback: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func nextPath(reader *bufio.Reader, currentCommitID string) ([]*gitalypb.ChangedPaths, error) {
+	// When using git-diff-tree(1) option '-c' each line will be in the format:
+	//
+	//    1. a colon for each source.
+	//    2. mode for each "src"; 000000 if creation or unmerged.
+	//    3. a space.
+	//    4. mode for "dst"; 000000 if deletion or unmerged.
+	//    5. a space.
+	//    6. oid for each "src"; 0{40} if creation or unmerged.
+	//    7. a space.
+	//    8. oid for "dst"; 0{40} if deletion, unmerged or "work tree out of
+	//       sync with the index".
+	//    9. a space.
+	//   10. status is concatenated status characters for each parent
+	//   11. a tab or a NUL when -z option is used.
+	//   12. path for "src"
+	//   13. a tab or a NUL when -z option is used; only exists for C or R.
+	//   14. path for "dst"; only exists for C or R.
+	//
+	// Example output:
+	//
+	// ::100644 100644 100644 fabadb8 cc95eb0 4866510 MM       desc.c
+	// ::100755 100755 100755 52b7a2d 6d1ac04 d2ac7d7 RM       bar.sh
+	// ::100644 100644 100644 e07d6c5 9042e82 ee91881 RR       phooey.c
+	//
+	// This example has 2 sources, the mode and oid represent the values at
+	// each of the parents. When option '-m' was used this would be shown as:
+	//
+	// :100644 100644 fabadb8 4866510 M       desc.c
+	// :100755 100755 52b7a2d d2ac7d7 R       bar.sh
+	// :100644 100644 e07d6c5 ee91881 R       phooey.c
+	// :100644 100644 cc95eb0 4866510 M       desc.c
+	// :100755 100755 6d1ac04 d2ac7d7 M       bar.sh
+	// :100644 100644 9042e82 ee91881 R       phooey.c
+	//
+	// The number of sources returned depends on the number of parents of
+	// the commit, so we don't know in advance. First step is to count
+	// number of colons.
+
+	line, err := reader.ReadBytes(numStatDelimiter)
+	if err != nil {
+		return nil, err
+	}
+	split := bytes.Split(line[:len(line)-1], []byte(" "))
+
+	// Determine the number of sources.
+	// The first colon was eaten by reader.ReadBytes(':') so we need to add
+	// one extra to get the total source count.
+	srcCount := bytes.LastIndexByte(split[0], byte(':')) + 2
+	split[0] = split[0][srcCount-1:]
+
+	// Status letters C and R are always followed by a score denoting the percentage of similarity
+	// between the source and target of the move or copy. The scores are not needed, so they are
+	// removed to simplify the parsing operation.
+	pathStatus := removeStatusScores(split[len(split)-1])
+
+	// The new blob id of a changed path is the last object ID in the output.
+	// It's applied for a single source:
+	//
+	// :100644 100644 5be4a4a 0000000 M file.c
+	//
+	// And for multiple sources:
+	//
+	// ::100644 100644 100644 fabadb8 cc95eb0 4866510 MM	desc.c
+	newBlobID := string(split[len(split)-2])
+
+	// Sanity check on the number of fields. There should be:
+	// * a mode + hash for each source
+	// * a mode + hash for the destination
+	// * a status indicator (might be concatenated for multiple sources)
+	if len(split) != (2*srcCount)+2+1 || len(pathStatus) != srcCount {
+		return nil, fmt.Errorf("git diff-tree parsing failed on: %v", line)
+	}
+
+	// An old path is present in the output before the new path if the change status is a rename or
+	// copy. Combined diffs never include an old path as part of the output. Since a combined diff
+	// has more than one status, we skip setting old path when there is not one status.
+	var oldPath []byte
+	if len(pathStatus) == 1 {
+		switch statusTypeMap[pathStatus[0]] {
+		case gitalypb.ChangedPaths_RENAMED, gitalypb.ChangedPaths_COPIED:
+			path, err := reader.ReadBytes(numStatDelimiter)
+			if err != nil {
+				return nil, err
+			}
+			oldPath = bytes.TrimSuffix(path, []byte("\x00"))
+		}
+	}
+
+	// Read the path (until the next NUL delimiter)
+	path, err := reader.ReadBytes(numStatDelimiter)
+	if err != nil {
+		return nil, err
+	}
+	path = bytes.TrimSuffix(path, []byte("\x00"))
+
+	// Produce a gitalypb.ChangedPaths for each source
+	changedPaths := make([]*gitalypb.ChangedPaths, srcCount)
+	for i := range changedPaths {
+		oldMode, err := strconv.ParseInt(string(split[i]), 8, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parsing old mode: %w", err)
+		}
+
+		newMode, err := strconv.ParseInt(string(split[srcCount]), 8, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parsing new mode: %w", err)
+		}
+
+		parsedPath, ok := statusTypeMap[pathStatus[i]]
+		if !ok {
+			return nil, structerr.NewInternal("unknown changed paths returned: %v", string(pathStatus))
+		}
+
+		changedPaths[i] = &gitalypb.ChangedPaths{
+			Status:    parsedPath,
+			OldPath:   oldPath,
+			Path:      path,
+			OldMode:   int32(oldMode),
+			NewMode:   int32(newMode),
+			OldBlobId: string(split[srcCount+i+1]),
+			NewBlobId: newBlobID,
+			CommitId:  currentCommitID,
+		}
+	}
+
+	return changedPaths, nil
+}
+
+func removeStatusScores(s []byte) []byte {
+	var status []byte
+	for _, b := range s {
+		if _, ok := statusTypeMap[b]; ok {
+			status = append(status, b)
+		}
+	}
+	return status
+}
+
+// This sender implements the interface in the chunker class
+type findChangedPathsSender struct {
+	paths  []*gitalypb.ChangedPaths
+	stream gitalypb.DiffService_FindChangedPathsServer
+}
+
+func (t *findChangedPathsSender) Reset() {
+	t.paths = nil
+}
+
+func (t *findChangedPathsSender) Append(m proto.Message) {
+	t.paths = append(t.paths, m.(*gitalypb.ChangedPaths))
+}
+
+func (t *findChangedPathsSender) Send() error {
+	return t.stream.Send(&gitalypb.FindChangedPathsResponse{
+		Paths: t.paths,
+	})
+}
+
+func resolveObjectWithType(
+	ctx context.Context,
+	objectInfoReader catfile.ObjectInfoReader,
+	revision string,
+	expectedType string,
+) (git.ObjectID, error) {
+	if revision == "" {
+		return "", structerr.NewInvalidArgument("revision cannot be empty")
+	}
+
+	info, err := objectInfoReader.Info(ctx, git.Revision(fmt.Sprintf("%s^{%s}", revision, expectedType)))
+	if err != nil {
+		if errors.As(err, &catfile.NotFoundError{}) {
+			return "", structerr.NewNotFound("revision can not be found: %q", revision)
+		}
+		return "", err
+	}
+
+	return info.Oid, nil
+}
+
+func (s *server) validateFindChangedPathsRequestParams(ctx context.Context, in *gitalypb.FindChangedPathsRequest) error {
+	repository := in.GetRepository()
+	if err := s.locator.ValidateRepository(ctx, repository); err != nil {
+		return structerr.NewInvalidArgument("%w", err)
+	}
+
+	gitRepo := s.localRepoFactory.Build(repository)
+
+	if len(in.GetCommits()) > 0 { //nolint:staticcheck
+		if len(in.GetRequests()) > 0 {
+			return structerr.NewInvalidArgument("cannot specify both commits and requests")
+		}
+
+		in.Requests = make([]*gitalypb.FindChangedPathsRequest_Request, len(in.GetCommits())) //nolint:staticcheck
+		for i, commit := range in.GetCommits() {                                              //nolint:staticcheck
+			in.Requests[i] = &gitalypb.FindChangedPathsRequest_Request{
+				Type: &gitalypb.FindChangedPathsRequest_Request_CommitRequest_{
+					CommitRequest: &gitalypb.FindChangedPathsRequest_Request_CommitRequest{
+						CommitRevision: commit,
+					},
+				},
+			}
+		}
+	}
+
+	objectInfoReader, cancel, err := s.catfileCache.ObjectInfoReader(ctx, gitRepo)
+	if err != nil {
+		return structerr.NewInternal("getting object info reader: %w", err)
+	}
+	defer cancel()
+
+	for _, request := range in.GetRequests() {
+		switch t := request.GetType().(type) {
+		case *gitalypb.FindChangedPathsRequest_Request_CommitRequest_:
+			oid, err := resolveObjectWithType(
+				ctx,
+				objectInfoReader,
+				t.CommitRequest.GetCommitRevision(),
+				"commit",
+			)
+			if err != nil {
+				return structerr.NewInternal("resolving commit: %w", err)
+			}
+			t.CommitRequest.CommitRevision = oid.String()
+
+			for i, commit := range t.CommitRequest.GetParentCommitRevisions() {
+				oid, err := resolveObjectWithType(
+					ctx,
+					objectInfoReader,
+					commit,
+					"commit",
+				)
+				if err != nil {
+					return structerr.NewInternal("resolving commit parent: %w", err)
+				}
+				t.CommitRequest.ParentCommitRevisions[i] = oid.String()
+			}
+		case *gitalypb.FindChangedPathsRequest_Request_TreeRequest_:
+			oid, err := resolveObjectWithType(
+				ctx,
+				objectInfoReader,
+				t.TreeRequest.GetLeftTreeRevision(),
+				"tree",
+			)
+			if err != nil {
+				return structerr.NewInternal("resolving left tree: %w", err)
+			}
+			t.TreeRequest.LeftTreeRevision = oid.String()
+
+			oid, err = resolveObjectWithType(
+				ctx,
+				objectInfoReader,
+				t.TreeRequest.GetRightTreeRevision(),
+				"tree",
+			)
+			if err != nil {
+				return structerr.NewInternal("resolving right tree: %w", err)
+			}
+			t.TreeRequest.RightTreeRevision = oid.String()
+		}
+	}
+
+	return nil
+}

@@ -1,0 +1,198 @@
+package ref
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/git/updateref"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+func (s *server) DeleteRefs(ctx context.Context, in *gitalypb.DeleteRefsRequest) (_ *gitalypb.DeleteRefsResponse, returnedErr error) {
+	if err := validateDeleteRefRequest(ctx, s.locator, in); err != nil {
+		return nil, structerr.NewInvalidArgument("%w", err)
+	}
+
+	repo := s.localRepoFactory.Build(in.GetRepository())
+
+	refnames, err := s.refsToRemove(ctx, repo, in)
+	if err != nil {
+		return nil, structerr.NewInternal("%w", err)
+	}
+
+	updater, err := updateref.New(ctx, repo, updateref.WithNoDeref())
+	if err != nil {
+		if errors.Is(err, gitcmd.ErrInvalidArg) {
+			return nil, structerr.NewInvalidArgument("%w", err)
+		}
+		return nil, structerr.NewInternal("%w", err)
+	}
+	defer func() {
+		if err := updater.Close(); err != nil && returnedErr == nil {
+			returnedErr = fmt.Errorf("close updater: %w", err)
+		}
+	}()
+
+	voteHash := voting.NewVoteHash()
+
+	var invalidRefnames [][]byte
+
+	for _, ref := range refnames {
+		if err := git.ValidateRevision([]byte(ref)); err != nil {
+			invalidRefnames = append(invalidRefnames, []byte(ref))
+		}
+	}
+
+	if len(invalidRefnames) > 0 {
+		return nil, structerr.NewInvalidArgument("invalid references").WithDetail(
+			&gitalypb.DeleteRefsError{
+				Error: &gitalypb.DeleteRefsError_InvalidFormat{
+					InvalidFormat: &gitalypb.InvalidRefFormatError{
+						Refs: invalidRefnames,
+					},
+				},
+			},
+		)
+	}
+	if err := updater.Start(); err != nil {
+		return nil, structerr.NewInternal("start reference transaction: %w", err)
+	}
+
+	for _, ref := range refnames {
+		if err := updater.Delete(ref); err != nil {
+			return nil, structerr.NewInternal("unable to delete refs: %w", err)
+		}
+
+		if _, err := voteHash.Write([]byte(ref.String() + "\n")); err != nil {
+			return nil, structerr.NewInternal("could not update vote hash: %w", err)
+		}
+	}
+
+	vote, err := voteHash.Vote()
+	if err != nil {
+		return nil, structerr.NewInternal("could not compute vote: %w", err)
+	}
+
+	if err := transaction.VoteOnContext(ctx, s.txManager, vote, voting.Preparing); err != nil {
+		return nil, structerr.NewInternal("preparing vote: %w", err)
+	}
+
+	if err := updater.Prepare(); err != nil {
+		// A locked reference or a locked packed-refs file both mean that a concurrent writer holds
+		// a lock we would need. Both are transient, so the caller may retry. The packed-refs lock
+		// covers the whole file, so there is no reference to report in that case.
+		var lockedRefs [][]byte
+		var alreadyLockedErr updateref.AlreadyLockedError
+		if errors.As(err, &alreadyLockedErr) {
+			lockedRefs = [][]byte{[]byte(alreadyLockedErr.ReferenceName)}
+		} else if !errors.Is(err, updateref.ErrPackedRefsLocked) {
+			return nil, structerr.NewInternal("unable to prepare: %w", err)
+		}
+
+		return nil, structerr.NewAborted("cannot lock references").WithDetail(
+			&gitalypb.DeleteRefsError{
+				Error: &gitalypb.DeleteRefsError_ReferencesLocked{
+					ReferencesLocked: &gitalypb.ReferencesLockedError{
+						Refs: lockedRefs,
+					},
+				},
+			},
+		)
+	}
+
+	// All deletes we're doing in this RPC are force deletions. Because we're required to filter
+	// out transactions which only consist of force deletions, we never do any voting via the
+	// reference-transaction hook here. Instead, we need to resort to a manual vote which is
+	// simply the concatenation of all reference we're about to delete.
+	if err := transaction.VoteOnContext(ctx, s.txManager, vote, voting.Prepared); err != nil {
+		return nil, structerr.NewInternal("prepared vote: %w", err)
+	}
+
+	if err := updater.Commit(); err != nil {
+		return nil, structerr.NewInternal("unable to commit: %w", err)
+	}
+
+	if err := transaction.VoteOnContext(ctx, s.txManager, vote, voting.Committed); err != nil {
+		return nil, structerr.NewInternal("committing vote: %w", err)
+	}
+
+	return &gitalypb.DeleteRefsResponse{}, nil
+}
+
+func (s *server) refsToRemove(ctx context.Context, repo *localrepo.Repo, req *gitalypb.DeleteRefsRequest) ([]git.ReferenceName, error) {
+	if len(req.GetRefs()) > 0 {
+		refs := make([]git.ReferenceName, len(req.GetRefs()))
+		for i, ref := range req.GetRefs() {
+			refs[i] = git.ReferenceName(ref)
+		}
+		return refs, nil
+	}
+
+	prefixes := make([]string, len(req.GetExceptWithPrefix()))
+	for i, prefix := range req.GetExceptWithPrefix() {
+		prefixes[i] = string(prefix)
+	}
+
+	existingRefs, err := repo.GetReferences(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var refs []git.ReferenceName
+	for _, existingRef := range existingRefs {
+		if hasAnyPrefix(existingRef.Name.String(), prefixes) {
+			continue
+		}
+
+		refs = append(refs, existingRef.Name)
+	}
+
+	return refs, nil
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateDeleteRefRequest(ctx context.Context, locator storage.Locator, req *gitalypb.DeleteRefsRequest) error {
+	if err := locator.ValidateRepository(ctx, req.GetRepository()); err != nil {
+		return err
+	}
+
+	if len(req.GetExceptWithPrefix()) > 0 && len(req.GetRefs()) > 0 {
+		return errors.New("ExceptWithPrefix and Refs are mutually exclusive")
+	}
+
+	if len(req.GetExceptWithPrefix()) == 0 && len(req.GetRefs()) == 0 { // You can't delete all refs
+		return errors.New("empty ExceptWithPrefix and Refs")
+	}
+
+	for _, prefix := range req.GetExceptWithPrefix() {
+		if len(prefix) == 0 {
+			return errors.New("empty prefix for exclusion")
+		}
+	}
+
+	for _, ref := range req.GetRefs() {
+		if len(ref) == 0 {
+			return errors.New("empty ref")
+		}
+	}
+
+	return nil
+}

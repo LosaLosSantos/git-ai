@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://gitlab.com/gitlab-org/caproni/-/raw/main/schema/caproni-project.schema.json
+# Per-repo config: gitaly's skaffold reloader and prepare hook.
+# Infra, deployers, and cluster live in `gitlab-caproni`.
+#
+# Loaded when the gitaly repository is in edit mode. Set
+# repositories.gitaly.edit_mode: true in caproni.local.yaml.
+
+lifecycle_hooks:
+  - type: edit_mode_start
+    script: .gitlab/caproni/skaffold-prepare.sh
+
+reloaders:
+  gitaly:
+    type: skaffold
+    repository: gitaly
+    edit_mode: false
+    skaffold:
+      namespace: gitlab
+      config_file: skaffold.yaml

@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      GRAFT_TEST_POSTGRES_DSN: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libexpat1-dev gettext libssl-dev zlib1g-dev libpcre2-dev
+
+      - name: Build
+        run: make build
+
+      - name: Vet
+        run: go vet ./internal/graft/... ./internal/gitaly/service/storagecore/... ./internal/gitaly/config/... ./cmd/graft/... ./sdk/...
+
+      - name: Prepare tests
+        run: make prepare-tests
+
+      - name: Test (storage core, config, CLI, SDK)
+        run: go test -count=1 ./internal/graft/corestore/... ./internal/gitaly/config ./internal/gitaly/service/storagecore ./cmd/graft ./sdk
+
+      - name: Test (storage end to end)
+        run: go test -count=1 -run '^TestStorage' ./internal/graft/e2e
+
+      - name: Test (graft-agents module)
+        run: go -C tools/graft-agents test ./...

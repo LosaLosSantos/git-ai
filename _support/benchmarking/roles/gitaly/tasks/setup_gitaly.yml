@@ -1,0 +1,148 @@
+---
+- name: Create /var/opt/gitaly directory
+  file:
+    path: /var/opt/gitaly
+    state: directory
+    mode: '0700'
+    owner: git
+    group: git
+
+- name: Create /opt/gitaly directory
+  file:
+    path: /opt/gitaly
+    state: directory
+    mode: '0755'
+    owner: git
+    group: git
+
+- name: Create runtime directory
+  file:
+    path: /var/opt/gitaly/run
+    state: directory
+    mode: '0700'
+    owner: git
+    group: git
+
+- name: Create log directory
+  file:
+    path: /var/log/gitaly
+    state: directory
+    mode: '0755'
+    owner: git
+    group: git
+
+- name: Install Gitaly build dependencies
+  apt:
+    name:
+      - cmake
+      - libssl-dev
+      - pkg-config
+    state: present
+
+- name: Install Git build dependencies
+  apt:
+    name:
+      - dh-autoreconf
+      - libcurl4-gnutls-dev
+      - libexpat1-dev
+      - gettext
+      - libz-dev
+      - libssl-dev
+      - asciidoc
+      - libffi-dev
+      - xmlto
+      - docbook2x
+      - install-info
+      - libpcre2-dev
+      - python3-pip
+      - ninja-build
+    state: present
+
+- name: Install meson via pip
+  pip:
+    name: meson
+    state: present
+
+- name: Clone Gitaly at specified commit
+  git:
+    repo: https://gitlab.com/gitlab-org/gitaly.git
+    dest: /src/gitaly
+    version: "{{ target_instance.gitaly_revision }}"
+  become_user: git
+
+- name: Build Gitaly
+  make:
+    target: build
+    jobs: "{{ ansible_processor_nproc }}"
+    chdir: /src/gitaly
+  environment:
+    PATH: '/usr/local/go/bin:{{ ansible_env.PATH }}'
+  become_user: git
+
+- name: Install Gitaly to /opt/gitaly
+  make:
+    target: install
+    params:
+      PREFIX: /opt/gitaly
+    jobs: "{{ ansible_processor_nproc }}"
+    chdir: /src/gitaly
+  environment:
+    PATH: '/usr/local/go/bin:{{ ansible_env.PATH }}'
+    CFLAGS: '-fno-omit-frame-pointer -g -O2'
+  become_user: git
+
+- name: Install Gitaly config
+  template:
+    src: config.toml.j2
+    dest: /var/opt/gitaly/config.toml
+    owner: git
+    group: git
+    mode: '0600'
+
+# Install and start mock GitLab API before Gitaly
+- name: Install mock GitLab API server script
+  copy:
+    src: mock-gitlab-api.py
+    dest: /usr/local/bin/mock-gitlab-api.py
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install mock GitLab API systemd service
+  template:
+    src: mock-gitlab-api.service.j2
+    dest: /etc/systemd/system/mock-gitlab-api.service
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Reload systemd daemon for mock API
+  systemd:
+    daemon_reload: true
+
+- name: Enable and start mock GitLab API service
+  systemd:
+    name: mock-gitlab-api
+    enabled: true
+    state: started
+
+- name: Wait for mock GitLab API to be responding
+  uri:
+    url: "http://127.0.0.1:3001/api/v4/internal/check"
+    method: GET
+    status_code: 200
+  register: api_check
+  until: api_check.status == 200
+  retries: 10
+  delay: 2
+
+# Now install and configure Gitaly (which will connect to the mock API)
+- name: Install Gitaly systemd service
+  template:
+    src: gitaly.service.j2
+    dest: /etc/systemd/system/gitaly.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - load service

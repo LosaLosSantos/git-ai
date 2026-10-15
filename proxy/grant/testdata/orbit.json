@@ -1,0 +1,52 @@
+{
+  "GitalyServer": {
+    "address": "tcp://praefect.internal:2305",
+    "token": "gitaly-token",
+    "call_metadata": {
+      "client_name": "gkg-indexer",
+      "gitaly-feature-example": "true",
+      "remote_ip": "10.0.0.7"
+    }
+  },
+  "GitalyProxy": {
+    "profile": "readonly_repository",
+    "consumer": "gkg-indexer",
+    "repository": {
+      "storage_name": "default",
+      "relative_path": "@hashed/6b/86/6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b.git",
+      "gl_repository": "project-42",
+      "gl_project_path": "group/proj"
+    },
+    "allowed_methods": [
+      "/gitaly.RepositoryService/RepositoryExists",
+      "/gitaly.RepositoryService/GetArchive",
+      "/gitaly.BlobService/ListBlobs",
+      "/gitaly.BlobService/GetBlob",
+      "/gitaly.BlobService/GetBlobs",
+      "/gitaly.BlobService/ListLFSPointers",
+      "/gitaly.CommitService/FindCommit",
+      "/gitaly.CommitService/FindCommits",
+      "/gitaly.CommitService/ListCommits",
+      "/gitaly.CommitService/GetTreeEntries",
+      "/gitaly.CommitService/TreeEntry",
+      "/gitaly.CommitService/ListFiles",
+      "/gitaly.CommitService/LastCommitForPath",
+      "/gitaly.CommitService/CommitIsAncestor",
+      "/gitaly.CommitService/ListLastCommitsForTree",
+      "/gitaly.CommitService/RawBlame",
+      "/gitaly.DiffService/FindChangedPaths",
+      "/gitaly.DiffService/RawDiff",
+      "/gitaly.DiffService/CommitDiff",
+      "/gitaly.RefService/FindDefaultBranchName",
+      "/gitaly.RefService/FindBranch",
+      "/gitaly.RefService/FindLocalBranches",
+      "/gitaly.RefService/FindAllTags",
+      "/gitaly.RefService/FindTag",
+      "/gitaly.RefService/ListRefs"
+    ],
+    "expires_in": 600,
+    "max_concurrent_streams": 32,
+    "project_id": 42,
+    "root_namespace_id": 7
+  }
+}

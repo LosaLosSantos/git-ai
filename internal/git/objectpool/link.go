@@ -1,0 +1,204 @@
+package objectpool
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+)
+
+// Link calls the non-receiver method version of Link with the parameters
+// injected from the object pool.
+func (o *ObjectPool) Link(ctx context.Context, repo *localrepo.Repo) error {
+	return Link(ctx, o.Repo, repo, o.txManager)
+}
+
+// Link will link the given repository to the object pool. This is done by writing the object pool's
+// path relative to the repository into the repository's "alternates" file. This does not trigger
+// deduplication, which is the responsibility of the caller.
+func Link(ctx context.Context, pool, repo *localrepo.Repo, txManager transaction.Manager) (returnedErr error) {
+	altPath, err := repo.InfoAlternatesPath(ctx)
+	if err != nil {
+		return err
+	}
+
+	expectedRelPath, err := getRelativeObjectPath(ctx, pool, repo)
+	if err != nil {
+		return err
+	}
+
+	linked, err := linkedToRepository(ctx, pool, repo)
+	if err != nil {
+		return err
+	}
+
+	if linked {
+		// When the repository is already linked to the repository, cast a vote to ensure the
+		// repository is consistent with the other replicas.
+		if err := transaction.VoteOnContext(ctx, txManager, voting.VoteFromData([]byte("repository linked")), voting.Synchronized); err != nil {
+			return fmt.Errorf("vote on linked repository: %w", err)
+		}
+
+		return nil
+	}
+
+	alternatesWriter, err := safe.NewLockingFileWriter(altPath)
+	if err != nil {
+		return fmt.Errorf("creating alternates writer: %w", err)
+	}
+	defer func() {
+		if err := alternatesWriter.Close(); err != nil && returnedErr == nil {
+			returnedErr = fmt.Errorf("closing alternates writer: %w", err)
+		}
+	}()
+
+	if _, err := io.WriteString(alternatesWriter, expectedRelPath); err != nil {
+		return fmt.Errorf("writing alternates: %w", err)
+	}
+
+	if err := transaction.CommitLockedFile(ctx, txManager, alternatesWriter); err != nil {
+		return fmt.Errorf("committing alternates: %w", err)
+	}
+
+	if tx := storage.ExtractTransaction(ctx); tx != nil {
+		alternatesRelativePath, err := filepath.Rel(tx.FS().Root(), altPath)
+		if err != nil {
+			return fmt.Errorf("rel alternates file: %w", err)
+		}
+
+		if err := tx.FS().RecordFile(alternatesRelativePath); err != nil {
+			return fmt.Errorf("record alternates file")
+		}
+	}
+
+	return removeMemberBitmaps(ctx, pool, repo)
+}
+
+// removeMemberBitmaps removes packfile bitmaps from the member
+// repository that just joined the pool. If Git finds two packfiles with
+// bitmaps it will print a warning, which is visible to the end user
+// during a Git clone. Our goal is to avoid that warning. In normal
+// operation, the next 'git gc' or 'git repack -ad' on the member
+// repository will remove its local bitmap file. In other words the
+// situation we eventually converge to is that the pool may have a bitmap
+// but none of its members will. With removeMemberBitmaps we try to
+// change "eventually" to "immediately", so that users won't see the
+// warning. https://gitlab.com/gitlab-org/gitaly/issues/1728
+func removeMemberBitmaps(ctx context.Context, pool *localrepo.Repo, repo *localrepo.Repo) error {
+	poolPath, err := pool.Path(ctx)
+	if err != nil {
+		return err
+	}
+
+	poolBitmaps, err := getBitmaps(poolPath)
+	if err != nil {
+		return err
+	}
+	if len(poolBitmaps) == 0 {
+		return nil
+	}
+
+	repoPath, err := repo.Path(ctx)
+	if err != nil {
+		return err
+	}
+
+	memberBitmaps, err := getBitmaps(repoPath)
+	if err != nil {
+		return err
+	}
+	if len(memberBitmaps) == 0 {
+		return nil
+	}
+
+	for _, bitmap := range memberBitmaps {
+		if err := os.Remove(bitmap); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func getBitmaps(repoPath string) ([]string, error) {
+	packDir := filepath.Join(repoPath, "objects/pack")
+	entries, err := os.ReadDir(packDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var bitmaps []string
+	for _, entry := range entries {
+		if name := entry.Name(); strings.HasSuffix(name, ".bitmap") && strings.HasPrefix(name, "pack-") {
+			bitmaps = append(bitmaps, filepath.Join(packDir, name))
+		}
+	}
+
+	return bitmaps, nil
+}
+
+func getRelativeObjectPath(ctx context.Context, pool, repo *localrepo.Repo) (string, error) {
+	poolPath, err := pool.Path(ctx)
+	if err != nil {
+		return "", fmt.Errorf("getting object pool path: %w", err)
+	}
+
+	repoPath, err := repo.Path(ctx)
+	if err != nil {
+		return "", fmt.Errorf("getting repository path: %w", err)
+	}
+
+	relPath, err := filepath.Rel(filepath.Join(repoPath, "objects"), poolPath)
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(relPath, "objects"), nil
+}
+
+// linkedToRepository tests if a repository is linked to an object pool
+func linkedToRepository(ctx context.Context, pool, repo *localrepo.Repo) (bool, error) {
+	poolPath, err := pool.Path(ctx)
+	if err != nil {
+		return false, fmt.Errorf("getting object pool path: %w", err)
+	}
+
+	repoPath, err := repo.Path(ctx)
+	if err != nil {
+		return false, fmt.Errorf("getting repo path: %w", err)
+	}
+
+	altInfo, err := stats.AlternatesInfoForRepository(repoPath)
+	if err != nil {
+		return false, fmt.Errorf("getting alternates info: %w", err)
+	}
+
+	if !altInfo.Exists || len(altInfo.ObjectDirectories) == 0 {
+		return false, nil
+	}
+
+	relPath := altInfo.ObjectDirectories[0]
+	expectedRelPath, err := getRelativeObjectPath(ctx, pool, repo)
+	if err != nil {
+		return false, err
+	}
+
+	if relPath == expectedRelPath {
+		return true, nil
+	}
+
+	if filepath.Clean(relPath) != filepath.Join(poolPath, "objects") {
+		return false, fmt.Errorf("unexpected alternates content: %q", relPath)
+	}
+
+	return false, nil
+}

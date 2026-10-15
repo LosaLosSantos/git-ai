@@ -1,0 +1,140 @@
+package tracker
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var (
+	alwaysInErrorWindow = func(time.Time, time.Time) bool { return true }
+	neverInErrorWindow  = func(time.Time, time.Time) bool { return false }
+)
+
+func TestErrorTracker_IncrErrors(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	writeThreshold, readThreshold := 10, 10
+
+	errors, err := newErrors(ctx, alwaysInErrorWindow, uint32(readThreshold), uint32(writeThreshold))
+	require.NoError(t, err)
+
+	node := "backend-node-1"
+
+	assert.False(t, errors.WriteThresholdReached(node))
+	assert.False(t, errors.ReadThresholdReached(node))
+
+	for i := 0; i < writeThreshold; i++ {
+		errors.IncrWriteErr(node)
+	}
+
+	assert.True(t, errors.WriteThresholdReached(node))
+
+	for i := 0; i < readThreshold; i++ {
+		errors.IncrReadErr(node)
+	}
+
+	assert.True(t, errors.ReadThresholdReached(node))
+
+	// Use `neverInErrorWindow()` to make sure that all errors in the queue are cleared.
+	errors, err = newErrors(ctx, neverInErrorWindow, uint32(readThreshold), uint32(writeThreshold))
+	require.NoError(t, err)
+
+	errors.clear()
+
+	assert.False(t, errors.WriteThresholdReached(node))
+	assert.False(t, errors.ReadThresholdReached(node))
+}
+
+func TestErrorTracker_Concurrency(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	readAndWriteThreshold := 10
+	errors, err := newErrors(ctx, alwaysInErrorWindow, uint32(readAndWriteThreshold), uint32(readAndWriteThreshold))
+	require.NoError(t, err)
+
+	node := "backend-node-1"
+
+	assert.False(t, errors.WriteThresholdReached(node))
+	assert.False(t, errors.ReadThresholdReached(node))
+
+	var g sync.WaitGroup
+	for i := 0; i < readAndWriteThreshold; i++ {
+		g.Add(1)
+		go func() {
+			errors.IncrWriteErr(node)
+			errors.IncrReadErr(node)
+			errors.ReadThresholdReached(node)
+			errors.WriteThresholdReached(node)
+
+			g.Done()
+		}()
+	}
+
+	g.Wait()
+}
+
+func TestErrorTracker_ClearErrors(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	writeThreshold, readThreshold := 10, 10
+	errors, err := newErrors(ctx, alwaysInErrorWindow, uint32(readThreshold), uint32(writeThreshold))
+	require.NoError(t, err)
+
+	node := "backend-node-1"
+
+	now := time.Now()
+	beforeNow := now.Add(-10 * time.Millisecond)
+	afterNow := now.Add(10 * time.Millisecond)
+
+	errors.incrWriteErrTime(node, beforeNow)
+	errors.incrReadErrTime(node, beforeNow)
+
+	errors.isInErrorWindow = func(_ time.Time, errTime time.Time) bool {
+		// Consider all errors which have been added until now to not be part of the error
+		// window anymore. All new events will be considered part of it though.
+		return errTime.After(now)
+	}
+
+	errors.incrWriteErrTime(node, afterNow)
+	errors.incrReadErrTime(node, afterNow)
+
+	errors.clear()
+	assert.Len(t, errors.readErrors[node], 1, "clear should only have cleared the read error older than the time specified")
+	assert.Len(t, errors.writeErrors[node], 1, "clear should only have cleared the write error older than the time specified")
+}
+
+func TestErrorTracker_Expired(t *testing.T) {
+	ctx, cancel := context.WithCancel(testhelper.Context(t))
+
+	threshold := 10
+	errors, err := newErrors(ctx, alwaysInErrorWindow, uint32(threshold), uint32(threshold))
+	require.NoError(t, err)
+
+	node := "node"
+	for i := 0; i < threshold; i++ {
+		errors.IncrWriteErr(node)
+		errors.IncrReadErr(node)
+	}
+
+	assert.True(t, errors.ReadThresholdReached(node))
+	assert.True(t, errors.WriteThresholdReached(node))
+
+	cancel()
+
+	assert.False(t, errors.ReadThresholdReached(node))
+	assert.False(t, errors.WriteThresholdReached(node))
+
+	for i := 0; i < threshold; i++ {
+		errors.IncrWriteErr(node)
+		errors.IncrReadErr(node)
+	}
+
+	assert.False(t, errors.ReadThresholdReached(node))
+	assert.False(t, errors.WriteThresholdReached(node))
+}

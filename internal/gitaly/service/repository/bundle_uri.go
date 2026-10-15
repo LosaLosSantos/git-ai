@@ -1,0 +1,28 @@
+package repository
+
+import (
+	"context"
+
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+// GenerateBundleURI generates a bundle on the server for bundle-URI use.
+func (s *server) GenerateBundleURI(ctx context.Context, req *gitalypb.GenerateBundleURIRequest) (_ *gitalypb.GenerateBundleURIResponse, returnErr error) {
+	if s.bundleURIManager == nil {
+		return nil, structerr.NewFailedPrecondition("no bundle-generation manager available")
+	}
+
+	repository := req.GetRepository()
+	if err := s.locator.ValidateRepository(ctx, repository); err != nil {
+		return nil, structerr.NewInvalidArgument("%w", err)
+	}
+
+	repo := s.localRepoFactory.Build(repository)
+
+	if err := s.bundleURIManager.Generate(ctx, repo); err != nil {
+		return nil, structerr.NewInternal("generate bundle: %w", err)
+	}
+
+	return &gitalypb.GenerateBundleURIResponse{}, nil
+}

@@ -1,0 +1,14 @@
+[[runners]]
+    [runners.autoscaler]
+        plugin = "googlecloud:latest"
+        capacity_per_instance = 1
+        max_instances = 12
+
+    [runners.autoscaler.plugin_config]
+        project = "PLACEHOLDER_PROJECT_NAME"
+        name = "PLACEHOLDER_INSTANCE_GROUP"
+        zone = "PLACEHOLDER_ZONE"
+
+    [[runners.autoscaler.policy]]
+        idle_count = 0
+        idle_time = "5m0s"

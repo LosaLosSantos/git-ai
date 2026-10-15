@@ -1,0 +1,70 @@
+---
+- name: Install perf
+  apt:
+    name:
+      - linux-tools-common
+      - "linux-tools-{{ ansible_kernel }}"
+      - "linux-headers-{{ ansible_kernel }}"
+      - libc6-dbg
+      - sysstat
+    state: present
+
+- name: Install bpftrace
+  ansible.builtin.get_url:
+    url: https://github.com/bpftrace/bpftrace/releases/download/{{ bpftrace_version }}/bpftrace
+    dest: /usr/local/bin/bpftrace
+    mode: 0755
+
+- name: Create /src directory
+  file:
+    path: /src
+    state: directory
+    mode: 0755
+
+- name: Clone Flamegraph
+  git:
+    repo: https://github.com/brendangregg/flamegraph.git
+    dest: /src/flamegraph
+  become_user: git
+
+- name: Install stackcollapse-perf.pl as stackcollapse-perf
+  copy:
+    src: /src/flamegraph/stackcollapse-perf.pl
+    dest: /usr/local/bin/stackcollapse-perf
+    mode: 0755
+    remote_src: true
+
+- name: Install stackcollapse-bpftrace.pl as stackcollapse-bpftrace
+  copy:
+    src: /src/flamegraph/stackcollapse-bpftrace.pl
+    dest: /usr/local/bin/stackcollapse-bpftrace
+    mode: 0755
+    remote_src: true
+
+- name: Install flamegraph.pl as flamegraph
+  copy:
+    src: /src/flamegraph/flamegraph.pl
+    dest: /usr/local/bin/flamegraph
+    mode: 0755
+    remote_src: true
+
+- name: Install off-CPU profiling scripts
+  copy:
+    src: gitaly_offcpu_profiler/
+    dest: /usr/local/gitaly_offcpu_profiler/
+    mode: preserve
+    directory_mode: 0755
+
+- name: Install summarize_cpu_usage.pl
+  copy:
+    src: summarize_cpu_usage.pl
+    dest: /usr/local/bin/summarize_cpu_usage.pl
+    mode: 0755
+
+- name: Install profile-gitaly.sh as profile-gitaly
+  copy:
+    src: "{{ playbook_dir }}/experiments/{{ gitaly_benchmarking_experiment_name }}/profile-gitaly.sh"
+    dest: /usr/local/bin/profile-gitaly
+    owner: root
+    group: root
+    mode: '0755'

@@ -1,0 +1,10 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${CM_NAME}
+  namespace: ${KUBE_NAMESPACE}
+binaryData:
+  k6-benchmark.js: ${K6_SCRIPT_B64}
+  repositories.json: ${REPOS_JSON_B64}
+  plot.py: ${PLOT_PY_B64}

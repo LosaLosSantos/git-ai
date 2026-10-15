@@ -1,0 +1,2695 @@
+package manager
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/command"
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/housekeeping"
+	"github.com/feder-cr/open_scion/internal/git/housekeeping/config"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/git/stats"
+	gitalycfg "github.com/feder-cr/open_scion/internal/gitaly/config"
+	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
+	"github.com/feder-cr/open_scion/internal/helper/perm"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/peer"
+)
+
+type entryFinalState int
+
+const (
+	Delete entryFinalState = iota
+	Keep
+
+	ancient = 240 * time.Hour
+	recent  = 24 * time.Hour
+)
+
+type errorInjectingCommandFactory struct {
+	gitcmd.CommandFactory
+	injectedErrors map[string]error
+}
+
+func (f errorInjectingCommandFactory) New(
+	ctx context.Context,
+	repo storage.Repository,
+	cmd gitcmd.Command,
+	opts ...gitcmd.CmdOpt,
+) (*command.Command, error) {
+	if injectedErr, ok := f.injectedErrors[cmd.Name]; ok {
+		return nil, injectedErr
+	}
+
+	return f.CommandFactory.New(ctx, repo, cmd, opts...)
+}
+
+type blockingCommandFactory struct {
+	gitcmd.CommandFactory
+	block map[string]chan struct{}
+}
+
+func (f *blockingCommandFactory) New(
+	ctx context.Context,
+	repo storage.Repository,
+	cmd gitcmd.Command,
+	opts ...gitcmd.CmdOpt,
+) (*command.Command, error) {
+	if ch, ok := f.block[cmd.Name]; ok {
+		ch <- struct{}{}
+		<-ch
+	}
+
+	return f.CommandFactory.New(ctx, repo, cmd, opts...)
+}
+
+func TestRepackIfNeeded(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	t.Run("no repacking", func(t *testing.T) {
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		// Create a loose object to verify it's not getting repacked.
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"), gittest.WithMessage("a"))
+
+		didRepack, repackObjectsCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: false,
+		})
+		require.NoError(t, err)
+		require.False(t, didRepack)
+		require.Equal(t, config.RepackObjectsConfig{}, repackObjectsCfg)
+
+		requireObjectsState(t, repo, objectsState{
+			looseObjects: 2,
+		})
+	})
+
+	t.Run("incremental repack", func(t *testing.T) {
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		// Create an object and pack it into a packfile.
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"), gittest.WithMessage("a"))
+		gittest.Exec(t, cfg, "-C", repoPath, "repack", "-Ad")
+		// And a second object that is loose. The incremental repack should only pack the
+		// loose object.
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"), gittest.WithMessage("b"))
+
+		didRepack, repackObjectsCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: true,
+			repackObjectsCfg: config.RepackObjectsConfig{
+				Strategy: config.RepackObjectsStrategyIncrementalWithUnreachable,
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, didRepack)
+		require.Equal(t, config.RepackObjectsConfig{
+			Strategy: config.RepackObjectsStrategyIncrementalWithUnreachable,
+		}, repackObjectsCfg)
+
+		requireObjectsState(t, repo, objectsState{
+			packfiles: 2,
+			hasBitmap: true,
+		})
+	})
+
+	t.Run("full repack", func(t *testing.T) {
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		// Create an object and pack it into a packfile.
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("a"), gittest.WithMessage("a"))
+		gittest.Exec(t, cfg, "-C", repoPath, "repack", "-Ad")
+		// And a second object that is loose. The full repack should repack both the
+		// packfiles and loose objects into a single packfile.
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("b"), gittest.WithMessage("b"))
+
+		didRepack, repackObjectsCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: true,
+			repackObjectsCfg: config.RepackObjectsConfig{
+				Strategy: config.RepackObjectsStrategyFullWithUnreachable,
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, didRepack)
+		require.Equal(t, config.RepackObjectsConfig{
+			Strategy: config.RepackObjectsStrategyFullWithUnreachable,
+		}, repackObjectsCfg)
+
+		requireObjectsState(t, repo, objectsState{
+			packfiles: 1,
+		})
+	})
+
+	t.Run("cruft repack with recent unreachable object", func(t *testing.T) {
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("reachable"), gittest.WithMessage("reachable"))
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("unreachable"))
+
+		// The expiry time is before we have written the objects, so they should be packed
+		// into a cruft pack.
+		expiryTime := time.Now().Add(-1 * time.Hour)
+
+		didRepack, repackObjectsCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: true,
+			repackObjectsCfg: config.RepackObjectsConfig{
+				Strategy:          config.RepackObjectsStrategyFullWithCruft,
+				CruftExpireBefore: expiryTime,
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, didRepack)
+		require.Equal(t, config.RepackObjectsConfig{
+			Strategy:          config.RepackObjectsStrategyFullWithCruft,
+			CruftExpireBefore: expiryTime,
+		}, repackObjectsCfg)
+
+		requireObjectsState(t, repo, objectsState{
+			packfiles:  2,
+			cruftPacks: 1,
+		})
+	})
+
+	t.Run("cruft repack with expired cruft object", func(t *testing.T) {
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("reachable"), gittest.WithMessage("reachable"))
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("unreachable"))
+		gittest.Exec(t, cfg, "-C", repoPath, "repack", "--cruft", "-d")
+
+		// The expiry time is after we have written the cruft pack, so the unreachable
+		// object should get pruned.
+		expiryTime := time.Now().Add(1 * time.Hour)
+
+		didRepack, repackObjectsCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: true,
+			repackObjectsCfg: config.RepackObjectsConfig{
+				Strategy:          config.RepackObjectsStrategyFullWithCruft,
+				CruftExpireBefore: expiryTime,
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, didRepack)
+		require.Equal(t, config.RepackObjectsConfig{
+			Strategy:          config.RepackObjectsStrategyFullWithCruft,
+			CruftExpireBefore: expiryTime,
+		}, repackObjectsCfg)
+
+		requireObjectsState(t, repo, objectsState{
+			packfiles:  1,
+			cruftPacks: 0,
+		})
+	})
+
+	t.Run("failed repack returns configuration", func(t *testing.T) {
+		repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+
+		gitCmdFactory := errorInjectingCommandFactory{
+			CommandFactory: gittest.NewCommandFactory(t, cfg),
+			injectedErrors: map[string]error{
+				"repack": assert.AnError,
+			},
+		}
+
+		repo := localrepo.New(testhelper.NewLogger(t), gitalycfg.NewLocator(cfg), gitCmdFactory, nil, repoProto)
+
+		expectedCfg := config.RepackObjectsConfig{
+			Strategy:          config.RepackObjectsStrategyFullWithCruft,
+			CruftExpireBefore: time.Now(),
+		}
+
+		didRepack, actualCfg, err := repackIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldRepackObjects: true,
+			repackObjectsCfg:    expectedCfg,
+		})
+		require.Equal(t, fmt.Errorf("repack failed: %w", assert.AnError), err)
+		require.False(t, didRepack)
+		require.Equal(t, expectedCfg, actualCfg)
+	})
+}
+
+func TestPackRefsInhibitors(t *testing.T) {
+	t.Parallel()
+
+	type setupData struct {
+		errExpected          error
+		refsShouldBePacked   bool
+		shouldPackReferences func(context.Context) bool
+	}
+
+	for _, tc := range []struct {
+		desc            string
+		setup           func(t *testing.T, ctx context.Context, m *RepositoryManager, repo storage.Repository, b *blockingCommandFactory) setupData
+		repoStateExists bool
+	}{
+		{
+			desc: "strategy doesn't pack references",
+			setup: func(t *testing.T, ctx context.Context, m *RepositoryManager, repo storage.Repository, b *blockingCommandFactory) setupData {
+				return setupData{
+					refsShouldBePacked:   false,
+					shouldPackReferences: func(context.Context) bool { return false },
+				}
+			},
+		},
+		{
+			desc: "strategy packs references",
+			setup: func(t *testing.T, ctx context.Context, m *RepositoryManager, repo storage.Repository, b *blockingCommandFactory) setupData {
+				return setupData{
+					refsShouldBePacked:   true,
+					shouldPackReferences: func(context.Context) bool { return true },
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+			logger := testhelper.NewLogger(t)
+
+			gitCmdFactory := blockingCommandFactory{
+				CommandFactory: gittest.NewCommandFactory(t, cfg),
+				block:          make(map[string]chan struct{}),
+			}
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.New(logger, gitalycfg.NewLocator(cfg), &gitCmdFactory, nil, repoProto)
+
+			// Write an empty commit such that we can create valid refs.
+			gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+			manager := New(gitalycfgprom.Config{}, logger, nil, nil)
+			data := tc.setup(t, ctx, manager, repo, &gitCmdFactory)
+
+			didRepack, err := manager.packRefsIfNeeded(ctx, repo, mockOptimizationStrategy{
+				shouldRepackReferences: data.shouldPackReferences,
+			})
+
+			require.Equal(t, data.errExpected, err)
+			require.Equal(t, didRepack, data.refsShouldBePacked)
+
+			_, ok := manager.repositoryStates.values[repositoryStatesKey(repo)]
+			require.Equal(t, tc.repoStateExists, ok)
+		})
+	}
+}
+
+func TestOptimizeRepository(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	txManager := transaction.NewManager(cfg, testhelper.SharedLogger(t), backchannel.NewRegistry())
+
+	earlierDate := time.Date(2022, 12, 1, 0, 0, 0, 0, time.Local)
+	laterDate := time.Date(2022, 12, 1, 12, 0, 0, 0, time.Local)
+
+	linkRepoToPool := func(t *testing.T, repoPath, poolPath string, date time.Time) {
+		t.Helper()
+
+		alternatesPath := filepath.Join(repoPath, "objects", "info", "alternates")
+
+		alternatesContent, err := filepath.Rel(
+			filepath.Join(repoPath, "objects"),
+			filepath.Join(poolPath, "objects"),
+		)
+		require.NoError(t, err)
+
+		require.NoError(t, os.WriteFile(
+			alternatesPath,
+			[]byte(alternatesContent),
+			mode.File,
+		))
+		require.NoError(t, os.Chtimes(alternatesPath, date, date))
+	}
+
+	readPackfiles := func(t *testing.T, repoPath string) []string {
+		packPaths, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "pack-*.pack"))
+		require.NoError(t, err)
+
+		packs := make([]string, 0, len(packPaths))
+		for _, packPath := range packPaths {
+			packs = append(packs, filepath.Base(packPath))
+		}
+		return packs
+	}
+
+	type metric struct {
+		name, status string
+		count        int
+	}
+
+	type setupData struct {
+		repo                          *localrepo.Repo
+		options                       []OptimizeRepositoryOption
+		expectedErr                   error
+		expectedMetrics               []metric
+		expectedMetricsForTransaction []metric
+		expectedMetricsForPool        []metric
+		expectedCommitGraphInfo       stats.CommitGraphInfo
+	}
+
+	for _, tc := range []struct {
+		desc                      string
+		setup                     func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData
+		shouldNotRunInTransaction string
+	}{
+		{
+			desc: "empty repository does nothing",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+
+				metrics := []metric{
+					{name: "total", status: "success", count: 1},
+				}
+
+				// We always create commit graphs with reftables.
+				if testhelper.IsReftableEnabled() {
+					metrics = append(metrics, metric{name: "written_commit_graph_full", status: "success", count: 1})
+				}
+
+				return setupData{
+					repo:            localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: metrics,
+				}
+			},
+		},
+		{
+			desc: "repository without bitmap repacks objects",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository without commit-graph writes commit-graph",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index")
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "optimizing repository without commit-graph bloom filters and generation data",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				// Prepare the repository so that it has a commit-graph, but that commit-graph is
+				// missing bloom filters.
+				gittest.Exec(t, cfg, "-C", repoPath,
+					"-c", "commitGraph.generationVersion=1",
+					"commit-graph", "write", "--split", "--reachable")
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedCommitGraphInfo: stats.CommitGraphInfo{
+						Exists:                 true,
+						HasBloomFilters:        true,
+						HasGenerationData:      true,
+						CommitGraphChainLength: 1,
+					},
+				}
+			},
+		},
+		{
+			desc: "optimizing repository without commit-graph bloom filters with generation data",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				// Prepare the repository so that it has a commit-graph, but that commit-graph is
+				// missing bloom filters.
+				gittest.Exec(t, cfg, "-C", repoPath,
+					"-c", "commitGraph.generationVersion=2",
+					"commit-graph", "write", "--split", "--reachable")
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedCommitGraphInfo: stats.CommitGraphInfo{
+						Exists:                 true,
+						HasBloomFilters:        true,
+						HasGenerationData:      true,
+						CommitGraphChainLength: 1,
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with commit-graph without generation data writes commit-graph",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=1", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository without multi-pack-index performs incremental repack",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "-b")
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with multiple packfiles packs only for object pool",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+
+				// Create two packfiles by creating two objects and then packing
+				// twice. Note that the second git-repack(1) is incremental so that
+				// we don't remove the first packfile.
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("first"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "--write-bitmap-index")
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("second"), gittest.WithMessage("second"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack")
+
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_full_with_cruft", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedMetricsForPool: []metric{
+						{name: "packed_objects_full_with_unreachable", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_incremental", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "well-packed repository does not optimize",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_incremental", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "well-packed repository with multi-pack-index does not optimize",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index", "--write-midx")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "recent loose objects don't get pruned",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+
+				// The repack won't repack the following objects because they're
+				// broken, and thus we'll retry to prune them afterwards.
+				require.NoError(t, os.MkdirAll(filepath.Join(repoPath, "objects", "17"), mode.Directory))
+
+				// We set the object's mtime to be almost two weeks ago. Given that
+				// our timeout is at exactly two weeks this shouldn't caused them to
+				// get pruned.
+				almostTwoWeeksAgo := time.Now().Add(stats.StaleObjectsGracePeriod).Add(time.Minute)
+
+				for i := 0; i < housekeeping.LooseObjectLimit+1; i++ {
+					blobPath := filepath.Join(repoPath, "objects", "17", fmt.Sprintf("%d", i))
+					require.NoError(t, os.WriteFile(blobPath, nil, mode.File))
+					require.NoError(t, os.Chtimes(blobPath, almostTwoWeeksAgo, almostTwoWeeksAgo))
+				}
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_incremental", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "old loose objects get pruned",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "-d", "--write-bitmap-index")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+
+				// Create loose objects exceeding our loose object limit. All of them are unreachable,
+				// so they won't get packed during the all-into-one repack.
+				moreThanTwoWeeksAgo := time.Now().Add(stats.StaleObjectsGracePeriod).Add(-time.Minute)
+				for i := 0; i < housekeeping.LooseObjectLimit+1; i++ {
+					objectID := gittest.WriteBlob(t, cfg, repoPath, []byte(fmt.Sprintf("content %d", i)))
+					blobPath := filepath.Join(repoPath, "objects", string(objectID[0:2]), string(objectID[2:]))
+					require.NoError(t, os.Chtimes(blobPath, moreThanTwoWeeksAgo, moreThanTwoWeeksAgo))
+				}
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "pruned_objects", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedMetricsForTransaction: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					// Object pools never prune objects.
+					expectedMetricsForPool: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_commit_graph_incremental", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "loose refs get packed",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				testhelper.SkipWithReftable(t, `tests are specific to files backend`)
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+
+				for i := 0; i < 16; i++ {
+					gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(fmt.Sprintf("branch-%d", i)))
+				}
+
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-A", "--write-bitmap-index")
+				gittest.Exec(t, cfg, "-c", "commitGraph.generationVersion=2", "-C", repoPath, "commit-graph", "write", "--split", "--changed-paths")
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "packed_refs", status: "success", count: 1},
+						{name: "written_commit_graph_incremental", status: "success", count: 1},
+						{name: "written_bitmap", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository connected to empty object pool",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("some-branch"))
+
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, laterDate))
+				linkRepoToPool(t, repoPath, poolPath, earlierDate)
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with all objects deduplicated via pool",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+				commitID := gittest.WriteCommit(t, cfg, poolPath)
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, laterDate))
+				linkRepoToPool(t, repoPath, poolPath, earlierDate)
+
+				gittest.WriteRef(t, cfg, repoPath, "refs/heads/some-branch", commitID)
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with some deduplicated objects",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+				commitID := gittest.WriteCommit(t, cfg, poolPath)
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, laterDate))
+				linkRepoToPool(t, repoPath, poolPath, earlierDate)
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(commitID), gittest.WithBranch("some-branch"))
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "recently linked repository gets a full repack",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				testhelper.SkipWithReftable(t, `tests are specific to files backend`)
+
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath)
+
+				// Pretend that the last full repack has happened before creating
+				// the gitalternates file. This should cause a full repack in order
+				// to deduplicate all objects.
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, earlierDate))
+				linkRepoToPool(t, repoPath, poolPath, laterDate)
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_full_with_cruft", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedMetricsForPool: []metric{
+						{
+							name:   "packed_objects_full_with_unreachable",
+							status: "success",
+							count:  1,
+						},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with some deduplicated objects and eager strategy",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+				commitID := gittest.WriteCommit(t, cfg, poolPath)
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, laterDate))
+				linkRepoToPool(t, repoPath, poolPath, earlierDate)
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(commitID), gittest.WithBranch("some-branch"))
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					options: []OptimizeRepositoryOption{
+						WithOptimizationStrategyConstructor(func(repoInfo stats.RepositoryInfo) housekeeping.OptimizationStrategy {
+							return housekeeping.NewEagerOptimizationStrategy(repoInfo)
+						}),
+					},
+					expectedMetrics: []metric{
+						{name: "packed_refs", status: "success", count: 1},
+						{name: "pruned_objects", status: "success", count: 1},
+						{name: "packed_objects_full_with_cruft", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedMetricsForTransaction: []metric{
+						{name: "packed_refs", status: "success", count: 1},
+						{name: "packed_objects_full_with_cruft", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+					expectedMetricsForPool: []metric{
+						{name: "packed_refs", status: "success", count: 1},
+						{name: "packed_objects_full_with_unreachable", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc: "repository with same packfile in pool",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				_, poolPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           gittest.NewObjectPoolName(t),
+				})
+				gittest.WriteCommit(t, cfg, poolPath, gittest.WithBranch("some-branch"))
+				gittest.Exec(t, cfg, "-C", poolPath, "repack", "-Ad")
+
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("some-branch"))
+				gittest.Exec(t, cfg, "-C", repoPath, "repack", "-Ad")
+
+				repoPackfiles := readPackfiles(t, repoPath)
+				require.Len(t, repoPackfiles, 1)
+
+				// Assert that the packfiles in both the repository and the object
+				// pool are actually the same. This is likely to happen e.g. when
+				// the object pool has just been created and the repository was
+				// linked to it and has caused bugs with geometric repacking in the
+				// past.
+				require.Equal(t, repoPackfiles, readPackfiles(t, poolPath))
+
+				require.NoError(t, stats.UpdateFullRepackTimestamp(repoPath, laterDate))
+				linkRepoToPool(t, repoPath, poolPath, earlierDate)
+
+				return setupData{
+					repo: localrepo.NewTestRepo(t, cfg, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "success", count: 1},
+						{name: "written_commit_graph_full", status: "success", count: 1},
+						{name: "written_multi_pack_index", status: "success", count: 1},
+						{name: "total", status: "success", count: 1},
+					},
+				}
+			},
+		},
+		{
+			desc:                      "failing repack",
+			shouldNotRunInTransaction: "cannot inject a command error into WAL transaction manager",
+			setup: func(t *testing.T, cfg gitalycfg.Cfg, relativePath string) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           relativePath,
+				})
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("branch"))
+
+				gitCmdFactory := errorInjectingCommandFactory{
+					CommandFactory: gittest.NewCommandFactory(t, cfg),
+					injectedErrors: map[string]error{
+						"repack": assert.AnError,
+					},
+				}
+
+				return setupData{
+					repo: localrepo.New(testhelper.NewLogger(t), gitalycfg.NewLocator(cfg), gitCmdFactory, nil, repo),
+					expectedMetrics: []metric{
+						{name: "packed_objects_geometric", status: "failure", count: 1},
+						{name: "written_bitmap", status: "failure", count: 1},
+						{name: "written_multi_pack_index", status: "failure", count: 1},
+						{name: "total", status: "failure", count: 1},
+					},
+					expectedErr: fmt.Errorf("could not repack: %w", fmt.Errorf("repack failed: %w", assert.AnError)),
+				}
+			},
+		},
+	} {
+		testRepoAndPool(t, tc.desc, func(t *testing.T, relativePath string) {
+			testWithAndWithoutTransaction(t, ctx, tc.desc, func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+				t.Parallel()
+
+				if tc.shouldNotRunInTransaction != "" && node != nil {
+					t.Skipf("test should not run in transaction: %s", tc.shouldNotRunInTransaction)
+					return
+				}
+				setup := tc.setup(t, cfg, relativePath)
+				manager := New(cfg.Prometheus, testhelper.SharedLogger(t), txManager, node)
+
+				err := manager.OptimizeRepository(ctx, setup.repo, setup.options...)
+				require.Equal(t, setup.expectedErr, err)
+
+				expectedMetrics := setup.expectedMetrics
+				if node != nil && setup.expectedMetricsForTransaction != nil {
+					expectedMetrics = setup.expectedMetricsForTransaction
+				}
+				// If object pool is enabled, asserting transaction's metrics using
+				// expectedMetricsForPool.
+				if storage.IsPoolRepository(setup.repo) && setup.expectedMetricsForPool != nil {
+					expectedMetrics = setup.expectedMetricsForPool
+				}
+
+				var buf bytes.Buffer
+				_, err = buf.WriteString("# HELP gitaly_housekeeping_tasks_total Total number of housekeeping tasks performed in the repository\n")
+				require.NoError(t, err)
+				_, err = buf.WriteString("# TYPE gitaly_housekeeping_tasks_total counter\n")
+				require.NoError(t, err)
+
+				for _, metric := range expectedMetrics {
+					_, err := buf.WriteString(fmt.Sprintf(
+						"gitaly_housekeeping_tasks_total{housekeeping_task=%q, status=%q} %d\n",
+						metric.name, metric.status, metric.count,
+					))
+					require.NoError(t, err)
+				}
+
+				testhelper.RequirePromMetrics(t, manager.metrics.TasksTotal, buf.String())
+
+				path, err := setup.repo.Path(ctx)
+				require.NoError(t, err)
+
+				if setup.expectedCommitGraphInfo != (stats.CommitGraphInfo{}) && node != nil {
+					nodeStorage, err := node.GetStorage(setup.repo.GetStorageName())
+					require.NoError(t, err)
+
+					// Start a transaction to ensure the WAL is fully applied. This test is still
+					// accessing the repository directly in the storage.
+					tx, err := nodeStorage.Begin(ctx, storage.TransactionOptions{
+						ReadOnly:     true,
+						RelativePath: setup.repo.GetRelativePath(),
+					})
+					require.NoError(t, err)
+					defer func() {
+						require.NoError(t, tx.Rollback(ctx))
+					}()
+
+					commitGraphInfo, err := stats.CommitGraphInfoForRepository(path)
+					require.NoError(t, err)
+					require.Equal(t, setup.expectedCommitGraphInfo, commitGraphInfo)
+				}
+
+				// The state of the repo should be cleared after running housekeeping.
+				require.NotContains(t, manager.repositoryStates.values, path)
+			})
+		})
+	}
+}
+
+func TestOptimizeRepository_ConcurrencyLimit(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+
+	testWithAndWithoutTransaction(t, ctx, "subsequent calls get skipped", func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+		reqReceivedCh, ch := make(chan struct{}), make(chan struct{})
+
+		repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		firstCall := true
+		manager := New(gitalycfgprom.Config{}, testhelper.NewLogger(t), nil, node)
+		manager.optimizeFunc = func(context.Context, *localrepo.Repo, housekeeping.OptimizationStrategy) error {
+			if firstCall {
+				firstCall = false
+				reqReceivedCh <- struct{}{}
+				ch <- struct{}{}
+				return nil
+			}
+
+			return fmt.Errorf("unexpected second optimize call")
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, manager.OptimizeRepository(ctx, repo))
+		}()
+		defer func() {
+			<-ch
+			wg.Wait()
+		}()
+
+		<-reqReceivedCh
+
+		// When repository optimizations are performed for a specific repository already,
+		// then any subsequent calls to the same repository should just return immediately
+		// without doing any optimizations at all.
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+	})
+	// We want to confirm that even if a state exists, the housekeeping shall run as
+	// long as the state doesn't state that there is another housekeeping running
+	// i.e. `isRunning` is set to false.
+	testWithAndWithoutTransaction(t, ctx, "there is no other housekeeping running but state exists", func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+		ch := make(chan struct{})
+
+		repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		manager := New(gitalycfgprom.Config{}, testhelper.SharedLogger(t), nil, node)
+		manager.optimizeFunc = func(context.Context, *localrepo.Repo, housekeeping.OptimizationStrategy) error {
+			// This should only happen if housekeeping is running successfully.
+			// So by sending data on this channel we can notify the test that this
+			// function ran successfully.
+			ch <- struct{}{}
+
+			return nil
+		}
+
+		// We're not acquiring a lock here, because there is no other goroutines running
+		// We set the state, but make sure that isRunning is explicitly set to false. This states
+		// that there is no housekeeping running currently.
+		manager.repositoryStates.values[repositoryStatesKey(repo)] = &refCountedState{
+			state: &repositoryState{
+				isRunning: false,
+			},
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, manager.OptimizeRepository(ctx, repo))
+		}()
+
+		// Only if optimizeFunc is run, we shall receive data here, this acts as test that
+		// housekeeping ran successfully.
+		<-ch
+		wg.Wait()
+	})
+
+	testWithAndWithoutTransaction(t, ctx, "there is a housekeeping running state", func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+		repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		manager := New(gitalycfgprom.Config{}, testhelper.SharedLogger(t), nil, node)
+		manager.optimizeFunc = func(context.Context, *localrepo.Repo, housekeeping.OptimizationStrategy) error {
+			require.FailNow(t, "housekeeping run should have been skipped")
+			return nil
+		}
+
+		stateKey := repositoryStatesKey(repo)
+
+		// we create a state before calling the OptimizeRepository function.
+		ok, cleanup := manager.repositoryStates.tryRunningHousekeeping(repo)
+		require.True(t, ok)
+		// check that the state actually exists.
+		require.Contains(t, manager.repositoryStates.values, stateKey)
+
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+
+		// After running the cleanup, the state should be removed.
+		cleanup()
+		require.NotContains(t, manager.repositoryStates.values, stateKey)
+	})
+
+	testWithAndWithoutTransaction(t, ctx, "multiple repositories concurrently", func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+		reqReceivedCh, ch := make(chan struct{}), make(chan struct{})
+
+		repoProtoFirst, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repoFirst := localrepo.NewTestRepo(t, cfg, repoProtoFirst)
+		repoProtoSecond, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repoSecond := localrepo.NewTestRepo(t, cfg, repoProtoSecond)
+
+		reposOptimized := make(map[string]struct{})
+
+		manager := New(gitalycfgprom.Config{}, testhelper.SharedLogger(t), nil, node)
+		manager.optimizeFunc = func(ctx context.Context, repo *localrepo.Repo, _ housekeeping.OptimizationStrategy) error {
+			relativePath := repo.GetRelativePath()
+			if tx := storage.ExtractTransaction(ctx); tx != nil {
+				relativePath = tx.OriginalRepository(&gitalypb.Repository{
+					StorageName:  repo.GetStorageName(),
+					RelativePath: repo.GetRelativePath(),
+				}).GetRelativePath()
+			}
+
+			reposOptimized[relativePath] = struct{}{}
+
+			if relativePath == repoFirst.GetRelativePath() {
+				reqReceivedCh <- struct{}{}
+				ch <- struct{}{}
+			}
+
+			return nil
+		}
+
+		// We block in the first call so that we can assert that a second call
+		// to a different repository performs the optimization regardless without blocking.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NoError(t, manager.OptimizeRepository(ctx, repoFirst))
+		}()
+
+		<-reqReceivedCh
+
+		// Because this optimizes a different repository this call shouldn't block.
+		require.NoError(t, manager.OptimizeRepository(ctx, repoSecond))
+
+		<-ch
+
+		assert.Contains(t, reposOptimized, repoFirst.GetRelativePath())
+		assert.Contains(t, reposOptimized, repoSecond.GetRelativePath())
+
+		wg.Wait()
+	})
+
+	testWithAndWithoutTransaction(t, ctx, "serialized optimizations", func(t *testing.T, cfg gitalycfg.Cfg, node storage.Node) {
+		reqReceivedCh, ch := make(chan struct{}), make(chan struct{})
+		repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+		var optimizations int
+
+		manager := New(gitalycfgprom.Config{}, testhelper.SharedLogger(t), nil, node)
+		manager.optimizeFunc = func(context.Context, *localrepo.Repo, housekeeping.OptimizationStrategy) error {
+			optimizations++
+
+			if optimizations == 1 {
+				reqReceivedCh <- struct{}{}
+				ch <- struct{}{}
+			}
+
+			return nil
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		}()
+
+		<-reqReceivedCh
+
+		// Because we already have a concurrent call which optimizes the repository we expect
+		// that all subsequent calls which try to optimize the same repository return immediately.
+		// Furthermore, we expect to see only a single call to the optimizing function because we
+		// don't want to optimize the same repository concurrently.
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		assert.Equal(t, 1, optimizations)
+
+		<-ch
+		wg.Wait()
+
+		// When performing optimizations sequentially though the repository
+		// should be unlocked after every call, and consequentially we should
+		// also see multiple calls to the optimizing function.
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		require.NoError(t, manager.OptimizeRepository(ctx, repo))
+		assert.Equal(t, 4, optimizations)
+	})
+}
+
+func TestPruneIfNeeded(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	objectPath := func(oid git.ObjectID) string {
+		return filepath.Join(repoPath, "objects", oid.String()[0:2], oid.String()[2:])
+	}
+
+	// Write two blobs, one recent blob and one blob that is older than two weeks and that would
+	// thus get pruned.
+	recentBlobID := gittest.WriteBlob(t, cfg, repoPath, []byte("recent"))
+	staleBlobID := gittest.WriteBlob(t, cfg, repoPath, []byte("stale"))
+	twoWeeksAgo := time.Now().Add(-1 * 2 * 7 * 24 * time.Hour)
+	require.NoError(t, os.Chtimes(objectPath(staleBlobID), twoWeeksAgo, twoWeeksAgo))
+
+	// We shouldn't prune when the strategy determines there aren't enough old objects.
+	didPrune, err := pruneIfNeeded(ctx, repo, mockOptimizationStrategy{
+		shouldPruneObjects: false,
+		pruneObjectsCfg: housekeeping.PruneObjectsConfig{
+			ExpireBefore: twoWeeksAgo,
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, didPrune)
+
+	// Consequentially, the objects shouldn't have been pruned.
+	require.FileExists(t, objectPath(recentBlobID))
+	require.FileExists(t, objectPath(staleBlobID))
+
+	// But we naturally should prune if told so.
+	didPrune, err = pruneIfNeeded(ctx, repo, mockOptimizationStrategy{
+		shouldPruneObjects: true,
+		pruneObjectsCfg: housekeeping.PruneObjectsConfig{
+			ExpireBefore: twoWeeksAgo,
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, didPrune)
+
+	// But we should only prune the stale blob, never the recent one.
+	require.FileExists(t, objectPath(recentBlobID))
+	require.NoFileExists(t, objectPath(staleBlobID))
+}
+
+func TestWriteCommitGraphIfNeeded(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	t.Run("strategy does not update commit-graph", func(t *testing.T) {
+		t.Parallel()
+
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+		written, cfg, err := writeCommitGraphIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldWriteCommitGraph: false,
+		})
+		require.NoError(t, err)
+		require.False(t, written)
+		require.Equal(t, config.WriteCommitGraphConfig{}, cfg)
+
+		require.NoFileExists(t, filepath.Join(repoPath, "objects", "info", "commit-graph"))
+		require.NoDirExists(t, filepath.Join(repoPath, "objects", "info", "commit-graphs"))
+	})
+
+	t.Run("strategy does update commit-graph", func(t *testing.T) {
+		t.Parallel()
+
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+		written, cfg, err := writeCommitGraphIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldWriteCommitGraph: true,
+		})
+		require.NoError(t, err)
+		require.True(t, written)
+		require.Equal(t, config.WriteCommitGraphConfig{}, cfg)
+
+		require.NoFileExists(t, filepath.Join(repoPath, "objects", "info", "commit-graph"))
+		require.DirExists(t, filepath.Join(repoPath, "objects", "info", "commit-graphs"))
+	})
+
+	t.Run("commit-graph with pruned objects", func(t *testing.T) {
+		t.Parallel()
+
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		// Write a first commit-graph that contains the root commit, only.
+		rootCommitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+		gittest.Exec(t, cfg, "-C", repoPath, "commit-graph", "write", "--reachable", "--split", "--changed-paths")
+
+		// Write a second, incremental commit-graph that contains a commit we're about to
+		// make unreachable and then prune.
+		unreachableCommitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(rootCommitID), gittest.WithBranch("main"))
+		gittest.Exec(t, cfg, "-C", repoPath, "commit-graph", "write", "--reachable", "--split=no-merge", "--changed-paths")
+
+		// Reset the "main" branch back to the initial root commit ID and prune the now
+		// unreachable second commit.
+		gittest.Exec(t, cfg, "-C", repoPath, "update-ref", "refs/heads/main", rootCommitID.String())
+		gittest.Exec(t, cfg, "-C", repoPath, "prune", "--expire", "now")
+
+		// The commit-graph chain now refers to the pruned commit, and git-commit-graph(1)
+		// should complain about that.
+		var stderr bytes.Buffer
+		verifyCmd := gittest.NewCommand(t, cfg, "-C", repoPath, "commit-graph", "verify")
+		verifyCmd.Stderr = &stderr
+		require.EqualError(t, verifyCmd.Run(), "exit status 1")
+		require.Equal(t, stderr.String(), fmt.Sprintf("error: Could not read %[1]s\nfailed to parse commit %[1]s from object database for commit-graph\n", unreachableCommitID))
+
+		// Write the commit-graph incrementally.
+		didWrite, writeCommitGraphCfg, err := writeCommitGraphIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldWriteCommitGraph: true,
+		})
+		require.NoError(t, err)
+		require.True(t, didWrite)
+		require.Equal(t, config.WriteCommitGraphConfig{}, writeCommitGraphCfg)
+
+		// We should still observe the failure failure.
+		stderr.Reset()
+		verifyCmd = gittest.NewCommand(t, cfg, "-C", repoPath, "commit-graph", "verify")
+		verifyCmd.Stderr = &stderr
+		require.EqualError(t, verifyCmd.Run(), "exit status 1")
+		require.Equal(t, stderr.String(), fmt.Sprintf("error: Could not read %[1]s\nfailed to parse commit %[1]s from object database for commit-graph\n", unreachableCommitID))
+
+		// Write the commit-graph a second time, but this time we ask to rewrite the
+		// commit-graph completely.
+		didWrite, writeCommitGraphCfg, err = writeCommitGraphIfNeeded(ctx, repo, mockOptimizationStrategy{
+			shouldWriteCommitGraph: true,
+			writeCommitGraphCfg: config.WriteCommitGraphConfig{
+				ReplaceChain: true,
+			},
+		})
+		require.NoError(t, err)
+		require.True(t, didWrite)
+		require.Equal(t, config.WriteCommitGraphConfig{
+			ReplaceChain: true,
+		}, writeCommitGraphCfg)
+
+		// The commit-graph should now have been fixed.
+		gittest.Exec(t, cfg, "-C", repoPath, "commit-graph", "verify")
+	})
+}
+
+func TestRepositoryManager_CleanStaleData(t *testing.T) {
+	t.Parallel()
+	testcases := []struct {
+		name            string
+		entries         []entry
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			name: "clean",
+			entries: []entry{
+				d("objects", []entry{
+					f("a", withAge(recent)),
+					f("b", withAge(recent)),
+					f("c", withAge(recent)),
+				}),
+			},
+		},
+		{
+			name: "emptyperms",
+			entries: []entry{
+				d("objects", []entry{
+					f("b", withAge(recent)),
+					f("tmp_a", withAge(2*time.Hour), withMode(0o000)),
+				}),
+			},
+		},
+		{
+			name: "emptytempdir",
+			entries: []entry{
+				d("objects", []entry{
+					d("tmp_d", []entry{}, withMode(0o000)),
+					f("b"),
+				}),
+			},
+		},
+		{
+			name: "oldtempfile",
+			entries: []entry{
+				d("objects", []entry{
+					f("tmp_a", expectDeletion),
+					f("b", withAge(recent)),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				objects: 1,
+			},
+		},
+		{
+			name: "subdir temp file",
+			entries: []entry{
+				d("objects", []entry{
+					d("a", []entry{
+						f("tmp_b", expectDeletion),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				objects: 1,
+			},
+		},
+		{
+			name: "inaccessible tmp directory",
+			entries: []entry{
+				d("objects", []entry{
+					d("tmp_a", []entry{
+						f("tmp_b", expectDeletion),
+					}, withMode(0o000)),
+				}),
+			},
+		},
+		{
+			name: "deeply nested inaccessible tmp directory",
+			entries: []entry{
+				d("objects", []entry{
+					d("tmp_a", []entry{
+						d("tmp_a", []entry{
+							f("tmp_b", withMode(0o000), expectDeletion),
+						}, withAge(recent)),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				objects: 1,
+			},
+		},
+		{
+			name: "files outside of object database",
+			entries: []entry{
+				f("tmp_a"),
+				d("info", []entry{
+					f("tmp_a"),
+				}),
+			},
+		},
+		{
+			name: "recent unattributed packfile lock",
+			entries: []entry{
+				d("objects", []entry{
+					d("pack", []entry{
+						f("pack-abcd.keep", withAge(recent)),
+					}),
+				}),
+			},
+		},
+		{
+			name: "recent receive-pack packfile lock",
+			entries: []entry{
+				d("objects", []entry{
+					d("pack", []entry{
+						f("pack-abcd.keep", withData("receive-pack 1 on host"), withAge(recent)),
+					}),
+				}),
+			},
+		},
+		{
+			name: "stale manual packfile lock",
+			entries: []entry{
+				d("objects", []entry{
+					d("pack", []entry{
+						f("pack-abcd.keep", withData("some manual description")),
+					}),
+				}),
+			},
+		},
+		{
+			name: "stale receive-pack packfile lock",
+			entries: []entry{
+				d("objects", []entry{
+					d("pack", []entry{
+						f("pack-abcd.keep", withData("receive-pack 1 on host"), expectDeletion),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				packFileLocks: 1,
+			},
+		},
+		{
+			name: "stale fetch-pack packfile lock",
+			entries: []entry{
+				d("objects", []entry{
+					d("pack", []entry{
+						f("pack-abcd.keep", withData("fetch-pack 1 on host"), expectDeletion),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				packFileLocks: 1,
+			},
+		},
+		{
+			name: "temporary object directories",
+			entries: []entry{
+				d("objects", []entry{
+					// Recent temporary directory should be kept
+					d("tmp_objdir_recent", []entry{
+						f("somefile", withData("content")),
+					}, withAge(1*time.Hour)),
+					// Stale temporary directory should be deleted
+					d("tmp_objdir_stale", []entry{
+						d("ab", []entry{
+							f("1234567890abcdef", withData("object content"), expectDeletion),
+						}, expectDeletion),
+						f("loose_object", withData("loose object"), expectDeletion),
+					}, expectDeletion),
+					// Directory without tmp_objdir prefix should be kept
+					d("tmp_other", []entry{
+						f("file", withData("content")),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				objectdirs: 1,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			// We need to fix permissions so we don't fail to
+			// remove the temporary directory after the test.
+			defer func() {
+				require.NoError(t, perm.FixDirectoryPermissions(ctx, repoPath))
+			}()
+
+			for _, e := range tc.entries {
+				e.create(t, repoPath)
+			}
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+			for _, e := range tc.entries {
+				e.validate(t, repoPath)
+			}
+
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_reftable(t *testing.T) {
+	if !testhelper.IsReftableEnabled() {
+		t.Skip("test is reftable dependent")
+	}
+
+	t.Parallel()
+
+	for _, tc := range []struct {
+		desc            string
+		age             time.Duration
+		expected        bool
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			desc:     "fresh lock",
+			age:      0,
+			expected: true,
+		},
+		{
+			desc:     "stale lock",
+			age:      housekeeping.ReftableLockfileGracePeriod + time.Minute,
+			expected: false,
+			expectedMetrics: cleanStaleDataMetrics{
+				reftablelocks: 1,
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			path := filepath.Join(repoPath, "reftable", "tables.list.lock")
+
+			require.NoError(t, os.WriteFile(path, []byte{}, mode.File))
+			filetime := time.Now().Add(-tc.age)
+			require.NoError(t, os.Chtimes(path, filetime, filetime))
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+			exists := false
+			if _, err := os.Stat(path); err == nil {
+				exists = true
+			} else if !errors.Is(err, os.ErrNotExist) {
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tc.expected, exists)
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_references(t *testing.T) {
+	testhelper.SkipWithReftable(t, "writes references directly to filesystem")
+
+	t.Parallel()
+
+	type ref struct {
+		name string
+		age  time.Duration
+		size int
+	}
+
+	testcases := []struct {
+		desc            string
+		refs            []ref
+		expected        []string
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			desc: "normal reference",
+			refs: []ref{
+				{name: "refs/heads/master", age: 1 * time.Second, size: 40},
+			},
+			expected: []string{
+				"refs/heads/master",
+			},
+		},
+		{
+			desc: "recent empty reference is not deleted",
+			refs: []ref{
+				{name: "refs/heads/master", age: 1 * time.Hour, size: 0},
+			},
+			expected: []string{
+				"refs/heads/master",
+			},
+		},
+		{
+			desc: "old empty reference is deleted",
+			refs: []ref{
+				{name: "refs/heads/master", age: 25 * time.Hour, size: 0},
+			},
+			expected: nil,
+			expectedMetrics: cleanStaleDataMetrics{
+				refs: 1,
+			},
+		},
+		{
+			desc: "multiple references",
+			refs: []ref{
+				{name: "refs/keep/kept-because-recent", age: 1 * time.Hour, size: 0},
+				{name: "refs/keep/kept-because-nonempty", age: 25 * time.Hour, size: 1},
+				{name: "refs/keep/prune", age: 25 * time.Hour, size: 0},
+				{name: "refs/tags/kept-because-recent", age: 1 * time.Hour, size: 0},
+				{name: "refs/tags/kept-because-nonempty", age: 25 * time.Hour, size: 1},
+				{name: "refs/tags/prune", age: 25 * time.Hour, size: 0},
+				{name: "refs/heads/kept-because-recent", age: 1 * time.Hour, size: 0},
+				{name: "refs/heads/kept-because-nonempty", age: 25 * time.Hour, size: 1},
+				{name: "refs/heads/prune", age: 25 * time.Hour, size: 0},
+			},
+			expected: []string{
+				"refs/keep/kept-because-recent",
+				"refs/keep/kept-because-nonempty",
+				"refs/tags/kept-because-recent",
+				"refs/tags/kept-because-nonempty",
+				"refs/heads/kept-because-recent",
+				"refs/heads/kept-because-nonempty",
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				refs: 3,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			for _, ref := range tc.refs {
+				path := filepath.Join(repoPath, ref.name)
+
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), mode.Directory))
+				require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte{0}, ref.size), mode.File))
+				filetime := time.Now().Add(-ref.age)
+				require.NoError(t, os.Chtimes(path, filetime, filetime))
+			}
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+			var actual []string
+			require.NoError(t, filepath.Walk(filepath.Join(repoPath, "refs"), func(path string, info os.FileInfo, _ error) error {
+				if !info.IsDir() {
+					ref, err := filepath.Rel(repoPath, path)
+					require.NoError(t, err)
+					actual = append(actual, ref)
+				}
+				return nil
+			}))
+
+			require.ElementsMatch(t, tc.expected, actual)
+
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_infoattributes(t *testing.T) {
+	t.Parallel()
+	testcases := []struct {
+		name            string
+		entries         []entry
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			name: "clean info/attributes file when there is one",
+			entries: []entry{
+				d("info", []entry{
+					f("attributes", expectDeletion, withData("*.go diff=go text\n*.md text\n*.jpg -text")),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				infoAttributes: 1,
+			},
+		},
+		{
+			name: "do not delete other files in the info directory",
+			entries: []entry{
+				d("info", []entry{
+					f("some_other_file", withData("I should not be deleted")),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				infoAttributes: 0,
+			},
+		},
+		{
+			name: "no error if info/attributes file is already gone",
+			entries: []entry{
+				d("info", []entry{}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				infoAttributes: 0,
+			},
+		},
+		{
+			name: "info/attributes file with empty permission",
+			entries: []entry{
+				d("info", []entry{
+					f("attributes", expectDeletion,
+						withData("*.go diff=go text\n*.md text\n*.jpg -text"), withMode(0o000)),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				infoAttributes: 1,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			for _, e := range tc.entries {
+				e.create(t, repoPath)
+			}
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+			for _, e := range tc.entries {
+				e.validate(t, repoPath)
+			}
+
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_emptyRefDirs(t *testing.T) {
+	t.Parallel()
+	testcases := []struct {
+		name            string
+		entries         []entry
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			name: "unrelated empty directories",
+			entries: []entry{
+				d("objects", []entry{
+					d("empty", []entry{}),
+				}),
+			},
+		},
+		{
+			name: "empty ref dir gets retained",
+			entries: []entry{
+				d("refs", []entry{}),
+			},
+		},
+		{
+			name: "empty nested non-stale ref dir gets kept",
+			entries: []entry{
+				d("refs", []entry{
+					d("nested", []entry{}, withAge(23*time.Hour)),
+				}),
+			},
+		},
+		{
+			name: "empty nested stale ref dir gets pruned",
+			entries: []entry{
+				d("refs", []entry{
+					d("nested", []entry{}, expectDeletion),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				refsEmptyDir: 1,
+			},
+		},
+		{
+			name: "hierarchy of nested stale ref dirs gets pruned",
+			entries: []entry{
+				d("refs", []entry{
+					d("first", []entry{
+						d("second", []entry{}, expectDeletion),
+					}, expectDeletion),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				refsEmptyDir: 2,
+			},
+		},
+		{
+			name: "hierarchy with intermediate non-stale ref dir gets kept",
+			entries: []entry{
+				d("refs", []entry{
+					d("first", []entry{
+						d("second", []entry{
+							d("third", []entry{}, withAge(recent), expectDeletion),
+						}, withAge(1*time.Hour)),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				refsEmptyDir: 1,
+			},
+		},
+		{
+			name: "stale hierrachy with refs gets partially retained",
+			entries: []entry{
+				d("refs", []entry{
+					d("first", []entry{
+						d("second", []entry{
+							d("third", []entry{}, withAge(recent), expectDeletion),
+						}, expectDeletion),
+						d("other", []entry{
+							f("ref", withAge(1*time.Hour)),
+						}),
+					}),
+				}),
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				refsEmptyDir: 2,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			for _, e := range tc.entries {
+				e.create(t, repoPath)
+			}
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+			for _, e := range tc.entries {
+				e.validate(t, repoPath)
+			}
+
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_withSpecificFile(t *testing.T) {
+	t.Parallel()
+
+	entryInSubdir := func(e entry, subdirs ...string) entry {
+		if len(subdirs) == 0 {
+			return e
+		}
+
+		var topLevelDir, currentDir *dirEntry
+		for _, subdir := range subdirs {
+			dir := d(subdir, []entry{}, withAge(1*time.Hour))
+			if topLevelDir == nil {
+				topLevelDir = dir
+			}
+
+			if currentDir != nil {
+				currentDir.entries = []entry{dir}
+			}
+
+			currentDir = dir
+		}
+
+		currentDir.entries = []entry{e}
+
+		return topLevelDir
+	}
+
+	for _, tc := range []struct {
+		desc            string
+		file            string
+		subdirs         []string
+		finder          housekeeping.FindStaleFileFunc
+		expectedMetrics cleanStaleDataMetrics
+	}{
+		{
+			desc:   "locked HEAD",
+			file:   "HEAD.lock",
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+		{
+			desc:   "locked config",
+			file:   "config.lock",
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+		{
+			desc: "locked attributes",
+			file: "attributes.lock",
+			subdirs: []string{
+				"info",
+			},
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+		{
+			desc: "locked alternates",
+			file: "alternates.lock",
+			subdirs: []string{
+				"objects", "info",
+			},
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+		{
+			desc: "locked commit-graph-chain",
+			file: "commit-graph-chain.lock",
+			subdirs: []string{
+				"objects", "info", "commit-graphs",
+			},
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+		{
+			desc:   "locked packed-refs",
+			file:   "packed-refs.lock",
+			finder: housekeeping.FindPackedRefsLock,
+			expectedMetrics: cleanStaleDataMetrics{
+				packedRefsLock: 1,
+			},
+		},
+		{
+			desc:   "temporary packed-refs",
+			file:   "packed-refs.new",
+			finder: housekeeping.FindPackedRefsNew,
+			expectedMetrics: cleanStaleDataMetrics{
+				packedRefsNew: 1,
+			},
+		},
+		{
+			desc: "multi-pack index",
+			file: "multi-pack-index.lock",
+			subdirs: []string{
+				"objects", "pack",
+			},
+			finder: housekeeping.FindStaleLockfiles,
+			expectedMetrics: cleanStaleDataMetrics{
+				locks: 1,
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+			for _, subcase := range []struct {
+				desc          string
+				entry         entry
+				expectedFiles []string
+			}{
+				{
+					desc:  fmt.Sprintf("fresh %s is kept", tc.file),
+					entry: f(tc.file, withAge(10*time.Minute)),
+				},
+				{
+					desc: fmt.Sprintf("stale %s in subdir is kept", tc.file),
+					entry: d("subdir", []entry{
+						f(tc.file, withAge(24*time.Hour)),
+					}),
+				},
+				{
+					desc:  fmt.Sprintf("stale %s is deleted", tc.file),
+					entry: f(tc.file, withAge(61*time.Minute), expectDeletion),
+					expectedFiles: []string{
+						filepath.Join(append([]string{repoPath}, append(tc.subdirs, tc.file)...)...),
+					},
+				},
+				{
+					desc:  fmt.Sprintf("%q is kept", tc.file[:len(tc.file)-1]),
+					entry: f(tc.file[:len(tc.file)-1], withAge(61*time.Minute)),
+				},
+				{
+					desc:  fmt.Sprintf("%q is kept", "~"+tc.file),
+					entry: f("~"+tc.file, withAge(61*time.Minute)),
+				},
+				{
+					desc:  fmt.Sprintf("%q is kept", tc.file+"~"),
+					entry: f(tc.file+"~", withAge(61*time.Minute)),
+				},
+			} {
+				t.Run(subcase.desc, func(t *testing.T) {
+					entry := entryInSubdir(subcase.entry, tc.subdirs...)
+					entry.create(t, repoPath)
+
+					staleFiles, err := tc.finder(ctx, repoPath)
+					require.NoError(t, err)
+					require.ElementsMatch(t, subcase.expectedFiles, staleFiles)
+
+					require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+					entry.validate(t, repoPath)
+				})
+			}
+
+			requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_serverInfo(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	entries := []entry{
+		d("info", []entry{
+			f("ref"),
+			f("refs", expectDeletion),
+			f("refsx"),
+			f("refs_123456", expectDeletion),
+		}),
+		d("objects", []entry{
+			d("info", []entry{
+				f("pack"),
+				f("packs", expectDeletion),
+				f("packsx"),
+				f("packs_123456", expectDeletion),
+			}),
+		}),
+	}
+
+	for _, entry := range entries {
+		entry.create(t, repoPath)
+	}
+
+	staleFiles, err := housekeeping.FindServerInfo(ctx, repoPath)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{
+		filepath.Join(repoPath, "info/refs"),
+		filepath.Join(repoPath, "info/refs_123456"),
+		filepath.Join(repoPath, "objects/info/packs"),
+		filepath.Join(repoPath, "objects/info/packs_123456"),
+	}, staleFiles)
+
+	mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+	require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+
+	for _, entry := range entries {
+		entry.validate(t, repoPath)
+	}
+
+	requireCleanStaleDataMetrics(t, mgr, cleanStaleDataMetrics{
+		serverInfo: 4,
+	})
+}
+
+func TestRepositoryManager_CleanStaleData_referenceLocks(t *testing.T) {
+	testhelper.SkipWithReftable(t, "only applicable to the files reference backend")
+
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	for _, tc := range []struct {
+		desc                   string
+		entries                []entry
+		expectedReferenceLocks []string
+		expectedMetrics        cleanStaleDataMetrics
+		gracePeriod            time.Duration
+		cfg                    housekeeping.CleanStaleDataConfig
+		metricsCompareFn       func(t *testing.T, m *RepositoryManager, metrics cleanStaleDataMetrics)
+	}{
+		{
+			desc: "fresh lock is kept",
+			entries: []entry{
+				d("refs", []entry{
+					f("main", withAge(10*time.Minute)),
+					f("main.lock", withAge(10*time.Minute)),
+				}),
+			},
+			gracePeriod: housekeeping.ReferenceLockfileGracePeriod,
+			cfg:         housekeeping.DefaultStaleDataCleanup(),
+		},
+		{
+			desc: "fresh lock is deleted when grace period is low",
+			entries: []entry{
+				d("refs", []entry{
+					f("main", withAge(10*time.Minute)),
+					f("main.lock", withAge(10*time.Minute), expectDeletion),
+				}),
+			},
+			expectedReferenceLocks: []string{
+				"refs/main.lock",
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				reflocks: 1,
+			},
+			gracePeriod:      time.Second,
+			cfg:              housekeeping.OnlyStaleReferenceLockCleanup(time.Second),
+			metricsCompareFn: requireReferenceLockCleanupMetrics,
+		},
+		{
+			desc: "stale lock is deleted",
+			entries: []entry{
+				d("refs", []entry{
+					f("main", withAge(1*time.Hour)),
+					f("main.lock", withAge(1*time.Hour), expectDeletion),
+				}),
+			},
+			expectedReferenceLocks: []string{
+				"refs/main.lock",
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				reflocks: 1,
+			},
+			gracePeriod: housekeeping.ReferenceLockfileGracePeriod,
+			cfg:         housekeeping.DefaultStaleDataCleanup(),
+		},
+		{
+			desc: "nested reference locks are deleted",
+			entries: []entry{
+				d("refs", []entry{
+					d("tags", []entry{
+						f("main", withAge(1*time.Hour)),
+						f("main.lock", withAge(1*time.Hour), expectDeletion),
+					}),
+					d("heads", []entry{
+						f("main", withAge(1*time.Hour)),
+						f("main.lock", withAge(1*time.Hour), expectDeletion),
+					}),
+					d("foobar", []entry{
+						f("main", withAge(1*time.Hour)),
+						f("main.lock", withAge(1*time.Hour), expectDeletion),
+					}),
+				}),
+			},
+			expectedReferenceLocks: []string{
+				"refs/tags/main.lock",
+				"refs/heads/main.lock",
+				"refs/foobar/main.lock",
+			},
+			expectedMetrics: cleanStaleDataMetrics{
+				reflocks: 3,
+			},
+			gracePeriod: housekeeping.ReferenceLockfileGracePeriod,
+			cfg:         housekeeping.DefaultStaleDataCleanup(),
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testcfg.Build(t)
+
+			repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+				SkipCreationViaService: true,
+			})
+			repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+			for _, e := range tc.entries {
+				e.create(t, repoPath)
+			}
+
+			// We need to recreate the temporary directory on each
+			// run, so we don't have the full path available when
+			// creating the testcases.
+			var expectedReferenceLocks []string
+			for _, referenceLock := range tc.expectedReferenceLocks {
+				expectedReferenceLocks = append(expectedReferenceLocks, filepath.Join(repoPath, referenceLock))
+			}
+
+			staleLockfiles, err := housekeeping.FindStaleReferenceLocks(tc.gracePeriod)(ctx, repoPath)
+			require.NoError(t, err)
+			require.ElementsMatch(t, expectedReferenceLocks, staleLockfiles)
+
+			mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+			require.NoError(t, mgr.CleanStaleData(ctx, repo, tc.cfg))
+
+			for _, e := range tc.entries {
+				e.validate(t, repoPath)
+			}
+
+			if tc.metricsCompareFn != nil {
+				tc.metricsCompareFn(t, mgr, tc.expectedMetrics)
+			} else {
+				requireCleanStaleDataMetrics(t, mgr, tc.expectedMetrics)
+			}
+		})
+	}
+}
+
+func TestRepositoryManager_CleanStaleData_missingRepo(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	require.NoError(t, os.RemoveAll(repoPath))
+
+	require.NoError(t, New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil).CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+}
+
+func TestRepositoryManager_CleanStaleData_unsetConfiguration(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	configPath := filepath.Join(repoPath, "config")
+
+	require.NoError(t, os.WriteFile(configPath, []byte(
+		`[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+	commitGraph = true
+	sparseCheckout = true
+	splitIndex = false
+[remote "first"]
+	fetch = baz
+	mirror = baz
+	prune = baz
+	url = baz
+[http "first"]
+	extraHeader = barfoo
+[http "second"]
+	extraHeader = barfoo
+[http]
+	extraHeader = untouched
+[http "something"]
+	else = untouched
+[totally]
+	unrelated = untouched
+`), mode.File))
+
+	mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+	require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+	require.Equal(t,
+		`[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[http]
+	extraHeader = untouched
+[http "something"]
+	else = untouched
+[totally]
+	unrelated = untouched
+`, string(testhelper.MustReadFile(t, configPath)))
+
+	requireCleanStaleDataMetrics(t, mgr, cleanStaleDataMetrics{
+		configkeys: 1,
+	})
+}
+
+func TestRepositoryManager_CleanStaleData_unsetConfigurationTransactional(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	gittest.Exec(t, cfg, "-C", repoPath, "config", "http.some.extraHeader", "value")
+
+	txManager := transaction.NewTrackingManager()
+
+	ctx, err := txinfo.InjectTransaction(ctx, 1, "node", true)
+	require.NoError(t, err)
+	ctx = peer.NewContext(ctx, &peer.Peer{
+		AuthInfo: backchannel.WithID(nil, 1234),
+	})
+
+	require.NoError(t, New(cfg.Prometheus, testhelper.SharedLogger(t), txManager, nil).CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+	require.Equal(t, 3, len(txManager.Votes()))
+
+	configKeysBytes := gittest.Exec(t, cfg, "-C", repoPath, "config", "--list", "--local", "--name-only")
+	configKeys := bytes.Split(bytes.TrimSuffix(configKeysBytes, []byte("\n")), []byte("\n"))
+
+	expectedConfig := [][]byte{
+		[]byte("core.repositoryformatversion"),
+		[]byte("core.filemode"),
+		[]byte("core.bare"),
+	}
+
+	if runtime.GOOS == "darwin" {
+		expectedConfig = append(expectedConfig, []byte("core.ignorecase"), []byte("core.precomposeunicode"))
+	}
+	if testhelper.IsReftableEnabled() {
+		expectedConfig = append(expectedConfig, []byte("extensions.refstorage"))
+	}
+
+	if gittest.DefaultObjectHash.Format == "sha256" {
+		expectedConfig = append(expectedConfig, []byte("extensions.objectformat"))
+	}
+
+	require.ElementsMatch(t, expectedConfig, configKeys)
+}
+
+func TestRepositoryManager_CleanStaleData_pruneEmptyConfigSections(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	configPath := filepath.Join(repoPath, "config")
+
+	require.NoError(t, os.WriteFile(configPath, []byte(
+		`[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[uploadpack]
+	allowAnySHA1InWant = true
+[remote "tmp-8be1695862b62390d1f873f9164122e4"]
+[remote "tmp-d97f78c39fde4b55e0d0771dfc0501ef"]
+[remote "tmp-23a2471e7084e1548ef47bbc9d6afff6"]
+[remote "tmp-d76633a16d61f6681de396ec9ecfd7b5"]
+	prune = true
+[remote "tmp-8fbf8d5e7585d48668f1791284a912ef"]
+[remote "tmp-f539c59068f291e52f1140e39830f9ca"]
+[remote "tmp-17b67d28909768db3213917255c72af2"]
+	prune = true
+[remote "tmp-03b5e8c765135b343214d471843a062a"]
+[remote "tmp-f57338181aca1d599669dbb71ce9ce57"]
+[remote "tmp-8c948ca94832c2725733e48cb2902287"]
+`), mode.File))
+
+	mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+	require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+	require.Equal(t, `[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[uploadpack]
+	allowAnySHA1InWant = true
+`, string(testhelper.MustReadFile(t, configPath)))
+
+	requireCleanStaleDataMetrics(t, mgr, cleanStaleDataMetrics{
+		configkeys:     1,
+		configsections: 7,
+	})
+}
+
+func TestRepositoryManager_CleanStaleData_removeGitLabFullPathConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	configPath := filepath.Join(repoPath, "config")
+
+	require.NoError(t, os.WriteFile(configPath, []byte(
+		`[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[uploadpack]
+	allowAnySHA1InWant = true
+[gitlab]
+	fullpath = foo/bar
+	other = config
+`), mode.File))
+
+	mgr := New(cfg.Prometheus, testhelper.SharedLogger(t), nil, nil)
+
+	require.NoError(t, mgr.CleanStaleData(ctx, repo, housekeeping.DefaultStaleDataCleanup()))
+	require.Equal(t, `[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[uploadpack]
+	allowAnySHA1InWant = true
+[gitlab]
+	other = config
+`, string(testhelper.MustReadFile(t, configPath)))
+
+	requireCleanStaleDataMetrics(t, mgr, cleanStaleDataMetrics{
+		configFullpath: 1,
+	})
+}
+
+func TestPackRefsWithKeepAroundReferences(t *testing.T) {
+	testhelper.SkipWithReftable(t, "tests are specific to files backend")
+
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	logger := testhelper.NewLogger(t)
+
+	gitCmdFactory := gittest.NewCommandFactory(t, cfg)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := localrepo.New(logger, gitalycfg.NewLocator(cfg), gitCmdFactory, nil, repoProto)
+
+	commitOID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+	for i := 0; i < 20; i++ {
+		refName := fmt.Sprintf("refs/keep-around/%s-%d", commitOID, i)
+		gittest.Exec(t, cfg, "-C", repoPath, "update-ref", refName, commitOID.String())
+	}
+
+	packedRefsPath := filepath.Join(repoPath, "packed-refs")
+	_, err := os.Stat(packedRefsPath)
+	require.True(t, os.IsNotExist(err), "packed-refs should not exist initially")
+
+	manager := New(gitalycfgprom.Config{}, logger, nil, nil)
+
+	strategy := mockOptimizationStrategy{
+		shouldRepackReferences: func(context.Context) bool { return true },
+	}
+
+	didPackRefs, err := manager.packRefsIfNeeded(ctx, repo, strategy)
+	require.NoError(t, err)
+	require.True(t, didPackRefs)
+
+	packedRefsContent, err := os.ReadFile(packedRefsPath)
+	require.NoError(t, err)
+	packedRefs := string(packedRefsContent)
+
+	// Check that keep-around refs are packed
+	require.Contains(t, packedRefs, "refs/keep-around/", "packed-refs should contain keep-around references")
+}
+
+// mockOptimizationStrategy is a mock strategy that can be used with OptimizeRepository.
+type mockOptimizationStrategy struct {
+	shouldRepackObjects    bool
+	repackObjectsCfg       config.RepackObjectsConfig
+	shouldPruneObjects     bool
+	pruneObjectsCfg        housekeeping.PruneObjectsConfig
+	shouldRepackReferences func(ctx context.Context) bool
+	shouldWriteCommitGraph bool
+	writeCommitGraphCfg    config.WriteCommitGraphConfig
+}
+
+func (m mockOptimizationStrategy) ShouldRepackObjects(context.Context) (bool, config.RepackObjectsConfig) {
+	return m.shouldRepackObjects, m.repackObjectsCfg
+}
+
+func (m mockOptimizationStrategy) ShouldPruneObjects(context.Context) (bool, housekeeping.PruneObjectsConfig) {
+	return m.shouldPruneObjects, m.pruneObjectsCfg
+}
+
+func (m mockOptimizationStrategy) ShouldRepackReferences(ctx context.Context) bool {
+	return m.shouldRepackReferences(ctx)
+}
+
+func (m mockOptimizationStrategy) ShouldWriteCommitGraph(context.Context) (bool, config.WriteCommitGraphConfig, error) {
+	return m.shouldWriteCommitGraph, m.writeCommitGraphCfg, nil
+}

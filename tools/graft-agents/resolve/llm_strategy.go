@@ -1,0 +1,220 @@
+package resolve
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+)
+
+// The "llm" strategy resolves content conflicts with a language model. It is
+// registered here, so any program that imports this package can use it from
+// configuration. The model backend is chosen by the nested [strategy.llm]
+// table and must be registered by the program (blank import of
+// tools/graft-agents/llm/anthropic, llm/openai or llm/command):
+//
+//	[[strategy]]
+//	type = "llm"
+//	paths = ["**/*.go", "docs/**"]
+//	min_confidence = "medium"      # optional: high, medium (default) or low
+//	max_prompt_bytes = 65536       # optional: largest prompt sent (whole file or region)
+//	context_lines = 8              # optional
+//	max_answer_bytes = 1048576     # optional
+//	max_regions = 32               # optional: most conflicting regions per file
+//
+//	[strategy.llm]
+//	type = "openai"
+//	model = "llama3.1"
+//	base_url = "http://localhost:11434/v1"
+//	timeout = "120s"
+//	max_tokens = 4096              # optional: answer limit; unset = provider default
+//
+//	[strategy.llm.options]         # optional, provider specific
+//	...
+//
+// The strategy declines (the chain continues, no model call is made) for files
+// it cannot merge: a side that is absent, a symlink, a mode conflict, binary
+// content, a diff too large to split (the LCS table of the changed middle of
+// the file is limited to 8M cells, roughly 2800 changed lines on each side),
+// more conflicting regions than max_regions, or a region whose prompt exceeds
+// max_prompt_bytes. A rejected or failed answer is a strategy failure and the
+// chain continues as well. Checks configured for the path still run on the
+// accepted answer.
+func init() {
+	RegisterStrategy("llm", newLLMStrategy)
+}
+
+// llmStrategy is immutable after construction. Resolve may run concurrently
+// (HTTP mode), so the provider must be safe for concurrent use.
+type llmStrategy struct {
+	provider llm.Provider
+	opt      LLMOptions
+	timeout  time.Duration
+}
+
+func newLLMStrategy(spec StrategySpec) (Strategy, error) {
+	if err := allowOnly(spec, "llm", "min_confidence", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions"); err != nil {
+		return nil, err
+	}
+
+	var opt LLMOptions
+	var err error
+	if opt.MinConfidence, err = optString(spec, "min_confidence"); err != nil {
+		return nil, err
+	}
+	if opt.MaxPromptBytes, err = llmOptInt(spec, "max_prompt_bytes"); err != nil {
+		return nil, err
+	}
+	if opt.ContextLines, err = llmOptInt(spec, "context_lines"); err != nil {
+		return nil, err
+	}
+	if opt.MaxAnswerBytes, err = llmOptInt(spec, "max_answer_bytes"); err != nil {
+		return nil, err
+	}
+	if opt.MaxRegions, err = llmOptInt(spec, "max_regions"); err != nil {
+		return nil, err
+	}
+
+	cfg, err := llmProviderConfig(spec)
+	if err != nil {
+		return nil, err
+	}
+	// The configured limit is the answer budget of every request. Unset, the
+	// provider's own default applies.
+	opt.MaxTokens = cfg.MaxTokens
+	if opt, err = opt.withDefaults(); err != nil {
+		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
+	}
+
+	timeout, err := cfg.TimeoutOrDefault()
+	if err != nil {
+		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
+	}
+	p, err := llm.New(cfg)
+	if errors.Is(err, llm.ErrDisabled) {
+		return nil, fmt.Errorf("strategy %q: the llm table needs a provider type", spec.Name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
+	}
+	return &llmStrategy{provider: p, opt: opt, timeout: timeout}, nil
+}
+
+// Resolve implements Strategy.
+func (s *llmStrategy) Resolve(ctx context.Context, f File, _ protocol.Request) (Resolution, bool, error) {
+	if !regularFile(f.Ours) || !regularFile(f.Theirs) || f.Ours.Mode != f.Theirs.Mode {
+		return Resolution{}, false, nil
+	}
+	if f.Base != nil && f.Base.Mode == protocol.ModeSymlink {
+		return Resolution{}, false, nil
+	}
+
+	lf := LLMFile{Path: f.Path, Ours: llmBytes(f.Ours.Content), Theirs: llmBytes(f.Theirs.Content)}
+	if f.Base != nil {
+		lf.Base = llmBytes(f.Base.Content)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	res, err := ResolveLLM(ctx, s.provider, lf, s.opt)
+	switch {
+	case errors.Is(err, ErrLLMNotApplicable):
+		return Resolution{}, false, nil
+	case err != nil:
+		return Resolution{}, false, err
+	}
+	return Resolution{Action: protocol.ActionWrite, Mode: f.Ours.Mode, Content: res.Content}, true, nil
+}
+
+// llmBytes keeps an empty side distinct from an absent one: ResolveLLM treats
+// nil as absent.
+func llmBytes(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
+}
+
+// llmProviderConfig decodes the [strategy.llm] table.
+func llmProviderConfig(spec StrategySpec) (llm.Config, error) {
+	raw, ok := spec.Options["llm"]
+	if !ok {
+		return llm.Config{}, fmt.Errorf("strategy %q: missing [strategy.llm] table", spec.Name)
+	}
+	tbl, ok := raw.(map[string]any)
+	if !ok {
+		return llm.Config{}, fmt.Errorf("strategy %q: llm must be a table", spec.Name)
+	}
+
+	var unknown []string
+	for k := range tbl {
+		switch k {
+		case "type", "model", "base_url", "api_key_env", "command", "timeout", "max_tokens", "effort", "options":
+		default:
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		return llm.Config{}, fmt.Errorf("strategy %q: llm: unknown keys %v", spec.Name, unknown)
+	}
+
+	var cfg llm.Config
+	var err error
+	strs := []struct {
+		key string
+		dst *string
+	}{
+		{"type", &cfg.Type}, {"model", &cfg.Model}, {"base_url", &cfg.BaseURL},
+		{"api_key_env", &cfg.APIKeyEnv}, {"timeout", &cfg.Timeout}, {"effort", &cfg.Effort},
+	}
+	for _, s := range strs {
+		if *s.dst, err = stringField(tbl, s.key); err != nil {
+			return llm.Config{}, fmt.Errorf("strategy %q: llm: %w", spec.Name, err)
+		}
+	}
+	if cfg.Command, err = stringListField(tbl, "command"); err != nil {
+		return llm.Config{}, fmt.Errorf("strategy %q: llm: %w", spec.Name, err)
+	}
+	if v, ok := tbl["max_tokens"]; ok {
+		n, ok := v.(int64)
+		if !ok || n < 0 || n > 1<<20 {
+			return llm.Config{}, fmt.Errorf("strategy %q: llm: max_tokens must be an integer between 0 and %d", spec.Name, 1<<20)
+		}
+		cfg.MaxTokens = int(n)
+	}
+	if v, ok := tbl["options"]; ok {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return llm.Config{}, fmt.Errorf("strategy %q: llm: options must be a table", spec.Name)
+		}
+		cfg.Options = make(map[string]string, len(m))
+		for k, val := range m {
+			s, ok := val.(string)
+			if !ok {
+				return llm.Config{}, fmt.Errorf("strategy %q: llm: option %q must be a string", spec.Name, k)
+			}
+			cfg.Options[k] = s
+		}
+	}
+	if cfg.Type == "" {
+		return llm.Config{}, fmt.Errorf("strategy %q: llm: type is required", spec.Name)
+	}
+	return cfg, nil
+}
+
+// llmOptInt reads an optional non-negative integer option of the strategy.
+func llmOptInt(spec StrategySpec, key string) (int, error) {
+	v, ok := spec.Options[key]
+	if !ok {
+		return 0, nil
+	}
+	n, ok := v.(int64)
+	if !ok || n < 0 || n > 1<<31-1 {
+		return 0, fmt.Errorf("strategy %q: %s must be a non-negative integer", spec.Name, key)
+	}
+	return int(n), nil
+}

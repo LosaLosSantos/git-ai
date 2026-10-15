@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// DerivedDataService serves history queries backed by derived data: values
+// computed once per (commit, path) from the values of the commit's parents,
+// persisted, and reused by every later query. Because inputs are immutable
+// commits, cached values never need invalidation.
+service DerivedDataService {
+
+  // Blame attributes every line of a file at a revision to the commit that
+  // last changed it, as structured data.
+  rpc Blame(BlameRequest) returns (stream BlameResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // PathHistory returns the commits that changed a path, newest first,
+  // following first parents.
+  rpc PathHistory(PathHistoryRequest) returns (stream PathHistoryResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+}
+
+// BlameRequest is a request for the Blame RPC.
+message BlameRequest {
+  // repository is the repository to read from.
+  Repository repository = 1 [(target_repository)=true];
+  // revision is the commit-ish to blame at.
+  bytes revision = 2;
+  // path is the file path relative to the repository root.
+  bytes path = 3;
+}
+
+// BlameResponse carries a batch of attributed lines.
+message BlameResponse {
+  // Line is one attributed line.
+  message Line {
+    // line_number is 1-based.
+    int32 line_number = 1;
+    // commit_id is the commit that introduced the line in its current form.
+    string commit_id = 2;
+    // original_line_number is the line's number in commit_id's version.
+    int32 original_line_number = 3;
+    // content is the line content without the trailing newline.
+    bytes content = 4;
+  }
+
+  // commit_id is the resolved revision. Only set on the first message.
+  string commit_id = 1;
+  // lines is a batch of lines in ascending line_number order.
+  repeated Line lines = 2;
+}
+
+// PathHistoryRequest is a request for the PathHistory RPC.
+message PathHistoryRequest {
+  // repository is the repository to read from.
+  Repository repository = 1 [(target_repository)=true];
+  // revision is the commit-ish to start at.
+  bytes revision = 2;
+  // path is the file or directory path relative to the repository root.
+  bytes path = 3;
+  // limit bounds the number of commits; 0 means 100.
+  uint32 limit = 4;
+}
+
+// PathHistoryResponse carries a batch of commits.
+message PathHistoryResponse {
+  // commits is a batch of commits, newest first.
+  repeated GitCommit commits = 1;
+}

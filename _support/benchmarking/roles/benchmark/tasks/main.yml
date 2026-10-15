@@ -1,0 +1,30 @@
+---
+- name: Set run_name
+  set_fact: "run_name=benchmark-{{ lookup('pipe', 'date +%s') }}"
+
+- name: Run benchmarks against each target machine
+  include_tasks: bench.yml
+  loop: "{{ groups['gitaly'] }}"
+  loop_control:
+    loop_var: current_gitaly
+
+- name: Archive results on client
+  archive:
+    path:
+      - "/tmp/{{ run_name }}"
+    dest: "/tmp/{{ run_name }}.tar.gz"
+    owner: gitaly_bench
+
+- name: Fetch results from client
+  fetch:
+    src: "/tmp/{{ run_name }}.tar.gz"
+    dest: "{{ playbook_dir }}/experiments/{{ gitaly_benchmarking_experiment_name }}/results/"
+    flat: true
+
+- name: Delete results from client
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/{{ run_name }}.tar.gz"
+    - "/tmp/{{ run_name }}"

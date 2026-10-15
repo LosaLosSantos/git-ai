@@ -1,0 +1,147 @@
+# LabKit Logging Field Standardization TODO
+# AUTO-GENERATED FILE. DO NOT EDIT MANUALLY.
+#
+# This file tracks deprecated logging fields that need to be migrated to
+# standard fields defined in gitlab.com/gitlab-org/labkit/v2/fields.
+# Each offense represents a file using a deprecated field name.
+#
+# How to fix:
+#   Replace the string literal with the constant from the fields package.
+#   e.g. log.WithField("source_ip", ...) → log.WithField(fields.RemoteIP, ...)
+#
+# Adding offenses when an immediate fix is not possible:
+#   go get gitlab.com/gitlab-org/labkit/v2/cmd/validate-log-fields
+#   go run gitlab.com/gitlab-org/labkit/v2/cmd/validate-log-fields -update-todo
+#   go mod tidy
+#
+# Regenerate entire TODO:
+#   Delete this file, then run the command above.
+
+---
+offenses:
+    - callsite: internal/burdenmonitor/load_shedder.go
+      deprecated_field: reason
+      standard_field: fields.LogMessage
+    - callsite: internal/burdenmonitor/poller.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/cli/gitaly/serve.go
+      deprecated_field: duration_ms
+      standard_field: fields.DurationS
+    - callsite: internal/command/subprocess_logger.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/git/housekeeping/manager/optimize_repository.go
+      deprecated_field: total_time
+      standard_field: fields.DurationS
+    - callsite: internal/git/trace2hooks/log_exporter.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/git/trace2hooks/log_exporter.go
+      deprecated_field: start_time
+      standard_field: fields.Timestamp
+    - callsite: internal/gitaly/maintenance/daily.go
+      deprecated_field: actual_duration
+      standard_field: fields.DurationS
+    - callsite: internal/gitaly/maintenance/optimize.go
+      deprecated_field: time_ms
+      standard_field: fields.DurationS
+    - callsite: internal/gitaly/server/server.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/gitaly/service/repository/snapshot.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/gitaly/service/smarthttp/cache.go
+      deprecated_field: service
+      standard_field: fields.ServiceName
+    - callsite: internal/gitaly/service/smarthttp/inforefs.go
+      deprecated_field: service
+      standard_field: fields.ServiceName
+    - callsite: internal/gitaly/storage/keyvalue/databasemgr/db.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/gitaly/storage/storagemgr/partition/migration/manager.go
+      deprecated_field: duration
+      standard_field: fields.DurationS
+    - callsite: internal/gitaly/storage/storagemgr/partition/snapshot/manager.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/gitaly/transaction/manager.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/gitlab/client/gitlabnet.go
+      deprecated_field: duration_ms
+      standard_field: fields.DurationS
+    - callsite: internal/gitlab/http_client.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/grpc/backchannel/client.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/grpc/backchannel/server.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/grpc/middleware/panichandler/panic_handler.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/praefect/datastore/collector.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/datastore/collector_test.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/datastore/collector_test.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/praefect/datastore/listener.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/datastore/storage_provider.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/datastore/storage_provider_test.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/datastore/storage_provider_test.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/praefect/nodes/health_manager.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/nodes/health_manager.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/praefect/reconciler/reconciler.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/replicator.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/repocleaner/action_log.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/repocleaner/action_log_test.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/repocleaner/repository.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/repocleaner/repository_test.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/server.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/transactions/manager.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: internal/praefect/verifier.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: internal/tempdir/clean.go
+      deprecated_field: time_ms
+      standard_field: fields.DurationS
+    - callsite: internal/testhelper/testserver/praefect.go
+      deprecated_field: component
+      standard_field: fields.ServiceName

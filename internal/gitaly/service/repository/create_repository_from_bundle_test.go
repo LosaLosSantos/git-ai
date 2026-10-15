@@ -1,0 +1,324 @@
+package repository
+
+import (
+	"bytes"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/featureflag"
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/gitaly/repoutil"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/open_scion/streamio"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/status"
+)
+
+func TestCreateRepositoryFromBundle_mvccBackend(t *testing.T) {
+	t.Parallel()
+
+	// When GIT_DEFAULT_REF_FORMAT is set, git honors it directly and the command factory skips
+	// its own ref-format selection, so the MVCC backend cannot be chosen.
+	testhelper.SkipWithReftable(t, "MVCC backend selection is overridden by GIT_DEFAULT_REF_FORMAT")
+
+	ctx := testhelper.Context(t)
+	cfg, repoClient := setupRepositoryService(t)
+
+	// Build a bundle from a source repository with a couple of commits.
+	_, bundleRepoPath := gittest.CreateRepository(t, ctx, cfg)
+	commitID := gittest.WriteCommit(t, cfg, bundleRepoPath, gittest.WithReference("refs/heads/main"))
+	gittest.Exec(t, cfg, "-C", bundleRepoPath, "symbolic-ref", "HEAD", "refs/heads/main")
+	bundleData := gittest.Exec(t, cfg, "-C", bundleRepoPath, "bundle", "create", "-", "--all")
+
+	repoProto := &gitalypb.Repository{
+		StorageName:  cfg.Storages[0].Name,
+		RelativePath: gittest.NewRepositoryName(t),
+	}
+
+	// Enable the MVCC backend for the created repository. OutgoingCtxWithFeatureFlag replaces the
+	// default injected by testhelper.Context on the outgoing metadata transmitted to the server.
+	ctx = featureflag.OutgoingCtxWithFeatureFlag(ctx, featureflag.NewRepoMVCCBackend, true)
+
+	stream, err := repoClient.CreateRepositoryFromBundle(ctx)
+	require.NoError(t, err)
+
+	writer := streamio.NewWriter(func(p []byte) error {
+		return stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{Data: p})
+	})
+	require.NoError(t, stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{Repository: repoProto}))
+	_, err = writer.Write(bundleData)
+	require.NoError(t, err)
+	_, err = stream.CloseAndRecv()
+	require.NoError(t, err)
+
+	repoPath := filepath.Join(cfg.Storages[0].Path, gittest.GetReplicaPath(t, ctx, cfg, repoProto))
+
+	// The references from the bundle were cloned into the MVCC repository, and it is a functional
+	// MVCC repository. gittest helpers detect the MVCC backend from the repository on disk and
+	// select the matching Git binary.
+	require.Equal(t, commitID, gittest.ResolveRevision(t, cfg, repoPath, "refs/heads/main"))
+	requireFunctionalRepository(t, ctx, cfg, repoPath, git.ReferenceBackendMVCC)
+}
+
+func TestCreateRepositoryFromBundle(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repoClient := setupRepositoryService(t)
+
+	type setupData struct {
+		repoProto    *gitalypb.Repository
+		bundleData   []byte
+		expectedRefs []git.Reference
+		expectedErr  error
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		setup func(t *testing.T) setupData
+	}{
+		{
+			desc: "create repository from bundle",
+			setup: func(t *testing.T) setupData {
+				_, bundleRepoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				// Create objects and references that will be used to validate the repository.
+				oldRef := "refs/heads/old"
+				newRef := "refs/heads/new"
+				commitID1 := gittest.WriteCommit(t, cfg, bundleRepoPath, gittest.WithReference(oldRef))
+				commitID2 := gittest.WriteCommit(t, cfg, bundleRepoPath, gittest.WithReference(newRef), gittest.WithParents(commitID1))
+
+				// Change HEAD to validate the created repository will use the same reference.
+				gittest.Exec(t, cfg, "-C", bundleRepoPath, "symbolic-ref", "HEAD", newRef)
+
+				// Generate a Git bundle that will be used to create a repository from.
+				bundleData := gittest.Exec(t, cfg, "-C", bundleRepoPath, "bundle", "create", "-", "--all")
+
+				return setupData{
+					repoProto: &gitalypb.Repository{
+						StorageName:  cfg.Storages[0].Name,
+						RelativePath: gittest.NewRepositoryName(t),
+					},
+					bundleData: bundleData,
+					expectedRefs: []git.Reference{
+						git.NewSymbolicReference("HEAD", git.ReferenceName(newRef)),
+						git.NewReference(git.ReferenceName(oldRef), commitID1),
+						git.NewReference(git.ReferenceName(newRef), commitID2),
+					},
+				}
+			},
+		},
+		{
+			desc: "invalid bundle",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					// If an invalid Git bundle is transmitted, the RPC returns an error.
+					repoProto: &gitalypb.Repository{
+						StorageName:  cfg.Storages[0].Name,
+						RelativePath: gittest.NewRepositoryName(t),
+					},
+					bundleData:  []byte("not-a-bundle"),
+					expectedErr: structerr.NewInternal("creating repository: cloning bundle: waiting for git-clone: exit status 128"),
+				}
+			},
+		},
+		{
+			desc: "invalid argument",
+			setup: func(t *testing.T) setupData {
+				// If the repository is not specified in the RPC request, an error is returned.
+				return setupData{
+					repoProto:   nil,
+					expectedErr: structerr.NewInvalidArgument("%w", storage.ErrRepositoryNotSet),
+				}
+			},
+		},
+		{
+			desc: "repo already exists",
+			setup: func(t *testing.T) setupData {
+				// If the specified repository already exists a new one can not be created.
+				repoProto, _ := gittest.CreateRepository(t, ctx, cfg)
+
+				return setupData{
+					repoProto: repoProto,
+					expectedErr: testhelper.GitalyOrPraefect(
+						structerr.NewAlreadyExists("creating repository: repository exists already"),
+						structerr.NewAlreadyExists("route repository creation: reserve repository id: repository already exists"),
+					),
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			setup := tc.setup(t)
+
+			stream, err := repoClient.CreateRepositoryFromBundle(ctx)
+			require.NoError(t, err)
+
+			writer := streamio.NewWriter(func(p []byte) error {
+				if err := stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{Data: p}); err != nil {
+					return err
+				}
+				return nil
+			})
+
+			// Some test cases will not transmit any bundle data. To ensure the first request with
+			// repository information is received, explicitly send the first request.
+			require.NoError(t, stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{Repository: setup.repoProto}))
+
+			// If the test case is transmitting Git bundle data, write the content to the stream.
+			_, err = writer.Write(setup.bundleData)
+			require.NoError(t, err)
+
+			_, err = stream.CloseAndRecv()
+
+			// It is possible for the returned error to contain metadata embedded in its message
+			// that makes it difficult to assert equivalency. For this reason, the status code is
+			// verified, but the error message only asserts it contains a specified substring.
+			if setup.expectedErr != nil {
+				testhelper.RequireGrpcCode(t, err, status.Code(setup.expectedErr))
+				require.ErrorContains(t, err, setup.expectedErr.Error())
+				return
+			}
+			require.NoError(t, err)
+
+			// Verify connectivity and validity of the repository objects.
+			resp, err := repoClient.Fsck(ctx, &gitalypb.FsckRequest{Repository: setup.repoProto})
+			require.NoError(t, err)
+			require.Nil(t, resp.GetError())
+
+			repo := localrepo.NewTestRepo(t, cfg, setup.repoProto)
+			repoPath, err := repo.Path(ctx)
+			require.NoError(t, err)
+
+			refs := gittest.GetReferences(t, cfg, repoPath)
+			head := gittest.GetSymbolicRef(t, cfg, repoPath, "HEAD")
+
+			// Verify repository contains references from the bundle.
+			require.ElementsMatch(t, setup.expectedRefs, append(refs, head))
+		})
+	}
+}
+
+func TestCreateRepositoryFromBundle_transactional(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	txManager := transaction.NewTrackingManager()
+	cfg, client := setupRepositoryService(t, testserver.WithTransactionManager(txManager))
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	// Reset the votes casted while creating the test repository.
+	txManager.Reset()
+
+	masterOID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("master"))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("feature"))
+
+	// keep-around refs are not cloned in the initial step, but are added via the second call to
+	// git-fetch(1). We thus create some of them to exercise their behaviour with regards to
+	// transactional voting.
+	for _, keepAroundRef := range []string{"refs/keep-around/1", "refs/keep-around/2"} {
+		gittest.Exec(t, cfg, "-C", repoPath, "update-ref", keepAroundRef, masterOID.String())
+	}
+
+	ctx, err := txinfo.InjectTransaction(ctx, 1, "primary", true)
+	require.NoError(t, err)
+	ctx = metadata.IncomingToOutgoing(ctx)
+
+	stream, err := client.CreateRepositoryFromBundle(ctx)
+	require.NoError(t, err)
+
+	createdRepo := &gitalypb.Repository{
+		StorageName:  repoProto.GetStorageName(),
+		RelativePath: gittest.NewRepositoryName(t),
+	}
+
+	require.NoError(t, stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{
+		Repository: createdRepo,
+	}))
+
+	bundle := gittest.Exec(t, cfg, "-C", repoPath, "bundle", "create", "-",
+		"refs/heads/master", "refs/heads/feature", "refs/keep-around/1", "refs/keep-around/2")
+
+	_, err = io.Copy(streamio.NewWriter(func(p []byte) error {
+		require.NoError(t, stream.Send(&gitalypb.CreateRepositoryFromBundleRequest{
+			Data: p,
+		}))
+		return nil
+	}), bytes.NewReader(bundle))
+	require.NoError(t, err)
+
+	_, err = stream.CloseAndRecv()
+	require.NoError(t, err)
+
+	createVote := func(hash string, phase voting.Phase) transaction.PhasedVote {
+		vote, err := voting.VoteFromString(hash)
+		require.NoError(t, err)
+		return transaction.PhasedVote{Vote: vote, Phase: phase}
+	}
+
+	// This test is asserting storage layout as part of computing the expected vote hash. In particular,
+	// the references are not necessarily packed when the transaction is committed. Compute the expected
+	// vote thus from the state of the bundled repository. For the vote to match, we have to first modify
+	// the state to match what the RPC handler would produce. The created repository has its default branch
+	// set to master and has references packed.
+	gittest.Exec(t, cfg, "-C", repoPath, "symbolic-ref", "HEAD", "refs/heads/master")
+	gittest.Exec(t, cfg, "-C", repoPath, "pack-refs", "--all")
+
+	// When a Git repository is initialized via git-init(1) it knows upfront whether extensions such
+	// as --object-format are used. Consequently, Git can write the config for the repository in a
+	// single go. When a repository gets created via git-clone(1), it does not immediately know what
+	// the object format is for the remote repository so the repository config gets initially
+	// created without this info. Later in the clone process the object format gets discovered and
+	// the config gets updated accordingly. Starting in Git v2.48 this subtle detail causes
+	// potential differences in the ordering of the config entries. While the content is ultimately
+	// the same, transaction votes rely on the content of repository files to be exactly the same.
+	// To avoid config formatting discrepancies between git-init(1) and git-clone(1), just use the
+	// real config when computing the expected vote.
+	configStream, err := client.GetConfig(ctx, &gitalypb.GetConfigRequest{Repository: createdRepo})
+	require.NoError(t, err)
+
+	data := &bytes.Buffer{}
+	_, err = io.Copy(data, streamio.NewReader(func() ([]byte, error) {
+		response, err := configStream.Recv()
+		return response.GetData(), err
+	}))
+	require.NoError(t, err)
+	require.NoError(t, configStream.CloseSend())
+	require.NoError(t, os.Remove(filepath.Join(repoPath, "config")))
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "config"), data.Bytes(), mode.File))
+
+	// Compute the vote hash to assert that we really hash exactly the files that we
+	// expect to hash. Furthermore, this is required for cross-platform compatibility given that
+	// the configuration may be different depending on the platform.
+	hash := voting.NewVoteHash()
+	votingRepo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	err = repoutil.VoteRepository(ctx, &hash, votingRepo)
+	require.NoError(t, err)
+
+	filesVote, err := hash.Vote()
+	require.NoError(t, err)
+
+	require.Equal(t, []transaction.PhasedVote{
+		// Manual votes we compute by walking the repository.
+		createVote(filesVote.String(), voting.Preparing),
+		createVote(filesVote.String(), voting.Prepared),
+		createVote(filesVote.String(), voting.Committed),
+	}, txManager.Votes())
+}

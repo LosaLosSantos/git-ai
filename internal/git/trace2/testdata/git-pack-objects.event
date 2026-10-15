@@ -1,0 +1,20 @@
+{"event":"version","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","time":"2023-02-22T12:05:04.840009Z","file":"common-main.c","line":50,"evt":"3","exe":"2.39.1"}
+{"event":"start","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"common-main.c","line":51,"t_abs":0.002338,"argv":["git","pack-objects","toon","--compression=0"]}
+{"event":"def_repo","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"repository.c","line":136,"repo":1,"worktree":"/gitaly"}
+{"event":"cmd_name","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"git.c","line":461,"name":"pack-objects","hierarchy":"pack-objects"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4460,"repo":1,"nesting":1,"category":"pack-objects","label":"enumerate-objects"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":268,"repo":1,"nesting":2,"category":"progress","label":"Enumerating objects"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":346,"repo":1,"t_rel":0.001083,"nesting":2,"category":"progress","label":"Enumerating objects"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4490,"repo":1,"t_rel":0.001435,"nesting":1,"category":"pack-objects","label":"enumerate-objects"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4496,"repo":1,"nesting":1,"category":"pack-objects","label":"prepare-pack"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":268,"repo":1,"nesting":2,"category":"progress","label":"Counting objects"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":346,"repo":1,"t_rel":0.000075,"nesting":2,"category":"progress","label":"Counting objects"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4499,"repo":1,"t_rel":0.000090,"nesting":1,"category":"pack-objects","label":"prepare-pack"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4502,"repo":1,"nesting":1,"category":"pack-objects","label":"write-pack-file"}
+{"event":"region_enter","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":268,"repo":1,"nesting":2,"category":"progress","label":"Writing objects"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"progress.c","line":346,"repo":1,"t_rel":0.003972,"nesting":2,"category":"progress","label":"Writing objects"}
+{"event":"data","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":1312,"repo":1,"t_abs":0.008451,"t_rel":0.003996,"nesting":2,"category":"pack-objects","key":"write_pack_file/wrote","value":"1"}
+{"event":"region_leave","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"builtin/pack-objects.c","line":4505,"repo":1,"t_rel":0.004003,"nesting":1,"category":"pack-objects","label":"write-pack-file"}
+{"event":"data","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"wrapper.c","line":600,"repo":1,"t_abs":0.008482,"t_rel":0.008482,"nesting":1,"category":"fsync","key":"fsync/writeout-only","value":"2"}
+{"event":"exit","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"git.c","line":721,"t_abs":0.008489,"code":0}
+{"event":"atexit","sid":"1234/20230222T120504.839855Z-Ha0f0bee5-P0000ccc6","thread":"main","file":"trace2/tr2_tgt_event.c","line":204,"t_abs":0.008495,"code":0}

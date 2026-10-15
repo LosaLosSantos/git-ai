@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package gitalyproxytest;
+
+option go_package = "github.com/feder-cr/open_scion/proxy/policy/testdata;testdata";
+
+import "lint.proto";
+import "shared.proto";
+
+message NestedTarget {
+  gitaly.Repository repository = 1 [(gitaly.target_repository) = true];
+}
+
+message AmbiguousRequest {
+  gitaly.Repository repository = 1 [(gitaly.target_repository) = true];
+  NestedTarget nested = 2;
+}

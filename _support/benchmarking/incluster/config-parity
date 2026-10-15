@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""config-parity - diff the control Gitaly config against the MVCC Gitaly
+config fetching the live configs from the respective pods.
+Expected differences (storage paths, addresses, secrets, backend keys)
+are ignored.
+
+Usage: config-parity <control-config.toml> <mvcc-config.toml>
+
+Read the control's effective config from inside the pod rather than its ConfigMap
+The ConfigMap can be newer than what is actually loaded in the pod.
+
+    kubectl -n gitlab exec gitaly-benchmark-control-0 -c gitaly -- \
+        cat /run/gitaly-config/config.toml > control.toml
+    kubectl -n gitlab exec gitlab-gitaly-0 -c gitaly -- \
+        cat /etc/gitaly/config.toml > mvcc.toml
+
+Exit status: 0 = match or check skipped, 1 = divergence, 2 = usage error.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None
+
+# storage[N].path is the variable under test; storage[N].name legitimately
+# differs too (the control serves "benchmark-control").
+_STORAGE_PATH_RE = re.compile(r"^storage\[\d+\]\.(path|name)$")
+
+# Dotted-key prefixes that are expected to differ.
+_IGNORE_PREFIXES = (
+    "elastic",              # MVCC-only elastic/object-storage backend
+    "auth.token",           # secret; identical value by construction anyway
+    "logging.dir",          # per-deployment log path
+    "gitlab.url",           # namespace-specific internal URL
+    "gitlab.secret_file",   # per-deployment secret mount path
+    "cgroups.mountpoint",   # per-pod cgroup slice path, differs by pod UID
+    "listen_addr",          # control uses its own port
+    "tls_listen_addr",
+    "prometheus_listen_addr",
+    "socket_path",          # chart wires unix sockets the control doesn't use
+    "internal_socket_dir",
+    "runtime_dir",
+)
+
+
+def _ignored(key: str) -> bool:
+    lk = key.lower()
+    if _STORAGE_PATH_RE.match(key):
+        return True
+    # s3 backend keys live under [git]; drop the whole family.
+    if lk.startswith("git.s3") or "s3_backend" in lk:
+        return True
+    return any(lk == p or lk.startswith(p + ".") or lk.startswith(p + "[")
+               for p in _IGNORE_PREFIXES)
+
+
+def _flatten(obj, prefix: str = "") -> dict:
+    """Flatten a parsed TOML document to dotted keys (arrays indexed [i])."""
+    out: dict = {}
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            out.update(_flatten(val, f"{prefix}.{key}" if prefix else key))
+    elif isinstance(obj, list):
+        for i, val in enumerate(obj):
+            out.update(_flatten(val, f"{prefix}[{i}]"))
+    else:
+        out[prefix] = obj
+    return out
+
+
+def _fmt(value) -> str:
+    s = repr(value)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def _load(path: Path) -> dict | None:
+    try:
+        with path.open("rb") as f:
+            doc = tomllib.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"[config-parity] could not parse {path}: {exc}; skipping check",
+              file=sys.stderr)
+        return None
+    # fsck git.config entries only affect ingestion, not benchmark
+    # fairness; other git.config keys are still compared.
+    git_cfg = doc.get("git", {}).get("config")
+    if isinstance(git_cfg, list):
+        doc["git"]["config"] = [
+            e for e in git_cfg
+            if "fsck" not in str(e.get("key", "")).lower()
+        ]
+    return _flatten(doc)
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: config-parity <control.toml> <mvcc.toml>", file=sys.stderr)
+        return 2
+    if tomllib is None:
+        print("[config-parity] tomllib unavailable (Python < 3.11); "
+              "skipping parity check", file=sys.stderr)
+        return 0
+
+    control = _load(Path(sys.argv[1]))
+    mvcc = _load(Path(sys.argv[2]))
+    if control is None or mvcc is None:
+        return 0
+
+    control = {k: v for k, v in control.items() if not _ignored(k)}
+    mvcc = {k: v for k, v in mvcc.items() if not _ignored(k)}
+
+    # Keys set on MVCC but not the control are the fairness risk.
+    missing = sorted(set(mvcc) - set(control))
+    extra = sorted(set(control) - set(mvcc))
+    differ = sorted(k for k in set(control) & set(mvcc)
+                    if control[k] != mvcc[k])
+
+    if not (missing or extra or differ):
+        print("[config-parity] OK: control and MVCC configs match on all "
+              "non-ignored keys.", file=sys.stderr)
+        return 0
+
+    print("[config-parity] WARNING: control config does not mirror the live "
+          "MVCC config (ignoring storage paths, s3/elastic, addresses, token, "
+          "per-deployment paths):", file=sys.stderr)
+    if missing:
+        print("  set on MVCC but MISSING from control "
+              "(control may be under-tuned vs the backend under test):",
+              file=sys.stderr)
+        for k in missing:
+            print(f"    - {k} = {_fmt(mvcc[k])}", file=sys.stderr)
+    if differ:
+        print("  value DIFFERS (control vs MVCC):", file=sys.stderr)
+        for k in differ:
+            print(f"    - {k}: {_fmt(control[k])} != {_fmt(mvcc[k])}",
+                  file=sys.stderr)
+    if extra:
+        print("  set on control but ABSENT from MVCC:", file=sys.stderr)
+        for k in extra:
+            print(f"    - {k} = {_fmt(control[k])}", file=sys.stderr)
+    print("  Review whether any of these can move latency more than the "
+          "storage backend does; mirror them in tf-gke-gitlab-bootstrap's "
+          "k8s_gitaly_control_config.toml.tpl if so.",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// ObjectService provides on-demand, content-addressed access to Git objects.
+//
+// It is designed for always-online clients (agents, CI jobs, sparse working
+// copies and cache tiers) that fetch exactly the trees and blobs they need
+// instead of negotiating packfiles. Objects are immutable, so every response
+// of this service is cacheable forever by object ID.
+service ObjectService {
+
+  // GetObjects streams the raw contents of the requested objects. Objects are
+  // returned in request order. Large objects are split across several
+  // messages: the first message of an object carries oid, type and size, and
+  // every message carries the next chunk of data at the given offset. Objects
+  // that do not exist are reported with `missing = true` and no data, so a
+  // single RPC never fails because of one absent object.
+  //
+  // Transfers are resumable: a client that lost the stream re-issues the
+  // request with the not-yet-completed object IDs, passing the partially
+  // received object as resume_oid together with resume_offset.
+  rpc GetObjects(GetObjectsRequest) returns (stream GetObjectsResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // GetTree lists the entries of a tree, optionally recursively, in a
+  // stable order (depth-first, entries sorted by path). The tree is selected
+  // either by tree_oid or by revision plus path.
+  rpc GetTree(GetTreeRequest) returns (stream GetTreeResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+}
+
+// GetObjectsRequest is a request for the GetObjects RPC.
+message GetObjectsRequest {
+  // repository is the repository to read objects from.
+  Repository repository = 1 [(target_repository)=true];
+  // oids are the full object IDs to fetch. Duplicates are returned once. The
+  // number of object IDs per request is limited (see max_objects in the
+  // server configuration); requests above the limit fail with
+  // InvalidArgument.
+  repeated string oids = 2;
+  // resume_oid, if set, must be one of oids. Its data is returned starting at
+  // resume_offset instead of 0.
+  string resume_oid = 3;
+  // resume_offset is the byte offset to resume resume_oid at.
+  int64 resume_offset = 4;
+}
+
+// GetObjectsResponse is one chunk of one object.
+message GetObjectsResponse {
+  // oid is the object ID this chunk belongs to.
+  string oid = 1;
+  // type is the object type. Only set on the first message of an object.
+  ObjectType type = 2;
+  // size is the total object size in bytes. Only set on the first message of
+  // an object.
+  int64 size = 3;
+  // offset is the byte offset of data within the object.
+  int64 offset = 4;
+  // data is a chunk of the object's raw contents.
+  bytes data = 5;
+  // missing is true if the object does not exist. No data follows.
+  bool missing = 6;
+}
+
+// GetTreeRequest is a request for the GetTree RPC.
+message GetTreeRequest {
+  // repository is the repository to read the tree from.
+  Repository repository = 1 [(target_repository)=true];
+  // tree_oid selects the tree directly. Mutually exclusive with revision.
+  string tree_oid = 2;
+  // revision selects a commit-ish whose tree (or subtree at path) is listed.
+  bytes revision = 3;
+  // path is the subtree path relative to the root of revision. Empty means
+  // the root tree. Ignored when tree_oid is set.
+  bytes path = 4;
+  // recursive lists the whole subtree instead of only direct entries.
+  bool recursive = 5;
+  // include_sizes resolves and returns the size of every blob entry.
+  bool include_sizes = 6;
+}
+
+// GetTreeResponse carries a batch of tree entries.
+message GetTreeResponse {
+  // Entry is one entry of a tree.
+  message Entry {
+    // path is the entry path relative to the listed tree.
+    bytes path = 1;
+    // oid is the object ID of the entry.
+    string oid = 2;
+    // type is the object type (BLOB, TREE or COMMIT for submodules).
+    ObjectType type = 3;
+    // mode is the Git file mode, e.g. 0100644.
+    int32 mode = 4;
+    // size is the blob size if include_sizes was requested, otherwise 0.
+    int64 size = 5;
+  }
+
+  // tree_oid is the object ID of the listed tree. Only set on the first
+  // message.
+  string tree_oid = 1;
+  // entries is a batch of entries.
+  repeated Entry entries = 2;
+}

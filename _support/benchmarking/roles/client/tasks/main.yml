@@ -1,0 +1,96 @@
+---
+- name: Load config
+  include_vars:
+    file: "{{ playbook_dir }}/experiments/{{ gitaly_benchmarking_experiment_name }}/config.yml"
+    name: config
+# needed for Ansible > 4.0 https://github.com/ansible/ansible/issues/74830
+- name: Install acl
+  apt:
+    name:
+      - acl
+    state: present
+
+- name: Create 'git' user
+  user:
+    name: git
+    uid: 1999
+    groups: admin
+    append: true
+
+- name: Create /src directory
+  file:
+    path: /src
+    state: directory
+    mode: '0755'
+    owner: git
+    group: git
+
+- name: Clone Gitaly
+  git:
+    repo: https://gitlab.com/gitlab-org/gitaly.git
+    dest: /src/gitaly
+    version: "{{ config.client.gitaly_revision }}"
+  become_user: git
+
+- name: Peel gitaly_revision
+  command: "git rev-parse --verify {{ config.client.gitaly_revision }}^{commit}"
+  register: gitaly_commit
+  args:
+    chdir: /src/gitaly
+  become_user: git
+
+- name: Checkout Gitaly at specified commit
+  git:
+    repo: https://gitlab.com/gitlab-org/gitaly.git
+    dest: /src/gitaly
+    version: "{{ gitaly_commit['stdout'] }}"
+  become_user: git
+
+- name: Find Gitaly's Golang version
+  shell: "awk '/^golang /{ print $2 }' /src/gitaly/.tool-versions"
+  register: golang_version
+
+- name: Persist golang_version
+  set_fact:
+    golang_version: "{{ golang_version['stdout'] }}"
+
+- include_tasks: "{{ playbook_dir }}/roles/gitaly/tasks/setup_go.yml"
+
+- name: Find Gitaly's Ruby version
+  shell: "awk '/^ruby/{ print $2 }' /src/gitaly/.tool-versions"
+  register: ruby_version
+
+- name: Persist ruby_version
+  set_fact:
+    ruby_version: "{{ ruby_version['stdout'] }}"
+
+- include_tasks: setup-k6.yml
+
+- name: Build fetcher
+  command:
+    cmd: go build -o /tmp/fetcher ./_support/benchmarking/fetcher/
+    chdir: /src/gitaly
+  environment:
+    PATH: '/usr/local/go/bin:{{ ansible_env.PATH }}'
+  become_user: git
+
+- name: Install fetcher
+  copy:
+    src: /tmp/fetcher
+    dest: /usr/local/bin/fetcher
+    mode: "0755"
+    remote_src: yes
+
+- name: Generate SSH key
+  shell: ssh-keygen -q -t ed25519 -f /root/.ssh/id_ed25519 -N ""
+  args:
+    creates: /root/.ssh/id_ed25519
+
+- name: Copy SSH key
+  slurp:
+    src: /root/.ssh/id_ed25519.pub
+  register: client_ssh_key_var
+
+- name: Persist SSH key as fact
+  set_fact:
+    client_ssh_key: "{{ client_ssh_key_var['content'] }}"

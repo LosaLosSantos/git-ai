@@ -1,0 +1,80 @@
+package helper
+
+import "time"
+
+// Ticker ticks on the channel returned by C to signal something.
+type Ticker interface {
+	C() <-chan time.Time
+	Stop()
+	Reset()
+}
+
+// NewTimerTicker returns a Ticker that ticks after the specified interval
+// has passed since the previous Reset call.
+//
+// Requires go 1.23 or later in go.mod: Reset() and Stop() rely on the
+// Go 1.23 guarantee that the timer channel is empty when either method
+// returns, making manual draining unnecessary.
+func NewTimerTicker(interval time.Duration) Ticker {
+	t := time.NewTimer(interval)
+	t.Stop()
+	return &timerTicker{timer: t, interval: interval}
+}
+
+type timerTicker struct {
+	timer    *time.Timer
+	interval time.Duration
+}
+
+func (tt *timerTicker) C() <-chan time.Time { return tt.timer.C }
+
+func (tt *timerTicker) Reset() { tt.timer.Reset(tt.interval) }
+
+func (tt *timerTicker) Stop() { tt.timer.Stop() }
+
+// ManualTicker implements a ticker that ticks when Tick is called.
+// Stop and Reset functions call the provided functions.
+type ManualTicker struct {
+	c         chan time.Time
+	StopFunc  func()
+	ResetFunc func()
+}
+
+//nolint:revive // This is unintentionally missing documentation.
+func (mt *ManualTicker) C() <-chan time.Time { return mt.c }
+
+//nolint:revive // This is unintentionally missing documentation.
+func (mt *ManualTicker) Stop() { mt.StopFunc() }
+
+//nolint:revive // This is unintentionally missing documentation.
+func (mt *ManualTicker) Reset() { mt.ResetFunc() }
+
+//nolint:revive // This is unintentionally missing documentation.
+func (mt *ManualTicker) Tick() { mt.c <- time.Now() }
+
+// NewManualTicker returns a Ticker that can be manually controlled.
+func NewManualTicker() *ManualTicker {
+	return &ManualTicker{
+		c:         make(chan time.Time, 1),
+		StopFunc:  func() {},
+		ResetFunc: func() {},
+	}
+}
+
+// NewCountTicker returns a ManualTicker with a ResetFunc that
+// calls the provided callback on Reset call after it has been
+// called N times.
+func NewCountTicker(n int, callback func()) *ManualTicker {
+	ticker := NewManualTicker()
+	ticker.ResetFunc = func() {
+		n--
+		if n < 0 {
+			callback()
+			return
+		}
+
+		ticker.Tick()
+	}
+
+	return ticker
+}

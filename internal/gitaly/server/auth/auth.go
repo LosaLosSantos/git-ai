@@ -1,0 +1,98 @@
+package auth
+
+import (
+	"context"
+	"time"
+
+	gitalyauth "github.com/feder-cr/open_scion/auth"
+	gitalycfgauth "github.com/feder-cr/open_scion/internal/gitaly/config/auth"
+	grpcmwauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+var authCount = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "gitaly_authentications_total",
+		Help: "Counts of of Gitaly request authentication attempts",
+	},
+	[]string{"enforced", "status"},
+)
+
+// IsAuthenticated returns true if the request has a username set in the gRPC metadata.
+func IsAuthenticated(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+
+	usernames := md.Get("username")
+	return len(usernames) > 0
+}
+
+// UnauthenticatedHealthService wraps the health server and disables authentication for all of its methods.
+type UnauthenticatedHealthService struct{ grpc_health_v1.HealthServer }
+
+// AuthFuncOverride disables authentication on the service's methods and just returns the passed in context.
+func (UnauthenticatedHealthService) AuthFuncOverride(ctx context.Context, fullMethodName string) (context.Context, error) {
+	return ctx, nil
+}
+
+// StreamServerInterceptor checks for Gitaly bearer tokens.
+func StreamServerInterceptor(conf gitalycfgauth.Config) grpc.StreamServerInterceptor {
+	return grpcmwauth.StreamServerInterceptor(checkFunc(conf))
+}
+
+// UnaryServerInterceptor checks for Gitaly bearer tokens.
+func UnaryServerInterceptor(conf gitalycfgauth.Config) grpc.UnaryServerInterceptor {
+	return grpcmwauth.UnaryServerInterceptor(checkFunc(conf))
+}
+
+func checkFunc(conf gitalycfgauth.Config) func(ctx context.Context) (context.Context, error) {
+	return func(ctx context.Context) (context.Context, error) {
+		if len(conf.GetToken()) == 0 {
+			countStatus("server disabled authentication", conf.Transitioning).Inc()
+			return ctx, nil
+		}
+
+		err := gitalyauth.CheckToken(ctx, conf.GetToken(), time.Now())
+		switch status.Code(err) {
+		case codes.OK:
+			countStatus(okLabel(conf.Transitioning), conf.Transitioning).Inc()
+		case codes.Unauthenticated:
+			countStatus("unauthenticated", conf.Transitioning).Inc()
+		case codes.PermissionDenied:
+			countStatus("denied", conf.Transitioning).Inc()
+		default:
+			countStatus("invalid", conf.Transitioning).Inc()
+		}
+
+		if conf.Transitioning {
+			err = nil
+		}
+
+		return ctx, err
+	}
+}
+
+func okLabel(transitioning bool) string {
+	if transitioning {
+		// This special value is an extra warning sign to administrators that
+		// authentication is currently not enforced.
+		return "would be ok"
+	}
+	return "ok"
+}
+
+func countStatus(status string, transitioning bool) prometheus.Counter {
+	enforced := "true"
+	if transitioning {
+		enforced = "false"
+	}
+	return authCount.WithLabelValues(enforced, status)
+}

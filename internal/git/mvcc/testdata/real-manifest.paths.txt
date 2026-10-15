@@ -1,0 +1,11 @@
+Paths listed in real-manifest.bin (PATH chunk), one per line.
+These are relative to the MVCC cache directory.
+
+Refs paths:
+refs/e546fa0090bfdaa4a4d632cf241dfb6f411cd36e5c86d4274fe9dd9f85833a70.ref
+
+Objs paths:
+pack/cec0880cf4323043aeb2268a3eaefdbd0e006c60.idx
+pack/cec0880cf4323043aeb2268a3eaefdbd0e006c60.pack
+pack/cec0880cf4323043aeb2268a3eaefdbd0e006c60.rev
+

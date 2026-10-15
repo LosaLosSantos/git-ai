@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Best-effort Grafana integration for the in-cluster benchmark flow.
+
+Subcommands:
+  annotate  POST a region annotation (--start/--end epoch seconds) tagged
+            ``gitaly-benchmark`` so the dashboard shades that window.
+  snapshot  Render the dashboard for a window to PNG (needs the Grafana
+            image-renderer; skipped with a warning otherwise).
+
+Reaches Grafana via ``GRAFANA_URL`` if set, else a temporary
+``kubectl port-forward``. Non-fatal by design: a benchmark never fails
+because Grafana was unreachable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def _log(msg: str) -> None:
+    print(f"[grafana] {msg}", file=sys.stderr)
+
+
+def _env_true(name: str, default: bool = True) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _free_port() -> int:
+    # Small TOCTOU window before port-forward binds; fine for a short-lived call.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_healthy(base: str, timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/api/health", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(1)
+    return False
+
+
+class Grafana:
+    """A reachable Grafana endpoint, optionally via a managed port-forward."""
+
+    def __init__(self) -> None:
+        self._pf: subprocess.Popen | None = None
+        self.base: str | None = None
+
+    def __enter__(self) -> "Grafana":
+        url = os.environ.get("GRAFANA_URL")
+        if url:
+            self.base = url.rstrip("/")
+            if not _wait_healthy(self.base):
+                _log(f"GRAFANA_URL {self.base} is not answering /api/health")
+                self.base = None
+            return self
+
+        ns = os.environ.get("GRAFANA_NAMESPACE", "prometheus")
+        svc = os.environ.get("GRAFANA_SERVICE", "prometheus-grafana")
+        svc_port = os.environ.get("GRAFANA_SERVICE_PORT", "80")
+        local = _free_port()
+        cmd = ["kubectl"]
+        if os.environ.get("KUBECONFIG"):
+            cmd += ["--kubeconfig", os.environ["KUBECONFIG"]]
+        if os.environ.get("KUBE_CONTEXT"):
+            cmd += ["--context", os.environ["KUBE_CONTEXT"]]
+        cmd += ["-n", ns, "port-forward", f"svc/{svc}", f"{local}:{svc_port}"]
+        try:
+            self._pf = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            _log(f"could not start kubectl port-forward: {exc}")
+            return self
+        base = f"http://127.0.0.1:{local}"
+        if _wait_healthy(base):
+            self.base = base
+        else:
+            _log(f"port-forward to svc/{svc} in ns {ns} never became healthy")
+            self.__exit__()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self._pf and self._pf.poll() is None:
+            self._pf.terminate()
+            try:
+                self._pf.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._pf.kill()
+        self._pf = None
+
+    def _headers(self, extra: dict | None = None) -> dict:
+        headers = dict(extra or {})
+        key = os.environ.get("GRAFANA_API_KEY")
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    def post_annotation(self, text: str, tags: list[str],
+                        start_s: float, end_s: float) -> bool:
+        if not self.base:
+            return False
+        payload = {"time": int(start_s * 1000), "timeEnd": int(end_s * 1000),
+                   "tags": tags, "text": text}
+        req = urllib.request.Request(
+            f"{self.base}/api/annotations", data=json.dumps(payload).encode(),
+            headers=self._headers({"Content-Type": "application/json"}),
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                json.load(r)
+            return True
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            _log(f"annotation POST failed: {exc}")
+            return False
+
+    def render(self, uid: str, slug: str, start_s: float, end_s: float,
+               out_path: str, width: int, height: int) -> bool:
+        if not self.base:
+            return False
+        # encoding=png forces a PNG (this Grafana renders dashboards to PDF
+        # by default). Works for both the in-process plugin and a remote
+        # renderer; the plugin list is empty in remote mode, so it can't
+        # be used to detect availability.
+        url = (f"{self.base}/render/d/{uid}/{slug}?orgId=1&encoding=png"
+               f"&from={int(start_s * 1000)}&to={int(end_s * 1000)}"
+               f"&width={width}&height={height}&kiosk&theme=light")
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, headers=self._headers()),
+                    timeout=120) as r:
+                data = r.read()
+        except (urllib.error.URLError, OSError) as exc:
+            _log(f"render failed: {exc}")
+            return False
+        # Without a renderer Grafana returns a small fixed-size placeholder
+        # PNG; a real render matches the requested width.
+        if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
+            _log("render did not return a PNG; skipping snapshot")
+            return False
+        if struct.unpack(">I", data[16:20])[0] < width * 0.75:
+            _log("no image renderer available; skipping snapshot")
+            return False
+        try:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(data)
+        except OSError as exc:
+            _log(f"could not write snapshot to {out_path}: {exc}")
+            return False
+        return True
+
+
+def cmd_annotate(args) -> int:
+    if not _env_true("GRAFANA_ANNOTATE"):
+        _log("GRAFANA_ANNOTATE is off; skipping annotation")
+        return 0
+    tags = ["gitaly-benchmark"] + [t for t in args.tag if t]
+    with Grafana() as gf:
+        if gf.post_annotation(args.text, tags, args.start, args.end):
+            _log(f"annotated run window: {args.text}")
+        else:
+            _log("could not annotate run window (non-fatal); report link still works")
+    return 0
+
+
+def cmd_snapshot(args) -> int:
+    if not _env_true("GRAFANA_SNAPSHOT"):
+        _log("GRAFANA_SNAPSHOT is off; skipping snapshot")
+        return 0
+    uid = os.environ.get("GRAFANA_DASHBOARD_UID", "efneoyur0u4u8f")
+    slug = os.environ.get("GRAFANA_DASHBOARD_SLUG", "gitaly-benchmark-testing")
+    with Grafana() as gf:
+        if gf.render(uid, slug, args.start, args.end, args.output,
+                     args.width, args.height):
+            _log(f"wrote dashboard snapshot to {args.output}")
+        else:
+            _log("no snapshot captured (non-fatal); report links to the dashboard")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_ann = sub.add_parser("annotate", help="POST a run-window annotation")
+    p_ann.add_argument("--text", required=True, help="Annotation label")
+    p_ann.add_argument("--tag", action="append", default=[],
+                       help="Extra tag (repeatable); gitaly-benchmark is always added")
+    p_ann.add_argument("--start", type=float, required=True, help="epoch seconds")
+    p_ann.add_argument("--end", type=float, required=True, help="epoch seconds")
+    p_ann.set_defaults(func=cmd_annotate)
+
+    p_snap = sub.add_parser("snapshot", help="Render the dashboard to PNG")
+    p_snap.add_argument("--output", required=True, help="PNG output path")
+    p_snap.add_argument("--start", type=float, required=True, help="epoch seconds")
+    p_snap.add_argument("--end", type=float, required=True, help="epoch seconds")
+    p_snap.add_argument("--width", type=int, default=1600)
+    p_snap.add_argument("--height", type=int, default=1400)
+    p_snap.set_defaults(func=cmd_snapshot)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

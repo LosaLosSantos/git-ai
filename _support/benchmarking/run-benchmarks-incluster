@@ -1,0 +1,482 @@
+#!/bin/sh
+# run-benchmarks-incluster: drive a benchmark run as a Kubernetes Job inside
+# an existing GitLab/Gitaly cluster.
+#
+# Required environment variables:
+#   EXPERIMENT                 - name of a subdir under experiments/
+#   WORKLOAD_IDENTITY_GSA      - email of the GCP service account bound to
+#                                the in-cluster ServiceAccount via Workload
+#                                Identity. Must have objectAdmin on the bucket.
+#                                Optional on repeat runs: resolved from the
+#                                gitaly-benchmark ServiceAccount if unset.
+#
+# Optional but commonly set:
+#   BENCHMARK_RESULTS_BUCKET   - GCS bucket name (without gs:// prefix) that
+#                                the uploader sidecar writes to.
+#                                Default: gitaly-benchmark-results
+#   BENCHMARK_IMAGE            - fully-qualified image ref for the benchmark
+#                                client. Defaults to the Artifact Registry repo
+#                                used by `make push-benchmark-image`, tagged
+#                                with the current git short SHA:
+#                                  us-east1-docker.pkg.dev/gitaly-benchmark-0150d6cf/
+#                                    gitaly-benchmarking/benchmark-client:<git-sha>
+#                                Override to pin to a specific tag or registry.
+#
+# Optional environment variables:
+#   KUBE_NAMESPACE             - namespace for both the Job and Gitaly.
+#                                Default: gitlab. The Job is always co-located
+#                                with Gitaly so it can read gitlab-gitaly-secret
+#                                and inspect the Gitaly pod without cross-
+#                                namespace RBAC.
+#   GITALY_SERVICE             - in-cluster service name for Gitaly.
+#                                Default: gitlab-gitaly
+#   GITALY_PORT                - Gitaly gRPC port. Default: 8075
+#   GITALY_POD_SELECTOR        - label selector for the Gitaly pod.
+#                                Default: app=gitaly
+#   GITALY_CONTAINER           - container name inside the pod. Default: gitaly
+#   GITALY_METRICS_PORT        - Gitaly Prometheus / pprof port. Default: 9236
+#   PROFILE                    - "true"/"false". Default: true. When true,
+#                                the benchmark container scrapes Go pprof
+#                                from each Gitaly pod's /debug/pprof
+#                                endpoint over HTTP (no in-pod exec, no
+#                                SYS_PTRACE required).
+#   PROFILE_DURATION           - seconds. Default: 120
+#   WORKLOAD_DURATION          - duration string, default 60s
+#   WORKLOAD_WAIT_DURATION     - seconds, defaults to WORKLOAD_DURATION + 60.
+#                                Bounds the workload phase (k6 + pprof + upload).
+#   PUSH_TRANSPORTS            - comma list of push-section transports,
+#                                "ssh" and/or "http". Default: ssh,http
+#   PUSH_ONLY                  - "1" runs only the push sections, at 1/10
+#                                load. Default: 0
+#   GITLAB_HTTP_URL            - workhorse base URL for repo clones and http
+#                                pushes. Default: the chart's webservice.
+#   GITLAB_SSH_URL             - gitlab-shell base URL for the ssh
+#                                transport. Default: the chart's Service.
+#   BENCH_GROUP                - group of the bench projects; must match
+#                                provision-repos. Default: bench
+#   GITALY_STORAGE_NAME        - storage the target Gitaly serves. Default:
+#                                default. Anything else selects the
+#                                control_* disk paths in config.yml.
+#   STARTUP_GRACE              - seconds budgeted in activeDeadlineSeconds
+#                                for pod startup (node provisioning + image
+#                                pulls). Default: 600.
+#   CLEAR_GITALY_CACHE         - "true"/"false". Default: false. When true
+#                                the wrapper (a) rollout-restarts the
+#                                Gitaly StatefulSet to drop in-process
+#                                caches (catfile, pack, ref) and (b) drops
+#                                the kernel page cache on the Gitaly node
+#                                via a privileged debug pod. Step (b) needs
+#                                `kubectl debug node` permission; failures
+#                                are non-fatal. Default is off so back-to-
+#                                back runs are fast; set to true when you
+#                                need cold-cache numbers comparable to the
+#                                Ansible VM flow's `clear_page_cache`.
+#   CLEAR_PAGE_CACHE           - "true"/"false". Default: false. Set to
+#                                true to drop the node's kernel page cache
+#                                (requires CLEAR_GITALY_CACHE=true too).
+#   CACHE_CLEAR_DEBUG_IMAGE    - image used for the page-cache debug pod.
+#                                Default: busybox.
+#
+# Grafana run-window annotation (best-effort; see incluster/grafana):
+#   GRAFANA_ANNOTATE=false     - skip marking this run's window on the dashboard.
+#   BENCHMARK_ANNOTATION_LABEL - annotation-text prefix (the A/B side); set by
+#                                run-benchmarks-compare, empty standalone.
+#   GRAFANA_URL / GRAFANA_NAMESPACE / GRAFANA_SERVICE - Grafana endpoint; unset
+#                                GRAFANA_URL port-forwards to the Service.
+#
+# Dedicated node pool:
+#   The benchmark runs on a dedicated, tainted+labeled node pool (provisioned
+#   in the cluster's Terraform, gl-gitaly/tf-gke-gitlab-bootstrap) so it is
+#   isolated from the Gitaly/GitLab workloads it measures and is never
+#   preempted. The pool autoscales from zero, so it costs nothing until a run
+#   lands on it. The nodeSelector/tolerations that pin the Job to this pool are
+#   baked into incluster/job.yaml.j2; the normal invocation needs no scheduling
+#   env vars:
+#     EXPERIMENT=incluster-master _support/benchmarking/run-benchmarks-incluster
+#
+# Exit codes:
+#   0 on success, non-zero if the Job fails or any kubectl call errors.
+
+set -eu
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+[ -n "${EXPERIMENT:-}" ] || die "EXPERIMENT must be set"
+BENCHMARK_RESULTS_BUCKET="${BENCHMARK_RESULTS_BUCKET:-gitaly-benchmark-results}"
+# WORKLOAD_IDENTITY_GSA is validated later, after KUBECTL is set up, so we can
+# fall back to the existing ServiceAccount's annotation.
+
+# BENCHMARK_IMAGE precedence: env override > last push (.last-pushed-image) > :latest.
+_LAST_IMAGE_FILE="$(cd "$(dirname "$0")" && pwd)/.last-pushed-image"
+if [ -z "${BENCHMARK_IMAGE:-}" ] && [ -s "${_LAST_IMAGE_FILE}" ]; then
+    BENCHMARK_IMAGE="$(head -n1 "${_LAST_IMAGE_FILE}")"
+    echo "[wrapper] using last-pushed image: ${BENCHMARK_IMAGE}"
+fi
+if [ -z "${BENCHMARK_IMAGE:-}" ]; then
+    BENCHMARK_IMAGE="us-east1-docker.pkg.dev/gitaly-benchmark-0150d6cf/gitaly-benchmarking/benchmark-client:latest"
+    echo "[wrapper] no recorded image; defaulting to :latest (run 'make push-benchmark-image' or set BENCHMARK_IMAGE to pin)"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EXP_DIR="${SCRIPT_DIR}/experiments/${EXPERIMENT}"
+[ -d "${EXP_DIR}" ] || die "experiment directory not found: ${EXP_DIR}"
+[ -f "${EXP_DIR}/k6-benchmark.js" ] || die "${EXP_DIR}/k6-benchmark.js missing"
+[ -f "${EXP_DIR}/config.yml" ] || die "${EXP_DIR}/config.yml missing"
+
+# Auto-activate the benchmarking virtualenv (see README "Setup your
+# environment"); it carries the PyYAML used to render repositories.json.
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -f "${SCRIPT_DIR}/env/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    . "${SCRIPT_DIR}/env/bin/activate"
+fi
+
+# Probe PyYAML upfront to fail with an actionable message instead of a
+# Python traceback mid-pipeline.
+if ! python3 -c "import yaml" >/dev/null 2>&1; then
+    die "python3 cannot import yaml. Either:
+    (a) create the benchmarking virtualenv: cd ${SCRIPT_DIR} && python3 -m venv env && env/bin/pip install -r requirements.txt
+    (b) install PyYAML system-wide:        pip3 install pyyaml"
+fi
+
+# The Job and Gitaly share a single namespace (default "gitlab"): no
+# cross-namespace RBAC, and the wrapper reads gitlab-gitaly-secret directly.
+KUBE_NAMESPACE="${KUBE_NAMESPACE:-gitlab}"
+GITALY_SERVICE="${GITALY_SERVICE:-gitlab-gitaly}"
+GITALY_PORT="${GITALY_PORT:-8075}"
+GITALY_POD_SELECTOR="${GITALY_POD_SELECTOR:-app=gitaly}"
+GITALY_CONTAINER="${GITALY_CONTAINER:-gitaly}"
+GITALY_METRICS_PORT="${GITALY_METRICS_PORT:-9236}"
+PROFILE="${PROFILE:-true}"
+PROFILE_DURATION="${PROFILE_DURATION:-120}"
+WORKLOAD_DURATION="${WORKLOAD_DURATION:-60s}"
+# WORKLOAD_DURATION + 60s margin, or a static 300s when WORKLOAD_DURATION
+# isn't a bare-second value like "120s". Bounds the workload phase (k6 +
+# concurrent pprof scrape + result upload), not pod startup.
+if [ -z "${WORKLOAD_WAIT_DURATION:-}" ]; then
+    case "${WORKLOAD_DURATION}" in
+    *s) WORKLOAD_WAIT_DURATION="$((${WORKLOAD_DURATION%s} + 60))" ;;
+    *) WORKLOAD_WAIT_DURATION=300 ;;
+    esac
+fi
+
+# Push sections: transports to run, workhorse base URL (clones + http
+# pushes), and the bench project group (must match provision-repos).
+PUSH_TRANSPORTS="${PUSH_TRANSPORTS:-ssh,http}"
+PUSH_ONLY="${PUSH_ONLY:-0}"
+GITLAB_HTTP_URL="${GITLAB_HTTP_URL:-http://gitlab-webservice-default.${KUBE_NAMESPACE}.svc:8181}"
+GITLAB_SSH_URL="${GITLAB_SSH_URL:-ssh://git@gitlab-gitlab-shell.${KUBE_NAMESPACE}.svc:22}"
+BENCH_GROUP="${BENCH_GROUP:-bench}"
+GITALY_STORAGE_NAME="${GITALY_STORAGE_NAME:-default}"
+
+# Covers node provisioning, image pulling, and pod startup time.
+STARTUP_GRACE="${STARTUP_GRACE:-600}"
+
+# The Job's activeDeadlineSeconds budgets every sequential phase: pod
+# startup (STARTUP_GRACE), k6 setup, the mixed workload, the write-path
+# sections (phase counts mirror k6-benchmark.js), and branch-cleanup
+# teardown. Doubled for headroom: a deadline kill loses the whole run.
+_n_transports=0
+for _t in $(printf '%s' "${PUSH_TRANSPORTS}" | tr ',' ' '); do
+    [ "${_t}" = "none" ] || _n_transports=$((_n_transports + 1))
+done
+_sections=$((4 + 4 * _n_transports))
+# 35 = sectionDuration (30s) + GAP_SECONDS (5s) in k6-benchmark.js.
+ACTIVE_DEADLINE_SECONDS="$((2 * (STARTUP_GRACE + 300 + WORKLOAD_WAIT_DURATION + _sections * 35 + 600)))"
+
+KUBECTL="kubectl"
+[ -n "${KUBECONFIG:-}" ] && KUBECTL="${KUBECTL} --kubeconfig=${KUBECONFIG}"
+[ -n "${KUBE_CONTEXT:-}" ] && KUBECTL="${KUBECTL} --context=${KUBE_CONTEXT}"
+
+# Resolve WORKLOAD_IDENTITY_GSA: env var, else read it back from the
+# gitaly-benchmark ServiceAccount a prior run created (annotation
+# iam.gke.io/gcp-service-account; see incluster/serviceaccount.yaml.j2).
+if [ -z "${WORKLOAD_IDENTITY_GSA:-}" ]; then
+    WORKLOAD_IDENTITY_GSA="$(${KUBECTL} -n "${KUBE_NAMESPACE}" \
+        get serviceaccount gitaly-benchmark \
+        -o "jsonpath={.metadata.annotations.iam\.gke\.io/gcp-service-account}" \
+        2>/dev/null || true)"
+    [ -n "${WORKLOAD_IDENTITY_GSA}" ] &&
+        echo "[wrapper] resolved WORKLOAD_IDENTITY_GSA from ServiceAccount: ${WORKLOAD_IDENTITY_GSA}"
+fi
+if [ -z "${WORKLOAD_IDENTITY_GSA:-}" ]; then
+    die "WORKLOAD_IDENTITY_GSA unset and not found on the gitaly-benchmark
+    ServiceAccount in ns ${KUBE_NAMESPACE} (absent on first run). Either:
+      (a) set it: export WORKLOAD_IDENTITY_GSA=<sa>@<project>.iam.gserviceaccount.com
+      (b) find it: kubectl -n ${KUBE_NAMESPACE} get serviceaccount gitaly-benchmark \\
+            -o jsonpath='{.metadata.annotations.iam\.gke\.io/gcp-service-account}'"
+fi
+
+# The Gitaly shared auth token lives in the chart's gitlab-gitaly-secret;
+# k6 signs every RPC with a v2 HMAC bearer derived from it. The Job reads
+# it via secretKeyRef, so the Job and secret must share KUBE_NAMESPACE.
+# Verify it now to fail fast instead of CrashLoopBackOff at Job start.
+GITALY_AUTH_SECRET_NAME="${GITALY_AUTH_SECRET_NAME:-gitlab-gitaly-secret}"
+GITALY_AUTH_SECRET_KEY="${GITALY_AUTH_SECRET_KEY:-token}"
+if ! ${KUBECTL} -n "${KUBE_NAMESPACE}" \
+    get secret "${GITALY_AUTH_SECRET_NAME}" \
+    -o "jsonpath={.data.${GITALY_AUTH_SECRET_KEY}}" >/dev/null 2>&1; then
+    die "could not find ${GITALY_AUTH_SECRET_NAME}/${GITALY_AUTH_SECRET_KEY} in ns ${KUBE_NAMESPACE}.
+    The Gitaly client in this cluster needs a shared auth token. Either:
+      (a) confirm the secret exists: kubectl -n ${KUBE_NAMESPACE} get secret ${GITALY_AUTH_SECRET_NAME}
+      (b) override the lookup: GITALY_AUTH_SECRET_NAME=...  GITALY_AUTH_SECRET_KEY=..."
+fi
+
+RUN_NAME="benchmark-$(date +%s)"
+JOB_NAME="gitaly-benchmark-${EXPERIMENT}-$(date +%s)"
+CM_NAME="${JOB_NAME}-config"
+SA_NAME="gitaly-benchmark"
+GITALY_ADDRESS="${GITALY_SERVICE}.${KUBE_NAMESPACE}.svc.cluster.local:${GITALY_PORT}"
+
+echo "[wrapper] experiment=${EXPERIMENT} run=${RUN_NAME}"
+echo "[wrapper] target=tcp://${GITALY_SERVICE}.${KUBE_NAMESPACE}.svc:${GITALY_PORT} (k6 GITALY_ADDRESS=${GITALY_ADDRESS})"
+echo "[wrapper] image=${BENCHMARK_IMAGE}"
+echo "[wrapper] bucket=gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}"
+
+# Record the deployed Gitaly image in the cluster, as this can be different from
+# the changes introduced in the MR.
+GITALY_VERSION="$(${KUBECTL} -n "${KUBE_NAMESPACE}" get pods -l "${GITALY_POD_SELECTOR}" \
+    -o jsonpath="{.items[0].spec.containers[?(@.name==\"${GITALY_CONTAINER}\")].image}" \
+    2>/dev/null || true)"
+echo "[wrapper] gitaly under test=${GITALY_VERSION:-unknown}"
+
+render() {
+    sed \
+        -e "s|\${EXPERIMENT}|${EXPERIMENT}|g" \
+        -e "s|\${RUN_NAME}|${RUN_NAME}|g" \
+        -e "s|\${JOB_NAME}|${JOB_NAME}|g" \
+        -e "s|\${CM_NAME}|${CM_NAME}|g" \
+        -e "s|\${SA_NAME}|${SA_NAME}|g" \
+        -e "s|\${KUBE_NAMESPACE}|${KUBE_NAMESPACE}|g" \
+        -e "s|\${BENCHMARK_IMAGE}|${BENCHMARK_IMAGE}|g" \
+        -e "s|\${BENCHMARK_RESULTS_BUCKET}|${BENCHMARK_RESULTS_BUCKET}|g" \
+        -e "s|\${WORKLOAD_IDENTITY_GSA}|${WORKLOAD_IDENTITY_GSA}|g" \
+        -e "s|\${GITALY_ADDRESS}|${GITALY_ADDRESS}|g" \
+        -e "s|\${GITALY_SERVICE}|${GITALY_SERVICE}|g" \
+        -e "s|\${GITALY_NAMESPACE}|${KUBE_NAMESPACE}|g" \
+        -e "s|\${GITALY_POD_SELECTOR}|${GITALY_POD_SELECTOR}|g" \
+        -e "s|\${GITALY_CONTAINER}|${GITALY_CONTAINER}|g" \
+        -e "s|\${GITALY_METRICS_PORT}|${GITALY_METRICS_PORT}|g" \
+        -e "s|\${WORKLOAD_DURATION}|${WORKLOAD_DURATION}|g" \
+        -e "s|\${ACTIVE_DEADLINE_SECONDS}|${ACTIVE_DEADLINE_SECONDS}|g" \
+        -e "s|\${PROFILE}|${PROFILE}|g" \
+        -e "s|\${PROFILE_DURATION}|${PROFILE_DURATION}|g" \
+        -e "s|\${K6_SCRIPT_B64}|${K6_SCRIPT_B64}|g" \
+        -e "s|\${REPOS_JSON_B64}|${REPOS_JSON_B64}|g" \
+        -e "s|\${PLOT_PY_B64}|${PLOT_PY_B64}|g" \
+        -e "s|\${GITALY_AUTH_SECRET_NAME}|${GITALY_AUTH_SECRET_NAME}|g" \
+        -e "s|\${GITALY_AUTH_SECRET_KEY}|${GITALY_AUTH_SECRET_KEY}|g" \
+        -e "s|\${PUSH_TRANSPORTS}|${PUSH_TRANSPORTS}|g" \
+        -e "s|\${PUSH_ONLY}|${PUSH_ONLY}|g" \
+        -e "s|\${GITLAB_HTTP_URL}|${GITLAB_HTTP_URL}|g" \
+        -e "s|\${GITLAB_SSH_URL}|${GITLAB_SSH_URL}|g" \
+        -e "s|\${BENCH_GROUP}|${BENCH_GROUP}|g" \
+        -e "s|\${GITALY_STORAGE_NAME}|${GITALY_STORAGE_NAME}|g" \
+        "$1"
+}
+
+# Render repositories.json from the experiment's config.yml. A non-default
+# storage swaps in the control_* disk paths/gl_repositories provision-repos
+# wrote, so k6 and the push helper address the repos the target serves.
+REPOS_JSON_B64="$(python3 -c "
+import json, sys, yaml, base64
+repos = yaml.safe_load(open('${EXP_DIR}/config.yml'))['repositories']
+if '${GITALY_STORAGE_NAME}' != 'default':
+    for r in repos:
+        if not r.get('control_disk_path'):
+            sys.exit(f\"repo {r['name']!r} has no control_disk_path in \"
+                     'config.yml; run incluster/provision-repos --write-config '
+                     '(the control storage must be registered in Rails)')
+        r['disk_path'] = r['control_disk_path']
+        r['gl_repository'] = r.get('control_gl_repository', '')
+print(base64.b64encode(json.dumps(repos).encode()).decode())
+")"
+
+K6_SCRIPT_B64="$(base64 <"${EXP_DIR}/k6-benchmark.js" | tr -d '\n')"
+
+if [ -f "${EXP_DIR}/plot.py" ]; then
+    PLOT_PY_B64="$(base64 <"${EXP_DIR}/plot.py" | tr -d '\n')"
+else
+    PLOT_PY_B64=""
+fi
+
+# The namespace already exists (the chart creates it); deliberately no
+# `kubectl create namespace` to avoid fighting the chart's ownership.
+
+render "${SCRIPT_DIR}/incluster/serviceaccount.yaml.j2" | ${KUBECTL} apply -f -
+render "${SCRIPT_DIR}/incluster/configmap.yaml.j2" | ${KUBECTL} apply -f -
+
+# Cold-cache prep, modelled on the VM flow's `clear_page_cache` Ansible
+# task. Two layers:
+#
+#   1. Rollout-restart the Gitaly StatefulSet, dropping its in-process
+#      catfile, pack, and ref caches.
+#   2. Drop the kernel page cache on the node hosting Gitaly - the
+#      analogue of `sync && echo 3 > /proc/sys/vm/drop_caches`. Requires
+#      `kubectl debug node`; non-fatal, a denial only weakens the
+#      cold-cache guarantee.
+#
+# Both default off so back-to-back iteration stays fast.
+CLEAR_GITALY_CACHE="${CLEAR_GITALY_CACHE:-false}"
+CLEAR_PAGE_CACHE="${CLEAR_PAGE_CACHE:-false}"
+CACHE_CLEAR_DEBUG_IMAGE="${CACHE_CLEAR_DEBUG_IMAGE:-busybox}"
+if [ "${CLEAR_GITALY_CACHE}" = "true" ]; then
+    echo "[wrapper] restarting Gitaly to drop in-process caches"
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" rollout restart \
+        statefulset/"${GITALY_SERVICE}"
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" rollout status \
+        statefulset/"${GITALY_SERVICE}" --timeout=5m
+
+    if [ "${CLEAR_PAGE_CACHE}" = "true" ]; then
+        # Resolve the node hosting the (now-restarted) Gitaly pod.
+        gitaly_pod="$(${KUBECTL} -n "${KUBE_NAMESPACE}" \
+            get pods -l "${GITALY_POD_SELECTOR}" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+        if [ -n "${gitaly_pod}" ]; then
+            gitaly_node="$(${KUBECTL} -n "${KUBE_NAMESPACE}" \
+                get pod "${gitaly_pod}" \
+                -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+        fi
+        if [ -n "${gitaly_node:-}" ]; then
+            echo "[wrapper] dropping kernel page cache on node ${gitaly_node}"
+            # `kubectl debug node` mounts the node root at /host; chroot so
+            # the write hits the host's procfs, not the debug container's
+            # masked /proc.
+            ${KUBECTL} debug "node/${gitaly_node}" \
+                --image="${CACHE_CLEAR_DEBUG_IMAGE}" \
+                --profile=sysadmin \
+                -- chroot /host /bin/sh -c \
+                'sync && echo 3 > /proc/sys/vm/drop_caches' ||
+                echo "[wrapper] page-cache drop failed; continuing"
+        else
+            echo "[wrapper] could not resolve Gitaly node for page-cache drop; skipping"
+        fi
+    fi
+fi
+
+render "${SCRIPT_DIR}/incluster/job.yaml.j2" | ${KUBECTL} apply -f -
+
+echo "[wrapper] Job ${JOB_NAME} applied; streaming benchmark container logs"
+${KUBECTL} -n "${KUBE_NAMESPACE}" wait --for=condition=Ready pod \
+    -l "run-name=${RUN_NAME}" --timeout=120s || true
+# Grafana run-window start: pod is Ready (k6 about to run), so node/image-pull
+# time is excluded from the marked region.
+RUN_START_EPOCH="$(date +%s)"
+${KUBECTL} -n "${KUBE_NAMESPACE}" logs -f \
+    job/"${JOB_NAME}" -c benchmark --tail=-1 || true
+
+# Stream the uploader sidecar too. It only acts once the benchmark container
+# finishes (it waits for /tmp/run/.done), and on failure the pod is GC'd too
+# fast for post-hoc capture, so this is the only reliable way to see an
+# upload error (auth, permissions, missing results, ...).
+echo "[wrapper] streaming uploader sidecar logs"
+${KUBECTL} -n "${KUBE_NAMESPACE}" logs -f \
+    job/"${JOB_NAME}" -c uploader --tail=-1 || true
+
+echo "[wrapper] waiting for Job to reach a terminal state"
+# Poll for Complete OR Failed: `kubectl wait --for=condition=complete` would
+# ignore failure and burn the whole timeout while the failed pod (and its
+# logs) gets garbage-collected. Breaking out on failure lets the diagnostics
+# below capture the pod state and logs in time.
+_deadline=$(($(date +%s) + ACTIVE_DEADLINE_SECONDS + 300))
+job_status=""
+while [ "$(date +%s)" -lt "${_deadline}" ]; do
+    if [ "$(${KUBECTL} -n "${KUBE_NAMESPACE}" get job "${JOB_NAME}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)" = "True" ]; then
+        job_status=success
+        break
+    fi
+    if [ "$(${KUBECTL} -n "${KUBE_NAMESPACE}" get job "${JOB_NAME}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)" = "True" ]; then
+        job_status=failed
+        break
+    fi
+    sleep 5
+done
+[ -n "${job_status}" ] || {
+    echo "[wrapper] timed out waiting for terminal state" >&2
+    job_status=failed
+}
+
+echo "[wrapper] Job status: ${job_status}"
+
+# Add a little 30s buffer to capture the tail end of the run
+GRAFANA_WINDOW_END_PAD_SECONDS="${GRAFANA_WINDOW_END_PAD_SECONDS:-30}"
+RUN_END_EPOCH="$(( $(date +%s) + GRAFANA_WINDOW_END_PAD_SECONDS ))"
+
+# On failure, surface why before the pod is garbage-collected: both
+# containers' logs (a Job that fails while the benchmark container exited 0
+# points at the uploader) plus pod/Job state and events. Reading the output:
+# exit code 137 = SIGKILL (OOM), DeadlineExceeded = activeDeadlineSeconds,
+# Evicted = node disk/memory pressure. All read-only, best-effort.
+if [ "${job_status}" != "success" ]; then
+    echo "[wrapper] --- failure diagnostics ---" >&2
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" get pods -l "run-name=${RUN_NAME}" -o wide >&2 || true
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" get pods -l "run-name=${RUN_NAME}" \
+        -o jsonpath='{range .items[*]}pod {.metadata.name} phase={.status.phase} reason={.status.reason}{"\n"}{range .status.containerStatuses[*]}  container {.name}: restarts={.restartCount} state={.state} lastTerminated.reason={.lastState.terminated.reason} exitCode={.lastState.terminated.exitCode}{"\n"}{end}{end}' >&2 || true
+    echo >&2
+    echo "[wrapper] Job conditions:" >&2
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" get job "${JOB_NAME}" \
+        -o jsonpath='{range .status.conditions[*]}  {.type}={.status} reason={.reason} message={.message}{"\n"}{end}' >&2 || true
+    echo "[wrapper] uploader container logs:" >&2
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" logs -l "run-name=${RUN_NAME}" -c uploader --prefix --tail=50 >&2 2>&1 || true
+    echo "[wrapper] benchmark container logs (tail):" >&2
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" logs -l "run-name=${RUN_NAME}" -c benchmark --prefix --tail=20 >&2 2>&1 || true
+    echo "[wrapper] recent events:" >&2
+    ${KUBECTL} -n "${KUBE_NAMESPACE}" describe job "${JOB_NAME}" 2>/dev/null |
+        sed -n '/Events:/,$p' >&2 || true
+    echo "[wrapper] --- end diagnostics ---" >&2
+fi
+
+mkdir -p "${EXP_DIR}/results/${RUN_NAME}"
+[ -n "${GITALY_VERSION}" ] && printf '%s\n' "${GITALY_VERSION}" \
+    >"${EXP_DIR}/results/${RUN_NAME}/gitaly-version.txt"
+
+# Record the run window for report.py's Grafana deep link, and mark it on the
+# dashboard. Best-effort: a benchmark never fails because Grafana was down.
+{
+    printf 'RUN_NAME=%s\n' "${RUN_NAME}"
+    printf 'GITALY_SERVICE=%s\n' "${GITALY_SERVICE}"
+    printf 'RUN_START_EPOCH=%s\n' "${RUN_START_EPOCH}"
+    printf 'RUN_END_EPOCH=%s\n' "${RUN_END_EPOCH}"
+    printf 'ANNOTATION_LABEL=%s\n' "${BENCHMARK_ANNOTATION_LABEL:-}"
+} >"${EXP_DIR}/results/${RUN_NAME}/grafana-run.env"
+
+if [ -n "${BENCHMARK_ANNOTATION_LABEL:-}" ]; then
+    _anno_text="${BENCHMARK_ANNOTATION_LABEL} · ${GITALY_SERVICE} · ${RUN_NAME}"
+else
+    _anno_text="${GITALY_SERVICE} · ${RUN_NAME}"
+fi
+"${SCRIPT_DIR}/incluster/grafana" annotate \
+    --text "${_anno_text}" \
+    --tag "${RUN_NAME}" --tag "${GITALY_SERVICE}" --tag "${EXPERIMENT}" \
+    --start "${RUN_START_EPOCH}" --end "${RUN_END_EPOCH}" || true
+
+# Harvest results from GCS regardless of job status (partial results are useful).
+if command -v gcloud >/dev/null 2>&1; then
+    # --no-user-output-enabled suppresses the per-file "Copying gs://..." lines
+    # (one per object is noisy in CI logs); errors are still surfaced.
+    gcloud storage rsync --recursive --no-user-output-enabled \
+        "gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}/" \
+        "${EXP_DIR}/results/${RUN_NAME}/" || true
+    tar -czf "${EXP_DIR}/results/${RUN_NAME}.tar.gz" \
+        -C "${EXP_DIR}/results" "${RUN_NAME}" || true
+elif command -v gsutil >/dev/null 2>&1; then
+    # -q quiets gsutil's per-file copy progress.
+    gsutil -q -m rsync -r "gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}/" \
+        "${EXP_DIR}/results/${RUN_NAME}/" || true
+    tar -czf "${EXP_DIR}/results/${RUN_NAME}.tar.gz" \
+        -C "${EXP_DIR}/results" "${RUN_NAME}" || true
+else
+    echo "[wrapper] WARNING: neither gcloud nor gsutil on PATH; skipping results download"
+    echo "[wrapper] results remain at gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}/"
+fi
+
+echo "[wrapper] cleaning up Job and ConfigMap (bucket contents preserved)"
+${KUBECTL} -n "${KUBE_NAMESPACE}" delete job "${JOB_NAME}" --ignore-not-found
+${KUBECTL} -n "${KUBE_NAMESPACE}" delete configmap "${CM_NAME}" --ignore-not-found
+
+[ "${job_status}" = "success" ] || exit 1
+echo "[wrapper] benchmark complete: ${EXP_DIR}/results/${RUN_NAME}.tar.gz"

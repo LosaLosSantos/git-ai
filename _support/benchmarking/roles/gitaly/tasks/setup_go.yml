@@ -1,0 +1,18 @@
+---
+- name: Create /usr/local/go directory
+  file:
+    path: /usr/local/go
+    state: directory
+    mode: 0755
+
+# Relies on client setup detecting Go version first
+- name: Install Go
+  unarchive:
+    src: "https://go.dev/dl/go{{ hostvars[groups['client'][0]]['golang_version'] }}.linux-amd64.tar.gz"
+    dest: /usr/local
+    remote_src: true
+    creates: /usr/local/go/bin/go
+  retries: 3
+  delay: 3
+  register: result
+  until: result is success

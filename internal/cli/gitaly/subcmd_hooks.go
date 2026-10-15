@@ -1,0 +1,154 @@
+package gitaly
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"time"
+
+	gitalyauth "github.com/feder-cr/open_scion/auth"
+	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/open_scion/streamio"
+	"github.com/urfave/cli/v3"
+	"google.golang.org/grpc"
+)
+
+const (
+	flagStorage    = "storage"
+	flagRepository = "repository"
+	flagConfig     = "config"
+)
+
+func newHooksCommand() *cli.Command {
+	return &cli.Command{
+		Name:        "hooks",
+		Usage:       "manage Git hooks",
+		Description: "Manage hooks for a Git repository.",
+		Commands: []*cli.Command{
+			{
+				Name:  "set",
+				Usage: "set custom hooks for a Git repository",
+				UsageText: `gitaly hooks set --storage <storage_name> --repository <path_on_storage> --config <gitaly_config_file> < <hooks_tarbar_file>.tar
+
+Example: gitaly hooks set --storage default --repository @hashed/path/repository.git --config gitaly.config.toml < hooks_tarball.tar`,
+				Description: `Reads a tarball containing custom Git hooks from stdin and writes the hooks to the specified repository.
+To remove custom Git hooks for a specified repository, run the set subcommand with an empty tarball file.`,
+				Action: setHooksAction,
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  flagStorage,
+						Usage: "storage containing the repository",
+					},
+					&cli.StringFlag{
+						Name:     flagRepository,
+						Usage:    "repository to set hooks for",
+						Required: true,
+					},
+					gitalyConfigFlag(),
+				},
+			},
+		},
+	}
+}
+
+func setHooksAction(ctx context.Context, cmd *cli.Command) error {
+	log.ConfigureCommand()
+
+	cfg, err := loadConfig(cmd.String(flagConfig))
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	storage := cmd.String(flagStorage)
+	if storage == "" {
+		if len(cfg.Storages) != 1 {
+			return fmt.Errorf("multiple storages configured: use --storage to target storage explicitly")
+		}
+
+		storage = cfg.Storages[0].Name
+	}
+
+	address, err := cfg.GetAddressWithScheme()
+	if err != nil {
+		return fmt.Errorf("get Gitaly address: %w", err)
+	}
+
+	conn, err := dial(ctx, address, cfg.Auth.GetToken(), 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("create connection: %w", err)
+	}
+	defer conn.Close()
+
+	if err := setRepoHooks(ctx, conn,
+		cmd.Reader,
+		storage,
+		cmd.String(flagRepository),
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// setRepoHooks sets custom hooks for the specified repository. The specified reader is expected to
+// provide a tarball containing custom git hooks within a `custom_hooks` directory.
+func setRepoHooks(ctx context.Context, conn *grpc.ClientConn, reader io.Reader, storage, relativePath string) (returnErr error) {
+	repoClient := gitalypb.NewRepositoryServiceClient(conn)
+	stream, err := repoClient.SetCustomHooks(ctx)
+	if err != nil {
+		return fmt.Errorf("create repository client: %w", err)
+	}
+
+	defer func() {
+		if _, err := stream.CloseAndRecv(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("closing hooks archive stream: %w", err))
+		}
+	}()
+
+	// Send first request containing only repository information.
+	if err := stream.Send(&gitalypb.SetCustomHooksRequest{
+		Repository: &gitalypb.Repository{
+			StorageName:  storage,
+			RelativePath: relativePath,
+		},
+	}); err != nil {
+		return err
+	}
+
+	// Configure streamWriter to transmit tarball data to stream.
+	streamWriter := streamio.NewWriter(func(p []byte) error {
+		if err := stream.Send(&gitalypb.SetCustomHooksRequest{Data: p}); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if _, err := io.Copy(streamWriter, reader); err != nil {
+		return fmt.Errorf("copying hooks archive: %w", err)
+	}
+
+	return nil
+}
+
+func dial(ctx context.Context, addr, token string, timeout time.Duration, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	opts = append(opts,
+		client.UnaryInterceptor(),
+		client.StreamInterceptor(),
+	)
+
+	if len(token) > 0 {
+		opts = append(opts,
+			grpc.WithPerRPCCredentials(
+				gitalyauth.RPCCredentialsV2(token),
+			),
+		)
+	}
+
+	return client.New(ctx, addr, client.WithGrpcOptions(opts))
+}

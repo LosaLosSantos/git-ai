@@ -1,0 +1,7 @@
+---
+- name: Destroy benchmark cluster
+  hosts: localhost
+  roles:
+    - destroy
+  become: false
+  gather_facts: no

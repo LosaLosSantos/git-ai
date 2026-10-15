@@ -1,0 +1,375 @@
+package commit
+
+import (
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/housekeeping"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/node"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	rubyContent = "puts 'Hello world!'\n"
+
+	javaContent = `public class HelloWorldFactory {
+	public static void main(String[] args){
+		IHelloWorldFactory factory = HelloWorldFactory().getInstance();
+		IHelloWorld helloWorld = factory.getHelloWorld();
+		IHelloWorldString helloWorldString = helloWorld.getHelloWorldString();
+		IPrintStrategy printStrategy = helloWorld.getPrintStrategy();
+		helloWorld.print(printStrategy, helloWorldString%);
+	}
+}
+`
+
+	cContent = `#include <stdio.h>
+
+	int main(const char *argv[]) {
+		puts("Hello, world!")
+	}
+`
+)
+
+func TestCommitLanguages(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = startTestServices(t, cfg)
+	client := newCommitServiceClient(t, cfg.SocketPath)
+
+	type setupData struct {
+		request          *gitalypb.CommitLanguagesRequest
+		expectedErr      error
+		expectedResponse *gitalypb.CommitLanguagesResponse
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		setup func(t *testing.T) setupData
+	}{
+		{
+			desc: "no repository provided",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: nil,
+					},
+					expectedErr: structerr.NewInvalidArgument("%w", storage.ErrRepositoryNotSet),
+				}
+			},
+		},
+		{
+			desc: "invalid revision",
+			setup: func(t *testing.T) setupData {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: repo,
+						Revision:   []byte("--output=/meow"),
+					},
+					expectedErr: structerr.NewInvalidArgument("revision can't start with '-'"),
+				}
+			},
+		},
+		{
+			desc: "empty revision falls back to default branch",
+			setup: func(t *testing.T) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+					gittest.TreeEntry{Path: "file.c", Mode: "100644", Content: cContent},
+				))
+
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: repo,
+						Revision:   nil,
+					},
+					expectedResponse: &gitalypb.CommitLanguagesResponse{
+						Languages: []*gitalypb.CommitLanguagesResponse_Language{
+							{Name: "C", Color: "#555555", Share: 100, Bytes: uint64(len(cContent)), LanguageId: 41},
+						},
+					},
+				}
+			},
+		},
+		{
+			desc: "ambiguous revision",
+			setup: func(t *testing.T) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				// Write both a branch and a tag named "v1.0.0" with different contents so that we can
+				// verify which of both references has precedence.
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("v1.0.0"), gittest.WithTreeEntries(
+					gittest.TreeEntry{Path: "file.c", Mode: "100644", Content: cContent},
+				))
+				gittest.WriteCommit(t, cfg, repoPath, gittest.WithReference("refs/tags/v1.0.0"), gittest.WithTreeEntries(
+					gittest.TreeEntry{Path: "file.rb", Mode: "100644", Content: rubyContent},
+				))
+
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: repo,
+						Revision:   []byte("v1.0.0"),
+					},
+					expectedResponse: &gitalypb.CommitLanguagesResponse{
+						Languages: []*gitalypb.CommitLanguagesResponse_Language{
+							{Name: "C", Color: "#555555", Share: 100, Bytes: uint64(len(cContent)), LanguageId: 41},
+						},
+					},
+				}
+			},
+		},
+		{
+			desc: "multiple languages",
+			setup: func(t *testing.T) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				commit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+					gittest.TreeEntry{Path: "file.rb", Mode: "100644", Content: rubyContent},
+					gittest.TreeEntry{Path: "file.java", Mode: "100644", Content: javaContent},
+					gittest.TreeEntry{Path: "file.c", Mode: "100644", Content: cContent},
+				))
+
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: repo,
+						Revision:   []byte(commit),
+					},
+					expectedResponse: &gitalypb.CommitLanguagesResponse{
+						Languages: []*gitalypb.CommitLanguagesResponse_Language{
+							{Name: "Java", Color: "#b07219", Share: 79.67145538330078, Bytes: uint64(len(javaContent)), LanguageId: 181},
+							{Name: "C", Color: "#555555", Share: 16.221765518188477, Bytes: uint64(len(cContent)), LanguageId: 41},
+							{Name: "Ruby", Color: "#701516", Share: 4.106776237487793, Bytes: uint64(len(rubyContent)), LanguageId: 326},
+						},
+					},
+				}
+			},
+		},
+		{
+			desc: "linguist-language alias resolved to canonical name",
+			setup: func(t *testing.T) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				commit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+					gittest.TreeEntry{Path: "network.msg", Mode: "100644", Content: strings.Repeat("a", 200)},
+					gittest.TreeEntry{
+						Path:    ".gitattributes",
+						Mode:    "100644",
+						Content: "*.msg linguist-language=omnetpp-msg\n*.msg linguist-detectable\n",
+					},
+				))
+
+				return setupData{
+					request: &gitalypb.CommitLanguagesRequest{
+						Repository: repo,
+						Revision:   []byte(commit),
+					},
+					expectedResponse: &gitalypb.CommitLanguagesResponse{
+						Languages: []*gitalypb.CommitLanguagesResponse_Language{
+							{Name: "OMNeT++ MSG", Color: "#a0e0a0", Share: 100, Bytes: 200, LanguageId: 664100008},
+						},
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			setup := tc.setup(t)
+
+			response, err := client.CommitLanguages(ctx, setup.request)
+			testhelper.RequireGrpcError(t, setup.expectedErr, err)
+			testhelper.ProtoEqual(t, setup.expectedResponse, response)
+		})
+	}
+}
+
+func TestCommitLanguages_transactional(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	txManager := transaction.NewTrackingManager()
+	cfg, client := setupCommitService(t, ctx, testserver.WithTransactionManager(txManager))
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+		gittest.TreeEntry{Path: "file.rb", Mode: "100644", Content: rubyContent},
+	))
+
+	ctx, err := txinfo.InjectTransaction(ctx, 1, "node", true)
+	require.NoError(t, err)
+	ctx = metadata.IncomingToOutgoing(ctx)
+
+	response, err := client.CommitLanguages(ctx, &gitalypb.CommitLanguagesRequest{
+		Repository: repo,
+		Revision:   []byte(commitID),
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, response.GetLanguages())
+
+	// CommitLanguages casts a deterministic vote on the resolved commit ID. This is what lets the
+	// transaction commit when running behind Praefect, instead of returning 0/N votes and marking
+	// every replica outdated. We assert the vote is present rather than matching the full set, as
+	// the storage layer casts its own votes too when WAL is enabled.
+	require.Contains(t, txManager.Votes(), transaction.PhasedVote{
+		Phase: voting.Committed,
+		Vote:  voting.VoteFromData([]byte(commitID)),
+	}, "CommitLanguages should cast a committed vote derived from the commit ID")
+}
+
+func TestConcurrentCommitLanguages(t *testing.T) {
+	t.Parallel()
+
+	if testhelper.IsPraefectEnabled() {
+		t.Skip("usage of gittest.WriteCommit causes a race condition.")
+	}
+
+	ctx := testhelper.Context(t)
+	logger := testhelper.NewLogger(t)
+
+	t.Run("concurrent commit languages with transactions", func(t *testing.T) {
+		cfg := testcfg.Build(t)
+		cfg.SocketPath = startTestServices(t, cfg)
+		client := newCommitServiceClient(t, cfg.SocketPath)
+
+		// Create a repository with some content for language detection
+		repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+			SkipCreationViaService: true,
+		})
+		repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+		_, dbMgr := dbSetup(t, ctx, cfg, testhelper.TempDir(t), cfg.Storages[0].Name, logger)
+
+		catfileCache := catfile.NewCache(cfg)
+		t.Cleanup(catfileCache.Stop)
+
+		cmdFactory := gittest.NewCommandFactory(t, cfg)
+		localRepoFactory := localrepo.NewFactory(logger, config.NewLocator(cfg), cmdFactory, catfileCache)
+
+		m := partition.NewMetrics(housekeeping.NewMetrics(cfg.Prometheus))
+		partitionFactoryOptions := []partition.FactoryOption{
+			partition.WithCmdFactory(cmdFactory),
+			partition.WithRepoFactory(localRepoFactory),
+			partition.WithMetrics(m),
+		}
+		partitionFactory := partition.NewFactory(partitionFactoryOptions...)
+
+		ptnMgr, err := node.NewManager(cfg.Storages, storagemgr.NewFactory(
+			logger, dbMgr, partitionFactory, config.DefaultMaxInactivePartitions, storagemgr.NewMetrics(cfg.Prometheus),
+		))
+		require.NoError(t, err)
+		defer ptnMgr.Close()
+
+		commit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+			gittest.TreeEntry{Path: "file.rb", Mode: "100644", Content: rubyContent},
+			gittest.TreeEntry{Path: "file.java", Mode: "100644", Content: javaContent},
+			gittest.TreeEntry{Path: "file.c", Mode: "100644", Content: cContent},
+		))
+
+		request := &gitalypb.CommitLanguagesRequest{
+			Repository: repoProto,
+			Revision:   []byte(commit),
+		}
+
+		expectedResponse := &gitalypb.CommitLanguagesResponse{
+			Languages: []*gitalypb.CommitLanguagesResponse_Language{
+				{Name: "Java", Color: "#b07219", Share: 79.67145538330078, Bytes: uint64(len(javaContent)), LanguageId: 181},
+				{Name: "C", Color: "#555555", Share: 16.221765518188477, Bytes: uint64(len(cContent)), LanguageId: 41},
+				{Name: "Ruby", Color: "#701516", Share: 4.106776237487793, Bytes: uint64(len(rubyContent)), LanguageId: 326},
+			},
+		}
+		storageHandle, err := ptnMgr.GetStorage(cfg.Storages[0].Name)
+		require.NoError(t, err)
+		// Test concurrent operations on the same commit with transactions
+		const numGoroutines = 3
+		var wg sync.WaitGroup
+		results := make(chan *gitalypb.CommitLanguagesResponse, numGoroutines)
+		errors := make(chan error, numGoroutines)
+
+		// Launch concurrent operations (mix of read-only and read-write transactions)
+		for range numGoroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				tx, err := storageHandle.Begin(ctx, storage.TransactionOptions{
+					RelativePath: repo.GetRelativePath(),
+					ReadOnly:     false,
+				})
+				if err != nil {
+					errors <- err
+					return
+				}
+				ctxWithTx := storage.ContextWithTransaction(ctx, tx)
+				var committed bool
+				defer func() {
+					if !committed {
+						require.NoError(t, tx.Rollback(ctxWithTx))
+					}
+				}()
+
+				response, err := client.CommitLanguages(ctxWithTx, request)
+				if err != nil {
+					errors <- err
+					return
+				}
+
+				commitLSN, err := tx.Commit(ctxWithTx)
+				if err != nil {
+					errors <- err
+					return
+				}
+				committed = true
+				results <- response
+				storage.LogTransactionCommit(ctxWithTx, logger, commitLSN, fmt.Sprintf("CommitLanguages for commitID: %s", commit.String()))
+			}()
+		}
+
+		wg.Wait()
+		close(results)
+		close(errors)
+
+		// Count errors and successes
+		var errorCount int
+		var successCount int
+
+		// Count errors (expect transaction conflicts)
+		for err := range errors {
+			errorCount++
+			require.Error(t, err)
+		}
+
+		// Count successful responses
+		for response := range results {
+			successCount++
+			testhelper.ProtoEqual(t, expectedResponse, response)
+		}
+
+		require.Equal(t, numGoroutines, successCount, "expected exactly 3 successful operation total")
+		require.Equal(t, 0, errorCount, "expected no operations to fail")
+	})
+}

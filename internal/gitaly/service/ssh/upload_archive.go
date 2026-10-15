@@ -1,0 +1,90 @@
+package ssh
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/feder-cr/open_scion/internal/command"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/open_scion/streamio"
+)
+
+func (s *server) SSHUploadArchive(stream gitalypb.SSHService_SSHUploadArchiveServer) error {
+	req, err := stream.Recv() // First request contains Repository only
+	if err != nil {
+		return structerr.NewInternal("%w", err)
+	}
+	if err = validateFirstUploadArchiveRequest(stream.Context(), s.locator, req); err != nil {
+		return structerr.NewInvalidArgument("%w", err)
+	}
+
+	if err = s.sshUploadArchive(stream, req); err != nil {
+		return structerr.NewInternal("%w", err)
+	}
+
+	return nil
+}
+
+func (s *server) sshUploadArchive(stream gitalypb.SSHService_SSHUploadArchiveServer, req *gitalypb.SSHUploadArchiveRequest) error {
+	ctx := stream.Context()
+
+	repoPath, err := s.locator.GetRepoPath(ctx, req.GetRepository())
+	if err != nil {
+		return err
+	}
+
+	stdin := streamio.NewReader(func() ([]byte, error) {
+		request, err := stream.Recv()
+		return request.GetStdin(), err
+	})
+
+	var m sync.Mutex
+	stdout := streamio.NewSyncWriter(&m, func(p []byte) error {
+		return stream.Send(&gitalypb.SSHUploadArchiveResponse{Stdout: p})
+	})
+	stderr := streamio.NewSyncWriter(&m, func(p []byte) error {
+		return stream.Send(&gitalypb.SSHUploadArchiveResponse{Stderr: p})
+	})
+
+	timeoutTicker := s.uploadArchiveRequestTimeoutTickerFactory()
+
+	repo := s.localRepoFactory.Build(req.GetRepository())
+
+	if err := s.runUploadCommand(ctx, repo, stdin, stdout, stderr, timeoutTicker, pktline.PktFlush(), gitcmd.Command{
+		Name: "upload-archive",
+		Args: []string{repoPath},
+	}); err != nil {
+		if status, ok := command.ExitStatus(err); ok {
+			if err := stream.Send(&gitalypb.SSHUploadArchiveResponse{
+				ExitStatus: &gitalypb.ExitStatus{Value: int32(status)},
+			}); err != nil {
+				return fmt.Errorf("sending exit status: %w", err)
+			}
+
+			return fmt.Errorf("send: %w", err)
+		}
+
+		return fmt.Errorf("running upload-archive: %w", err)
+	}
+
+	return stream.Send(&gitalypb.SSHUploadArchiveResponse{
+		ExitStatus: &gitalypb.ExitStatus{Value: 0},
+	})
+}
+
+func validateFirstUploadArchiveRequest(ctx context.Context, locator storage.Locator, req *gitalypb.SSHUploadArchiveRequest) error {
+	if err := locator.ValidateRepository(ctx, req.GetRepository()); err != nil {
+		return err
+	}
+	if req.Stdin != nil {
+		return errors.New("non-empty stdin in first request")
+	}
+
+	return nil
+}

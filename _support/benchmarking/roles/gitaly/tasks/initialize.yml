@@ -1,0 +1,148 @@
+---
+- name: Install client SSH pubkey
+  authorized_key:
+    user: root
+    key: "{{ hostvars[groups['client'][0]]['client_ssh_key'] | b64decode }}"
+
+# needed for Ansible > 4.0 https://github.com/ansible/ansible/issues/74830
+- name: Install acl
+  apt:
+    name:
+      - acl
+    state: present
+
+- name: Install filesystem tools
+  apt:
+    name:
+      - "{{ {'xfs': 'xfsprogs', 'btrfs': 'btrfs-progs', 'ext4': 'e2fsprogs'}[target_instance.filesystem | default('ext4')] }}"
+    state: present
+    update_cache: yes
+
+# Set high uid to ensure it's not squashed by another service
+- name: Create 'git' user
+  user:
+    name: git
+    uid: 1999
+    groups: admin,google-sudoers
+    append: true
+
+- name: Format repositories disk
+  filesystem:
+    fstype: "{{ target_instance.filesystem | default('ext4') }}"
+    dev: /dev/disk/by-id/google-repository-disk
+    opts: "{{ target_instance.fs_format_opts | default(omit) }}"
+
+- name: Create mount point directory
+  file:
+    path: /mnt/git-repositories
+    state: directory
+    mode: '0755'
+
+- name: Mount repositories disk
+  mount:
+    path: /mnt/git-repositories
+    src: /dev/disk/by-id/google-repository-disk
+    fstype: "{{ target_instance.filesystem | default('ext4') }}"
+    opts: "{{ target_instance.fs_mount_opts | default(omit) }}"
+    state: mounted
+
+- name: Set permissions on repositories directory
+  file:
+    path: /mnt/git-repositories
+    owner: git
+    group: git
+    mode: '0755'
+    state: directory
+
+- name: Add Git PPA repository
+  apt_repository:
+    repo: ppa:git-core/ppa
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Install Git
+  apt:
+    name: git
+    state: latest
+  become: true
+
+- name: Clone repositories in parallel
+  shell: |
+    if [ ! -d "{{ item.name }}" ]; then
+      git clone --bare --ref-format={{ item.reference_backend }} {{ item.remote }} {{ item.name }}
+    fi
+  args:
+    chdir: /mnt/git-repositories
+    creates: "/mnt/git-repositories/{{ item.name }}"
+  loop: "{{ config.repositories }}"
+  async: 900
+  poll: 30
+
+- name: Mark repository directories as safe
+  command: git config --global --add safe.directory /mnt/git-repositories/{{ item.name }}
+  loop: "{{ config.repositories }}"
+
+- name: Add additional refs if required
+  shell: |
+    set -euo pipefail
+
+    if git -C {{ item.name }} rev-parse --verify refs/refs/zzz-1 >/dev/null 2>&1; then
+      echo "Refs already exist for {{ item.name }}, skipping"
+      exit 0
+    fi
+
+    COMMIT_SHA="$(git -C {{ item.name }} rev-parse HEAD)"
+    BATCH_SIZE=250000
+    TOTAL_REFS={{ item.additional_refs }}
+
+    for batch_start in $(seq 1 $BATCH_SIZE $TOTAL_REFS); do
+      batch_end=$((batch_start + BATCH_SIZE - 1))
+      if [ $batch_end -gt $TOTAL_REFS ]; then
+        batch_end=$TOTAL_REFS
+      fi
+
+      echo "Processing batch: refs $batch_start to $batch_end"
+
+      > base_refs  # Clear the file for each batch
+      for i in $(seq $batch_start $batch_end); do
+        echo "create refs/refs/zzz-$i $COMMIT_SHA" >> base_refs
+      done
+
+      git -C {{ item.name }} update-ref --stdin < base_refs
+
+      if [[ "{{ item.reference_backend }}" = "files" ]]; then
+        git -C {{ item.name }} pack-refs --all --auto
+      fi
+
+      rm base_refs
+    done
+  loop: "{{ config.repositories }}"
+  when:
+    - item.additional_refs is defined
+    - item.additional_refs is number
+  async: 900
+  poll: 30
+  args:
+    chdir: /mnt/git-repositories
+    executable: /bin/bash
+
+- name: Set git as owner of repositories directory
+  file:
+    path: /mnt/git-repositories
+    owner: git
+    group: git
+    state: directory
+    recurse: yes
+
+- name: Create /src directory
+  file:
+    path: /src
+    state: directory
+    mode: '0755'
+    owner: git
+    group: git
+
+# Match limits set by Omnibus
+- name: Set file-max
+  shell: echo "1000000" > /proc/sys/fs/file-max

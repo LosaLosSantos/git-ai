@@ -1,0 +1,43 @@
+{"event":"version","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","time":"2023-02-21T08:10:10.668546Z","evt":"3","exe":"2.39.1"}
+{"event":"start","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","t_abs":0.086062,"argv":["git","status"]}
+{"event":"def_repo","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"worktree":"/Users/userx/www/gitlab-development-kit/gitaly"}
+{"event":"cmd_name","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","name":"status","hierarchy":"status"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"index","label":"do_read_index","msg":".git/index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"cache_tree","label":"read"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000124,"nesting":2,"category":"cache_tree","label":"read"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.089751,"t_rel":0.000452,"nesting":2,"category":"index","key":"read/version","value":"2"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.089772,"t_rel":0.000473,"nesting":2,"category":"index","key":"read/cache_nr","value":"1585"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000494,"nesting":1,"category":"index","label":"do_read_index","msg":".git/index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"progress","label":"Refresh index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","nesting":2,"category":"index","label":"preload"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","t_rel":0.004743,"nesting":2,"category":"index","label":"preload"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","nesting":2,"category":"index","label":"refresh"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","t_rel":0.000017,"nesting":2,"category":"index","label":"refresh"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.094712,"t_rel":0.004818,"nesting":2,"category":"progress","key":"total_objects","value":"1585"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.004825,"nesting":1,"category":"progress","label":"Refresh index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"status","label":"worktrees"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"diff","label":"setup"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000005,"nesting":2,"category":"diff","label":"setup"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"diff","label":"write back to queue"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000004,"nesting":2,"category":"diff","label":"write back to queue"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000072,"nesting":1,"category":"status","label":"worktrees"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"status","label":"index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"unpack_trees","label":"unpack_trees"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000079,"nesting":2,"category":"unpack_trees","label":"unpack_trees"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"diff","label":"setup"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000003,"nesting":2,"category":"diff","label":"setup"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"diff","label":"write back to queue"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000003,"nesting":2,"category":"diff","label":"write back to queue"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.001523,"nesting":1,"category":"status","label":"index"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"status","label":"untracked"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":2,"category":"dir","label":"read_directory"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.008231,"nesting":2,"category":"dir","label":"read_directory"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.008266,"nesting":1,"category":"status","label":"untracked"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.104966,"t_rel":0.104966,"nesting":1,"category":"status","key":"count/changed","value":"0"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.104972,"t_rel":0.104972,"nesting":1,"category":"status","key":"count/untracked","value":"1"}
+{"event":"data","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.104976,"t_rel":0.104976,"nesting":1,"category":"status","key":"count/ignored","value":"0"}
+{"event":"region_enter","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"nesting":1,"category":"status","label":"print"}
+{"event":"region_leave","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_rel":0.000205,"nesting":1,"category":"status","label":"print"}
+{"event":"exit","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","t_abs":0.105195,"code":0}
+{"event":"data_json","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","repo":1,"t_abs":0.105204,"t_rel":0.105204,"nesting":1,"category":"traverse_trees","key":"statistics","value":{"traverse_trees_count":1,"traverse_trees_max_depth":1}}
+{"event":"atexit","sid":"1234/20230221T081010.667656Z-Ha0f0bee5-P000006c8","thread":"main","time":"2023-02-21T08:10:10.687877Z","t_abs":0.105208,"code":0}

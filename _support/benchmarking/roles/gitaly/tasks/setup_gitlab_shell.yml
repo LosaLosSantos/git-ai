@@ -1,0 +1,52 @@
+---
+- name: Install gitlab-shell build dependencies
+  apt:
+    name:
+      - krb5-user
+      - libgssapi-krb5-2
+      - libkrb5-dev
+      - libsasl2-modules-gssapi-mit
+    state: present
+
+- name: Create /opt/gitlab-shell directory
+  file:
+    path: /opt/gitlab-shell
+    state: directory
+    mode: '0755'
+    owner: git
+    group: git
+
+- name: Clone gitlab-shell
+  git:
+    repo: https://gitlab.com/gitlab-org/gitlab-shell.git
+    dest: /src/gitlab-shell
+    version: HEAD
+  become_user: git
+
+- name: Build gitlab-shell
+  make:
+    target: build
+    jobs: "{{ ansible_processor_nproc }}"
+    chdir: /src/gitlab-shell
+  environment:
+    PATH: '/usr/local/go/bin:{{ ansible_env.PATH }}'
+  become_user: git
+
+- name: Install gitlab-shell to /opt/gitlab-shell
+  make:
+    target: install
+    params:
+      PREFIX: /opt/gitlab-shell
+    jobs: "{{ ansible_processor_nproc }}"
+    chdir: /src/gitlab-shell
+  environment:
+    PATH: '/usr/local/go/bin:{{ ansible_env.PATH }}'
+  become_user: git
+
+- name: Create gitlab-shell secret
+  file:
+    path: /var/opt/gitaly/shell.secret
+    state: touch
+    mode: '0400'
+    owner: git
+    group: git

@@ -1,0 +1,59 @@
+project: unused-in-incluster-mode
+benchmark_region: unused
+benchmark_zone: unused
+os_image: unused
+client:
+  machine_type: unused
+  boot_disk_size: 0
+  boot_disk_type: unused
+  gitaly_revision: HEAD
+gitaly_instances:
+- name: incluster
+  machine_type: unused
+  boot_disk_type: unused
+  boot_disk_size: 0
+  gitaly_revision: HEAD
+  disk_size: 0
+  disk_type: unused
+  filesystem: ext4
+  fs_mount_opts: ''
+  fs_format_opts: ''
+repositories:
+- name: git
+  include_in_test: true
+  reference_backend: files
+  remote: https://gitlab.com/gitlab-org/git.git
+  revision: e9019fcafe0040228b8631c30f97ae1adb61bcdc
+  additional_refs: 200000
+  testdata:
+    commits:
+    - aec3f587505a472db67e9462d0702e7d463a449d
+    refs:
+    - refs/heads/master
+    files:
+    - README.md
+    directories:
+    - t
+  disk_path: '@hashed/a6/8b/a68b412c4282555f15546cf6e1fc42893b7e07f271557ceb021821098dd66c1b.git'
+  gl_repository: project-64
+  control_disk_path: '@hashed/3a/da/3ada92f28b4ceda38562ebf047c6ff05400d4c572352a1142eedfef67d21e662.git'
+  control_gl_repository: project-66
+- name: gitaly
+  include_in_test: true
+  reference_backend: files
+  remote: https://gitlab.com/gitlab-org/gitaly.git
+  revision: 6f60d68b8a3736e2ef05b118b46daf2d7bced358
+  additional_refs: 500000
+  testdata:
+    commits:
+    - b03725924e1289ddf16d77a3b1b33a3294bf550d
+    refs:
+    - refs/heads/master
+    files:
+    - README.md
+    directories:
+    - internal
+  disk_path: '@hashed/10/8c/108c995b953c8a35561103e2014cf828eb654a99e310f87fab94c2f4b7d2a04f.git'
+  gl_repository: project-65
+  control_disk_path: '@hashed/49/d1/49d180ecf56132819571bf39d9b7b342522a2ac6d23c1418d3338251bfe469c8.git'
+  control_gl_repository: project-67

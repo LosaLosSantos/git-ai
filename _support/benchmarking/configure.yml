@@ -1,0 +1,12 @@
+---
+- name: Client setup
+  hosts: client
+  roles:
+    - client
+  become: true
+
+- name: Gitaly setup
+  hosts: gitaly
+  roles:
+    - gitaly
+  become: true

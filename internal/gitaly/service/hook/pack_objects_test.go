@@ -1,0 +1,1165 @@
+package hook
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"fmt"
+	"io"
+	"net"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	hookPkg "github.com/feder-cr/open_scion/internal/gitaly/hook"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/limiter"
+	"github.com/feder-cr/open_scion/internal/streamcache"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/open_scion/streamio"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func hooksPayloadEnvForRepository(tb testing.TB, ctx context.Context, cfg config.Cfg, repo *gitalypb.Repository) []string {
+	tb.Helper()
+
+	objectHash, err := localrepo.NewTestRepo(tb, cfg, repo).ObjectHash(ctx)
+	require.NoError(tb, err)
+
+	hooksPayloadEnv, err := gitcmd.NewHooksPayload(ctx, cfg, repo, objectHash, nil, nil, gitcmd.PackObjectsHook, nil).Env()
+	require.NoError(tb, err)
+
+	return []string{hooksPayloadEnv}
+}
+
+func runTestsWithRuntimeDir(t *testing.T, testFunc func(*testing.T, string)) {
+	t.Helper()
+
+	t.Run("no runtime dir", func(t *testing.T) {
+		testFunc(t, "")
+	})
+
+	t.Run("with runtime dir", func(t *testing.T) {
+		testFunc(t, testhelper.TempDir(t))
+	})
+}
+
+func cfgWithCache(t *testing.T, minOccurrences int) config.Cfg {
+	cfg := testcfg.Build(t)
+	cfg.PackObjectsCache.Enabled = true
+	cfg.PackObjectsCache.Dir = testhelper.TempDir(t)
+	cfg.PackObjectsCache.MinOccurrences = minOccurrences
+	return cfg
+}
+
+func TestParsePackObjectsArgs(t *testing.T) {
+	testCases := []struct {
+		desc string
+		args []string
+		out  *packObjectsArgs
+		err  error
+	}{
+		{desc: "no args", args: []string{"pack-objects", "--stdout"}, out: &packObjectsArgs{}},
+		{desc: "no args shallow", args: []string{"--shallow-file", "", "pack-objects", "--stdout"}, out: &packObjectsArgs{shallowFile: true}},
+		{desc: "with args", args: []string{"pack-objects", "--foo", "-x", "--stdout"}, out: &packObjectsArgs{flags: []string{"--foo", "-x"}}},
+		{desc: "with args shallow", args: []string{"--shallow-file", "", "pack-objects", "--foo", "--stdout", "-x"}, out: &packObjectsArgs{shallowFile: true, flags: []string{"--foo", "-x"}}},
+		{desc: "missing stdout", args: []string{"pack-objects"}, err: errNoStdout},
+		{desc: "no pack objects", args: []string{"zpack-objects"}, err: errNoPackObjects},
+		{desc: "non empty shallow", args: []string{"--shallow-file", "z", "pack-objects"}, err: errNoPackObjects},
+		{desc: "bad global", args: []string{"-c", "foo=bar", "pack-objects"}, err: errNoPackObjects},
+		{desc: "non flag arg", args: []string{"pack-objects", "--foo", "x"}, err: errNonFlagArg},
+		{desc: "non flag arg shallow", args: []string{"--shallow-file", "", "pack-objects", "--foo", "x"}, err: errNonFlagArg},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			args, err := parsePackObjectsArgs(tc.args)
+			require.Equal(t, tc.out, args)
+			require.Equal(t, tc.err, err)
+		})
+	}
+}
+
+func TestServer_PackObjectsHook_separateContext(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testServerPackObjectsHookSeparateContextWithRuntimeDir)
+}
+
+func testServerPackObjectsHookSeparateContextWithRuntimeDir(t *testing.T, runtimeDir string) {
+	ctx := testhelper.Context(t)
+
+	cfg := cfgWithCache(t, 0)
+	cfg.SocketPath = runHooksServer(t, cfg, nil)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	// We write a commit with a large blob such that the response needs to be split over multiple messages.
+	// Otherwise it may happen that the request will finish before we can actually cancel the context.
+	data := make([]byte, 10*streamio.WriteBufferSize)
+	_, _ = rand.Read(data[:])
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTreeEntries(
+		gittest.TreeEntry{Path: "path", Mode: "100644", Content: string(data)},
+	))
+
+	req := &gitalypb.PackObjectsHookWithSidechannelRequest{
+		Repository:           repo,
+		Args:                 []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"},
+		EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, repo),
+	}
+	stdin := commitID.String() + "\n--not\n\n"
+
+	syncCh := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	// The first call sends a valid request, but will then immediately hang up without reading the response. This
+	// should not impact the second call in any way even if it uses the same cache entry.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		client, conn := newHooksClient(t, cfg.SocketPath)
+		defer testhelper.MustClose(t, conn)
+
+		ctx, wt, err := hookPkg.SetupSidechannel(
+			ctx,
+			gitcmd.HooksPayload{
+				RuntimeDir: runtimeDir,
+			},
+			func(c *net.UnixConn) error {
+				if _, err := io.WriteString(c, stdin); err != nil {
+					return err
+				}
+				if err := c.CloseWrite(); err != nil {
+					return err
+				}
+
+				// Read one byte of the response to ensure that this call got handled before the next
+				// one. Afterwards we exit immediately without reading the rest of the response.
+				buf := make([]byte, 1)
+				_, err := io.ReadFull(c, buf)
+
+				// Step 2: unblock the second Goroutine such that it can start invoking the RPC. At this
+				// point in time we know that git-pack-objects(1) is running already and originally
+				// created by this Goroutine.
+				syncCh <- struct{}{}
+				// Step 3: we wait for the second Goroutine to catch up and end up in the code that
+				// handles the sidechannel.
+				<-syncCh
+
+				return err
+			},
+		)
+		require.NoError(t, err)
+		defer testhelper.MustClose(t, wt)
+
+		_, err = client.PackObjectsHookWithSidechannel(ctx, req)
+		if runtime.GOOS == "darwin" {
+			require.Error(t, err)
+			// macOS uses different logic than Linux systems because the sendfile(3P) syscall is not
+			// available. The resulting error message is non-deterministic and includes the actual path of
+			// the pipe we're trying to write to.
+			require.Regexp(t, "pack objects hook: write unix ->.*: write: broken pipe", err.Error())
+			testhelper.RequireGrpcCode(t, err, codes.Canceled)
+		} else {
+			testhelper.RequireGrpcError(t, structerr.NewCanceled("pack objects hook: broken pipe"), err)
+		}
+		require.NoError(t, wt.Wait())
+
+		cancel()
+
+		// Step 6: unblock the second Goroutine such that it can resume processing the git-pack-objects(1) data.
+		syncCh <- struct{}{}
+	}()
+
+	// The second call sends the same request as we do in the first one, but starts at a point where the first call
+	// has already started to do its thing. But even though the first call will drop out early, we should be able to
+	// fully receive the packfile here.
+	wg.Add(1)
+	var stdout bytes.Buffer
+	go func() {
+		defer wg.Done()
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		client, conn := newHooksClient(t, cfg.SocketPath)
+		defer testhelper.MustClose(t, conn)
+
+		ctx, wt, err := hookPkg.SetupSidechannel(
+			ctx,
+			gitcmd.HooksPayload{
+				RuntimeDir: runtimeDir,
+			},
+			func(c *net.UnixConn) error {
+				// Step 4: unblock the first Goroutine such that it can exit. We know know that both
+				// Goroutines are handling the git-pack-objects(1) data.
+				syncCh <- struct{}{}
+				// Step 5: we wait for the first Goroutine to stop processing the RPC. After this point,
+				// we're the only ones still processing output of git-pack-objects(1).
+				<-syncCh
+
+				// Step 7: remainder of this logic. The first Goroutine has finished processing the RPC
+				// and is about to exit. Furthermore, it has cancelled its context.
+
+				if _, err := io.WriteString(c, stdin); err != nil {
+					return err
+				}
+				if err := c.CloseWrite(); err != nil {
+					return err
+				}
+
+				return pktline.EachSidebandPacket(c, func(band byte, data []byte) error {
+					if band == 1 {
+						_, err := stdout.Write(data)
+						return err
+					}
+					return nil
+				})
+			},
+		)
+		require.NoError(t, err)
+		defer testhelper.MustClose(t, wt)
+
+		// Step 1: we wait for the first Goroutine to have started processing its call.
+		<-syncCh
+
+		_, err = client.PackObjectsHookWithSidechannel(ctx, req)
+		assert.NoError(t, err)
+		assert.NoError(t, wt.Wait())
+	}()
+
+	wg.Wait()
+
+	// Sanity check: second call received valid response
+	gittest.ExecOpts(t, cfg, gittest.ExecConfig{Stdin: &stdout}, "-C", repoPath, "index-pack", "--stdin", "--fix-thin")
+}
+
+// TestServer_PackObjectsHookWithSidechannel_shutdownCancelsInFlight verifies that
+// git-pack-objects is terminated when the server begins shutting down, even though
+// it intentionally ignores the per-request context. Without this, a slow, lossy, or
+// stalled sidechannel transfer keeps git-pack-objects alive well past the graceful
+// shutdown period and blocks the process from exiting.
+func TestServer_PackObjectsHookWithSidechannel_shutdownCancelsInFlight(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testServerPackObjectsHookWithSidechannelShutdownCancels)
+}
+
+func testServerPackObjectsHookWithSidechannelShutdownCancels(t *testing.T, runtimeDir string) {
+	ctx := testhelper.Context(t)
+
+	// The pack-objects cache is left disabled so that git-pack-objects streams
+	// directly to the sidechannel. A stalled reader then blocks the process on its
+	// write, which is exactly the situation the shutdown cancellation must break.
+	cfg := testcfg.Build(t)
+
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	defer cancelShutdown()
+
+	cfg.SocketPath = runHooksServer(t, cfg, []serverOption{
+		func(s *server) { s.shutdownCtx = shutdownCtx },
+	})
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	// Write a large, incompressible blob so git-pack-objects produces enough output
+	// to fill the buffers and block on its write once the client stops reading.
+	data := make([]byte, 10*streamio.WriteBufferSize)
+	_, _ = rand.Read(data[:])
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithTreeEntries(
+		gittest.TreeEntry{Path: "path", Mode: "100644", Content: string(data)},
+	))
+
+	req := &gitalypb.PackObjectsHookWithSidechannelRequest{
+		Repository:           repo,
+		Args:                 []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"},
+		EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, repo),
+	}
+	stdin := commitID.String() + "\n--not\n\n"
+
+	client, conn := newHooksClient(t, cfg.SocketPath)
+	defer testhelper.MustClose(t, conn)
+
+	readingStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+
+	ctx, wt, err := hookPkg.SetupSidechannel(
+		ctx,
+		gitcmd.HooksPayload{RuntimeDir: runtimeDir},
+		func(c *net.UnixConn) error {
+			if _, err := io.WriteString(c, stdin); err != nil {
+				return err
+			}
+			if err := c.CloseWrite(); err != nil {
+				return err
+			}
+
+			// Read a single byte to confirm git-pack-objects has started producing
+			// output, then stop reading entirely. git-pack-objects blocks on its
+			// write once the buffers fill.
+			buf := make([]byte, 1)
+			if _, err := io.ReadFull(c, buf); err != nil {
+				return err
+			}
+			close(readingStarted)
+
+			// Hold the sidechannel open without draining it until the test is done,
+			// simulating a client that has stalled mid-download.
+			<-releaseCallback
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	// Ensure the stalled callback is released before the sidechannel waiter is
+	// closed, otherwise wt.Close() would block on it.
+	defer testhelper.MustClose(t, wt)
+	defer close(releaseCallback)
+
+	rpcErr := make(chan error, 1)
+	go func() {
+		_, err := client.PackObjectsHookWithSidechannel(ctx, req)
+		rpcErr <- err
+	}()
+
+	// Wait until git-pack-objects is running and the client has stopped reading.
+	select {
+	case <-readingStarted:
+	case err := <-rpcErr:
+		t.Fatalf("RPC returned before the transfer stalled: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("git-pack-objects never started producing output")
+	}
+
+	// Simulate the graceful shutdown period elapsing.
+	cancelShutdown()
+
+	// The RPC must return promptly now that shutdown terminates the otherwise
+	// uncancellable git-pack-objects process. Before the fix this blocks until the
+	// sidechannel connection breaks on its own.
+	select {
+	case err := <-rpcErr:
+		require.Error(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("PackObjectsHookWithSidechannel did not return after shutdown was signaled")
+	}
+}
+
+func TestServer_PackObjectsHook_usesCache(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testServerPackObjectsHookUsesCache)
+}
+
+func testServerPackObjectsHookUsesCache(t *testing.T, runtimeDir string) {
+	ctx := testhelper.Context(t)
+
+	testCases := []struct {
+		name         string
+		makeRequests func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest
+		// shouldUseCacheOf[i] contains the position of request that generates the cache for
+		// i-th request. shouldUseCacheOf[i] == -1 means i-th request does not use cache, thus
+		// create packfile
+		shouldUseCacheOf []int
+		minOccurrences   int
+	}{
+		{
+			name: "all requests are identical",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+				}
+			},
+			shouldUseCacheOf: []int{-1, 0, 0, 0, 0},
+		},
+		{
+			name: "requests with different protocols",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args, GitProtocol: "ssh"},
+					{Repository: repository, Args: args, GitProtocol: "ssh"},
+					{Repository: repository, Args: args, GitProtocol: "http"},
+					{Repository: repository, Args: args, GitProtocol: "http"},
+					{Repository: repository, Args: args, GitProtocol: "ssh"},
+				}
+			},
+			shouldUseCacheOf: []int{-1, 0, -1, 2, 0},
+		},
+		{
+			name: "requests with slightly different args",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args1 := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress"}
+				args2 := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args1},
+					{Repository: repository, Args: args1},
+					{Repository: repository, Args: args1},
+					{Repository: repository, Args: args2},
+					{Repository: repository, Args: args2},
+				}
+			},
+			shouldUseCacheOf: []int{-1, 0, 0, -1, 4},
+		},
+		{
+			name: "requests from different remote IPs",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args, RemoteIp: "1.2.3.4"},
+					{Repository: repository, Args: args, RemoteIp: "1.2.3.5"},
+					{Repository: repository, Args: args, RemoteIp: "1.2.3.4"},
+					{Repository: repository, Args: args, RemoteIp: "1.2.3.4"},
+					{Repository: repository, Args: args, RemoteIp: "1.2.3.5"},
+				}
+			},
+			// All from cached
+			shouldUseCacheOf: []int{-1, 0, 0, 0, 0},
+		},
+		{
+			name: "requests from different user IDs",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args, GlId: "1"},
+					{Repository: repository, Args: args, GlId: "1"},
+					{Repository: repository, Args: args, GlId: "1"},
+					{Repository: repository, Args: args, GlId: "2"},
+					{Repository: repository, Args: args, GlId: "3"},
+				}
+			},
+			// All from cached
+			shouldUseCacheOf: []int{-1, 0, 0, 0, 0},
+		},
+		{
+			name: "requests from different usernames",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args, GlId: "user-1"},
+					{Repository: repository, Args: args, GlId: "user-1"},
+					{Repository: repository, Args: args, GlId: "user-1"},
+					{Repository: repository, Args: args, GlId: "user-2"},
+					{Repository: repository, Args: args, GlId: "user-3"},
+				}
+			},
+			// All from cached
+			shouldUseCacheOf: []int{-1, 0, 0, 0, 0},
+		},
+		{
+			name: "min_occurrences setting is set to 1",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+				}
+			},
+			// The second one starts to serve cache
+			shouldUseCacheOf: []int{-1, -1, 0, 0, 0},
+			minOccurrences:   1,
+		},
+		{
+			name: "min_occurrences setting is set to 5",
+			makeRequests: func(repository *gitalypb.Repository) []*gitalypb.PackObjectsHookWithSidechannelRequest {
+				args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+				return []*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+					{Repository: repository, Args: args},
+				}
+			},
+			shouldUseCacheOf: []int{-1, -1, -1, -1, -1},
+			minOccurrences:   5,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := cfgWithCache(t, tc.minOccurrences)
+
+			tlc := &streamcache.TestLoggingCache{}
+			cfg.SocketPath = runHooksServer(t, cfg, []serverOption{func(s *server) {
+				tlc.Cache = s.packObjectsCache
+				s.packObjectsCache = tlc
+			}})
+
+			repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+			commitID := gittest.WriteCommit(t, cfg, repoPath)
+
+			doRequest := func(request *gitalypb.PackObjectsHookWithSidechannelRequest) {
+				var stdout []byte
+				ctx, wt, err := hookPkg.SetupSidechannel(
+					ctx,
+					gitcmd.HooksPayload{
+						RuntimeDir: runtimeDir,
+					},
+					func(c *net.UnixConn) error {
+						if _, err := io.WriteString(c, commitID.String()+"\n--not\n\n"); err != nil {
+							return err
+						}
+						if err := c.CloseWrite(); err != nil {
+							return err
+						}
+
+						return pktline.EachSidebandPacket(c, func(band byte, data []byte) error {
+							if band == 1 {
+								stdout = append(stdout, data...)
+							}
+							return nil
+						})
+					},
+				)
+				require.NoError(t, err)
+				defer testhelper.MustClose(t, wt)
+
+				client, conn := newHooksClient(t, cfg.SocketPath)
+				defer conn.Close()
+
+				request.EnvironmentVariables = hooksPayloadEnvForRepository(t, ctx, cfg, request.GetRepository())
+
+				_, err = client.PackObjectsHookWithSidechannel(ctx, request)
+				require.NoError(t, err)
+				require.NoError(t, wt.Wait())
+
+				gittest.ExecOpts(
+					t,
+					cfg,
+					gittest.ExecConfig{Stdin: bytes.NewReader(stdout)},
+					"-C", repoPath, "index-pack", "--stdin", "--fix-thin",
+				)
+			}
+
+			requests := tc.makeRequests(repo)
+			for _, request := range requests {
+				doRequest(request)
+			}
+
+			entries := tlc.Entries()
+			require.Len(t, entries, len(requests))
+
+			for i := 0; i < len(requests); i++ {
+				require.NoError(t, entries[i].Err)
+
+				if tc.shouldUseCacheOf[i] == -1 {
+					require.True(t, entries[i].Created, "request %d should create packfile", i)
+				} else {
+					require.False(t, entries[i].Created, "request %d should not create packfile", i)
+					entryOfCache := entries[tc.shouldUseCacheOf[i]]
+					require.Equal(t, entryOfCache.Key, entries[i].Key, "request %d does not cache key from request %d", i, tc.shouldUseCacheOf[i])
+				}
+			}
+		})
+	}
+}
+
+func TestServer_PackObjectsHookWithSidechannel(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testServerPackObjectsHookWithSidechannelWithRuntimeDir)
+}
+
+func testServerPackObjectsHookWithSidechannelWithRuntimeDir(t *testing.T, runtimeDir string) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	type setupData struct {
+		repo     *gitalypb.Repository
+		repoPath string
+		args     []string
+		stdin    string
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		setup func(*testing.T, context.Context, config.Cfg) setupData
+	}{
+		{
+			desc: "clone 1 branch",
+			setup: func(t *testing.T, ctx context.Context, cfg config.Cfg) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+				oid := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("branch"))
+
+				return setupData{
+					repo:     repo,
+					repoPath: repoPath,
+					stdin:    oid.String() + "\n--not\n\n",
+					args:     []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"},
+				}
+			},
+		},
+		{
+			desc: "shallow clone 1 branch",
+			setup: func(t *testing.T, ctx context.Context, cfg config.Cfg) setupData {
+				repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				firstCommit := gittest.WriteCommit(t, cfg, repoPath)
+				secondCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(firstCommit), gittest.WithBranch("branch"))
+
+				return setupData{
+					repo:     repo,
+					repoPath: repoPath,
+					stdin:    fmt.Sprintf("--shallow %[1]s\n%[1]s\n--not\n\n", secondCommit),
+					args:     []string{"--shallow-file", "", "pack-objects", "--revs", "--thin", "--stdout", "--shallow", "--progress", "--delta-base-offset", "--include-tag"},
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := cfgWithCache(t, 0)
+
+			logger := testhelper.NewLogger(t)
+			hook := testhelper.AddLoggerHook(logger)
+
+			cfg.SocketPath = runHooksServer(
+				t,
+				cfg,
+				nil,
+				testserver.WithLogger(logger),
+			)
+
+			setup := tc.setup(t, ctx, cfg)
+
+			var packets []string
+			ctx, wt, err := hookPkg.SetupSidechannel(
+				ctx,
+				gitcmd.HooksPayload{
+					RuntimeDir: runtimeDir,
+				},
+				func(c *net.UnixConn) error {
+					if _, err := io.WriteString(c, setup.stdin); err != nil {
+						return err
+					}
+					if err := c.CloseWrite(); err != nil {
+						return err
+					}
+
+					scanner := pktline.NewScanner(c)
+					for scanner.Scan() {
+						packets = append(packets, scanner.Text())
+					}
+					return scanner.Err()
+				},
+			)
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, wt)
+
+			client, conn := newHooksClient(t, cfg.SocketPath)
+			defer conn.Close()
+
+			_, err = client.PackObjectsHookWithSidechannel(ctx, &gitalypb.PackObjectsHookWithSidechannelRequest{
+				Repository:           setup.repo,
+				Args:                 setup.args,
+				EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, setup.repo),
+			})
+			require.NoError(t, err)
+
+			require.NoError(t, wt.Wait())
+			require.NotEmpty(t, packets)
+
+			var packdata []byte
+			for _, pkt := range packets {
+				require.Greater(t, len(pkt), 4)
+
+				switch band := pkt[4]; band {
+				case 1:
+					packdata = append(packdata, pkt[5:]...)
+				case 2:
+				default:
+					t.Fatalf("unexpected band: %d", band)
+				}
+			}
+
+			gittest.ExecOpts(
+				t,
+				cfg,
+				gittest.ExecConfig{Stdin: bytes.NewReader(packdata)},
+				"-C", setup.repoPath, "index-pack", "--stdin", "--fix-thin",
+			)
+
+			entry := hook.LastEntry()
+			require.NotNil(t, entry)
+
+			fields := entry.Data
+			require.Equal(t, fields["pack_objects_cache.hit"], "false")
+			require.Contains(t, fields, "pack_objects_cache.key")
+			require.Greater(t, fields["pack_objects_cache.served_bytes"], 0)
+			require.Greater(t, fields["pack_objects_cache.generated_bytes"], 0)
+
+			total := fields["pack_objects.compression_statistics"].(string)
+			require.True(t, strings.HasPrefix(total, "Total "))
+			require.False(t, strings.Contains(total, "\n"))
+		})
+	}
+}
+
+func TestServer_PackObjectsHookWithSidechannel_invalidArgument(t *testing.T) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runHooksServer(t, cfg, nil)
+	ctx := testhelper.Context(t)
+
+	repo, _ := gittest.CreateRepository(t, ctx, cfg)
+
+	testCases := []struct {
+		desc        string
+		req         *gitalypb.PackObjectsHookWithSidechannelRequest
+		expectedErr error
+	}{
+		{
+			desc:        "empty",
+			req:         &gitalypb.PackObjectsHookWithSidechannelRequest{},
+			expectedErr: structerr.NewInvalidArgument("%w", storage.ErrRepositoryNotSet),
+		},
+		{
+			desc:        "repo, no args",
+			req:         &gitalypb.PackObjectsHookWithSidechannelRequest{Repository: repo},
+			expectedErr: status.Error(codes.InvalidArgument, "invalid pack-objects command: []: missing pack-objects"),
+		},
+		{
+			desc:        "repo, bad args",
+			req:         &gitalypb.PackObjectsHookWithSidechannelRequest{Repository: repo, Args: []string{"rm", "-rf"}},
+			expectedErr: status.Error(codes.InvalidArgument, "invalid pack-objects command: [rm -rf]: missing pack-objects"),
+		},
+		{
+			desc:        "no side-channel address",
+			req:         &gitalypb.PackObjectsHookWithSidechannelRequest{Repository: repo, Args: []string{"pack-objects", "--revs", "--stdout"}},
+			expectedErr: status.Error(codes.InvalidArgument, `invalid side channel address: ""`),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			client, conn := newHooksClient(t, cfg.SocketPath)
+			defer conn.Close()
+
+			_, err := client.PackObjectsHookWithSidechannel(ctx, tc.req)
+			testhelper.RequireGrpcError(t, tc.expectedErr, err)
+		})
+	}
+}
+
+func TestServer_PackObjectsHookWithSidechannel_Canceled(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testServerPackObjectsHookWithSidechannelCanceledWithRuntimeDir)
+}
+
+func testServerPackObjectsHookWithSidechannelCanceledWithRuntimeDir(t *testing.T, runtimeDir string) {
+	ctx := testhelper.Context(t)
+	cfg := cfgWithCache(t, 0)
+	cfg.SocketPath = runHooksServer(t, cfg, nil)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	commitID := gittest.WriteCommit(t, cfg, repoPath)
+
+	ctx, wt, err := hookPkg.SetupSidechannel(
+		ctx,
+		gitcmd.HooksPayload{
+			RuntimeDir: runtimeDir,
+		},
+		func(c *net.UnixConn) error {
+			// Simulate a client that successfully initiates a request, but hangs up
+			// before fully consuming the response.
+			_, err := io.WriteString(c, fmt.Sprintf("%s\n--not\n\n", commitID))
+			return err
+		},
+	)
+	require.NoError(t, err)
+	defer testhelper.MustClose(t, wt)
+
+	client, conn := newHooksClient(t, cfg.SocketPath)
+	defer conn.Close()
+
+	_, err = client.PackObjectsHookWithSidechannel(ctx, &gitalypb.PackObjectsHookWithSidechannelRequest{
+		Repository:           repo,
+		Args:                 []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"},
+		EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, repo),
+	})
+	testhelper.RequireGrpcCode(t, err, codes.Canceled)
+
+	require.NoError(t, wt.Wait())
+}
+
+func withRunPackObjectsFn(
+	f func(
+		context.Context,
+		gitcmd.CommandFactory,
+		io.Writer,
+		*gitalypb.PackObjectsHookWithSidechannelRequest,
+		*packObjectsArgs,
+		io.Reader,
+		string,
+	) error,
+) serverOption {
+	return func(s *server) {
+		s.runPackObjectsFn = f
+	}
+}
+
+func setupSidechannel(t *testing.T, ctx context.Context, oid string) (context.Context, *hookPkg.SidechannelWaiter, error) {
+	return hookPkg.SetupSidechannel(
+		ctx,
+		gitcmd.HooksPayload{
+			RuntimeDir: testhelper.TempDir(t),
+		},
+		func(c *net.UnixConn) error {
+			// Simulate a client that successfully initiates a request, but hangs up
+			// before fully consuming the response.
+			_, err := io.WriteString(c, fmt.Sprintf("%s\n--not\n\n", oid))
+			return err
+		},
+	)
+}
+
+func TestPackObjects_concurrencyLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	args := []string{"pack-objects", "--revs", "--thin", "--stdout", "--progress", "--delta-base-offset"}
+
+	for _, tc := range []struct {
+		desc        string
+		setup       func(*testing.T, config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest
+		shouldLimit bool
+	}{
+		{
+			desc: "never reach limit",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repoA, _ := gittest.CreateRepository(t, ctx, cfg)
+				repoB, _ := gittest.CreateRepository(t, ctx, cfg)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "1.2.3.4",
+						Repository:           repoA,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, repoA),
+					},
+					{
+						GlId:                 "user-456",
+						RemoteIp:             "1.2.3.5",
+						Repository:           repoB,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnvForRepository(t, ctx, cfg, repoB),
+					},
+				}
+			},
+			shouldLimit: false,
+		},
+		{
+			desc: "normal IP address",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "1.2.3.4",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "1.2.3.4",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: true,
+		},
+		{
+			desc: "IP addresses including source port",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "1.2.3.4:47293",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "1.2.3.4:51010",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: true,
+		},
+		{
+			desc: "IPv4 loopback addresses",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "127.0.0.1",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "127.0.0.1",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: false,
+		},
+		{
+			desc: "IPv6 loopback addresses",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             net.IPv6loopback.String(),
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             net.IPv6loopback.String(),
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: false,
+		},
+		{
+			desc: "invalid IP addresses",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "hello-world",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "hello-world",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: false,
+		},
+		{
+			desc: "empty IP addresses",
+			setup: func(t *testing.T, cfg config.Cfg) [2]*gitalypb.PackObjectsHookWithSidechannelRequest {
+				repo, _ := gittest.CreateRepository(t, ctx, cfg)
+				hooksPayloadEnv := hooksPayloadEnvForRepository(t, ctx, cfg, repo)
+
+				return [2]*gitalypb.PackObjectsHookWithSidechannelRequest{
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+					{
+						GlId:                 "user-123",
+						RemoteIp:             "",
+						Repository:           repo,
+						Args:                 args,
+						EnvironmentVariables: hooksPayloadEnv,
+					},
+				}
+			},
+			shouldLimit: false,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := cfgWithCache(t, 0)
+
+			limiterCtx, cancel, simulateTimeout := testhelper.ContextWithSimulatedTimeout(ctx)
+			defer cancel()
+
+			monitor := limiter.NewPackObjectsConcurrencyMonitor(
+				cfg.Prometheus.GRPCLatencyBuckets,
+				"authenticated",
+			)
+			limiter := limiter.NewConcurrencyLimiter(
+				limiter.NewAdaptiveLimit("staticLimit", limiter.AdaptiveSetting{Initial: 1}),
+				0,
+				1*time.Millisecond,
+				monitor,
+			)
+			limiter.SetWaitTimeoutContext = func() context.Context { return limiterCtx }
+
+			registry := prometheus.NewRegistry()
+			registry.MustRegister(monitor)
+
+			receivedCh, blockCh := make(chan struct{}), make(chan struct{})
+			cfg.SocketPath = runHooksServer(t, cfg, []serverOption{
+				withRunPackObjectsFn(func(
+					context.Context,
+					gitcmd.CommandFactory,
+					io.Writer,
+					*gitalypb.PackObjectsHookWithSidechannelRequest,
+					*packObjectsArgs,
+					io.Reader,
+					string,
+				) error {
+					receivedCh <- struct{}{}
+					<-blockCh
+					return nil
+				}),
+			},
+				testserver.WithPackObjectsLimiter(limiter),
+			)
+
+			requests := tc.setup(t, cfg)
+
+			ctx1, wt1, err := setupSidechannel(t, ctx, "1dd08961455abf80ef9115f4afdc1c6f968b503c")
+			require.NoError(t, err)
+
+			ctx2, wt2, err := setupSidechannel(t, ctx, "2dd08961455abf80ef9115f4afdc1c6f968b503")
+			require.NoError(t, err)
+
+			client, conn := newHooksClient(t, cfg.SocketPath)
+			defer testhelper.MustClose(t, conn)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			errChan := make(chan error)
+
+			// We fire off two requests. Since the concurrency limit is set at 1,
+			// the first request will make it through the concurrency limiter and
+			// get blocked in the function provide to withRunPackObjectsFn() above.
+			// The second request will get concurrency limited and will be waiting
+			// in the queue.
+			// When we call Tick() on the max queue wait ticker, the second request
+			// will return with an error.
+
+			type call struct {
+				ctx context.Context
+				req *gitalypb.PackObjectsHookWithSidechannelRequest
+			}
+
+			for _, c := range []call{
+				{ctx: ctx1, req: requests[0]},
+				{ctx: ctx2, req: requests[1]},
+			} {
+				go func(c call) {
+					defer wg.Done()
+					_, err := client.PackObjectsHookWithSidechannel(c.ctx, c.req)
+					if err != nil {
+						errChan <- err
+					}
+				}(c)
+			}
+
+			if tc.shouldLimit {
+				<-receivedCh
+
+				require.NoError(t,
+					testutil.GatherAndCompare(registry,
+						bytes.NewBufferString(`# HELP gitaly_pack_objects_in_progress Gauge of number of concurrent in-progress calls
+# TYPE gitaly_pack_objects_in_progress gauge
+gitaly_pack_objects_in_progress{auth="authenticated"} 1
+`), "gitaly_pack_objects_in_progress"))
+
+				simulateTimeout()
+
+				err := <-errChan
+				testhelper.RequireGrpcCode(
+					t,
+					err,
+					codes.ResourceExhausted,
+				)
+
+				close(blockCh)
+
+				expectedMetrics := bytes.NewBufferString(`# HELP gitaly_pack_objects_dropped_total Number of requests dropped from the queue
+	# TYPE gitaly_pack_objects_dropped_total counter
+	gitaly_pack_objects_dropped_total{auth="authenticated",reason="max_time"} 1
+	# HELP gitaly_pack_objects_queued Gauge of number of queued calls
+	# TYPE gitaly_pack_objects_queued gauge
+	gitaly_pack_objects_queued{auth="authenticated"} 0
+	`)
+
+				require.NoError(t,
+					testutil.GatherAndCompare(registry, expectedMetrics,
+						"gitaly_pack_objects_dropped_total",
+						"gitaly_pack_objects_queued",
+					))
+
+				acquiringSecondsCount, err := testutil.GatherAndCount(registry,
+					"gitaly_pack_objects_acquiring_seconds")
+				require.NoError(t, err)
+
+				require.Equal(t, 1, acquiringSecondsCount)
+			} else {
+				close(blockCh)
+				<-receivedCh
+				<-receivedCh
+			}
+
+			wg.Wait()
+			require.NoError(t, wt1.Wait())
+			require.NoError(t, wt2.Wait())
+		})
+	}
+}

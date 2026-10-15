@@ -1,0 +1,890 @@
+package ssh
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	gitalyauth "github.com/feder-cr/open_scion/auth"
+	"github.com/feder-cr/open_scion/internal/featureflag"
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/open_scion/internal/grpc/sidechannel"
+	"github.com/feder-cr/open_scion/internal/helper"
+	"github.com/feder-cr/open_scion/internal/helper/text"
+	"github.com/feder-cr/open_scion/internal/streamcache"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/prometheus/client_golang/prometheus"
+	promtest "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+func runTestWithAndWithoutConfigOptions(t *testing.T, tf func(t *testing.T, ctx context.Context, opts ...testcfg.Option), opts ...testcfg.Option) {
+	testhelper.NewFeatureSets(
+		featureflag.BundleURI,
+	).Run(t, func(t *testing.T, ctx context.Context) {
+		t.Run("no config options", func(t *testing.T) { tf(t, ctx) })
+
+		if len(opts) > 0 {
+			t.Run("with config options", func(t *testing.T) {
+				tf(t, ctx, opts...)
+			})
+		}
+	})
+}
+
+// runClone runs the given Git command with gitaly-ssh set up as its SSH command. It will thus
+// invoke the Gitaly server's SSHUploadPackWithSidechannel endpoint.
+func runClone(
+	t *testing.T,
+	ctx context.Context,
+	cfg config.Cfg,
+	request *gitalypb.SSHUploadPackWithSidechannelRequest,
+	args ...string,
+) error {
+	payload, err := protojson.Marshal(request)
+	require.NoError(t, err)
+
+	var flagsWithValues []string
+	for flag, value := range featureflag.FromContext(ctx) {
+		flagsWithValues = append(flagsWithValues, flag.FormatWithValue(value))
+	}
+
+	var output bytes.Buffer
+	cloneCmd := gittest.NewCommand(t, cfg, append([]string{"clone"}, args...)...)
+	cloneCmd.Stdout = &output
+	cloneCmd.Stderr = &output
+	cloneCmd.Env = append(cloneCmd.Env,
+		fmt.Sprintf("GITALY_ADDRESS=%s", cfg.SocketPath),
+		fmt.Sprintf("GITALY_PAYLOAD=%s", payload),
+		fmt.Sprintf("GITALY_FEATUREFLAGS=%s", strings.Join(flagsWithValues, ",")),
+		fmt.Sprintf(`GIT_SSH_COMMAND=%s upload-pack`, cfg.BinaryPath("gitaly-ssh")),
+	)
+
+	if err := cloneCmd.Run(); err != nil {
+		return fmt.Errorf("Failed to run `git clone`: %q", output.Bytes())
+	}
+
+	return nil
+}
+
+func requireRevisionsEqual(t *testing.T, cfg config.Cfg, repoPathA, repoPathB, revision string) {
+	t.Helper()
+	require.Equal(t,
+		text.ChompBytes(gittest.Exec(t, cfg, "-C", repoPathA, "rev-parse", revision+"^{}")),
+		text.ChompBytes(gittest.Exec(t, cfg, "-C", repoPathB, "rev-parse", revision+"^{}")),
+	)
+}
+
+func TestUploadPackWithSidechannel_timeout(t *testing.T) {
+	t.Parallel()
+
+	runTestWithAndWithoutConfigOptions(t, testUploadPackWithSidechannelTimeout, testcfg.WithPackObjectsCacheEnabled())
+}
+
+func testUploadPackWithSidechannelTimeout(t *testing.T, ctx context.Context, opts ...testcfg.Option) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t, opts...)
+
+	cfg.SocketPath = runSSHServerWithOptions(t, cfg, []ServerOpt{
+		WithUploadPackRequestTimeoutTickerFactory(func() helper.Ticker {
+			// Create a ticker that will immediately tick when getting reset so that the
+			// server-side can observe this as an emulated timeout.
+			ticker := helper.NewManualTicker()
+			ticker.ResetFunc = func() {
+				ticker.Tick()
+			}
+			return ticker
+		}),
+	})
+
+	repo, repoPath := gittest.CreateRepository(t, testhelper.Context(t), cfg)
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	registry := sidechannel.NewRegistry()
+	client := newSSHClientWithSidechannel(t, ctx, registry, cfg.SocketPath)
+
+	ctx, waiter := sidechannel.RegisterSidechannel(ctx, registry, func(clientConn *sidechannel.ClientConn) (returnedErr error) {
+		// Discard all data and block on the connection closing. The client says nothing
+		// back to the server and doesn't finish the negotiation. This leads to the server
+		// closing the connections once the negotiation timeout fires.
+		_, err := io.Copy(io.Discard, clientConn)
+		assert.NoError(t, err)
+		return nil
+	})
+	defer testhelper.MustClose(t, waiter)
+
+	_, err := client.SSHUploadPackWithSidechannel(ctx, &gitalypb.SSHUploadPackWithSidechannelRequest{
+		Repository: repo,
+	})
+
+	// Because the client says nothing, the server would block. Because of
+	// the timeout, it won't block forever, and return with a non-zero exit
+	// code instead.
+	testhelper.RequireGrpcError(t, structerr.NewDeadlineExceeded("running upload-pack: waiting for negotiation: context canceled"), err)
+}
+
+func TestUploadPackWithSidechannel_client(t *testing.T) {
+	t.Parallel()
+
+	testhelper.NewFeatureSets(
+		featureflag.BundleURI,
+	).Run(t, testUploadPackWithSidechannelClient)
+}
+
+func testUploadPackWithSidechannelClient(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runSSHServer(t, cfg)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch))
+
+	registry := sidechannel.NewRegistry()
+	clientHandshaker := sidechannel.NewClientHandshaker(testhelper.SharedLogger(t), registry)
+	conn, err := client.New(ctx, cfg.SocketPath,
+		client.WithHandshaker(clientHandshaker),
+		client.WithGrpcOptions([]grpc.DialOption{
+			grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(cfg.Auth.Token)),
+		}))
+	require.NoError(t, err)
+
+	client := gitalypb.NewSSHServiceClient(conn)
+	defer testhelper.MustClose(t, conn)
+
+	for _, tc := range []struct {
+		desc             string
+		request          *gitalypb.SSHUploadPackWithSidechannelRequest
+		client           func(clientConn *sidechannel.ClientConn, cancelContext func()) error
+		expectedErr      error
+		expectedResponse *gitalypb.SSHUploadPackWithSidechannelResponse
+	}{
+		{
+			desc: "successful clone",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlinef(t, clientConn, "want %s multi_ack\n", commitID)
+				gittest.WritePktlineFlush(t, clientConn)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedResponse: &gitalypb.SSHUploadPackWithSidechannelResponse{
+				PackfileNegotiationStatistics: &gitalypb.PackfileNegotiationStatistics{
+					Packets: 2,
+					Caps:    []string{"multi_ack"},
+					Wants:   1,
+				},
+			},
+		},
+		{
+			desc: "successful clone with protocol v2",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+				gittest.WritePktlineString(t, clientConn, "agent=git/2.36.1\n")
+				gittest.WritePktlinef(t, clientConn, "object-format=%s\n", gittest.DefaultObjectHash.Format)
+				gittest.WritePktlineDelim(t, clientConn)
+				gittest.WritePktlinef(t, clientConn, "want %s\n", commitID)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+				gittest.WritePktlineFlush(t, clientConn)
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedResponse: &gitalypb.SSHUploadPackWithSidechannelResponse{
+				PackfileNegotiationStatistics: &gitalypb.PackfileNegotiationStatistics{
+					Packets: 5,
+					Wants:   1,
+				},
+			},
+		},
+		{
+			desc: "client talks protocol v0 but v2 is requested",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlinef(t, clientConn, "want %s multi_ack\n", commitID)
+				gittest.WritePktlineFlush(t, clientConn)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewInternal(
+				"running upload-pack: cmd wait: exit status 128, stderr: \"fatal: unknown capability 'want %s multi_ack'\\n\"",
+				commitID,
+			),
+		},
+		{
+			desc: "client talks protocol v2 but v0 is requested",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+				gittest.WritePktlineString(t, clientConn, "agent=git/2.36.1\n")
+				gittest.WritePktlinef(t, clientConn, "object-format=%s\n", gittest.DefaultObjectHash.Format)
+				gittest.WritePktlineDelim(t, clientConn)
+				gittest.WritePktlinef(t, clientConn, "want %s\n", commitID)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+				gittest.WritePktlineFlush(t, clientConn)
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewInternal(
+				"running upload-pack: cmd wait: exit status 128, stderr: %q",
+				"fatal: git upload-pack: protocol error, expected to get object ID, not 'command=fetch'\n",
+			),
+		},
+		{
+			desc: "request missing object",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				oid := strings.Repeat("1", gittest.DefaultObjectHash.EncodedLen())
+
+				gittest.WritePktlinef(t, clientConn, "want %s multi_ack\n", oid)
+				gittest.WritePktlineFlush(t, clientConn)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewInternal(
+				"running upload-pack: cmd wait: exit status 128, stderr: %q",
+				"fatal: git upload-pack: not our ref "+strings.Repeat("1", gittest.DefaultObjectHash.EncodedLen())+"\n",
+			),
+		},
+		{
+			desc: "request invalidly formatted object",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlineString(t, clientConn, "want 1111 multi_ack\n")
+				gittest.WritePktlineFlush(t, clientConn)
+				gittest.WritePktlineString(t, clientConn, "done\n")
+
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewInternal(
+				"running upload-pack: cmd wait: exit status 128, stderr: %q",
+				"fatal: git upload-pack: protocol error, expected to get object ID, not 'want 1111 multi_ack'\n",
+			),
+		},
+		{
+			desc: "missing input",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				require.NoError(t, clientConn.CloseWrite())
+				return nil
+			},
+			expectedResponse: &gitalypb.SSHUploadPackWithSidechannelResponse{
+				PackfileNegotiationStatistics: &gitalypb.PackfileNegotiationStatistics{},
+			},
+		},
+		{
+			desc: "short write",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+
+				_, err := io.WriteString(clientConn, "0011agent")
+				require.NoError(t, err)
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewCanceled("running upload-pack: user canceled the request"),
+		},
+		{
+			desc: "garbage",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, _ func()) error {
+				gittest.WritePktlineString(t, clientConn, "foobar")
+				require.NoError(t, clientConn.CloseWrite())
+				return nil
+			},
+			expectedErr: structerr.NewInternal(
+				"running upload-pack: cmd wait: exit status 128, stderr: %q",
+				"fatal: unknown capability 'foobar'\n",
+			),
+		},
+		{
+			desc: "close and cancellation",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, cancelContext func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+				gittest.WritePktlineString(t, clientConn, "agent=git/2.36.1\n")
+
+				require.NoError(t, clientConn.CloseWrite())
+				cancelContext()
+
+				return nil
+			},
+			expectedErr: structerr.NewCanceled("%w", context.Canceled),
+		},
+		{
+			desc: "cancellation and close",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, cancelContext func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+				gittest.WritePktlineString(t, clientConn, "agent=git/2.36.1\n")
+
+				cancelContext()
+				require.NoError(t, clientConn.CloseWrite())
+
+				return nil
+			},
+			expectedErr: structerr.NewCanceled("%w", context.Canceled),
+		},
+		{
+			desc: "cancellation without close",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			client: func(clientConn *sidechannel.ClientConn, cancelContext func()) error {
+				gittest.WritePktlineString(t, clientConn, "command=fetch\n")
+				gittest.WritePktlineString(t, clientConn, "agent=git/2.36.1\n")
+
+				cancelContext()
+
+				return nil
+			},
+			expectedErr: structerr.NewCanceled("%w", context.Canceled),
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(ctx)
+
+			ctx, waiter := sidechannel.RegisterSidechannel(ctx, registry, func(clientConn *sidechannel.ClientConn) (returnedErr error) {
+				errCh := make(chan error, 1)
+				go func() {
+					_, err := io.Copy(io.Discard, clientConn)
+					errCh <- err
+				}()
+				defer func() {
+					if err := <-errCh; err != nil && returnedErr == nil {
+						returnedErr = err
+					}
+				}()
+
+				return tc.client(clientConn, cancel)
+			})
+			defer testhelper.MustClose(t, waiter)
+
+			response, err := client.SSHUploadPackWithSidechannel(ctx, tc.request)
+			testhelper.RequireGrpcError(t, tc.expectedErr, err)
+			if tc.expectedResponse != nil && response != nil {
+				// The payload size is not deterministic(it's a different value in local-test end ci-test), so we set it to the expected value.
+				tc.expectedResponse.PackfileNegotiationStatistics.PayloadSize = response.GetPackfileNegotiationStatistics().GetPayloadSize()
+			}
+			testhelper.ProtoEqual(t, tc.expectedResponse, response)
+		})
+	}
+}
+
+func requireFailedSSHStream(t *testing.T, expectedErr error, recv func() (int32, error)) {
+	t.Helper()
+
+	done := make(chan struct{})
+	var code int32
+	var err error
+
+	go func() {
+		for err == nil {
+			code, err = recv()
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		testhelper.RequireGrpcError(t, expectedErr, err)
+		require.NotEqual(t, 0, code, "exit status")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for SSH stream")
+	}
+}
+
+func TestUploadPack_validation(t *testing.T) {
+	t.Parallel()
+
+	testhelper.NewFeatureSets(
+		featureflag.BundleURI,
+	).Run(t, testUploadPackValidation)
+}
+
+func testUploadPackValidation(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runSSHServer(t, cfg)
+
+	registry := sidechannel.NewRegistry()
+	client := newSSHClientWithSidechannel(t, ctx, registry, cfg.SocketPath)
+
+	for _, tc := range []struct {
+		desc        string
+		request     *gitalypb.SSHUploadPackWithSidechannelRequest
+		expectedErr error
+	}{
+		{
+			desc: "missing relative path",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: &gitalypb.Repository{
+					StorageName:  cfg.Storages[0].Name,
+					RelativePath: "",
+				},
+			},
+			expectedErr: structerr.NewInvalidArgument("%w", storage.ErrRepositoryPathNotSet),
+		},
+		{
+			desc: "missing repository",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: nil,
+			},
+			expectedErr: structerr.NewInvalidArgument("%w", storage.ErrRepositoryNotSet),
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx, waiter := sidechannel.RegisterSidechannel(ctx, registry, func(clientConn *sidechannel.ClientConn) (returnedErr error) {
+				require.NoError(t, clientConn.CloseWrite())
+				return nil
+			})
+			defer func() {
+				// The validation messages are returned before the RPC handler opens a sidechannel back.
+				// Thus, the waiter will properly fail.
+				_ = waiter.Close()
+			}()
+
+			_, err := client.SSHUploadPackWithSidechannel(ctx, tc.request)
+			testhelper.RequireGrpcError(t, tc.expectedErr, err)
+		})
+	}
+}
+
+func TestUploadPack_successful(t *testing.T) {
+	t.Parallel()
+	runTestWithAndWithoutConfigOptions(t, func(t *testing.T, ctx context.Context, opts ...testcfg.Option) {
+		testUploadPackSuccessful(t, ctx, opts...)
+	})
+}
+
+func testUploadPackSuccessful(t *testing.T, ctx context.Context, opts ...testcfg.Option) {
+	cfg := testcfg.Build(t, opts...)
+
+	testcfg.BuildGitalyHooks(t, cfg)
+	testcfg.BuildGitalySSH(t, cfg)
+
+	negotiationMetrics := prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"feature"})
+	servedBytesMetrics := prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"clone_type"})
+	protocolDetectingFactory := gittest.NewProtocolDetectingCommandFactory(t, ctx, cfg)
+
+	cfg.SocketPath = runSSHServerWithOptions(t, cfg, []ServerOpt{
+		WithPackfileNegotiationMetrics(negotiationMetrics),
+		WithUploadPackServedBytesMetrics(servedBytesMetrics),
+	}, testserver.WithGitCommandFactory(protocolDetectingFactory))
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	smallBlobID := gittest.WriteBlob(t, cfg, repoPath, []byte("foobar"))
+	largeBlobID := gittest.WriteBlob(t, cfg, repoPath, bytes.Repeat([]byte("1"), 2048))
+
+	// We set up the commits so that HEAD does not reference the above two blobs. If it did we'd
+	// fetch the blobs regardless of `--filter=blob:limit`.
+	rootCommitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(), gittest.WithTreeEntries(
+		gittest.TreeEntry{Path: "small", Mode: "100644", OID: smallBlobID},
+		gittest.TreeEntry{Path: "large", Mode: "100644", OID: largeBlobID},
+	))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(rootCommitID), gittest.WithBranch("main"), gittest.WithTreeEntries(
+		gittest.TreeEntry{Path: "unrelated", Mode: "100644", Content: "something"},
+	))
+	gittest.WriteTag(t, cfg, repoPath, "v1.0.0", rootCommitID.Revision())
+
+	for _, tc := range []struct {
+		desc             string
+		request          *gitalypb.SSHUploadPackWithSidechannelRequest
+		cloneArgs        []string
+		deepen           float64
+		cloneType        string
+		verify           func(t *testing.T, localRepoPath string)
+		expectedProtocol string
+	}{
+		{
+			desc: "full clone",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			cloneType: "full",
+		},
+		{
+			desc: "full clone with protocol v2",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			cloneType:        "full",
+			expectedProtocol: gitcmd.ProtocolV2,
+		},
+		{
+			desc: "shallow clone",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			cloneArgs: []string{
+				"--depth=1",
+			},
+			deepen:    1,
+			cloneType: "shallow",
+		},
+		{
+			desc: "shallow clone with protocol v2",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository:  repo,
+				GitProtocol: gitcmd.ProtocolV2,
+			},
+			cloneArgs: []string{
+				"--depth=1",
+			},
+			deepen:           1,
+			cloneType:        "shallow",
+			expectedProtocol: gitcmd.ProtocolV2,
+		},
+		{
+			desc: "partial clone",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+			},
+			cloneArgs: []string{
+				"--filter=blob:limit=1024",
+			},
+			cloneType: "partial",
+			verify: func(t *testing.T, repoPath string) {
+				gittest.RequireObjectNotExists(t, cfg, repoPath, largeBlobID)
+				gittest.RequireObjectExists(t, cfg, repoPath, smallBlobID)
+			},
+		},
+		{
+			desc: "hidden tags",
+			cloneArgs: []string{
+				"--mirror",
+			},
+			cloneType: "full",
+			request: &gitalypb.SSHUploadPackWithSidechannelRequest{
+				Repository: repo,
+				GitConfigOptions: []string{
+					"transfer.hideRefs=refs/tags",
+				},
+			},
+			verify: func(t *testing.T, localRepoPath string) {
+				// Assert that there is at least one tag that should've been cloned
+				// if refs weren't hidden as expected
+				require.NotEmpty(t, gittest.Exec(t, cfg, "-C", repoPath, "tag"))
+
+				// And then verify that we did indeed hide tags as expected, which
+				// is demonstrated by not having fetched any tags.
+				require.Empty(t, gittest.Exec(t, cfg, "-C", localRepoPath, "tag"))
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			localRepoPath := testhelper.TempDir(t)
+
+			negotiationMetrics.Reset()
+			servedBytesMetrics.Reset()
+			protocolDetectingFactory.Reset(t)
+
+			require.NoError(t, runClone(t, ctx, cfg, tc.request,
+				append([]string{
+					"git@localhost:test/test.git", localRepoPath,
+				}, tc.cloneArgs...)...,
+			))
+
+			requireRevisionsEqual(t, cfg, repoPath, localRepoPath, "refs/heads/main")
+
+			metric, err := negotiationMetrics.GetMetricWithLabelValues("deepen")
+			require.NoError(t, err)
+			require.Equal(t, tc.deepen, promtest.ToFloat64(metric))
+
+			servedBytes, err := servedBytesMetrics.GetMetricWithLabelValues(tc.cloneType)
+			require.NoError(t, err)
+			require.Greater(t, promtest.ToFloat64(servedBytes), 0.0,
+				"expected served bytes to be recorded under clone type %q", tc.cloneType)
+
+			if tc.verify != nil {
+				tc.verify(t, localRepoPath)
+			}
+
+			protocol := protocolDetectingFactory.ReadProtocol(t)
+			if tc.expectedProtocol != "" {
+				require.Contains(t, protocol, fmt.Sprintf("GIT_PROTOCOL=%s\n", gitcmd.ProtocolV2))
+			} else {
+				require.Empty(t, protocol)
+			}
+		})
+	}
+}
+
+type mockStreamCache struct {
+	fetch func(ctx context.Context, key string, dst io.Writer, create func(io.Writer) error) (written int64, created bool, err error)
+	streamcache.Cache
+}
+
+func (m mockStreamCache) Fetch(ctx context.Context, key string, dst io.Writer, create func(io.Writer) error) (written int64, created bool, err error) {
+	return m.fetch(ctx, key, dst, create)
+}
+
+func newRepositoryClient(tb testing.TB, cfg config.Cfg) gitalypb.RepositoryServiceClient {
+	conn, err := client.New(testhelper.Context(tb), cfg.SocketPath)
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, conn.Close()) })
+
+	return gitalypb.NewRepositoryServiceClient(conn)
+}
+
+func TestUploadPack_packObjectsHook(t *testing.T) {
+	t.Parallel()
+
+	t.Run("with backpressure", func(t *testing.T) {
+		cfg := testcfg.Build(t, testcfg.WithPackObjectsCacheEnabled())
+
+		require.True(t, cfg.PackObjectsCache.Enabled)
+		require.True(t, cfg.PackObjectsCache.Backpressure)
+
+		testUploadPackPackObjectsHook(t, cfg)
+	})
+
+	t.Run("without backpressure", func(t *testing.T) {
+		cfg := testcfg.Build(t, testcfg.WithPackObjectsCacheEnabled())
+		cfg.PackObjectsCache.Backpressure = false
+
+		testUploadPackPackObjectsHook(t, cfg)
+	})
+}
+
+func testUploadPackPackObjectsHook(t *testing.T, cfg config.Cfg) {
+	ctx := testhelper.Context(t)
+
+	testcfg.BuildGitalySSH(t, cfg)
+	testcfg.BuildGitalyHooks(t, cfg)
+
+	cache := streamcache.New(cfg.PackObjectsCache, testhelper.SharedLogger(t))
+	defer cache.Stop()
+
+	var packObjectsCacheKeys []string
+	cfg.SocketPath = runSSHServer(t, cfg, testserver.WithPackObjectsCache(mockStreamCache{
+		fetch: func(ctx context.Context, key string, dst io.Writer, create func(io.Writer) error) (written int64, created bool, err error) {
+			packObjectsCacheKeys = append(packObjectsCacheKeys, key)
+			return cache.Fetch(ctx, key, dst, create)
+		},
+	}))
+
+	repo, repoPath := gittest.CreateRepository(t, testhelper.Context(t), cfg)
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch))
+
+	require.NoError(t, runClone(t, ctx, cfg, &gitalypb.SSHUploadPackWithSidechannelRequest{
+		Repository: repo,
+	}, "git@localhost:test/test.git", testhelper.TempDir(t)))
+
+	// Perform a write into the repository before doing the second clone. We want to
+	// ensure that the cache key does not change even if the second clone runs in a
+	// different transaction snapshot due to the write.
+	resp, err := newRepositoryClient(t, cfg).WriteRef(ctx, &gitalypb.WriteRefRequest{
+		Repository: repo,
+		Ref:        []byte("refs/heads/invalidate-snapshot"),
+		Revision:   []byte(commitID),
+	})
+	require.NoError(t, err)
+	testhelper.ProtoEqual(t, &gitalypb.WriteRefResponse{}, resp)
+
+	require.NoError(t, runClone(t, ctx, cfg, &gitalypb.SSHUploadPackWithSidechannelRequest{
+		Repository: repo,
+	}, "git@localhost:test/test.git", testhelper.TempDir(t)))
+
+	// We expect two calls to the pack-objects cache as we run two clones.
+	require.Len(t, packObjectsCacheKeys, 2)
+	// The pack-objects cache should be called with the same key as the clones
+	// target the same repository.
+	require.Equal(t, packObjectsCacheKeys[0], packObjectsCacheKeys[1])
+}
+
+func TestUploadPack_withoutSideband(t *testing.T) {
+	t.Parallel()
+
+	runTestWithAndWithoutConfigOptions(t, testUploadPackWithoutSideband, testcfg.WithPackObjectsCacheEnabled())
+}
+
+func testUploadPackWithoutSideband(t *testing.T, ctx context.Context, opts ...testcfg.Option) {
+	cfg := testcfg.Build(t, opts...)
+
+	testcfg.BuildGitalySSH(t, cfg)
+	testcfg.BuildGitalyHooks(t, cfg)
+
+	cfg.SocketPath = runSSHServer(t, cfg)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch))
+
+	// While Git knows the side-band-64 capability, some other clients don't. There is no way
+	// though to have Git not use that capability, so we're instead manually crafting a packfile
+	// negotiation without that capability and send it along.
+	negotiation := bytes.NewBuffer([]byte{})
+	gittest.WritePktlinef(t, negotiation, "want %s multi_ack_detailed thin-pack include-tag ofs-delta agent=git/2.29.1", commitID)
+	gittest.WritePktlinef(t, negotiation, "want %s", commitID)
+	gittest.WritePktlineFlush(t, negotiation)
+	gittest.WritePktlineString(t, negotiation, "done")
+
+	request := &gitalypb.SSHUploadPackWithSidechannelRequest{
+		Repository: repo,
+	}
+	payload, err := protojson.Marshal(request)
+	require.NoError(t, err)
+
+	// As we're not using the sideband, the remote process will write both to stdout and stderr.
+	// Those simultaneous writes to both stdout and stderr created a race as we could've invoked
+	// two concurrent `SendMsg`s on the gRPC stream. And given that `SendMsg` is not thread-safe
+	// a deadlock would result.
+	uploadPack := exec.CommandContext(ctx, cfg.BinaryPath("gitaly-ssh"), "upload-pack", "dontcare", "dontcare")
+	uploadPack.Env = []string{
+		fmt.Sprintf("GITALY_ADDRESS=%s", cfg.SocketPath),
+		fmt.Sprintf("GITALY_PAYLOAD=%s", payload),
+	}
+	uploadPack.Stdin = negotiation
+
+	out, err := uploadPack.CombinedOutput()
+	require.NoError(t, err)
+	require.True(t, uploadPack.ProcessState.Success())
+	require.Contains(t, string(out), git.DefaultRef.String())
+	require.Contains(t, string(out), "Counting objects")
+	require.Contains(t, string(out), "PACK")
+}
+
+func TestUploadPack_invalidStorage(t *testing.T) {
+	t.Parallel()
+
+	testhelper.NewFeatureSets(
+		featureflag.BundleURI,
+	).Run(t, testUploadPackInvalidStorage)
+}
+
+func testUploadPackInvalidStorage(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runSSHServer(t, cfg)
+
+	testcfg.BuildGitalySSH(t, cfg)
+
+	repo, _ := gittest.CreateRepository(t, testhelper.Context(t), cfg)
+
+	localRepoPath := testhelper.TempDir(t)
+
+	err := runClone(t, ctx, cfg, &gitalypb.SSHUploadPackWithSidechannelRequest{
+		Repository: &gitalypb.Repository{
+			StorageName:  "foobar",
+			RelativePath: repo.GetRelativePath(),
+		},
+	}, "git@localhost:test/test.git", localRepoPath)
+	require.Error(t, err)
+
+	require.Contains(t, err.Error(), fmt.Sprintf("rpc error: code = InvalidArgument desc = %s", storage.NewStorageNotFoundError("foobar")))
+}
+
+func TestUploadPack_gitFailure(t *testing.T) {
+	t.Parallel()
+
+	testhelper.NewFeatureSets(
+		featureflag.BundleURI,
+	).Run(t, testUploadPackGitFailure)
+}
+
+func testUploadPackGitFailure(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runSSHServer(t, cfg)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	registry := sidechannel.NewRegistry()
+	client := newSSHClientWithSidechannel(t, ctx, registry, cfg.SocketPath)
+
+	// Writing an invalid config will allow repo to pass the `ValidateRepository` check but still
+	// trigger an error when git tries to access the repo.
+	//
+	// Remove the config file first as files are read-only with transactions.
+	configPath := filepath.Join(repoPath, "config")
+	require.NoError(t, os.Remove(configPath))
+	require.NoError(t, os.WriteFile(configPath, []byte("Not a valid gitconfig"), mode.File))
+
+	ctx, waiter := sidechannel.RegisterSidechannel(ctx, registry, func(clientConn *sidechannel.ClientConn) (returnedErr error) {
+		require.NoError(t, clientConn.CloseWrite())
+		return nil
+	})
+	defer testhelper.MustClose(t, waiter)
+
+	_, err := client.SSHUploadPackWithSidechannel(ctx, &gitalypb.SSHUploadPackWithSidechannelRequest{Repository: repo})
+	testhelper.RequireGrpcError(t,
+		structerr.NewInternal(`running upload-pack: cmd wait: exit status 128, stderr: "fatal: bad config line 1 in file ./config\n"`),
+		err,
+	)
+}

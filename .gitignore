@@ -1,0 +1,23 @@
+# Generic artifacts
+/_build/
+/*.deb
+
+# Gem build artifacts
+/gitaly-*.gem
+
+# Configuration and runtime data
+/config.mak
+/*.toml
+
+## macOS
+.DS_Store
+
+## IDE
+.idea
+
+## AI
+# Only user-specific overrides are ignored.
+.claude/settings.local.json
+
+## Skaffold
+k8s/statefulset.yaml

@@ -1,0 +1,928 @@
+package gitlab
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/promtest"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/require"
+	grpcmetadata "google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
+)
+
+type postReceiveRequest struct {
+	GLRepository  string   `json:"gl_repository,omitempty"`
+	Identifier    string   `json:"identifier,omitempty"`
+	Changes       string   `json:"changes,omitempty"`
+	PushOptions   []string `json:"push_options,omitempty"`
+	ClientContext []byte   `json:"gitaly_client_context_bin,omitempty"`
+}
+
+// TestAllowedVerifyParams uses client cert fixtures to test TLS connections. To
+// regenerate these certs, run `go generate access_test.go`.
+//
+//go:generate openssl req -newkey rsa:4096 -new -nodes -x509 -days 3650 -out testdata/certs/server.crt -keyout testdata/certs/server.key -subj "/C=US/ST=California/L=San Francisco/O=GitLab/OU=GitLab-Shell/CN=localhost" -addext "subjectAltName = IP:127.0.0.1"
+func TestAccess_verifyParams(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	user, password := "user", "password"
+	secretToken := "topsecret"
+	glID, glRepository := "key-123", "repo-1"
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+
+	changes := "changes1\nchanges2\nchanges3"
+	protocol := "protocol"
+
+	repo.GitObjectDirectory = "object/dir"
+	repo.GitAlternateObjectDirectories = []string{"alt/object/dir1", "alt/object/dir2"}
+
+	gitObjectDirFull := filepath.Join(repoPath, repo.GetGitObjectDirectory())
+	var gitAlternateObjectDirsFull []string
+
+	for _, gitAlternateObjectDirRel := range repo.GetGitAlternateObjectDirectories() {
+		gitAlternateObjectDirsFull = append(gitAlternateObjectDirsFull, filepath.Join(repoPath, gitAlternateObjectDirRel))
+	}
+
+	tempDir := testhelper.TempDir(t)
+	WriteShellSecretFile(t, tempDir, secretToken)
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	certificate := testhelper.GenerateCertificate(t)
+
+	serverURL, cleanup := NewTestServer(t, TestServerOptions{
+		User:                        user,
+		Password:                    password,
+		SecretToken:                 secretToken,
+		GLID:                        glID,
+		GLRepository:                glRepository,
+		Changes:                     changes,
+		PostReceiveCounterDecreased: true,
+		Protocol:                    protocol,
+		GitPushOptions:              nil,
+		GitObjectDir:                gitObjectDirFull,
+		GitAlternateObjectDirs:      gitAlternateObjectDirsFull,
+		RepoPath:                    repoPath,
+		ClientCertificate:           &certificate,
+		ServerCertificate:           &certificate,
+	})
+	defer cleanup()
+
+	c, err := NewHTTPClient(
+		testhelper.SharedLogger(t),
+		config.Gitlab{
+			URL:        serverURL,
+			SecretFile: secretFilePath,
+			HTTPSettings: config.HTTPSettings{
+				User:     user,
+				Password: password,
+				CAFile:   certificate.CertPath,
+			},
+		},
+		config.TLS{
+			CertPath: certificate.CertPath,
+			KeyPath:  certificate.KeyPath,
+		},
+		prometheus.Config{},
+	)
+	require.NoError(t, err)
+
+	badRepo := proto.Clone(repo).(*gitalypb.Repository)
+	badRepo.GitObjectDirectory = filepath.Join(repoPath, "bad/object/directory")
+
+	testCases := []struct {
+		desc                                  string
+		repo                                  *gitalypb.Repository
+		glRepository, glID, protocol, changes string
+		allowed                               bool
+	}{
+		{
+			desc:         "success",
+			repo:         repo,
+			glRepository: glRepository,
+			glID:         glID,
+			protocol:     protocol,
+			changes:      changes,
+			allowed:      true,
+		},
+		{
+			desc:         "repo with bad quarantine directories",
+			repo:         badRepo,
+			glRepository: glRepository,
+			glID:         glID,
+			protocol:     protocol,
+			changes:      changes,
+			allowed:      false,
+		},
+	}
+
+	for _, tc := range testCases {
+		allowed, _, err := c.Allowed(ctx, AllowedParams{
+			RepoPath:                      tc.repo.GetRelativePath(),
+			GitObjectDirectory:            tc.repo.GetGitObjectDirectory(),
+			GitAlternateObjectDirectories: tc.repo.GetGitAlternateObjectDirectories(),
+			GLRepository:                  tc.glRepository,
+			GLID:                          tc.glID,
+			GLProtocol:                    tc.protocol,
+			Changes:                       tc.changes,
+		})
+		require.NoError(t, err)
+		require.Equal(t, tc.allowed, allowed)
+	}
+}
+
+func TestAccess_escapedAndRelativeURLs(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	user, password := "user", "password"
+	secretToken := "topsecret"
+	glID, glRepository := "key-123", "repo-1"
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+
+	changes := "changes1\nchanges2\nchanges3"
+	protocol := "protocol"
+
+	repo.GitObjectDirectory = "object/dir"
+	repo.GitAlternateObjectDirectories = []string{"alt/object/dir1", "alt/object/dir2"}
+
+	gitObjectDirFull := filepath.Join(repoPath, repo.GetGitObjectDirectory())
+	var gitAlternateObjectDirsFull []string
+
+	for _, gitAlternateObjectDirRel := range repo.GetGitAlternateObjectDirectories() {
+		gitAlternateObjectDirsFull = append(gitAlternateObjectDirsFull, filepath.Join(repoPath, gitAlternateObjectDirRel))
+	}
+
+	tempDir := testhelper.TempDir(t)
+	WriteShellSecretFile(t, tempDir, secretToken)
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	testCases := []struct {
+		desc            string
+		escaped         bool
+		relativeURLRoot string
+		unixSocket      bool
+	}{
+		{
+			desc: "unescaped URL",
+		},
+		{
+			desc:    "escaped URL",
+			escaped: true,
+		},
+		{
+			desc:       "UNIX socket with no relative root",
+			unixSocket: true,
+		},
+		{
+			desc:            "UNIX socket with / root",
+			unixSocket:      true,
+			relativeURLRoot: "/",
+		},
+		{
+			desc:            "UNIX socket with /gitlab root",
+			unixSocket:      true,
+			relativeURLRoot: "/gitlab",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			serverURL, cleanup := NewTestServer(t, TestServerOptions{
+				User:                        user,
+				Password:                    password,
+				SecretToken:                 secretToken,
+				GLID:                        glID,
+				GLRepository:                glRepository,
+				Changes:                     changes,
+				PostReceiveCounterDecreased: true,
+				Protocol:                    protocol,
+				GitPushOptions:              nil,
+				GitObjectDir:                gitObjectDirFull,
+				GitAlternateObjectDirs:      gitAlternateObjectDirsFull,
+				RepoPath:                    repoPath,
+				RelativeURLRoot:             tc.relativeURLRoot,
+				UnixSocket:                  tc.unixSocket,
+			})
+			defer cleanup()
+
+			if tc.escaped {
+				serverURL = url.PathEscape(serverURL)
+			}
+
+			c, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:             serverURL,
+					RelativeURLRoot: tc.relativeURLRoot,
+					SecretFile:      secretFilePath,
+					HTTPSettings: config.HTTPSettings{
+						User:     user,
+						Password: password,
+					},
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			allowed, _, err := c.Allowed(ctx, AllowedParams{
+				RepoPath:                      repo.GetRelativePath(),
+				GitObjectDirectory:            repo.GetGitObjectDirectory(),
+				GitAlternateObjectDirectories: repo.GetGitAlternateObjectDirectories(),
+				GLID:                          glID,
+				GLRepository:                  glRepository,
+				GLProtocol:                    protocol,
+				Changes:                       changes,
+			})
+			require.NoError(t, err)
+			require.True(t, allowed)
+		})
+	}
+}
+
+func TestAccess_allowedResponseHandling(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+
+	// set git quarantine directories
+	gitObjectDir := filepath.Join(repoPath, "quarantine", "object", "dir")
+	repo.GitObjectDirectory = gitObjectDir
+	gitAltObjectDir := filepath.Join(repoPath, "objects")
+	repo.GitAlternateObjectDirectories = []string{gitAltObjectDir}
+
+	tempDir := testhelper.TempDir(t)
+	WriteShellSecretFile(t, tempDir, "secret_token")
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+	pushOptions := []string{"mr.create"}
+
+	testCases := []struct {
+		desc           string
+		allowedHandler func(w http.ResponseWriter, r *http.Request)
+		allowed        bool
+		errMsg         string
+	}{
+		{
+			desc: "allowed",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				defer testhelper.MustClose(t, r.Body)
+
+				// Validate client sends repository relative path.
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, repo.GetRelativePath(), reqBody.RelativePath)
+				require.Equal(t, pushOptions, reqBody.PushOptions)
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"status": true}`))
+				require.NoError(t, err)
+			},
+			allowed: true,
+			errMsg:  "",
+		},
+
+		{
+			desc: "not allowed",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"status": false, "message": "this change is not allowed"}`))
+				require.NoError(t, err)
+			},
+			allowed: false,
+			errMsg:  "this change is not allowed",
+		},
+		{
+			desc: "bad content type in response",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "bad mime type")
+				w.WriteHeader(http.StatusOK)
+			},
+			allowed: false,
+			errMsg:  "unsupported content type",
+		},
+		{
+			desc: "internal server error",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, err := w.Write([]byte(`{"status": true}`))
+				require.NoError(t, err)
+			},
+			allowed: false,
+			errMsg:  "",
+		},
+		{
+			desc: "bad response",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`this is not json`))
+				require.NoError(t, err)
+			},
+			allowed: false,
+			errMsg:  "decoding response from /allowed endpoint",
+		},
+		{
+			desc: "status multiple choice",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusMultipleChoices)
+				_, err := w.Write([]byte(`{"status": true}`))
+				require.NoError(t, err)
+			},
+			allowed: true,
+			errMsg:  "",
+		},
+		{
+			desc: "status unauthorized with message",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, err := w.Write([]byte(`{"message": "you're not allowed here'"}`))
+				require.NoError(t, err)
+			},
+			allowed: false,
+			errMsg:  "you're not allowed here",
+		},
+		{
+			desc: "status unauthorized",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+			},
+			allowed: false,
+			errMsg:  "Internal API error",
+		},
+		{
+			desc: "status not found",
+			allowedHandler: func(w http.ResponseWriter, r *http.Request) {
+				var reqBody allowedRequest
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&reqBody))
+				require.Equal(t, []byte("foobar"), reqBody.ClientContext)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, err := w.Write([]byte(`{"message": "not found"}`))
+				require.NoError(t, err)
+			},
+			allowed: false,
+			errMsg:  "not found",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(tc.allowedHandler))
+			defer server.Close()
+
+			c, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:        server.URL,
+					SecretFile: secretFilePath,
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			mockHistogramVec := promtest.NewMockHistogramVec()
+			c.latencyMetric = mockHistogramVec
+
+			allowed, message, err := c.Allowed(ctx, AllowedParams{
+				RepoPath:                      repoPath,
+				RelativePath:                  repo.GetRelativePath(),
+				GitObjectDirectory:            repo.GetGitObjectDirectory(),
+				GitAlternateObjectDirectories: repo.GetGitAlternateObjectDirectories(),
+				GLRepository:                  "repo-1",
+				GLID:                          "key-123",
+				GLProtocol:                    "http",
+				Changes:                       "a\nb\nc\nd",
+				ClientContext:                 []byte("foobar"),
+				PushOptions:                   pushOptions,
+			})
+			require.Equal(t, tc.allowed, allowed)
+			if err != nil {
+				require.Contains(t, err.Error(), tc.errMsg)
+			} else {
+				require.Equal(t, tc.errMsg, message)
+			}
+
+			require.Equal(t, [][]string{{"allowed"}}, mockHistogramVec.LabelsCalled())
+		})
+	}
+}
+
+func TestAccess_preReceive(t *testing.T) {
+	tempDir := testhelper.TempDir(t)
+
+	WriteShellSecretFile(t, tempDir, "secret_token")
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	testCases := []struct {
+		desc              string
+		prereceiveHandler func(w http.ResponseWriter, r *http.Request)
+		success           bool
+		errMsg            string
+	}{
+		{
+			desc: "everything ok",
+			prereceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"reference_counter_increased": true}`))
+				require.NoError(t, err)
+			},
+			success: true,
+			errMsg:  "",
+		},
+		{
+			desc: "reference counter not increased",
+			prereceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"reference_counter_increased": false}`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "",
+		},
+		{
+			desc: "server unavailable",
+			prereceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, err := w.Write([]byte(`{"message": "server is down!"}`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "server is down!",
+		},
+		{
+			desc: "non json content type",
+			prereceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"reference_counter_increased": true}`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "unsupported content type",
+		},
+		{
+			desc: "bad data",
+			prereceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`not json`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "decoding response from /pre_receive endpoint",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(tc.prereceiveHandler))
+			defer server.Close()
+
+			c, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:        server.URL,
+					SecretFile: secretFilePath,
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			mockHistogramVec := promtest.NewMockHistogramVec()
+			c.latencyMetric = mockHistogramVec
+			ctx := testhelper.Context(t)
+
+			success, err := c.PreReceive(ctx, "key-123")
+			require.Equal(t, tc.success, success)
+			if err != nil {
+				require.Contains(t, err.Error(), tc.errMsg)
+			}
+
+			require.Equal(t, [][]string{{"pre-receive"}}, mockHistogramVec.LabelsCalled())
+		})
+	}
+}
+
+func TestAccess_postReceive(t *testing.T) {
+	tempDir := testhelper.TempDir(t)
+
+	WriteShellSecretFile(t, tempDir, "secret_token")
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+	var receivedRequest postReceiveRequest
+
+	testCases := []struct {
+		desc               string
+		postReceiveHandler func(w http.ResponseWriter, r *http.Request)
+		pushOptions        []string
+		success            bool
+		errMsg             string
+	}{
+		{
+			desc: "everything ok",
+			postReceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				err := json.NewDecoder(r.Body).Decode(&receivedRequest)
+				require.NoError(t, err)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err = w.Write([]byte(`{"reference_counter_decreased": true}`))
+				require.NoError(t, err)
+			},
+			pushOptions: []string{"mr.create", "mr.label=test"},
+			success:     true,
+			errMsg:      "",
+		},
+		{
+			desc: "reference counter not decreased",
+			postReceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				err := json.NewDecoder(r.Body).Decode(&receivedRequest)
+				require.NoError(t, err)
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err = w.Write([]byte(`{"reference_counter_increased": false}`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "",
+		},
+		{
+			desc: "server unavailable",
+			postReceiveHandler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, err := w.Write([]byte(`{"message": "server is down!"}`))
+				require.NoError(t, err)
+			},
+			success: false,
+			errMsg:  "server is down!",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			receivedRequest = postReceiveRequest{}
+			server := httptest.NewServer(http.HandlerFunc(tc.postReceiveHandler))
+			defer server.Close()
+
+			c, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:        server.URL,
+					SecretFile: secretFilePath,
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			mockHistogramVec := promtest.NewMockHistogramVec()
+			c.latencyMetric = mockHistogramVec
+			ctx := testhelper.Context(t)
+
+			repositoryID := "project-123"
+			identifier := "key-123"
+			changes := "000 000 refs/heads/master"
+			clientCtx := []byte("foobar")
+			success, _, err := c.PostReceive(ctx, repositoryID, identifier, changes, clientCtx, tc.pushOptions...)
+			require.Equal(t, tc.success, success)
+			if err != nil {
+				require.Contains(t, err.Error(), tc.errMsg)
+			} else {
+				require.Equal(t, repositoryID, receivedRequest.GLRepository)
+				require.Equal(t, identifier, receivedRequest.Identifier)
+				require.Equal(t, changes, receivedRequest.Changes)
+				require.Equal(t, tc.pushOptions, receivedRequest.PushOptions)
+				require.Equal(t, clientCtx, receivedRequest.ClientContext)
+			}
+
+			require.Equal(t, [][]string{{"post-receive"}}, mockHistogramVec.LabelsCalled())
+		})
+	}
+}
+
+func Test_ObjectPoolMembers(t *testing.T) {
+	tempDir := testhelper.TempDir(t)
+
+	WriteShellSecretFile(t, tempDir, "secret_token")
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	testCases := []struct {
+		desc            string
+		handler         func(w http.ResponseWriter, r *http.Request)
+		diskPaths       []string
+		storage         string
+		upstreamOnly    bool
+		expectedMembers map[string][]ObjectPoolMember
+		shouldError     bool
+	}{
+		{
+			desc:      "successful response with members",
+			diskPaths: []string{"@pools/ab/cd/abcdef1234567890"},
+			storage:   "default",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodGet, r.Method)
+				require.Equal(t, []string{"@pools/ab/cd/abcdef1234567890"}, r.URL.Query()["disk_paths[]"])
+				require.Equal(t, "default", r.URL.Query().Get("storage"))
+				require.Empty(t, r.URL.Query().Get("upstream_only"))
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{
+					"@pools/ab/cd/abcdef1234567890": [
+						{"relative_path": "@hashed/ab/cd/abcdef.git", "public": true, "is_upstream": true},
+						{"relative_path": "@hashed/ef/gh/efghij.git", "public": false, "is_upstream": false}
+					]
+				}`))
+				require.NoError(t, err)
+			},
+			expectedMembers: map[string][]ObjectPoolMember{
+				"@pools/ab/cd/abcdef1234567890": {
+					{RelativePath: "@hashed/ab/cd/abcdef.git", Public: true, IsUpstream: true},
+					{RelativePath: "@hashed/ef/gh/efghij.git", Public: false, IsUpstream: false},
+				},
+			},
+		},
+		{
+			desc:         "upstream only",
+			diskPaths:    []string{"@pools/ab/cd/abcdef1234567890"},
+			storage:      "default",
+			upstreamOnly: true,
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, "true", r.URL.Query().Get("upstream_only"))
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{
+					"@pools/ab/cd/abcdef1234567890": [
+						{"relative_path": "@hashed/ab/cd/abcdef.git", "public": true, "is_upstream": true}
+					]
+				}`))
+				require.NoError(t, err)
+			},
+			expectedMembers: map[string][]ObjectPoolMember{
+				"@pools/ab/cd/abcdef1234567890": {
+					{RelativePath: "@hashed/ab/cd/abcdef.git", Public: true, IsUpstream: true},
+				},
+			},
+		},
+		{
+			desc: "multiple disk paths",
+			diskPaths: []string{
+				"@pools/ab/cd/pool1",
+				"@pools/ef/gh/pool2",
+			},
+			storage: "default",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, []string{
+					"@pools/ab/cd/pool1",
+					"@pools/ef/gh/pool2",
+				}, r.URL.Query()["disk_paths[]"])
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{
+					"@pools/ab/cd/pool1": [
+						{"relative_path": "repo1.git", "public": true, "is_upstream": true}
+					],
+					"@pools/ef/gh/pool2": []
+				}`))
+				require.NoError(t, err)
+			},
+			expectedMembers: map[string][]ObjectPoolMember{
+				"@pools/ab/cd/pool1": {
+					{RelativePath: "repo1.git", Public: true, IsUpstream: true},
+				},
+				"@pools/ef/gh/pool2": {},
+			},
+		},
+		{
+			desc:      "empty members",
+			diskPaths: []string{"@pools/ab/cd/abcdef1234567890"},
+			storage:   "default",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, err := w.Write([]byte(`{"@pools/ab/cd/abcdef1234567890": []}`))
+				require.NoError(t, err)
+			},
+			expectedMembers: map[string][]ObjectPoolMember{
+				"@pools/ab/cd/abcdef1234567890": {},
+			},
+		},
+		{
+			desc:      "server error",
+			diskPaths: []string{"@pools/ab/cd/nonexistent"},
+			storage:   "default",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			shouldError: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(tc.handler))
+			defer server.Close()
+
+			c, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:        server.URL,
+					SecretFile: secretFilePath,
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			ctx := testhelper.Context(t)
+
+			members, err := c.ObjectPoolMembers(ctx, tc.diskPaths, tc.storage, tc.upstreamOnly)
+			if tc.shouldError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.expectedMembers, members)
+			}
+		})
+	}
+}
+
+func TestAccess_remoteIPForwardedAllowed(t *testing.T) {
+	tempDir := testhelper.TempDir(t)
+
+	WriteShellSecretFile(t, tempDir, "secret_token")
+
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	remoteIP := "10.1.2.3"
+	var forwardedFor string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedFor = r.Header.Get("X-Forwarded-For")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(`{"status": true}`))
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	c, err := NewHTTPClient(
+		testhelper.SharedLogger(t),
+		config.Gitlab{
+			URL:        server.URL,
+			SecretFile: secretFilePath,
+		},
+		config.TLS{},
+		prometheus.Config{},
+	)
+	require.NoError(t, err)
+
+	ctx := testhelper.Context(t)
+	ctx = grpcmetadata.AppendToOutgoingContext(ctx, "remote_ip", remoteIP)
+	ctx = metadata.OutgoingToIncoming(ctx)
+
+	allowed, _, err := c.Allowed(ctx, AllowedParams{
+		GLRepository: "project-1",
+		GLID:         "user-1",
+		GLProtocol:   "http",
+	})
+	require.NoError(t, err)
+	require.True(t, allowed)
+	require.Equal(t, remoteIP, forwardedFor)
+}
+
+func TestNewHTTPClient_gitlabSecretConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	tempDir := testhelper.TempDir(t)
+	WriteShellSecretFile(t, tempDir, "secret_file_token")
+	secretFilePath := filepath.Join(tempDir, ".gitlab_shell_secret")
+
+	for _, tc := range []struct {
+		desc          string
+		secret        string
+		secretFile    string
+		expectedToken string
+	}{
+		{
+			desc:          "secret set",
+			secret:        "secret_token",
+			expectedToken: "secret_token",
+		},
+		{
+			desc:          "secret file set",
+			secretFile:    secretFilePath,
+			expectedToken: "secret_file_token",
+		},
+		{
+			desc: "secret and secret file set",
+			// A config with both the secret and secret file configured results in a validation
+			// error. Without validation, the directly configured secret is favored.
+			secret:        "secret_token",
+			secretFile:    secretFilePath,
+			expectedToken: "secret_token",
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				require.True(t, verifyJWT(request.Header.Get("Gitlab-Shell-Api-Request"), tc.expectedToken))
+			}))
+			defer server.Close()
+
+			httpClient, err := NewHTTPClient(
+				testhelper.SharedLogger(t),
+				config.Gitlab{
+					URL:        server.URL,
+					Secret:     tc.secret,
+					SecretFile: tc.secretFile,
+				},
+				config.TLS{},
+				prometheus.Config{},
+			)
+			require.NoError(t, err)
+
+			// Make a request with the HTTP client to invoke the server handler that validates the
+			// correct secret is sent.
+			resp, err := httpClient.Get(ctx, "")
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+		})
+	}
+}

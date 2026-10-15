@@ -1,0 +1,1155 @@
+#!/usr/bin/env python3
+"""
+provision-repos - idempotently provision benchmark repositories in a
+chart-installed GitLab and write their hashed disk paths back into the
+experiment's config.yml.
+
+The in-cluster flow has no filesystem access to storage nodes, so repos
+are created and imported via Rails APIs rather than cloned onto disk.
+
+For A/B comparisons a second, identical project set (BENCH_CONTROL_GROUP)
+is provisioned onto the control Gitaly's Rails storage
+(CONTROL_STORAGE_NAME) through the same pipeline, so both sides start
+from identically constructed state. Skipped when the storage isn't
+registered in Rails.
+
+Each set is made public, swept of stray workload refs, fetched when the
+pinned `revision` is missing, pinned on its default branch, and given
+the `additional_refs` zzz refs through Gitaly's write path. Re-runs are
+safe: existing projects are reused.
+
+Usage:
+    EXPERIMENT=incluster-master ./incluster/provision-repos
+    EXPERIMENT=incluster-master ./incluster/provision-repos --write-config
+
+The first form prints the YAML snippet for review; the second edits
+config.yml in place.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+# ruamel.yaml roundtrips comments and key order; fall back to PyYAML
+# (already required elsewhere) - still valid YAML, just reformatted.
+try:
+    from ruamel.yaml import YAML  # type: ignore
+
+    _yaml = YAML()
+    _yaml.preserve_quotes = True
+    _yaml.indent(mapping=2, sequence=2, offset=0)
+
+    def _load(p: Path):
+        with p.open() as f:
+            return _yaml.load(f)
+
+    def _dump(data, p: Path) -> None:
+        with p.open("w") as f:
+            _yaml.dump(data, f)
+
+except ImportError:
+    import yaml  # type: ignore
+
+    def _load(p: Path):
+        with p.open() as f:
+            return yaml.safe_load(f)
+
+    def _dump(data, p: Path) -> None:
+        with p.open("w") as f:
+            yaml.safe_dump(data, f, sort_keys=False)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BENCH_DIR = SCRIPT_DIR.parent
+
+# Group namespacing the benchmark projects.
+BENCH_GROUP = os.environ.get("BENCH_GROUP", "bench")
+
+# Control-side project set for A/B comparisons (see module docstring).
+BENCH_CONTROL_GROUP = os.environ.get("BENCH_CONTROL_GROUP", f"{BENCH_GROUP}-control")
+CONTROL_STORAGE_NAME = os.environ.get("CONTROL_STORAGE_NAME", "benchmark-control")
+
+# Namespace where the GitLab Helm chart lives; matches run-benchmarks-incluster.
+GITLAB_NAMESPACE = os.environ.get("GITLAB_NAMESPACE", "gitlab")
+
+# The chart ships gitlab-toolbox with app=toolbox.
+TOOLBOX_SELECTOR = os.environ.get("TOOLBOX_SELECTOR", "app=toolbox")
+
+# Sidekiq import poll loop.
+POLL_INTERVAL_SECONDS = int(os.environ.get("PROVISION_POLL_INTERVAL", "15"))
+POLL_TIMEOUT_SECONDS = int(os.environ.get("PROVISION_POLL_TIMEOUT", "1800"))
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _kubectl_cmd() -> list[str]:
+    cmd = ["kubectl"]
+    if kc := os.environ.get("KUBECONFIG"):
+        cmd += [f"--kubeconfig={kc}"]
+    if ctx := os.environ.get("KUBE_CONTEXT"):
+        cmd += [f"--context={ctx}"]
+    return cmd
+
+
+def find_toolbox_pod() -> str:
+    out = subprocess.run(
+        _kubectl_cmd()
+        + [
+            "-n",
+            GITLAB_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            TOOLBOX_SELECTOR,
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pod = out.stdout.strip()
+    if not pod:
+        die(
+            f"no toolbox pod found in namespace {GITLAB_NAMESPACE!r} "
+            f"matching selector {TOOLBOX_SELECTOR!r}.\n"
+            f"  stderr: {out.stderr.strip()}\n"
+            "  Override the lookup with GITLAB_NAMESPACE / TOOLBOX_SELECTOR."
+        )
+    return pod
+
+
+def rails_runner(pod: str, script: str, env: dict[str, str] | None = None) -> str:
+    """Execute a Ruby snippet via `gitlab-rails runner -` inside the toolbox pod.
+
+    The script goes over stdin (the `-` arg) to avoid quoting a multi-line
+    Ruby program through `kubectl exec`; parameters ride in an `env KEY=VALUE`
+    prefix because kubectl exec has no --env flag. Returns stdout; aborts on
+    non-zero exit.
+    """
+    extra_env = env or {}
+    env_prefix: list[str] = []
+    if extra_env:
+        env_prefix = ["env"] + [f"{k}={v}" for k, v in extra_env.items()]
+    cmd = _kubectl_cmd() + [
+        "-n",
+        GITLAB_NAMESPACE,
+        "exec",
+        "-i",
+        pod,
+        "--",
+        *env_prefix,
+        "gitlab-rails",
+        "runner",
+        "-",
+    ]
+    proc = subprocess.run(
+        cmd, input=script, capture_output=True, text=True, check=False
+    )
+    if proc.returncode != 0:
+        die(
+            "gitlab-rails runner failed:\n"
+            f"  exit_code={proc.returncode}\n"
+            f"  command: {shlex.join(cmd)}\n"
+            f"  stdout:\n{proc.stdout}\n"
+            f"  stderr:\n{proc.stderr}"
+        )
+    return proc.stdout
+
+
+# Creates (or finds) projects under the group, printing one JSON object per
+# line. Parameters arrive via ENV so the Ruby source needs no escaping.
+# Groups::CreateService returns a ServiceResponse (payload[:group]) on newer
+# GitLab but the Group directly on older versions; probe via respond_to?.
+_PROVISION_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+specs = JSON.parse(ENV.fetch('PROVISION_SPECS'))
+
+user = User.find_by_username('root') || User.admins.first
+unless user
+  STDERR.puts 'no admin user available; cannot create projects'
+  exit 1
+end
+
+# Public so the benchmark Job can clone anonymously over http.
+# update_column skips instance-level visibility validations on purpose.
+public_level = Gitlab::VisibilityLevel::PUBLIC
+
+ns = Namespace.find_by_full_path(group_path)
+unless ns
+  # GitLab 16.11+ requires groups/projects to belong to an Organization;
+  # attach the default org when present. Older versions ignore the arg.
+  org = nil
+  if defined?(::Organizations::Organization)
+    org = ::Organizations::Organization.find_by(path: 'default') ||
+          ::Organizations::Organization.first
+  end
+  attrs = {
+    name: group_path, path: group_path, visibility_level: public_level
+  }
+  attrs[:organization_id] = org.id if org
+
+  result = Groups::CreateService.new(user, attrs).execute
+  ns = if result.respond_to?(:payload)
+         result.payload[:group] || result.payload['group']
+       else
+         result
+       end
+  if ns.nil? || (ns.respond_to?(:persisted?) && !ns.persisted?)
+    err = ns.respond_to?(:errors) ? ns.errors.full_messages.join(', ') : result.inspect
+    STDERR.puts "FAIL group #{group_path}: #{err}"
+    exit 1
+  end
+end
+
+ns.update_column(:visibility_level, public_level) if ns.visibility_level != public_level
+
+specs.each do |spec|
+  name = spec.fetch('name')
+  url  = spec.fetch('remote')
+  full = "#{group_path}/#{name}"
+
+  storage = ENV['PROVISION_STORAGE'].to_s
+
+  project = Project.find_by_full_path(full)
+  if !project.nil? && !storage.empty? && project.repository_storage != storage
+    puts JSON.generate(name: name,
+                       error: "exists on storage #{project.repository_storage}, want #{storage}; re-run with --reset")
+    next
+  end
+  if project.nil?
+    project_attrs = {
+      name: name, path: name, namespace_id: ns.id,
+      visibility_level: public_level, import_url: url
+    }
+    project_attrs[:repository_storage] = storage unless storage.empty?
+    project_attrs[:organization_id] = ns.organization_id if ns.respond_to?(:organization_id) && ns.organization_id
+    project = ::Projects::CreateService.new(user, project_attrs).execute
+    unless project.respond_to?(:persisted?) && project.persisted?
+      err = project.respond_to?(:errors) ? project.errors.full_messages.join(', ') : project.inspect
+      puts JSON.generate(name: name, error: err)
+      next
+    end
+  end
+
+  if project.visibility_level != public_level
+    project.update_column(:visibility_level, public_level)
+  end
+
+  puts JSON.generate(
+    name:           name,
+    full_path:      project.full_path,
+    disk_path:      project.disk_path,
+    gl_repository:  "project-#{project.id}",
+    repo_storage:   project.repository_storage,
+    import_status:  project.import_status
+  )
+end
+""".strip()
+
+
+# Reset destroys the whole project instead of re-importing in place: an
+# MVCC repo recreated at its old hashed path reads a stale manifest and
+# is permanently broken. Callers re-resolve disk_path via --write-config.
+_RESET_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+specs = JSON.parse(ENV.fetch('PROVISION_SPECS'))
+
+user = User.find_by_username('root') || User.admins.first
+unless user
+  STDERR.puts 'no admin user available; cannot destroy projects'
+  exit 1
+end
+
+specs.each do |spec|
+  name = spec.fetch('name')
+  project = Project.find_by_full_path("#{group_path}/#{name}")
+  if project.nil?
+    puts JSON.generate(name: name, reset: true, skipped: true, reason: 'project not found')
+    next
+  end
+
+  ::Projects::DestroyService.new(project, user).execute
+  # Guard against the project row lingering (adjourned deletion etc.),
+  # which would make the recreate fail with "path already taken".
+  20.times do
+    break if Project.find_by_full_path("#{group_path}/#{name}").nil?
+    sleep 3
+  end
+  if Project.find_by_full_path("#{group_path}/#{name}")
+    puts JSON.generate(name: name, error: 'project still present after destroy')
+    next
+  end
+  puts JSON.generate(name: name, reset: true)
+end
+""".strip()
+
+
+_STATUS_SCRIPT = r"""
+require 'json'
+group_path = ENV.fetch('PROVISION_GROUP')
+names = JSON.parse(ENV.fetch('PROVISION_NAMES'))
+names.each do |name|
+  p = Project.find_by_full_path("#{group_path}/#{name}")
+  if p.nil?
+    puts JSON.generate(name: name, missing: true)
+    next
+  end
+  # -1 means unreadable; lets the caller tell a failed import from Rails
+  # post-import bookkeeping failures.
+  branches = begin
+    p.repository.raw_repository.branch_count
+  rescue StandardError
+    -1
+  end
+  puts JSON.generate(
+    name: name,
+    import_status: p.import_status,
+    import_error:  p.import_state&.last_error,
+    repo_exists:   p.repository.exists?,
+    branches:      branches
+  )
+end
+""".strip()
+
+
+# Imports never fetch again, so a `revision` bumped past the import date
+# can't resolve; fetch heads+tags, forced, never pruned (local-only zzz
+# refs must survive), via FetchRemote. No-op when the pin resolves.
+_FETCH_MISSING_REVISIONS_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+specs = JSON.parse(ENV.fetch('PROVISION_SPECS'))
+
+refmap = ['+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*']
+
+specs.each do |spec|
+  name = spec.fetch('name')
+  rev  = spec['revision'].to_s
+  next if rev.empty?
+
+  project = Project.find_by_full_path("#{group_path}/#{name}")
+  if project.nil?
+    puts JSON.generate(name: name, error: 'project not found')
+    next
+  end
+
+  if project.repository.commit(rev)
+    puts JSON.generate(name: name, fetched: false)
+    next
+  end
+
+  url = spec['remote'].to_s
+  if url.empty?
+    puts JSON.generate(name: name,
+                       error: "revision #{rev} missing and no remote to fetch from")
+    next
+  end
+
+  raw = project.repository.raw_repository
+  begin
+    begin
+      raw.fetch_remote(url, refmap: refmap, forced: true, prune: false)
+    rescue ArgumentError
+      # Older GitLab: fetch_remote without a prune kwarg (defaults safe here
+      # because the refmap only covers heads/tags, not refs/refs/zzz-*).
+      raw.fetch_remote(url, refmap: refmap, forced: true)
+    end
+  rescue StandardError => e
+    puts JSON.generate(name: name,
+                       error: "fetch from #{url} failed: #{e.class}: #{e.message}")
+    next
+  end
+
+  begin
+    project.repository.expire_branches_cache
+  rescue StandardError
+  end
+
+  if project.repository.commit(rev)
+    puts JSON.generate(name: name, fetched: true)
+  else
+    puts JSON.generate(name: name,
+                       error: "revision #{rev} still not found after fetching #{url} (remote rewritten?)")
+  end
+end
+""".strip()
+
+
+# Pin the default branch to config.yml's `revision` (via WriteRef) so
+# both sides serve identical content. No-op when already pinned.
+_ENFORCE_REVISION_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+specs = JSON.parse(ENV.fetch('PROVISION_SPECS'))
+
+specs.each do |spec|
+  name = spec.fetch('name')
+  rev  = spec['revision'].to_s
+  next if rev.empty?
+
+  project = Project.find_by_full_path("#{group_path}/#{name}")
+  if project.nil?
+    puts JSON.generate(name: name, error: 'project not found')
+    next
+  end
+
+  commit = project.repository.commit(rev)
+  if commit.nil?
+    puts JSON.generate(name: name, error: "revision #{rev} not found (remote rewritten?)")
+    next
+  end
+
+  branch = project.default_branch || 'master'
+  ref = "refs/heads/#{branch}"
+  current = project.repository.commit(branch)&.sha
+  if current == commit.sha
+    puts JSON.generate(name: name, ref: ref, revision: commit.sha, changed: false)
+  else
+    project.repository.raw_repository.write_ref(ref, commit.sha)
+    begin
+      project.repository.expire_branches_cache
+    rescue StandardError
+    end
+    puts JSON.generate(name: name, ref: ref, revision: commit.sha, changed: true, previous: current)
+  end
+end
+""".strip()
+
+
+# Sweep refs an aborted k6 run leaves behind (refs/test/*, benchmark-*
+# branches) before pinning, via ListRefs/DeleteRefs.
+_SWEEP_REFS_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+names = JSON.parse(ENV.fetch('PROVISION_NAMES'))
+
+STRAY_PREFIXES = ['refs/test/', 'refs/heads/benchmark-'].freeze
+
+names.each do |name|
+  project = Project.find_by_full_path("#{group_path}/#{name}")
+  if project.nil?
+    puts JSON.generate(name: name, error: 'project not found')
+    next
+  end
+
+  raw = project.repository.raw_repository
+  unless raw.respond_to?(:list_refs)
+    puts JSON.generate(name: name, swept: 0,
+                       warning: 'list_refs unavailable on this GitLab; sweep skipped')
+    next
+  end
+
+  # List broadly, filter client-side: for-each-ref prefixes only match
+  # at '/' boundaries, so 'refs/heads/benchmark-' can't be a pattern.
+  stray = raw.list_refs(['refs/test/', 'refs/heads/'],
+                        dynamic_timeout: Gitlab::GitalyClient.long_timeout)
+             .map(&:name)
+             .select { |n| STRAY_PREFIXES.any? { |p| n.start_with?(p) } }
+
+  if stray.empty?
+    puts JSON.generate(name: name, swept: 0)
+    next
+  end
+
+  stray.each_slice(1000) { |batch| raw.delete_refs(*batch) }
+  begin
+    project.repository.expire_branches_cache
+  rescue StandardError
+  end
+  puts JSON.generate(name: name, swept: stray.size)
+end
+""".strip()
+
+
+# Create the refs/refs/zzz-N refs on the pinned revision via bulk
+# UpdateReferences. The stream is built by hand because raw.update_refs
+# sets `repository` on every message, which Gitaly rejects once a call
+# spans multiple 100-ref slices.
+_ADDITIONAL_REFS_SCRIPT = r"""
+require 'json'
+
+group_path = ENV.fetch('PROVISION_GROUP')
+specs = JSON.parse(ENV.fetch('PROVISION_SPECS'))
+batch_size = Integer(ENV.fetch('PROVISION_REF_BATCH', '50000'))
+
+bulk_update_refs = lambda do |raw, updates|
+  requests = Enumerator.new do |y|
+    updates.each_slice(100).with_index do |slice, i|
+      msgs = slice.map do |u|
+        Gitaly::UpdateReferencesRequest::Update.new(
+          old_object_id: u[:old_sha],
+          new_object_id: u[:new_sha],
+          reference: u[:reference]
+        )
+      end
+      args = { updates: msgs }
+      args[:repository] = raw.gitaly_repository if i.zero?
+      y.yield Gitaly::UpdateReferencesRequest.new(**args)
+    end
+  end
+  Gitlab::GitalyClient.call(raw.storage, :ref_service, :update_references,
+                            requests, timeout: Gitlab::GitalyClient.long_timeout)
+end
+
+bulk_delete_refs = lambda do |raw, refs|
+  response = Gitlab::GitalyClient.call(
+    raw.storage, :ref_service, :delete_refs,
+    Gitaly::DeleteRefsRequest.new(repository: raw.gitaly_repository, refs: refs),
+    timeout: Gitlab::GitalyClient.long_timeout
+  )
+  raise "DeleteRefs: #{response.git_error}" unless response.git_error.to_s.empty?
+end
+
+specs.each do |spec|
+  name  = spec.fetch('name')
+  count = spec.fetch('additional_refs').to_i
+  next if count <= 0
+
+  project = Project.find_by_full_path("#{group_path}/#{name}")
+  if project.nil?
+    puts JSON.generate(name: name, error: 'project not found')
+    next
+  end
+
+  # Raw (uncached) RPCs throughout: Rails' repository.ref_exists? can
+  # serve a stale cache entry from a destroyed-and-recreated project.
+  raw = project.repository.raw_repository
+
+  # Skip only when the exact expected set exists. Probing sentinel refs
+  # (zzz-1, zzz-#{count}) instead would miss an interrupted sweep (deletion
+  # goes in lexicographic order, so both sentinels fall in the first batch)
+  # and a changed additional_refs count, stranding stale refs.
+  # use longer timeout so 6-figure ref deletion can still work
+  existing = raw.list_refs(['refs/refs/'],
+                           dynamic_timeout: Gitlab::GitalyClient.long_timeout)
+                .map(&:name)
+                .select { |n| n.start_with?('refs/refs/zzz-') }
+  expected = (1..count).map { |i| "refs/refs/zzz-#{i}" }
+  if existing.sort == expected.sort
+    puts JSON.generate(name: name, refs: count, skipped: true)
+    next
+  end
+
+  # A partial set can't be resumed (creations assert the ref doesn't exist
+  # yet, old_object_id all-zeroes); sweep leftovers first.
+  unless existing.empty?
+    existing.each_slice(1000) { |b| bulk_delete_refs.call(raw, b) }
+    STDERR.puts "#{name}: swept #{existing.size} stale zzz refs"
+  end
+
+  anchor = spec['revision'].to_s
+  anchor = project.default_branch || 'master' if anchor.empty?
+  commit = project.repository.commit(anchor)
+  if commit.nil?
+    puts JSON.generate(name: name, error: "anchor #{anchor} not found")
+    next
+  end
+  sha = commit.sha
+
+  blank = '0' * sha.length
+  (1..count).each_slice(batch_size) do |batch|
+    bulk_update_refs.call(raw, batch.map { |i|
+      { old_sha: blank, new_sha: sha, reference: "refs/refs/zzz-#{i}" }
+    })
+    STDERR.puts "#{name}: refs/refs/zzz-#{batch.last} of #{count}"
+  end
+
+  unless raw.ref_exists?("refs/refs/zzz-#{count}")
+    puts JSON.generate(name: name,
+                       error: "refs/refs/zzz-#{count} still missing after creation; the write path is dropping refs")
+    next
+  end
+
+  puts JSON.generate(name: name, refs: count, anchor: sha)
+rescue StandardError => e
+  # One slow repo must not abort the whole runner
+  puts JSON.generate(name: name, error: "#{e.class}: #{e.message}")
+end
+""".strip()
+
+
+# Mint the PAT the http push transport authenticates with. Revoke and
+# recreate each run: an existing token's cleartext can't be read back.
+_PAT_SCRIPT = r"""
+require 'json'
+
+user = User.admins.active.first
+if user.nil?
+  puts JSON.generate(error: 'no admin user available; cannot create PAT')
+  exit
+end
+
+name = 'gitaly-benchmark'
+user.personal_access_tokens.active.where(name: name).find_each(&:revoke!)
+token = user.personal_access_tokens.create!(
+  name: name,
+  scopes: ['api', 'write_repository'],
+  expires_at: 30.days.from_now
+)
+puts JSON.generate(token: token.token, user: user.username,
+                   expires_at: token.expires_at)
+""".strip()
+
+
+# Register the public half of the ssh transport's keypair on the admin user
+# so gitlab-shell can authenticate the benchmark client.
+_SSH_KEY_SCRIPT = r"""
+require 'json'
+
+user = User.admins.active.first
+if user.nil?
+  puts JSON.generate(error: 'no admin user available; cannot add an SSH key')
+  exit
+end
+
+title = 'gitaly-benchmark'
+user.keys.where(title: title).find_each(&:destroy)
+key = user.keys.new(title: title, key: ENV.fetch('BENCH_SSH_PUBKEY'))
+if key.save
+  puts JSON.generate(user: user.username, fingerprint: key.fingerprint_sha256)
+else
+  puts JSON.generate(error: key.errors.full_messages.join('; '))
+end
+""".strip()
+
+
+def rails_storages(pod: str) -> list[str]:
+    """Names of the Gitaly storages registered in Rails."""
+    out = rails_runner(
+        pod,
+        "require 'json'; puts JSON.generate(Gitlab.config.repositories.storages.keys)",
+    )
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            return json.loads(line)
+    return []
+
+
+def provision(pod: str, group: str, storage: str, specs: list[dict]) -> dict[str, dict]:
+    """Create projects (idempotently) and return per-name metadata."""
+    out = rails_runner(
+        pod,
+        _PROVISION_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_STORAGE": storage,
+            "PROVISION_SPECS": json.dumps(specs),
+        },
+    )
+    results: dict[str, dict] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            # Rails prints deprecation warnings to stdout; skip non-JSON lines.
+            continue
+        rec = json.loads(line)
+        results[rec["name"]] = rec
+    # A project silently created on the wrong storage would make the
+    # comparison measure the wrong Gitaly; fail instead.
+    for rec in results.values():
+        if storage and not rec.get("error") and rec.get("repo_storage") != storage:
+            rec["error"] = (
+                f"created on storage {rec.get('repo_storage')!r}, wanted "
+                f"{storage!r} (does Projects::CreateService honor "
+                "repository_storage on this GitLab version?)"
+            )
+    return results
+
+
+def reset_repositories(pod: str, group: str, specs: list[dict]) -> None:
+    """Destroy the bench projects so provisioning recreates them fresh."""
+    out = rails_runner(
+        pod,
+        _RESET_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_SPECS": json.dumps(specs),
+        },
+    )
+    reset_names = set()
+    errors = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        rec = json.loads(line)
+        if rec.get("error"):
+            errors.append(f"{rec['name']}: {rec['error']}")
+            continue
+        if rec.get("reset"):
+            reset_names.add(rec["name"])
+            state = "already absent" if rec.get("skipped") else "destroyed"
+            print(f"  {group}/{rec['name']}: {state}", file=sys.stderr)
+    missing = [
+        s["name"]
+        for s in specs
+        if s["name"] not in reset_names
+        and not any(e.startswith(f"{s['name']}:") for e in errors)
+    ]
+    if errors or missing:
+        die(
+            "repository reset failed:\n  "
+            + "\n  ".join(errors + [f"{n}: no reset confirmation" for n in missing])
+        )
+
+
+def wait_for_imports(pod: str, group: str, names: list[str]) -> dict[str, dict]:
+    """Poll Sidekiq import status until every project is finished/failed."""
+    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+    last: dict[str, dict] = {}
+    while True:
+        out = rails_runner(
+            pod,
+            _STATUS_SCRIPT,
+            env={
+                "PROVISION_GROUP": group,
+                "PROVISION_NAMES": json.dumps(names),
+            },
+        )
+        last = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            rec = json.loads(line)
+            last[rec["name"]] = rec
+
+        pending = [
+            n
+            for n in names
+            if last.get(n, {}).get("import_status")
+            not in (None, "finished", "failed", "none")
+        ]
+        for n in names:
+            r = last.get(n, {})
+            print(
+                f"  {group}/{n}: import_status="
+                f"{r.get('import_status', '?')} "
+                f"repo_exists={r.get('repo_exists', '?')}",
+                file=sys.stderr,
+            )
+        if not pending:
+            return last
+        if time.monotonic() > deadline:
+            die(
+                f"timed out after {POLL_TIMEOUT_SECONDS}s waiting for imports: "
+                f"{pending}"
+            )
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def fetch_missing_revisions(pod: str, group: str, specs: list[dict]) -> None:
+    """Fetch a repo's remote when its pinned revision is absent locally.
+
+    Repos whose pin already resolves are untouched, so bumping `revision:`
+    in config.yml self-heals after the one-time import goes stale.
+    """
+    pinned = [s for s in specs if s.get("revision")]
+    if not pinned:
+        return
+    out = rails_runner(
+        pod,
+        _FETCH_MISSING_REVISIONS_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_SPECS": json.dumps(pinned),
+        },
+    )
+    errors = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        rec = json.loads(line)
+        if rec.get("error"):
+            errors.append(f"{rec['name']}: {rec['error']}")
+            continue
+        state = "fetched from remote" if rec.get("fetched") else "already present"
+        print(
+            f"  {group}/{rec['name']}: pinned revision {state}",
+            file=sys.stderr,
+        )
+    if errors:
+        die("revision fetch failed:\n  " + "\n  ".join(errors))
+
+
+def enforce_revisions(pod: str, group: str, specs: list[dict]) -> None:
+    """Reset each project's default branch to its pinned revision."""
+    pinned = [s for s in specs if s.get("revision")]
+    if not pinned:
+        return
+    out = rails_runner(
+        pod,
+        _ENFORCE_REVISION_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_SPECS": json.dumps(pinned),
+        },
+    )
+    errors = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        rec = json.loads(line)
+        if rec.get("error"):
+            errors.append(f"{rec['name']}: {rec['error']}")
+            continue
+        state = "pinned" if rec.get("changed") else "already-pinned"
+        print(
+            f"  {group}/{rec['name']}: {rec['ref']} -> "
+            f"{rec['revision']} ({state})",
+            file=sys.stderr,
+        )
+    if errors:
+        die("revision enforcement failed:\n  " + "\n  ".join(errors))
+
+
+def sweep_stray_refs(pod: str, group: str, names: list[str]) -> None:
+    """Delete refs/test/* and benchmark-* branches left by previous runs."""
+    out = rails_runner(
+        pod,
+        _SWEEP_REFS_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_NAMES": json.dumps(names),
+        },
+    )
+    errors = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        rec = json.loads(line)
+        if rec.get("error"):
+            errors.append(f"{rec['name']}: {rec['error']}")
+            continue
+        msg = f"  {group}/{rec['name']}: swept {rec['swept']} stray refs"
+        if rec.get("warning"):
+            msg += f" ({rec['warning']})"
+        print(msg, file=sys.stderr)
+    if errors:
+        die("stray-ref sweep failed:\n  " + "\n  ".join(errors))
+
+
+def create_additional_refs(pod: str, group: str, specs: list[dict]) -> None:
+    """Create the zzz benchmark refs through the write path.
+
+    Mirrors the VM flow (roles/gitaly/tasks/initialize.yml) so every
+    provisioned project set carries the same ref load.
+    """
+    wanted = [s for s in specs if s.get("additional_refs")]
+    if not wanted:
+        return
+    out = rails_runner(
+        pod,
+        _ADDITIONAL_REFS_SCRIPT,
+        env={
+            "PROVISION_GROUP": group,
+            "PROVISION_SPECS": json.dumps(wanted),
+            "PROVISION_REF_BATCH": os.environ.get("PROVISION_REF_BATCH", "50000"),
+        },
+    )
+    errors = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        rec = json.loads(line)
+        if rec.get("error"):
+            errors.append(f"{rec['name']}: {rec['error']}")
+            continue
+        state = "already-present" if rec.get("skipped") else "created"
+        print(
+            f"  {group}/{rec['name']}: {rec['refs']} refs ({state})",
+            file=sys.stderr,
+        )
+    if errors:
+        die("additional-refs creation failed:\n  " + "\n  ".join(errors))
+
+
+def mint_push_token(pod: str) -> None:
+    """Mint the benchmark PAT and store it as the gitaly-benchmark-pat Secret
+    (key `token`), which the Job's http push transport reads via secretKeyRef.
+    The cleartext goes kubectl-stdin -> Secret, never printed or on disk."""
+    out = rails_runner(pod, _PAT_SCRIPT)
+    rec: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            rec = json.loads(line)
+    if rec.get("error") or not rec.get("token"):
+        die(f"PAT provisioning failed: {rec.get('error') or out.strip()}")
+    _store_secret("gitaly-benchmark-pat", {"token": rec["token"]})
+    print(
+        f"  PAT for {rec['user']} (expires {rec['expires_at']}) stored in "
+        f"secret gitaly-benchmark-pat/{GITLAB_NAMESPACE}",
+        file=sys.stderr,
+    )
+
+
+def _store_secret(name: str, data: dict[str, str]) -> None:
+    """Apply an Opaque Secret. Cleartext goes over kubectl's stdin, not
+    argv, which is world-readable in `ps`."""
+    manifest = json.dumps(
+        {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": name, "namespace": GITLAB_NAMESPACE},
+            "type": "Opaque",
+            "data": {
+                k: base64.b64encode(v.encode()).decode() for k, v in data.items()
+            },
+        }
+    )
+    apply = subprocess.run(
+        _kubectl_cmd() + ["apply", "-f", "-"],
+        input=manifest,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if apply.returncode != 0:
+        die(f"storing secret {name} failed: {apply.stderr.strip()}")
+
+
+def mint_ssh_key(pod: str) -> None:
+    """Provision the ssh transport's keypair: public half onto the admin
+    user, private half into a Secret. Fresh each run (GitLab keeps only
+    the public half)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        key_path = Path(tmp) / "id_ed25519"
+        keygen = subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+             "gitaly-benchmark", "-f", str(key_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if keygen.returncode != 0:
+            die(f"ssh-keygen failed: {keygen.stderr.strip() or keygen.stdout.strip()}")
+        private_key = key_path.read_text()
+        public_key = Path(f"{key_path}.pub").read_text().strip()
+
+    out = rails_runner(pod, _SSH_KEY_SCRIPT, env={"BENCH_SSH_PUBKEY": public_key})
+    rec: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            rec = json.loads(line)
+    if rec.get("error") or not rec.get("fingerprint"):
+        die(f"SSH key provisioning failed: {rec.get('error') or out.strip()}")
+    _store_secret("gitaly-benchmark-ssh-key", {"private_key": private_key})
+    print(
+        f"  SSH key for {rec['user']} ({rec['fingerprint']}) stored in "
+        f"secret gitaly-benchmark-ssh-key/{GITLAB_NAMESPACE}",
+        file=sys.stderr,
+    )
+
+
+def _gitaly_relative_path(disk_path: str) -> str:
+    # Rails returns disk_path without the trailing `.git`; Gitaly's
+    # gRPC relativePath expects it.
+    return disk_path if disk_path.endswith(".git") else f"{disk_path}.git"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--write-config",
+        action="store_true",
+        help="Edit experiments/${EXPERIMENT}/config.yml in place, "
+        "adding `disk_path:` keys next to each repo's `name:`.",
+    )
+    ap.add_argument(
+        "--reset",
+        action="store_true",
+        help="Remove and re-import existing benchmark repositories before provisioning.",
+    )
+    ap.add_argument(
+        "--experiment",
+        default=os.environ.get("EXPERIMENT"),
+        help="Experiment directory name (defaults to $EXPERIMENT).",
+    )
+    args = ap.parse_args()
+
+    if not args.experiment:
+        die("EXPERIMENT must be set (or pass --experiment)")
+
+    cfg_path = BENCH_DIR / "experiments" / args.experiment / "config.yml"
+    if not cfg_path.is_file():
+        die(f"experiment config not found: {cfg_path}")
+
+    cfg = _load(cfg_path)
+    repos = cfg.get("repositories") or []
+    if not repos:
+        die(f"no repositories defined in {cfg_path}")
+
+    specs = []
+    for r in repos:
+        name = r.get("name")
+        remote = r.get("remote")
+        if not name or not remote:
+            die(
+                f"repository entry missing required name/remote: {r!r}\n  in {cfg_path}"
+            )
+        spec = {"name": str(name), "remote": str(remote)}
+        if r.get("revision"):
+            spec["revision"] = str(r["revision"])
+        extra = r.get("additional_refs")
+        if isinstance(extra, int) and extra > 0:
+            spec["additional_refs"] = str(extra)
+        specs.append(spec)
+
+    pod = find_toolbox_pod()
+
+    # One (group, Rails storage, config.yml key prefix) per project set. The
+    # control set only exists when its storage is registered in Rails.
+    sides = [(BENCH_GROUP, "default", "")]
+    storages = rails_storages(pod)
+    if CONTROL_STORAGE_NAME in storages:
+        sides.append((BENCH_CONTROL_GROUP, CONTROL_STORAGE_NAME, "control_"))
+    else:
+        print(
+            f"[provision] storage {CONTROL_STORAGE_NAME!r} not registered in "
+            f"Rails (have: {', '.join(storages) or 'none'}); skipping the "
+            "control-side project set. Comparison runs need it: register "
+            "the control Gitaly as an external storage in the chart values.",
+            file=sys.stderr,
+        )
+
+    print(
+        "[provision] toolbox=" + pod + " sides="
+        + ", ".join(f"{g} (storage={s})" for g, s, _ in sides),
+        file=sys.stderr,
+    )
+
+    results: dict[str, dict[str, dict]] = {}
+    for group, storage, prefix in sides:
+        if args.reset:
+            print(f"[provision] resetting repositories in {group}", file=sys.stderr)
+            reset_repositories(pod, group, specs)
+
+        created = provision(pod, group, storage, specs)
+        failures = {n: r for n, r in created.items() if r.get("error")}
+        if failures:
+            die(
+                f"project creation failed in {group}:\n  "
+                + "\n  ".join(f"{n}: {r['error']}" for n, r in failures.items())
+            )
+
+        print(f"[provision] waiting for imports in {group}", file=sys.stderr)
+        status = wait_for_imports(pod, group, [s["name"] for s in specs])
+
+        failed = [
+            n
+            for n, r in status.items()
+            if r.get("import_status") == "failed" or r.get("missing")
+        ]
+        # The MVCC backend lacks RepositoryInfo, so Rails bookkeeping can
+        # mark an import "failed" even when the clone succeeded. Tolerate
+        # readable repos; revision enforcement still catches broken ones.
+        for n in list(failed):
+            r = status[n]
+            if not r.get("missing") and r.get("branches", -1) > 0:
+                print(
+                    f"  {group}/{n}: import marked failed but repository "
+                    f"is readable ({r['branches']} branches); continuing "
+                    f"(error was: {r.get('import_error')})",
+                    file=sys.stderr,
+                )
+                failed.remove(n)
+        if failed:
+            die(
+                f"imports failed in {group}:\n  "
+                + "\n  ".join(
+                    f"{n}: {status[n].get('import_error') or 'missing'}"
+                    for n in failed
+                )
+            )
+
+        print(f"[provision] sweeping stray benchmark refs in {group}", file=sys.stderr)
+        sweep_stray_refs(pod, group, [s["name"] for s in specs])
+
+        print(
+            f"[provision] fetching remotes where pinned revisions are "
+            f"missing in {group}",
+            file=sys.stderr,
+        )
+        fetch_missing_revisions(pod, group, specs)
+
+        print(f"[provision] enforcing pinned revisions in {group}", file=sys.stderr)
+        enforce_revisions(pod, group, specs)
+
+        print(
+            f"[provision] creating additional benchmark refs in {group} "
+            "(can take several minutes on first run)",
+            file=sys.stderr,
+        )
+        create_additional_refs(pod, group, specs)
+
+        results[prefix] = created
+
+    print("[provision] minting PAT for the http push transport", file=sys.stderr)
+    mint_push_token(pod)
+
+    print("[provision] minting SSH key for the ssh transport", file=sys.stderr)
+    mint_ssh_key(pod)
+
+    # No ref-packing on either side: MVCC has no packed-refs, and packing
+    # only the control would give the sides different ref layouts.
+
+    # Write each side's disk_path back to its repo entry (control keys get
+    # the control_ prefix). gl_repository rides along for the push
+    # sections' pre-receive hook.
+    for r in repos:
+        for prefix, created in results.items():
+            meta = created.get(str(r["name"]))
+            if not meta or not meta.get("disk_path"):
+                continue
+            r[f"{prefix}disk_path"] = _gitaly_relative_path(meta["disk_path"])
+            if meta.get("gl_repository"):
+                r[f"{prefix}gl_repository"] = meta["gl_repository"]
+
+    if args.write_config:
+        _dump(cfg, cfg_path)
+        print(
+            f"[provision] wrote disk_path/gl_repository entries to {cfg_path}",
+            file=sys.stderr,
+        )
+    else:
+        print("# paste this into the corresponding entry in", cfg_path)
+        for r in repos:
+            for prefix, _created in results.items():
+                if f"{prefix}disk_path" not in r:
+                    continue
+                print(f"  {prefix}disk_path: {r[f'{prefix}disk_path']!r}")
+                if f"{prefix}gl_repository" in r:
+                    print(f"  {prefix}gl_repository: {r[f'{prefix}gl_repository']!r}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

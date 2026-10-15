@@ -1,0 +1,20 @@
+# Compiles the bundled Git binaries that get embedded into the gitaly
+# image. Uses ubi9-minimal to match the base image gitaly actually
+# runs on.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
+
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+      diffutils \
+      gcc \
+      git \
+      libcurl-devel \
+      meson \
+      ninja-build \
+      openssl-devel \
+      pcre2-devel \
+      pkg-config \
+      tar \
+      zlib-devel && \
+    microdnf clean all
+
+WORKDIR /src

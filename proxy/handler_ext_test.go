@@ -1,0 +1,632 @@
+// Copyright 2017 Michal Witkowski. All Rights Reserved.
+// See LICENSE for licensing terms.
+
+package proxy_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/proxy"
+	"github.com/getsentry/sentry-go"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/interop/grpc_testing"
+	grpc_metadata "google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	rejectingMdKey = "test-reject-rpc-if-in-context"
+)
+
+func TestHandler_carriesClientMetadata(t *testing.T) {
+	t.Parallel()
+	testHandlerCarriesClientMetadata(t)
+}
+
+func TestHandler_carriesClientMetadataStressTest(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 50; i++ {
+		testHandlerCarriesClientMetadata(t)
+	}
+}
+
+func testHandlerCarriesClientMetadata(t *testing.T) {
+	ctx, client, backend := setupProxy(t)
+
+	backend.unaryCall = func(ctx context.Context, request *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+		metadata, ok := grpc_metadata.FromIncomingContext(ctx)
+		require.True(t, ok)
+
+		metadataValue, ok := metadata["injected_metadata"]
+		require.True(t, ok)
+		require.Equal(t, []string{"injected_value"}, metadataValue)
+
+		return &grpc_testing.SimpleResponse{Payload: request.GetPayload()}, nil
+	}
+
+	ctx = grpc_metadata.NewOutgoingContext(ctx, grpc_metadata.Pairs("injected_metadata", "injected_value"))
+
+	response, err := client.UnaryCall(ctx, &grpc_testing.SimpleRequest{
+		Payload: &grpc_testing.Payload{Body: []byte("data")},
+	})
+	require.NoError(t, err, "PingEmpty should succeed without errors")
+	testhelper.ProtoEqual(t, &grpc_testing.SimpleResponse{
+		Payload: &grpc_testing.Payload{Body: []byte("data")},
+	}, response)
+}
+
+func TestHandler_carriesHeadersAndTrailers(t *testing.T) {
+	t.Parallel()
+
+	ctx, client, backend := setupProxy(t)
+
+	backend.unaryCall = func(ctx context.Context, request *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+		require.NoError(t, grpc.SendHeader(ctx, grpc_metadata.Pairs("injected_header", "header_value")))
+		require.NoError(t, grpc.SetTrailer(ctx, grpc_metadata.Pairs("injected_trailer", "trailer_value")))
+		return &grpc_testing.SimpleResponse{Payload: request.GetPayload()}, nil
+	}
+
+	var headerMetadata, trailerMetadata grpc_metadata.MD
+
+	response, err := client.UnaryCall(ctx, &grpc_testing.SimpleRequest{
+		Payload: &grpc_testing.Payload{Body: []byte("data")},
+	}, grpc.Header(&headerMetadata), grpc.Trailer(&trailerMetadata))
+	require.NoError(t, err)
+	testhelper.ProtoEqual(t, &grpc_testing.SimpleResponse{
+		Payload: &grpc_testing.Payload{Body: []byte("data")},
+	}, response)
+
+	require.Equal(t, grpc_metadata.Pairs(
+		"content-type", "application/grpc",
+		"injected_header", "header_value",
+	), headerMetadata)
+	require.Equal(t, grpc_metadata.Pairs(
+		"injected_trailer", "trailer_value",
+	), trailerMetadata)
+}
+
+func TestHandler_propagatesServerError(t *testing.T) {
+	ctx, client, backend := setupProxy(t)
+
+	backend.unaryCall = func(context.Context, *grpc_testing.SimpleRequest) (*grpc_testing.SimpleResponse, error) {
+		return nil, status.Errorf(codes.ResourceExhausted, "service error")
+	}
+
+	sentryTriggered := 0
+	sentrySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sentryTriggered++
+	}))
+	defer sentrySrv.Close()
+
+	// minimal required sentry client configuration
+	sentryURL, err := url.Parse(sentrySrv.URL)
+	require.NoError(t, err)
+	sentryURL.User = url.UserPassword("stub", "stub")
+	sentryURL.Path = "/stub/1"
+
+	require.NoError(t, sentry.Init(sentry.ClientOptions{
+		Dsn:       sentryURL.String(),
+		Transport: sentry.NewHTTPSyncTransport(),
+	}))
+	defer func() {
+		if client := sentry.CurrentHub().Client(); client != nil {
+			client.Close()
+		}
+	}()
+
+	// Verify that Sentry is configured correctyl to be triggered.
+	sentry.CaptureEvent(sentry.NewEvent())
+	require.Equal(t, 1, sentryTriggered)
+
+	_, err = client.UnaryCall(ctx, &grpc_testing.SimpleRequest{})
+	testhelper.RequireGrpcError(t, status.Errorf(codes.ResourceExhausted, "service error"), err)
+
+	// Sentry must not be triggered because errors from remote must be just propagated.
+	require.Equal(t, 1, sentryTriggered)
+}
+
+func TestHandler_directorErrorIsPropagated(t *testing.T) {
+	t.Parallel()
+
+	// There is no need to set up the backend given that we should reject the call before we
+	// even hit the server.
+	ctx, client, _ := setupProxy(t)
+
+	// The proxy's director is set up so that it is rejecting requests when it sees the
+	// following gRPC metadata.
+	ctx = grpc_metadata.NewOutgoingContext(ctx, grpc_metadata.Pairs(rejectingMdKey, "true"))
+
+	_, err := client.UnaryCall(ctx, &grpc_testing.SimpleRequest{})
+	require.Error(t, err)
+	testhelper.RequireGrpcError(t, structerr.NewPermissionDenied("testing rejection"), err)
+}
+
+func TestHandler_fullDuplex(t *testing.T) {
+	t.Parallel()
+	testHandlerFullDuplex(t)
+}
+
+func TestHandler_fullDuplexStressTest(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 50; i++ {
+		testHandlerFullDuplex(t)
+	}
+}
+
+func testHandlerFullDuplex(t *testing.T) {
+	ctx, client, backend := setupProxy(t)
+
+	backend.fullDuplexCall = func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+		require.NoError(t, stream.SendHeader(grpc_metadata.Pairs("custom_header", "header_value")))
+
+		for i := 0; ; i++ {
+			request, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			require.NoError(t, err)
+
+			require.NoError(t, stream.Send(&grpc_testing.StreamingOutputCallResponse{
+				Payload: &grpc_testing.Payload{
+					Body: []byte(fmt.Sprintf("%s: %d", request.GetPayload().GetBody(), i)),
+				},
+			}))
+		}
+
+		stream.SetTrailer(grpc_metadata.Pairs("custom_trailer", "trailer_value"))
+		return nil
+	}
+
+	stream, err := client.FullDuplexCall(ctx)
+	require.NoError(t, err)
+
+	for i := 0; i < 20; i++ {
+		require.NoError(t, stream.Send(&grpc_testing.StreamingOutputCallRequest{
+			Payload: &grpc_testing.Payload{
+				Body: []byte(fmt.Sprintf("foo:%d", i)),
+			},
+		}))
+
+		response, err := stream.Recv()
+		require.NoError(t, err)
+		testhelper.ProtoEqual(t, &grpc_testing.StreamingOutputCallResponse{
+			Payload: &grpc_testing.Payload{
+				Body: []byte(fmt.Sprintf("foo:%d: %d", i, i)),
+			},
+		}, response)
+
+		if i == 0 {
+			headerMetadata, err := stream.Header()
+			require.NoError(t, err)
+			require.Equal(t, grpc_metadata.Pairs(
+				"content-type", "application/grpc",
+				"custom_header", "header_value",
+			), headerMetadata)
+		}
+	}
+
+	require.NoError(t, stream.CloseSend())
+	_, err = stream.Recv()
+	require.Equal(t, io.EOF, err)
+
+	require.Equal(t, grpc_metadata.Pairs(
+		"custom_trailer", "trailer_value",
+	), stream.Trailer())
+}
+
+func setupProxy(t *testing.T) (context.Context, grpc_testing.TestServiceClient, *interceptPinger) {
+	t.Helper()
+
+	ctx := testhelper.Context(t)
+
+	proxy2Server, backend := newBackendPinger(t, ctx)
+
+	director := func(ctx context.Context, _ string, peeker proxy.StreamPeeker) (*proxy.StreamParameters, error) {
+		payload, err := peeker.Peek()
+		if err != nil {
+			return nil, err
+		}
+
+		md, ok := grpc_metadata.FromIncomingContext(ctx)
+		if ok {
+			if _, exists := md[rejectingMdKey]; exists {
+				return proxy.NewStreamParameters(proxy.Destination{Ctx: metadata.IncomingToOutgoing(ctx), Msg: payload}, nil, nil, nil), status.Errorf(codes.PermissionDenied, "testing rejection")
+			}
+		}
+
+		// Explicitly copy the metadata, otherwise the tests will fail.
+		return proxy.NewStreamParameters(proxy.Destination{
+			Ctx:  metadata.IncomingToOutgoing(ctx),
+			Conn: proxy2Server,
+			Msg:  payload,
+		}, nil, nil, nil), nil
+	}
+
+	client2Proxy := newProxy(t, ctx, director, "mwitkow.testproto.TestService", "Ping")
+
+	return ctx, grpc_testing.NewTestServiceClient(client2Proxy), backend
+}
+
+func TestProxyErrorPropagation(t *testing.T) {
+	t.Parallel()
+
+	errBackend := status.Error(codes.InvalidArgument, "backend error")
+	errDirector := status.Error(codes.FailedPrecondition, "director error")
+	errRequestFinalizer := status.Error(codes.Internal, "request finalizer error")
+
+	for _, tc := range []struct {
+		desc                  string
+		backendError          error
+		directorError         error
+		requestFinalizerError error
+		returnedError         error
+		errHandler            func(error) error
+	}{
+		{
+			desc:          "backend error is propagated",
+			backendError:  errBackend,
+			returnedError: errBackend,
+		},
+		{
+			desc:          "director error is propagated",
+			directorError: errDirector,
+			returnedError: errDirector,
+		},
+		{
+			desc:                  "request finalizer error is propagated",
+			requestFinalizerError: errRequestFinalizer,
+			returnedError:         errRequestFinalizer,
+		},
+		{
+			desc:                  "director error cancels proxying",
+			backendError:          errBackend,
+			requestFinalizerError: errRequestFinalizer,
+			directorError:         errDirector,
+			returnedError:         errDirector,
+		},
+		{
+			desc:                  "backend error prioritized over request finalizer error",
+			backendError:          errBackend,
+			requestFinalizerError: errRequestFinalizer,
+			returnedError:         errBackend,
+		},
+		{
+			desc:                  "err handler gets error",
+			backendError:          errBackend,
+			requestFinalizerError: errRequestFinalizer,
+			returnedError:         errBackend,
+			errHandler: func(err error) error {
+				testhelper.RequireGrpcError(t, errBackend, err)
+				return errBackend
+			},
+		},
+		{
+			desc:          "err handler can swallow error",
+			backendError:  errBackend,
+			returnedError: nil,
+			errHandler: func(err error) error {
+				testhelper.RequireGrpcError(t, errBackend, err)
+				return nil
+			},
+		},
+		{
+			desc:                  "swallowed error surfaces request finalizer error",
+			backendError:          errBackend,
+			requestFinalizerError: errRequestFinalizer,
+			returnedError:         errRequestFinalizer,
+			errHandler: func(err error) error {
+				testhelper.RequireGrpcError(t, errBackend, err)
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := testhelper.Context(t)
+			tmpDir := testhelper.TempDir(t)
+			lc := net.ListenConfig{}
+			backendListener, err := lc.Listen(ctx, "unix", filepath.Join(tmpDir, "backend"))
+			require.NoError(t, err)
+
+			// We use a wait group to synchronize shutdown of the gRPC servers. This is
+			// done so that any errors returned by the servers are propagated while the
+			// test is still execution.
+			var wg sync.WaitGroup
+			defer wg.Wait()
+
+			backendServer := grpc.NewServer(grpc.UnknownServiceHandler(func(_ interface{}, s grpc.ServerStream) error {
+				_ = s.SendMsg(&grpc_testing.SimpleResponse{})
+				return tc.backendError
+			}))
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				err := backendServer.Serve(backendListener)
+				switch {
+				case errors.Is(err, grpc.ErrServerStopped):
+					// `grpc.Server.Serve()` may return `ErrServerStopped()` in
+					// case `Serve()` is called after `Stop()`. This can indeed
+					// happen in this test as the backend server will not get
+					// hit when the proxy server is already returning an error.
+				default:
+					require.NoError(t, err)
+				}
+			}()
+			defer backendServer.Stop()
+
+			backendClientConn, err := grpc.NewClient("unix://"+backendListener.Addr().String(),
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithDefaultCallOptions(grpc.ForceCodec(proxy.NewCodec())),
+			)
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, backendClientConn)
+
+			proxyListener, err := lc.Listen(ctx, "unix", filepath.Join(tmpDir, "proxy"))
+			require.NoError(t, err)
+
+			proxyServer := grpc.NewServer(
+				grpc.ForceServerCodec(proxy.NewCodec()),
+				grpc.UnknownServiceHandler(proxy.TransparentHandler(func(ctx context.Context, fullMethodName string, peeker proxy.StreamPeeker) (*proxy.StreamParameters, error) {
+					return proxy.NewStreamParameters(
+						proxy.Destination{
+							Ctx:        ctx,
+							Conn:       backendClientConn,
+							ErrHandler: tc.errHandler,
+						},
+						nil,
+						func() error { return tc.requestFinalizerError },
+						nil,
+					), tc.directorError
+				})),
+			)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				testhelper.MustServe(t, proxyServer, proxyListener)
+			}()
+			defer proxyServer.Stop()
+
+			proxyClientConn, err := grpc.NewClient("unix://"+proxyListener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, proxyClientConn)
+
+			resp, err := grpc_testing.NewTestServiceClient(proxyClientConn).UnaryCall(ctx, &grpc_testing.SimpleRequest{})
+			testhelper.RequireGrpcError(t, tc.returnedError, err)
+			if err != nil {
+				require.Nil(t, resp)
+			}
+		})
+	}
+}
+
+func TestHandler_preservesClientToServerErrorCode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		desc string
+		// timeout is the client's deadline. If it is zero, the client cancels its
+		// request instead.
+		timeout       time.Duration
+		expectedCodes []codes.Code
+	}{
+		{
+			desc:          "client cancellation",
+			expectedCodes: []codes.Code{codes.Canceled},
+		},
+		{
+			desc:    "client deadline",
+			timeout: time.Second,
+			// The proxy's server stream may see the client resetting the stream before
+			// the propagated deadline fires, so accept either code.
+			expectedCodes: []codes.Code{codes.Canceled, codes.DeadlineExceeded},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+
+			// The backend blocks until its stream is torn down so that the proxy only
+			// finishes once it has observed the client-side failure. Its first message
+			// tells us that the proxy is forwarding the stream.
+			backendConn, backend := newBackendPinger(t, ctx)
+			backendReceived := make(chan struct{})
+			backend.fullDuplexCall = func(stream grpc_testing.TestService_FullDuplexCallServer) error {
+				if _, err := stream.Recv(); err != nil {
+					return err
+				}
+				close(backendReceived)
+
+				for {
+					if _, err := stream.Recv(); err != nil {
+						return err
+					}
+				}
+			}
+
+			// The client sees its own Canceled or DeadlineExceeded regardless of what
+			// the proxy returns, so we capture the handler's error to check the code
+			// that the proxy reports.
+			handlerErr := make(chan error, 1)
+			proxyServer := grpc.NewServer(
+				grpc.ForceServerCodec(proxy.NewCodec()),
+				grpc.ChainStreamInterceptor(func(srv interface{}, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+					err := handler(srv, stream)
+					handlerErr <- err
+					return err
+				}),
+				grpc.UnknownServiceHandler(proxy.TransparentHandler(func(ctx context.Context, _ string, peeker proxy.StreamPeeker) (*proxy.StreamParameters, error) {
+					payload, err := peeker.Peek()
+					if err != nil {
+						return nil, err
+					}
+
+					// Detach the backend stream from the client's context so that it is
+					// only torn down by the proxy reacting to the client-side failure.
+					return proxy.NewStreamParameters(proxy.Destination{
+						Ctx:  context.WithoutCancel(ctx),
+						Conn: backendConn,
+						Msg:  payload,
+					}, nil, nil, nil), nil
+				})),
+			)
+			proxyListener := newListener(t)
+			go testhelper.MustServe(t, proxyServer, proxyListener)
+			defer proxyServer.Stop()
+
+			proxyConn, err := grpc.NewClient(proxyListener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, proxyConn)
+
+			clientCtx, cancel := context.WithCancel(ctx)
+			if tc.timeout > 0 {
+				clientCtx, cancel = context.WithTimeout(ctx, tc.timeout)
+			}
+			defer cancel()
+
+			stream, err := grpc_testing.NewTestServiceClient(proxyConn).FullDuplexCall(clientCtx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&grpc_testing.StreamingOutputCallRequest{}))
+			<-backendReceived
+
+			if tc.timeout == 0 {
+				cancel()
+			}
+
+			err = <-handlerErr
+			require.Contains(t, tc.expectedCodes, status.Code(err))
+			require.ErrorContains(t, err, "failed proxying c2s")
+		})
+	}
+}
+
+func TestRegisterStreamHandlers(t *testing.T) {
+	t.Parallel()
+
+	directorCalledError := errors.New("director was called")
+
+	requestSent := &grpc_testing.SimpleRequest{
+		Payload: &grpc_testing.Payload{
+			Body: []byte("hello"),
+		},
+	}
+
+	unaryCallStreamHandler := func(t *testing.T, srv interface{}, stream grpc.ServerStream) {
+		var request grpc_testing.SimpleRequest
+		require.NoError(t, stream.RecvMsg(&request))
+		testhelper.ProtoEqual(t, requestSent, &request)
+		require.NoError(t, stream.SendMsg(nil))
+	}
+
+	emptyCallStreamHandler := func(t *testing.T, srv interface{}, stream grpc.ServerStream) {
+		var request grpc_testing.Empty
+		require.NoError(t, stream.RecvMsg(&request))
+		require.NoError(t, stream.SendMsg(nil))
+	}
+
+	for _, tc := range []struct {
+		desc               string
+		registeredHandlers map[string]func(*testing.T, interface{}, grpc.ServerStream)
+		execute            func(*testing.T, context.Context, grpc_testing.TestServiceClient)
+		expectedErr        error
+		expectedCalls      map[string]int
+	}{
+		{
+			desc: "single handler",
+			registeredHandlers: map[string]func(*testing.T, interface{}, grpc.ServerStream){
+				"UnaryCall": unaryCallStreamHandler,
+			},
+			execute: func(t *testing.T, ctx context.Context, client grpc_testing.TestServiceClient) {
+				_, err := client.UnaryCall(ctx, requestSent)
+				require.NoError(t, err)
+			},
+			expectedCalls: map[string]int{
+				"UnaryCall": 1,
+			},
+		},
+		{
+			desc: "multiple handlers picks the right one",
+			registeredHandlers: map[string]func(*testing.T, interface{}, grpc.ServerStream){
+				"UnaryCall": unaryCallStreamHandler,
+				"EmptyCall": emptyCallStreamHandler,
+			},
+			execute: func(t *testing.T, ctx context.Context, client grpc_testing.TestServiceClient) {
+				_, err := client.EmptyCall(ctx, &grpc_testing.Empty{})
+				require.NoError(t, err)
+			},
+			expectedCalls: map[string]int{
+				"EmptyCall": 1,
+			},
+		},
+		{
+			desc: "call to unregistered handler",
+			registeredHandlers: map[string]func(*testing.T, interface{}, grpc.ServerStream){
+				"EmptyCall": emptyCallStreamHandler,
+			},
+			execute: func(t *testing.T, ctx context.Context, client grpc_testing.TestServiceClient) {
+				_, err := client.UnaryCall(ctx, requestSent)
+				testhelper.RequireGrpcError(t, directorCalledError, err)
+			},
+			expectedCalls: map[string]int{},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := testhelper.Context(t)
+
+			server := grpc.NewServer(
+				grpc.ForceServerCodec(proxy.NewCodec()),
+				grpc.UnknownServiceHandler(proxy.TransparentHandler(
+					func(ctx context.Context, fullMethodName string, peeker proxy.StreamPeeker) (*proxy.StreamParameters, error) {
+						return nil, directorCalledError
+					},
+				)),
+			)
+
+			calls := map[string]int{}
+			registeredHandlers := map[string]grpc.StreamHandler{}
+			for name, handler := range tc.registeredHandlers {
+				// We wrap every handler so that we can easily count the number of
+				// times each of them has been invoked.
+				registeredHandlers[name] = func(srv interface{}, stream grpc.ServerStream) error {
+					calls[name]++
+					handler(t, srv, stream)
+					return nil
+				}
+			}
+			proxy.RegisterStreamHandlers(server, grpc_testing.TestService_ServiceDesc.ServiceName, registeredHandlers)
+
+			listener := newListener(t)
+			go testhelper.MustServe(t, server, listener)
+			defer server.Stop()
+
+			conn, err := client.New(ctx, "tcp://"+listener.Addr().String())
+			require.NoError(t, err)
+			defer conn.Close()
+			client := grpc_testing.NewTestServiceClient(conn)
+
+			tc.execute(t, ctx, client)
+
+			require.Equal(t, tc.expectedCalls, calls)
+		})
+	}
+}

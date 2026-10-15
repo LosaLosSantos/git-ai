@@ -1,0 +1,117 @@
+package hook
+
+import (
+	"io"
+	"net"
+	"path/filepath"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/stretchr/testify/require"
+	grpc_metadata "google.golang.org/grpc/metadata"
+)
+
+func runTestsWithRuntimeDir(t *testing.T, testFunc func(*testing.T, string)) {
+	t.Helper()
+
+	t.Run("no runtime dir", func(t *testing.T) {
+		testFunc(t, "")
+	})
+
+	t.Run("with runtime dir", func(t *testing.T) {
+		testFunc(t, testhelper.TempDir(t))
+	})
+}
+
+func TestSidechannel(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testSidechannelWithRuntimeDir)
+}
+
+func testSidechannelWithRuntimeDir(t *testing.T, runtimeDir string) {
+	ctx := testhelper.Context(t)
+
+	// Client side
+	ctxOut, wt, err := SetupSidechannel(
+		ctx,
+		gitcmd.HooksPayload{
+			RuntimeDir: runtimeDir,
+		},
+		func(c *net.UnixConn) error {
+			_, err := io.WriteString(c, "ping")
+			return err
+		},
+	)
+	require.NoError(t, err)
+	defer testhelper.MustClose(t, wt)
+
+	require.DirExists(t, wt.socketDir)
+
+	// Server side
+	ctxIn := metadata.OutgoingToIncoming(ctxOut)
+	c, err := GetSidechannel(ctxIn)
+	require.NoError(t, err)
+	defer c.Close()
+
+	buf, err := io.ReadAll(c)
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(buf))
+
+	require.NoDirExists(t, wt.socketDir)
+
+	// Client side
+	require.NoError(t, wt.Wait())
+
+	if runtimeDir != "" {
+		require.DirExists(t, filepath.Join(runtimeDir, "chan.d"))
+	}
+}
+
+func TestSidechannel_cleanup(t *testing.T) {
+	t.Parallel()
+	runTestsWithRuntimeDir(t, testSidechannelCleanupWithRuntimeDir)
+}
+
+func testSidechannelCleanupWithRuntimeDir(t *testing.T, runtimeDir string) {
+	_, wt, err := SetupSidechannel(
+		testhelper.Context(t),
+		gitcmd.HooksPayload{
+			RuntimeDir: runtimeDir,
+		},
+		func(c *net.UnixConn) error { return nil },
+	)
+	require.NoError(t, err)
+
+	require.DirExists(t, wt.socketDir)
+	_ = wt.Close()
+	require.NoDirExists(t, wt.socketDir)
+
+	if runtimeDir != "" {
+		require.DirExists(t, filepath.Join(runtimeDir, "chan.d"))
+	}
+}
+
+func TestGetSidechannel(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	testCases := []string{
+		"foobar",
+		"sc.foo/../../bar",
+		"foo/../../bar",
+		"/etc/passwd",
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc, func(t *testing.T) {
+			ctx := grpc_metadata.NewIncomingContext(
+				ctx,
+				map[string][]string{sidechannelHeader: {tc}},
+			)
+			_, err := GetSidechannel(ctx)
+			require.Error(t, err)
+			require.Equal(t, InvalidSidechannelAddressError{tc}, err)
+		})
+	}
+}

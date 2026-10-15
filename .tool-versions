@@ -1,0 +1,15 @@
+# Versions of Gitaly dependencies managed by asdf.
+golang 1.26.8
+ko 0.18.1
+skaffold 2.24.0
+ruby 3.4.10
+
+# For linting documentation
+nodejs 24.21.0 # Dependency for markdownlint-cli2
+markdownlint-cli2 0.23.2
+lychee 0.24.2
+vale 3.21.0
+
+# For building Git
+meson 1.7.0
+ninja 1.12.1

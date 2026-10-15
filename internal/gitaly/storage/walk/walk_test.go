@@ -1,0 +1,93 @@
+package walk
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWalkStorage(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		repos      []string
+		breakRepos bool
+		files      []string
+	}{
+		{
+			name:  "repos found",
+			repos: []string{"@hashed/aa/bb/repo-1.git", "@hashed/01/23/repo-2.git"},
+		},
+		{
+			name:       "invalid repos skipped",
+			repos:      []string{"@hashed/aa/bb/repo-1.git", "@hashed/01/23/repo-2.git"},
+			breakRepos: true,
+		},
+		{
+			name:  "files ignored",
+			repos: []string{"@hashed/aa/bb/aabb.git", "@cluster/baz/45/67/89ab"},
+			files: []string{"@cluster/bar/01/23/a_file"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg := testcfg.Build(t)
+			storage := cfg.Storages[0]
+
+			var repoPaths []string
+			for _, path := range tc.repos {
+				_, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					SkipCreationViaService: true,
+					RelativePath:           path,
+				})
+
+				if tc.breakRepos {
+					// Repositories without an 'objects' directory are invalid.
+					objPath := filepath.Join(storage.Path, path, "objects")
+					require.NoError(t, os.RemoveAll(objPath))
+
+					// Don't expect repo path to be found.
+					continue
+				}
+
+				relPath, err := filepath.Rel(storage.Path, repoPath)
+				require.NoError(t, err)
+				repoPaths = append(repoPaths, relPath)
+			}
+
+			for _, file := range tc.files {
+				fullPath := filepath.Join(storage.Path, file)
+
+				dir := filepath.Dir(fullPath)
+				err := os.MkdirAll(dir, mode.Directory)
+				require.NoError(t, err)
+
+				f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE, mode.File)
+				require.NoError(t, err)
+				require.NoError(t, f.Close())
+			}
+
+			var foundPaths []string
+			repoAction := func(relPath string, gitDirInfo fs.FileInfo) error {
+				foundPaths = append(foundPaths, relPath)
+				return nil
+			}
+
+			locator := config.NewLocator(cfg)
+			require.NoError(t, FindRepositories(ctx, locator, storage.Name, repoAction))
+
+			require.ElementsMatch(t, foundPaths, repoPaths)
+		})
+	}
+}

@@ -1,0 +1,53 @@
+socket_path = "/var/opt/gitaly/gitaly.socket"
+
+# The directory where Gitaly's executables are stored
+bin_dir = "/opt/gitaly/bin"
+
+# The directory where Gitaly creates all data required at runtime.
+runtime_dir = "/var/opt/gitaly/run"
+
+# # Optional: listen on a TCP socket. This is insecure (no authentication)
+listen_addr = "0.0.0.0:8075"
+# tls_listen_addr = "127.0.0.1:8888
+
+# # Optional: export metrics via Prometheus
+prometheus_listen_addr = "127.0.0.1:9236"
+
+# # Optional: authenticate Gitaly requests using a shared secret
+[auth]
+# token = 'abc123secret'
+
+# transitioning = false # Set `transitioning` to true to temporarily allow unauthenticated while rolling out authentication.
+
+# [tls]
+# certificate_path = '/home/git/cert.cert'
+# key_path = '/home/git/key.pem'
+
+# # Git settings
+[git]
+catfile_cache_size = 10
+
+[[storage]]
+name = "default"
+path = "/mnt/git-repositories"
+
+# # You can optionally configure Gitaly to output JSON-formatted log messages to stdout
+[logging]
+level = "info"
+format = "json"
+dir = "/var/log/gitaly"
+
+[gitlab]
+url = "http://127.0.0.1:3001"
+secret_file = "/var/opt/gitaly/shell.secret"
+
+[gitlab.http-settings]
+self_signed_cert = false
+
+[pack_objects_cache]
+enabled = true
+dir = "/mnt/git-repositories/+gitaly/PackObjectsCache"
+max_age = '5m'
+
+[transactions]
+enabled = {{ target_instance['config']['transactions'] | default(false) | lower }}

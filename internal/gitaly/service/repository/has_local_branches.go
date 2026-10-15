@@ -1,0 +1,21 @@
+package repository
+
+import (
+	"context"
+
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+func (s *server) HasLocalBranches(ctx context.Context, in *gitalypb.HasLocalBranchesRequest) (*gitalypb.HasLocalBranchesResponse, error) {
+	repository := in.GetRepository()
+	if err := s.locator.ValidateRepository(ctx, repository); err != nil {
+		return nil, structerr.NewInvalidArgument("%w", err)
+	}
+	hasBranches, err := s.localRepoFactory.Build(repository).HasBranches(ctx)
+	if err != nil {
+		return nil, structerr.NewInternal("%w", err)
+	}
+
+	return &gitalypb.HasLocalBranchesResponse{Value: hasBranches}, nil
+}

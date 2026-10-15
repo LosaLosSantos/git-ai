@@ -1,0 +1,209 @@
+# Example Gitaly configuration file.
+# For Gitaly documentation, see https://docs.gitlab.com/administration/gitaly/.
+
+# A path which Gitaly should open a Unix socket.
+socket_path = "/home/git/gitlab/tmp/sockets/private/gitaly.socket"
+
+# Directory containing Gitaly executables.
+bin_dir = "/home/git/gitaly/_build/bin"
+
+# # Optional. The directory where Gitaly can create all files required to
+# # properly operate at runtime. If not set, Gitaly will create a directory in
+# # the global temporary directory. This directory must exist.
+# runtime_dir = "/home/git/gitaly/run"
+
+# # Optional if socket_path is set. TCP address for Gitaly to listen on. This is insecure (unencrypted connection).
+# listen_addr = "localhost:9999"
+
+# # Optional. TCP over TLS address for Gitaly to listen on.
+# tls_listen_addr = "localhost:8888"
+
+# # Optional. TCP listen address for Prometheus metrics. If not set, no Prometheus listener is started.
+# prometheus_listen_addr = "localhost:9236"
+
+# # Optional. A top-level setting (not part of any [[concurrency]] block). Client names, from the
+# # "client_name" gRPC metadata, treated as authenticated for concurrency limiting even without an
+# # end-user "username". These are trusted internal callers whose traffic must not fall into the
+# # unauthenticated limits meant for anonymous public Git access. Defaults to ["gitlab-sidekiq"]; set
+# # to an empty list to disable the exemption.
+# internal_clients = ["gitlab-sidekiq"]
+
+# # Optional. Authenticate Gitaly requests using a shared secret.
+# # Gitaly rejects requests that do not contain the authentication token in their headers.
+# # Authentication is disabled when the token setting is absent or an empty string.
+# [auth]
+# token = 'abc123secret'
+# # Read the token from a file (must have 0600 or 0400 permissions).
+# # The token and token_file options are mutually exclusive.
+# token_file = '/path/to/token/file'
+# # Set `transitioning` to true to temporarily allow unauthenticated while rolling out authentication. This allows you
+# # to monitor if all clients are authenticating correctly without causing a service outage for clients that are still
+# # to be configured correctly.
+# # Remember to disable transitioning when you are done changing your token settings.
+# transitioning = false
+
+# # Gitaly supports TLS encryption. You must bring your own certificates because this isn’t provided automatically.
+# [tls]
+# # Path to the certificate.
+# certificate_path = '/home/git/cert.cert'
+# # Path to the key.
+# key_path = '/home/git/key.pem'
+# Minimum offered TLS version. Options: ["TLS 1.2", "TLS 1.3"].
+# min_version = "TLS 1.2"
+
+# # Git settings
+# [git]
+# # Maximum number of cached 'cat-file' processes, which constitute a pair of 'git cat-file --batch' and
+# # 'git cat-file --batch-check' processes. Defaults to '100'.
+# catfile_cache_size = 100
+# # Path to GPG signing key. If not set, Gitaly doesn’t sign commits made using the UI.
+# signing_key = ""
+
+# [[git.config]]
+# key = fetch.fsckObjects
+# value = true
+# # Storages are the directories where Gitaly stores its data such as the repositories and runtime state.
+# # Each storage must have a unique name.
+[[storage]]
+# # The name of the storage
+name = "default"
+# # The path to the storage.
+path = "/home/git/repositories"
+
+# # You can optionally configure more storages for this Gitaly instance to serve up
+#
+# [[storage]]
+# name = "other_storage"
+# path = "/mnt/other_storage/repositories"
+#
+
+# # Optional. Configure Gitaly to output JSON-formatted log messages to stdout.
+# [logging]
+# # Log format. Either 'text' or 'json'.
+# format = "json"
+# # Optional. Set log level to only log entries with that severity or above.
+# # Valid values are, in order, 'debug', 'info', 'warn', 'error', 'fatal', and 'panic'. Defaults to 'info'.
+# level = "warn"
+# # Additionally, exceptions from the Go server can be reported to Sentry. Sentry DSN (Data Source Name)
+# # for exception monitoring.
+# sentry_dsn = "https://<key>:<secret>@sentry.io/<project>"
+# # Sentry Environment for exception monitoring.
+sentry_environment = ""
+
+# # Optional. Configure Gitaly to record histogram latencies on GRPC method calls in Prometheus.
+# [prometheus]
+# # Prometheus stores each observation in a bucket, which means you’d get an approximation of latency. Optimizing the
+# # buckets gives more control over the accuracy of the approximation.
+# grpc_latency_buckets = [0.001, 0.005, 0.025, 0.1, 0.5, 1.0, 10.0, 30.0, 60.0, 300.0, 1500.0]
+
+# # Custom Git hooks that are used to perform tasks based on changes performed in any repository.
+[hooks]
+# # Directory where custom Git hooks are installed. If left unset, no custom hooks are used.
+custom_hooks_dir = "/home/git/custom_hooks"
+# # Maximum time the post-receive hook waits for Praefect to finish transaction
+# # coordination (including the database generation update) before failing the push.
+# # Only applies when running through Praefect with the post-receive signal feature
+# # enabled; outside Praefect the hook does not wait. Defaults to "60s".
+# post_receive_wait_timeout = "60s"
+
+# # Gitaly must connect to the GitLab application to perform access checks when a user performs a change.
+[gitlab]
+# # URL of the GitLab server.
+url = "http+unix://%2Fhome%2Fgit%2Fgitlab%2Ftmp%2Fsockets%2Fgitlab-workhorse.socket"
+# # 'relative_url_root' is only needed if a UNIX socket is used in 'url' and GitLab is configured to
+# # use a relative path. For example, '/gitlab'.
+# relative_url_root = '/'
+# # Path of the file containing the secret token used to authenticate with GitLab. Use either 'secret_token' or 'secret'
+# # but not both.
+secret_file = "/home/git/gitlab-shell/.gitlab_shell_secret"
+# # Secret token used to authenticate with GitLab.
+# secret = ""
+
+[gitlab.http-settings]
+# read_timeout = 300
+# user = someone
+# password = somepass
+# ca_file = /etc/ssl/cert.pem
+# ca_path = /etc/pki/tls/certs
+self_signed_cert = false
+
+# # You can adjust the concurrency of each RPC endpoint
+# [[concurrency]]
+# # Name of the RPC endpoint.
+# rpc = "/gitaly.RepositoryService/OptimizeRepository"
+# # Concurrency per RPC per repository.
+# max_per_repo = 1
+# max_queue_wait = "1m"
+# max_queue_size = 10
+
+# Daily maintenance designates time slots to run daily to optimize and maintain
+# enabled storages.
+# [daily_maintenance]
+# start_hour = 23
+# start_minute = 30
+# duration = "45m"
+# storages = ["default"]
+# disabled = false
+
+# Limit the resources Gitaly can use via Linux cgroups v1
+# [cgroups]
+# mountpoint = "/sys/fs/cgroup"
+# hierarchy_root = "gitaly"
+# memory_bytes = 64424509440 # 60gb
+# cpu_shares = 1024
+# cpu_quota_us = 400000
+
+# Limit the resources each repository can use via Linux cgroups v1
+# [cgroups.repositories]
+# count = 500
+# memory_bytes = 12884901888 # 12gb
+# cpu_shares = 512
+# cpu_quota_us = 200000
+
+# # Server-side backups
+# [backup]
+# # The destination object-storage URL.
+# go_cloud_url = "gs://gitaly-backups"
+# # The object-storage URL for write-ahead log backups.
+# wal_backup_go_cloud_url = "gs://gitaly-wal-backups"
+# # Optional: defaults to 1
+# # The number of goroutines performing write-ahead log backups.
+# wal_backup_worker_count = 1
+# # Optional: defaults to 5,242,880 bytes (5MiB). If 0, the driver will choose a reasonable default.
+# # The size of each part in a multipart upload to object storage.
+# buffer_size = 0
+# # Optional: defaults to false. If true, gitaly will inject checksum algorithm to aws sdk v2 requests.
+# # This is needed to work with a bucket with object lock and versioning.
+# enable_trailing_checksum = false
+
+## Pack-object cache configuration
+# [pack_objects_cache]
+## If the cache is enabled or not
+# enabled = true
+## Controls whether the cache applies a backpressure mechanism
+# backpressure = true
+## Directory where cached packfile are stored
+# dir = '/path/to/cache'
+## Max duration of packfiles in the cache
+# max_age = '300s'
+## Minimum number of identical requests required before caching an object
+# min_occurrences = 1
+
+## Archive cache configuration
+# [archive_cache]
+## If the cache is enabled or not
+# enabled = true
+## Directory where cached archives are stored
+# dir = '/path/to/cache'
+## Max duration of packfiles in the cache
+# max_age = '300s'
+
+# # Bundle-URI
+# [bundle_uri]
+# # The destination object-storage URL.
+# go_cloud_url = "gs://my-bundle-uri-bucket"
+
+# # Negotiation timeouts for remote Git operations
+# [timeout]
+# upload_pack_negotiation = "10m"
+# upload_archive_negotiation = "1m"

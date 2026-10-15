@@ -1,0 +1,150 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${KUBE_NAMESPACE}
+  labels:
+    app: gitaly-benchmark
+    experiment: ${EXPERIMENT}
+    run-name: ${RUN_NAME}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${ACTIVE_DEADLINE_SECONDS}
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: gitaly-benchmark
+        experiment: ${EXPERIMENT}
+        run-name: ${RUN_NAME}
+    spec:
+      serviceAccountName: ${SA_NAME}
+      restartPolicy: Never
+      # Pin the benchmark to the dedicated, tainted+labeled node pool so it is
+      # isolated from the Gitaly/GitLab workloads it measures and is never
+      # preempted mid-run. The pool is provisioned in the cluster's Terraform
+      # (gl-gitaly/tf-gke-gitlab-bootstrap) with this label and taint, and
+      # autoscales from zero. See README.
+      nodeSelector:
+        workload: benchmark
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: benchmark
+          effect: NoSchedule
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: benchmark-config
+          configMap:
+            name: ${CM_NAME}
+      containers:
+        - name: benchmark
+          image: ${BENCHMARK_IMAGE}
+          # Always re-pull: tags are mutable, and a cached wrong-arch build
+          # under the same tag fails with "exec format error".
+          imagePullPolicy: Always
+          env:
+            - name: RUN_NAME
+              value: ${RUN_NAME}
+            - name: GITALY_ADDRESS
+              value: ${GITALY_ADDRESS}
+            - name: GITALY_PROTO_DIR
+              value: /src/gitaly/proto
+            - name: WORKLOAD_DURATION
+              value: ${WORKLOAD_DURATION}
+            - name: PROFILE
+              value: "${PROFILE}"
+            - name: PROFILE_DURATION
+              value: "${PROFILE_DURATION}"
+            - name: GITALY_NAMESPACE
+              value: ${GITALY_NAMESPACE}
+            # Resolves the pods backing the benchmarked Service via its
+            # Endpoints, so the log harvest excludes the co-deployed non-MVCC
+            # Gitaly, whose pods share the app=gitaly label.
+            - name: GITALY_SERVICE
+              value: ${GITALY_SERVICE}
+            - name: GITALY_POD_SELECTOR
+              value: ${GITALY_POD_SELECTOR}
+            - name: GITALY_CONTAINER
+              value: ${GITALY_CONTAINER}
+            - name: GITALY_METRICS_PORT
+              value: "${GITALY_METRICS_PORT}"
+            # Real-git-push sections: transports, workhorse URL, bench group.
+            - name: PUSH_TRANSPORTS
+              value: "${PUSH_TRANSPORTS}"
+            # "1" runs only the push sections at 1/10 load (quick benchmark).
+            - name: PUSH_ONLY
+              value: "${PUSH_ONLY}"
+            - name: GITLAB_HTTP_URL
+              value: ${GITLAB_HTTP_URL}
+            # gitlab-shell's sshd, for the ssh transport.
+            - name: GITLAB_SSH_URL
+              value: ${GITLAB_SSH_URL}
+            - name: BENCH_GROUP
+              value: ${BENCH_GROUP}
+            # Storage name the target Gitaly serves; k6 and benchmark-push
+            # put it in every repository message.
+            - name: GITALY_STORAGE_NAME
+              value: ${GITALY_STORAGE_NAME}
+            # PAT for the http push transport, minted by provision-repos;
+            # optional so ssh-only runs work without the secret.
+            - name: GITLAB_PAT
+              valueFrom:
+                secretKeyRef:
+                  name: gitaly-benchmark-pat
+                  key: token
+                  optional: true
+            # Private key for the ssh transport, minted by provision-repos;
+            # optional so a run without it still starts.
+            - name: BENCH_SSH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gitaly-benchmark-ssh-key
+                  key: private_key
+                  optional: true
+            # Shared Gitaly auth secret; k6 signs every RPC with a v2 HMAC
+            # bearer derived from it. secretKeyRef keeps the cleartext out
+            # of the Job spec and `kubectl describe`.
+            - name: GITALY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ${GITALY_AUTH_SECRET_NAME}
+                  key: ${GITALY_AUTH_SECRET_KEY}
+          volumeMounts:
+            - name: run
+              mountPath: /tmp/run
+            - name: benchmark-config
+              mountPath: /etc/benchmark
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+        - name: uploader
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "[uploader] waiting for /tmp/run/.done"
+              while [ ! -f /tmp/run/.done ]; do sleep 2; done
+              echo "[uploader] benchmark finished, syncing to gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}/"
+              gcloud storage rsync --recursive /tmp/run/${RUN_NAME}/ \
+                gs://${BENCHMARK_RESULTS_BUCKET}/${RUN_NAME}/
+              echo "[uploader] done"
+          volumeMounts:
+            - name: run
+              mountPath: /tmp/run
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

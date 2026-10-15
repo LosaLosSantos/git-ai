@@ -1,0 +1,175 @@
+package repository
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/require"
+)
+
+func TestObjectFormat(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, client := setupRepositoryService(t)
+
+	equalError := func(tb testing.TB, expected error) func(error) {
+		return func(actual error) {
+			tb.Helper()
+			testhelper.RequireGrpcError(tb, expected, actual)
+		}
+	}
+
+	type setupData struct {
+		request          *gitalypb.ObjectFormatRequest
+		requireError     func(error)
+		expectedResponse *gitalypb.ObjectFormatResponse
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		setup func(t *testing.T) setupData
+	}{
+		{
+			desc: "unset repository",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					request:      &gitalypb.ObjectFormatRequest{},
+					requireError: equalError(t, structerr.NewInvalidArgument("%w", storage.ErrRepositoryNotSet)),
+				}
+			},
+		},
+		{
+			desc: "missing storage name",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: &gitalypb.Repository{
+							RelativePath: "path",
+						},
+					},
+					requireError: equalError(t, structerr.NewInvalidArgument("%w", storage.ErrStorageNotSet)),
+				}
+			},
+		},
+		{
+			desc: "missing relative path",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: &gitalypb.Repository{
+							StorageName: cfg.Storages[0].Name,
+						},
+					},
+					requireError: equalError(t, structerr.NewInvalidArgument("%w", storage.ErrRepositoryPathNotSet)),
+				}
+			},
+		},
+		{
+			desc: "nonexistent repository",
+			setup: func(t *testing.T) setupData {
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: &gitalypb.Repository{
+							StorageName:  cfg.Storages[0].Name,
+							RelativePath: "nonexistent.git",
+						},
+					},
+					requireError: equalError(t, testhelper.ToInterceptedMetadata(
+						structerr.New("%w", storage.NewRepositoryNotFoundError(cfg.Storages[0].Name, "nonexistent.git")),
+					)),
+				}
+			},
+		},
+		{
+			desc: "SHA1",
+			setup: func(t *testing.T) setupData {
+				repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					ObjectFormat: "sha1",
+				})
+
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: repoProto,
+					},
+					expectedResponse: &gitalypb.ObjectFormatResponse{
+						Format: gitalypb.ObjectFormat_OBJECT_FORMAT_SHA1,
+					},
+				}
+			},
+		},
+		{
+			desc: "SHA256",
+			setup: func(t *testing.T) setupData {
+				repoProto, _ := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+					ObjectFormat: "sha256",
+				})
+
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: repoProto,
+					},
+					expectedResponse: &gitalypb.ObjectFormatResponse{
+						Format: gitalypb.ObjectFormat_OBJECT_FORMAT_SHA256,
+					},
+				}
+			},
+		},
+		{
+			desc: "invalid object format",
+			setup: func(t *testing.T) setupData {
+				repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+				// We write the config file manually so that we can use an
+				// exact-match for the error down below.
+				//
+				// Remove the config file first as files are read-only with transactions.
+				configPath := filepath.Join(repoPath, "config")
+				require.NoError(t, os.Remove(configPath))
+				require.NoError(t, os.WriteFile(configPath, []byte(
+					strings.Join([]string{
+						"[core]",
+						"repositoryformatversion = 1",
+						"bare = true",
+						"[extensions]",
+						"objectFormat = blake2b",
+					}, "\n"),
+				), mode.File))
+
+				return setupData{
+					request: &gitalypb.ObjectFormatRequest{
+						Repository: repoProto,
+					},
+					requireError: func(actual error) {
+						testhelper.RequireGrpcError(t,
+							structerr.NewInternal(`detecting object hash: unknown object format: "blake2b"`),
+							actual,
+						)
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			setupData := tc.setup(t)
+			response, err := client.ObjectFormat(ctx, setupData.request)
+			if setupData.requireError != nil {
+				setupData.requireError(err)
+				return
+			}
+
+			require.NoError(t, err)
+			testhelper.ProtoEqual(t, setupData.expectedResponse, response)
+		})
+	}
+}

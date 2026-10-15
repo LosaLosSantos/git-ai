@@ -1,0 +1,65 @@
+---
+# Custom instructions for GitLab Duo Code Review
+# Based on GitLab's official code review guidelines
+
+# References:
+# - Field Standardisation in Observability: https://handbook.gitlab.com/handbook/engineering/architecture/design-documents/observability_field_standardisation/
+
+
+# This file defines custom review criteria that will be applied to specific files
+# during merge request reviews. Instructions are grouped by name and can target
+# multiple file patterns using glob syntax.
+instructions:
+  - name: Log Field Standards
+    fileFilters:
+      - "**/*.go"
+      - "!**/*_test.go"
+    instructions: |
+      Backend engineers should be complying with the new field standardisation in observability best practices
+      1. For any log lines that have been altered:
+        - Ask: "If you are adding or modifying fields that aren't service specific, please ensure that the field is defined within the LabKit Go Fields package"
+        - Remind: "Common logging fields should be defined within the LabKit fields package and imported from there if they aren't service specific. Link: https://gitlab.com/gitlab-org/labkit/-/tree/master/fields?ref_type=heads"
+      2. For any new fields being added to log messages:
+        - Check to ensure that these fields are not dynamically generated
+        - Remind: "We're aiming to standardise the fields that we emit across all of our services at GitLab through this approach. Read more about this in https://handbook.gitlab.com/handbook/engineering/architecture/design-documents/observability_field_standardisation/"
+
+  - name: Unbounded log size
+    fileFilters:
+      - "**/*.go"
+      - "!**/*_test.go"
+    instructions: |
+      Gitaly is a long-running server process that produces structured logs. In
+      production, these logs are typically in JSON format and will potentially
+      be ingested by log aggregation systems like fluentd.
+
+      Gitaly's logging can be quite verbose, especially for new features which
+      we want enhanced observability on. Whenever logging fields are added or
+      modified, check:
+
+      - Whether the new field can experience unbounded growth due to how the
+        value of the field is being computed. For example, is the source of the
+        value a slice or a map that only grows in size?
+      - Whether the cardinality of field names is likely to be high. For
+        example, field names should not contain arbitrary values like PIDs or
+        other IDs.
+
+  - name: Dependency updates
+    fileFilters:
+      - "**/go.mod"
+      - "**/go.sum"
+    instructions: |
+      Updates to Go packages that are used by Gitaly can have subtle but far-reaching consequences. For
+      example, a minor version bump to the grpc-go package in https://gitlab.com/gitlab-org/gitaly/-/merge_requests/7531
+      resulted in significant performance degradation due to a bug and a behavioural change.
+
+      Therefore, it is crucial that dependencies on the critical path of Gitaly requests are thoroughly
+      vetted for correctness and performance. This can be challenging to do for every dependency update.
+
+      Provided that this MR is a dependency update (check the diff in the go.mod files), then assess the
+      updated dependency for any possible regressions. Scrutinise the upstream sources and inspect how
+      the dependency is being used by Gitaly.
+
+      Your report should include a score from 1 to 3 representing the risk that the dependency update
+      introduces. 1 is high risk, 2 is indeterminate, and 3 is low risk. This provides an indication to
+      human reviewers on how much time is required to be spent vetting the update.
+

@@ -1,0 +1,443 @@
+package server
+
+import (
+	netctx "context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"net"
+	"testing"
+	"time"
+
+	gitalyauth "github.com/feder-cr/open_scion/auth"
+	"github.com/feder-cr/open_scion/internal/cache"
+	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	gitmvcc "github.com/feder-cr/open_scion/internal/git/mvcc"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/config/auth"
+	"github.com/feder-cr/open_scion/internal/gitaly/hook"
+	"github.com/feder-cr/open_scion/internal/gitaly/hook/updateref"
+	"github.com/feder-cr/open_scion/internal/gitaly/service"
+	"github.com/feder-cr/open_scion/internal/gitaly/service/server"
+	"github.com/feder-cr/open_scion/internal/gitaly/service/setup"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/gitlab"
+	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
+	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/open_scion/internal/grpc/middleware/limithandler"
+	"github.com/feder-cr/open_scion/internal/grpc/middleware/mvcc"
+	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	expcredentials "google.golang.org/grpc/experimental/credentials"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+)
+
+func TestSanity(t *testing.T) {
+	serverSocketPath := runServer(t, testcfg.Build(t))
+
+	conn, err := dial(testhelper.Context(t), serverSocketPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	require.NoError(t, performUnaryRequest(t, conn))
+}
+
+func TestTLSSanity(t *testing.T) {
+	cfg := testcfg.Build(t)
+	addr := runSecureServer(t, cfg)
+
+	certPool, err := x509.SystemCertPool()
+	require.NoError(t, err)
+
+	cert := testhelper.MustReadFile(t, "testdata/gitalycert.pem")
+	ok := certPool.AppendCertsFromPEM(cert)
+	require.True(t, ok)
+
+	creds := expcredentials.NewTLSWithALPNDisabled(&tls.Config{
+		RootCAs:    certPool,
+		MinVersion: tls.VersionTLS12,
+	})
+
+	conn, err := dial(testhelper.Context(t), fmt.Sprintf("tls://%s", addr), client.WithTransportCredentials(creds))
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+
+	require.NoError(t, performUnaryRequest(t, conn))
+}
+
+func TestAuthFailures(t *testing.T) {
+	testCases := []struct {
+		desc string
+		opts []grpc.DialOption
+		code codes.Code
+	}{
+		{desc: "no auth", opts: nil, code: codes.Unauthenticated},
+		{
+			desc: "invalid auth",
+			opts: []grpc.DialOption{grpc.WithPerRPCCredentials(brokenAuth{})},
+			code: codes.Unauthenticated,
+		},
+		{
+			desc: "wrong secret",
+			opts: []grpc.DialOption{grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2("foobar"))},
+			code: codes.PermissionDenied,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{
+				Auth: auth.Config{Token: "quxbaz"},
+			}))
+
+			serverSocketPath := runServer(t, cfg)
+			conn, err := dial(testhelper.Context(t), serverSocketPath, client.WithGrpcOptions(tc.opts))
+			require.NoError(t, err, tc.desc)
+			t.Cleanup(func() { conn.Close() })
+			testhelper.RequireGrpcCode(t, performUnaryRequest(t, conn), tc.code)
+		})
+	}
+}
+
+func TestAuthSuccess(t *testing.T) {
+	token := "foobar"
+
+	testCases := []struct {
+		desc     string
+		opts     []grpc.DialOption
+		required bool
+		token    string
+	}{
+		{desc: "no auth, not required"},
+		{
+			desc:  "v2 correct auth, not required",
+			opts:  []grpc.DialOption{grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(token))},
+			token: token,
+		},
+		{
+			desc:  "v2 incorrect auth, not required",
+			opts:  []grpc.DialOption{grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2("incorrect"))},
+			token: token,
+		},
+		{
+			desc:     "v2 correct auth, required",
+			opts:     []grpc.DialOption{grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(token))},
+			token:    token,
+			required: true,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{
+				Auth: auth.Config{Token: tc.token, Transitioning: !tc.required},
+			}))
+
+			serverSocketPath := runServer(t, cfg)
+			conn, err := dial(testhelper.Context(t), serverSocketPath, client.WithGrpcOptions(tc.opts))
+			require.NoError(t, err, tc.desc)
+			t.Cleanup(func() { conn.Close() })
+			assert.NoError(t, performUnaryRequest(t, conn), tc.desc)
+		})
+	}
+}
+
+func TestUnauthenticatedHealthService(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	cfg := testcfg.Build(t)
+	cfg.Auth.Token = "secret-token"
+	serverSocketPath := runServer(t, cfg)
+
+	for _, tc := range []struct {
+		desc                    string
+		token                   string
+		expectedAuthFailureCode codes.Code
+	}{
+		{
+			desc:  "with correct token",
+			token: cfg.Auth.Token,
+		},
+		{
+			desc:                    "with wrong token",
+			token:                   "incorrect-token",
+			expectedAuthFailureCode: codes.PermissionDenied,
+		},
+		{
+			desc:                    "without token",
+			expectedAuthFailureCode: codes.Unauthenticated,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			var dialOpts []grpc.DialOption
+			if tc.token != "" {
+				dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(tc.token)))
+			}
+
+			conn, err := dial(testhelper.Context(t), serverSocketPath, client.WithGrpcOptions(dialOpts))
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, conn)
+
+			if err := performUnaryRequest(t, conn); tc.expectedAuthFailureCode != 0 {
+				testhelper.RequireGrpcCode(t, err, tc.expectedAuthFailureCode)
+			} else {
+				require.NoError(t, err)
+			}
+
+			resp, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+			require.NoError(t, err)
+			testhelper.ProtoEqual(t, resp, &healthpb.HealthCheckResponse{
+				Status: healthpb.HealthCheckResponse_SERVING,
+			})
+		})
+	}
+}
+
+type brokenAuth struct{}
+
+func (brokenAuth) RequireTransportSecurity() bool { return false }
+func (brokenAuth) GetRequestMetadata(netctx.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer blablabla"}, nil
+}
+
+func dial(ctx netctx.Context, serverSocketPath string, opts ...client.DialOption) (*grpc.ClientConn, error) {
+	return client.New(ctx, serverSocketPath, opts...)
+}
+
+func performUnaryRequest(tb testing.TB, conn *grpc.ClientConn) error {
+	ctx := testhelper.Context(tb)
+
+	_, err := gitalypb.NewServerServiceClient(conn).ServerInfo(ctx, &gitalypb.ServerInfoRequest{})
+	return err
+}
+
+func newOperationClient(t *testing.T, token, serverSocketPath string) (gitalypb.OperationServiceClient, *grpc.ClientConn) {
+	t.Helper()
+
+	connOpts := []grpc.DialOption{
+		grpc.WithPerRPCCredentials(gitalyauth.RPCCredentialsV2(token)),
+	}
+	conn, err := client.New(testhelper.Context(t), serverSocketPath, client.WithGrpcOptions(connOpts))
+	require.NoError(t, err)
+
+	return gitalypb.NewOperationServiceClient(conn), conn
+}
+
+func runServer(t *testing.T, cfg config.Cfg) string {
+	t.Helper()
+	ctx := testhelper.Context(t)
+
+	logger := testhelper.SharedLogger(t)
+	registry := backchannel.NewRegistry()
+	conns := client.NewPool()
+	t.Cleanup(func() { testhelper.MustClose(t, conns) })
+	locator := config.NewLocator(cfg)
+	txManager := transaction.NewManager(cfg, logger, registry)
+	gitCmdFactory := gittest.NewCommandFactory(t, cfg)
+	hookManager := hook.NewManager(cfg, locator, logger, gitCmdFactory, nil, txManager, gitlab.NewMockClient(
+		t, gitlab.MockAllowed, gitlab.MockPreReceive, gitlab.MockPostReceive,
+	), hook.NewPostReceiveRegistry())
+	catfileCache := catfile.NewCache(cfg)
+	t.Cleanup(catfileCache.Stop)
+	diskCache := cache.New(cfg, locator, logger)
+	_, setupPerRPCConcurrencyLimiters := limithandler.WithConcurrencyLimiters(cfg)
+	limitHandler := limithandler.New(cfg, limithandler.LimitConcurrencyByRepo, setupPerRPCConcurrencyLimiters)
+	updaterWithHooks := updateref.NewUpdaterWithHooks(cfg, logger, locator, hookManager, gitCmdFactory, catfileCache)
+
+	mvccMiddleware := mvcc.NewMvccInterceptor(gitmvcc.NewCacheFactory(cfg.RuntimeDir, locator), logger, protoregistry.GitalyProtoPreregistered, locator)
+	srv, err := NewGitalyServerFactory(
+		cfg,
+		logger,
+		registry,
+		diskCache,
+		[]*limithandler.LimiterMiddleware{limitHandler},
+		nil,
+		TransactionMiddleware{},
+		mvccMiddleware,
+	).New(true, false)
+	require.NoError(t, err)
+	localRepoFactory := localrepo.NewFactory(logger, locator, gitCmdFactory, catfileCache)
+
+	setup.RegisterAll(srv, &service.Dependencies{
+		Logger:                 logger,
+		Cfg:                    cfg,
+		GitalyHookManager:      hookManager,
+		TransactionManager:     txManager,
+		StorageLocator:         locator,
+		ClientPool:             conns,
+		GitCmdFactory:          gitCmdFactory,
+		CatfileCache:           catfileCache,
+		UpdaterWithHooks:       updaterWithHooks,
+		LocalRepositoryFactory: localRepoFactory,
+	})
+	serverSocketPath := testhelper.GetTemporaryGitalySocketFileName(t)
+
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "unix", serverSocketPath)
+	require.NoError(t, err)
+	t.Cleanup(srv.Stop)
+	go testhelper.MustServe(t, srv, listener)
+
+	return "unix://" + serverSocketPath
+}
+
+//go:generate openssl req -newkey rsa:4096 -new -nodes -x509 -days 3650 -out testdata/gitalycert.pem -keyout testdata/gitalykey.pem -subj "/C=US/ST=California/L=San Francisco/O=GitLab/OU=GitLab-Shell/CN=localhost" -addext "subjectAltName = IP:127.0.0.1, DNS:localhost"
+func runSecureServer(t *testing.T, cfg config.Cfg) string {
+	t.Helper()
+
+	cfg.TLS = config.TLS{
+		CertPath: "testdata/gitalycert.pem",
+		KeyPath:  "testdata/gitalykey.pem",
+	}
+
+	conns := client.NewPool()
+	t.Cleanup(func() { testhelper.MustClose(t, conns) })
+
+	_, setupPerRPCConcurrencyLimiters := limithandler.WithConcurrencyLimiters(cfg)
+
+	locator := config.NewLocator(cfg)
+	logger := testhelper.SharedLogger(t)
+	mvccMiddleware := mvcc.NewMvccInterceptor(gitmvcc.NewCacheFactory(cfg.RuntimeDir, locator), logger, protoregistry.GitalyProtoPreregistered, locator)
+	srv, err := NewGitalyServerFactory(
+		cfg,
+		logger,
+		backchannel.NewRegistry(),
+		cache.New(cfg, config.NewLocator(cfg), logger),
+		[]*limithandler.LimiterMiddleware{limithandler.New(cfg, limithandler.LimitConcurrencyByRepo, setupPerRPCConcurrencyLimiters)},
+		nil,
+		TransactionMiddleware{},
+		mvccMiddleware,
+	).New(true, true)
+	require.NoError(t, err)
+
+	gitalypb.RegisterServerServiceServer(srv, server.NewServer(&service.Dependencies{
+		Logger:        logger,
+		GitCmdFactory: gittest.NewCommandFactory(t, cfg),
+		Cfg:           cfg,
+	}))
+	healthpb.RegisterHealthServer(srv, health.NewServer())
+
+	listener, hostPort := testhelper.GetLocalhostListener(t)
+	t.Cleanup(srv.Stop)
+	go testhelper.MustServe(t, srv, listener)
+
+	return hostPort
+}
+
+func TestUnaryNoAuth(t *testing.T) {
+	cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{Auth: auth.Config{Token: "testtoken"}}))
+
+	path := runServer(t, cfg)
+	conn, err := dial(testhelper.Context(t), path)
+	require.NoError(t, err)
+	defer testhelper.MustClose(t, conn)
+	ctx := testhelper.Context(t)
+
+	client := gitalypb.NewRepositoryServiceClient(conn)
+	_, err = client.CreateRepository(ctx, &gitalypb.CreateRepositoryRequest{
+		Repository: &gitalypb.Repository{
+			StorageName:  cfg.Storages[0].Name,
+			RelativePath: "new/project/path",
+		},
+	},
+	)
+
+	testhelper.RequireGrpcCode(t, err, codes.Unauthenticated)
+}
+
+func TestStreamingNoAuth(t *testing.T) {
+	cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{Auth: auth.Config{Token: "testtoken"}}))
+
+	path := runServer(t, cfg)
+	conn, err := dial(testhelper.Context(t), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	ctx := testhelper.Context(t)
+
+	client := gitalypb.NewRepositoryServiceClient(conn)
+
+	response, err := client.GetFileAttributes(ctx, &gitalypb.GetFileAttributesRequest{
+		Repository: &gitalypb.Repository{
+			StorageName:  cfg.Storages[0].Name,
+			RelativePath: "new/project/path",
+		},
+	},
+	)
+	require.Nil(t, response)
+	testhelper.RequireGrpcCode(t, err, codes.Unauthenticated)
+}
+
+func TestAuthBeforeLimit(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{
+		Auth: auth.Config{Token: "abc123"},
+		Concurrency: []config.Concurrency{{
+			RPC: "/gitaly.OperationService/UserCreateTag",
+			ConcurrencyLimits: config.ConcurrencyLimits{
+				MaxPerRepo: 1,
+			},
+		}},
+	},
+	))
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	commitID := gittest.WriteCommit(t, cfg, repoPath)
+
+	gitlabURL, cleanup := gitlab.SetupAndStartGitlabServer(t, cfg.GitlabShell.Dir, &gitlab.TestServerOptions{
+		SecretToken:                 "secretToken",
+		GLID:                        gittest.GlID,
+		GLRepository:                repo.GetGlRepository(),
+		PostReceiveCounterDecreased: true,
+		Protocol:                    "web",
+	})
+	t.Cleanup(cleanup)
+	cfg.Gitlab.URL = gitlabURL
+
+	serverSocketPath := runServer(t, cfg)
+	client, conn := newOperationClient(t, cfg.Auth.Token, serverSocketPath)
+	t.Cleanup(func() { conn.Close() })
+
+	defer func(d time.Duration) {
+		gitalyauth.SetTokenValidityDuration(d)
+	}(gitalyauth.TokenValidityDuration())
+	gitalyauth.SetTokenValidityDuration(5 * time.Second)
+
+	gittest.WriteCustomHook(t, repoPath, "pre-receive", []byte(fmt.Sprintf(`#!/usr/bin/env bash
+sleep %v
+`, gitalyauth.TokenValidityDuration().Seconds())))
+
+	errChan := make(chan error)
+
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := client.UserCreateTag(ctx, &gitalypb.UserCreateTagRequest{
+				Repository:     repo,
+				TagName:        []byte(fmt.Sprintf("tag-name-%d", i)),
+				TargetRevision: []byte(commitID),
+				User:           gittest.TestUser,
+				Message:        []byte("a new tag!"),
+			})
+			errChan <- err
+		}()
+	}
+
+	timer := time.NewTimer(1 * time.Minute)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-timer.C:
+			require.Fail(t, "time limit reached waiting for calls to finish")
+		case err := <-errChan:
+			require.NoError(t, err)
+		}
+	}
+}

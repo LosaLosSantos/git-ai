@@ -1,0 +1,82 @@
+package transaction
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+)
+
+// RunOnContext runs the given function if the context identifies a transaction.
+func RunOnContext(ctx context.Context, fn func(txinfo.Transaction) error) error {
+	transaction, err := txinfo.TransactionFromContext(ctx)
+	if err != nil {
+		if errors.Is(err, txinfo.ErrTransactionNotFound) {
+			return nil
+		}
+		return err
+	}
+	return fn(transaction)
+}
+
+// VoteOnContext casts the vote on a transaction identified by the context, if there is any.
+func VoteOnContext(ctx context.Context, m Manager, vote voting.Vote, phase voting.Phase) error {
+	return RunOnContext(ctx, func(transaction txinfo.Transaction) error {
+		return m.Vote(ctx, transaction, vote, phase)
+	})
+}
+
+// CommitLockedFile will lock, vote and commit the LockingFileWriter in a race-free manner.
+func CommitLockedFile(ctx context.Context, m Manager, writer *safe.LockingFileWriter) (returnedErr error) {
+	if err := writer.Lock(); err != nil {
+		return fmt.Errorf("locking file: %w", err)
+	}
+
+	var vote voting.Vote
+	if err := RunOnContext(ctx, func(tx txinfo.Transaction) error {
+		preparingVote := voting.VoteFromData([]byte("preparing commit locked file"))
+		if err := m.Vote(ctx, tx, preparingVote, voting.Preparing); err != nil {
+			return fmt.Errorf("preimage vote at preparing phase: %w", err)
+		}
+
+		hasher := voting.NewVoteHash()
+
+		lockedFile, err := os.Open(writer.Path())
+		if err != nil {
+			return fmt.Errorf("opening locked file: %w", err)
+		}
+		defer lockedFile.Close()
+
+		if _, err := io.Copy(hasher, lockedFile); err != nil {
+			return fmt.Errorf("hashing locked file: %w", err)
+		}
+
+		vote, err = hasher.Vote()
+		if err != nil {
+			return fmt.Errorf("computing vote for locked file: %w", err)
+		}
+
+		if err := m.Vote(ctx, tx, vote, voting.Prepared); err != nil {
+			return fmt.Errorf("preimage vote at prepared phase: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return fmt.Errorf("voting on locked file: %w", err)
+	}
+
+	if err := writer.Commit(ctx); err != nil {
+		return fmt.Errorf("committing file: %w", err)
+	}
+
+	if err := VoteOnContext(ctx, m, vote, voting.Committed); err != nil {
+		return fmt.Errorf("postimage vote at committed phase: %w", err)
+	}
+
+	return nil
+}

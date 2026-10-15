@@ -1,0 +1,21 @@
+# graft-resolve configuration for the benchmark's shared file (shared/log.txt).
+#
+# Every shared change of graft-bench appends one line after the same header,
+# so two of them conflict. The union strategy keeps both lines; the trivial
+# strategy handles the rest (one side unchanged, or both sides equal). Any
+# other conflicting path stays unresolved, so the server rejects it.
+#
+# The server runs graft-resolve with this file. Add it to the server
+# configuration (see the header of demo.sh):
+#
+#   [graft.land.resolver]
+#   enabled = true
+#   command = ["/var/lib/graft/bin/graft-resolve", "--config", "/etc/graft/resolve.toml"]
+#   paths_allow = ["shared/log.txt"]
+
+[[strategy]]
+type = "trivial"
+
+[[strategy]]
+type = "union"
+paths = ["shared/log.txt"]

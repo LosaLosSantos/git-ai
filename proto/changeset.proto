@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "google/protobuf/timestamp.proto";
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// ChangesetService exposes the repository's changeset log: an append-only,
+// totally ordered record of every reference update accepted by this server
+// (lands, fast-forwards, server-side commits, merges, pushes, ...). Each
+// entry has a dense sequence number starting at 1, so clients and monitoring
+// agents can follow the log with a cursor.
+service ChangesetService {
+
+  // ListChangesets returns changesets with sequence > after_sequence in
+  // ascending order.
+  rpc ListChangesets(ListChangesetsRequest) returns (stream ListChangesetsResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // WatchChangesets first streams every changeset with sequence >
+  // after_sequence, then keeps the stream open and streams new changesets as
+  // they are recorded, until the client cancels.
+  rpc WatchChangesets(WatchChangesetsRequest) returns (stream WatchChangesetsResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+}
+
+// Changeset is one entry of the changeset log.
+message Changeset {
+  // sequence is the position in the log, starting at 1, without gaps.
+  uint64 sequence = 1;
+  // reference is the fully qualified reference that was updated.
+  bytes reference = 2;
+  // old_oid is the previous target (zero OID if the reference was created).
+  string old_oid = 3;
+  // new_oid is the new target (zero OID if the reference was deleted).
+  string new_oid = 4;
+  // operation names the operation that produced the update, e.g. "land",
+  // "ff_branch", "commit_files", "merge_branch", "receive_pack".
+  string operation = 5;
+  // actor identifies who performed the update (the authenticated agent or
+  // the request's user ID).
+  string actor = 6;
+  // recorded_at is when the server recorded the update.
+  google.protobuf.Timestamp recorded_at = 7;
+  // rewritten is true when the server rewrote history to perform the update
+  // (e.g. a land that rebased the change onto a newer tip).
+  bool rewritten = 8;
+  // members lists the individual changes of a batched land (operation
+  // "land_batch"): one reference update that landed several requests. Empty
+  // for every other changeset.
+  repeated ChangesetMember members = 9;
+}
+
+// ChangesetMember is one request landed as part of a batched land.
+message ChangesetMember {
+  // original_commit_id is the commit the request asked to land.
+  string original_commit_id = 1;
+  // commit_id is the commit that landed for it (rewritten when rebased).
+  string commit_id = 2;
+  // actor identifies who requested the land.
+  string actor = 3;
+  // rewritten is true when the request's commit was rebased or merged.
+  bool rewritten = 4;
+  // resolved_paths lists the files whose conflicts were resolved by the
+  // server's resolver for this request.
+  repeated bytes resolved_paths = 5;
+}
+
+// ListChangesetsRequest is a request for the ListChangesets RPC.
+message ListChangesetsRequest {
+  // repository is the repository whose log is listed.
+  Repository repository = 1 [(target_repository)=true];
+  // after_sequence is the exclusive start cursor (0 = from the beginning).
+  uint64 after_sequence = 2;
+  // limit bounds the number of changesets returned; 0 means 1000.
+  uint32 limit = 3;
+}
+
+// ListChangesetsResponse is a batch of changesets.
+message ListChangesetsResponse {
+  // changesets is a batch of changesets in ascending sequence order.
+  repeated Changeset changesets = 1;
+}
+
+// WatchChangesetsRequest is a request for the WatchChangesets RPC.
+message WatchChangesetsRequest {
+  // repository is the repository whose log is watched.
+  Repository repository = 1 [(target_repository)=true];
+  // after_sequence is the exclusive start cursor (0 = from the beginning).
+  uint64 after_sequence = 2;
+}
+
+// WatchChangesetsResponse carries one changeset.
+message WatchChangesetsResponse {
+  // changeset is the next changeset of the log.
+  Changeset changeset = 1;
+}

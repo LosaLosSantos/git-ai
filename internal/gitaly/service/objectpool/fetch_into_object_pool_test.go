@@ -1,0 +1,345 @@
+package objectpool
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/open_scion/internal/grpc/metadata"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestFetchIntoObjectPool_Success(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, repoPath, _, client := setup(t, ctx)
+
+	parentID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+
+	poolProto, _, poolPath := createObjectPool(t, ctx, cfg, repo)
+
+	// Create a new commit after having created the object pool. This commit exists only in the
+	// pool member, but not in the pool itself.
+	commitID := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(parentID), gittest.WithBranch("main"))
+	gittest.RequireObjectExists(t, cfg, repoPath, commitID)
+	gittest.RequireObjectNotExists(t, cfg, poolPath, commitID)
+
+	req := &gitalypb.FetchIntoObjectPoolRequest{
+		ObjectPool: poolProto,
+		Origin:     repo,
+	}
+
+	// Now we update the object pool, which should pull the new commit into the pool.
+	_, err := client.FetchIntoObjectPool(ctx, req)
+	require.NoError(t, err)
+
+	// Verify that the object pool is still consistent and that it's got the new commit now.
+	gittest.Exec(t, cfg, "-C", poolPath, "fsck")
+	gittest.RequireObjectExists(t, cfg, poolPath, commitID)
+
+	// Re-fetching the pool should be just fine.
+	_, err = client.FetchIntoObjectPool(ctx, req)
+	require.NoError(t, err)
+
+	// When the reftable backend is used, we can't manipulate refs directly on disk in the
+	// manner that the remainder of this test does.
+	if testhelper.IsReftableEnabled() {
+		return
+	}
+
+	// We now create a broken reference that is all-empty and stale. Normally, such references
+	// break many Git commands, including git-fetch(1). We should know to prune stale broken
+	// references though and thus be able to recover.
+	brokenRef := filepath.Join(poolPath, "refs", "heads", "broken")
+	require.NoError(t, os.MkdirAll(filepath.Dir(brokenRef), mode.Directory))
+	require.NoError(t, os.WriteFile(brokenRef, []byte{}, mode.File))
+	oldTime := time.Now().Add(-25 * time.Hour)
+	require.NoError(t, os.Chtimes(brokenRef, oldTime, oldTime))
+
+	// So the fetch should be successful, and...
+	_, err = client.FetchIntoObjectPool(ctx, req)
+	require.NoError(t, err)
+
+	// The handler executes housekeeping to remove broken references. While this may have been a reasonable
+	// pre-caution, it's not the RPC handlers job to remove broken state. Further, these changes are not voted
+	// on with Praefect. Regardless, it should have pruned the broken reference.
+	require.NoFileExists(t, brokenRef)
+}
+
+func TestFetchIntoObjectPool_transactional(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+
+	var votes []voting.Vote
+	var votesMutex sync.Mutex
+	txManager := transaction.MockManager{
+		VoteFn: func(_ context.Context, _ txinfo.Transaction, vote voting.Vote, _ voting.Phase) error {
+			votesMutex.Lock()
+			defer votesMutex.Unlock()
+			votes = append(votes, vote)
+			return nil
+		},
+	}
+
+	cfg := testcfg.Build(t)
+	cfg.SocketPath = runObjectPoolServer(
+		t, cfg, config.NewLocator(cfg),
+		testhelper.SharedLogger(t),
+		testserver.WithTransactionManager(&txManager),
+		// We need to disable Praefect given that we replace transactions with our own logic
+		// here.
+		testserver.WithDisablePraefect(),
+	)
+	testcfg.BuildGitalyHooks(t, cfg)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	conn, err := client.New(ctx, cfg.SocketPath)
+	require.NoError(t, err)
+	defer testhelper.MustClose(t, conn)
+
+	client := gitalypb.NewObjectPoolServiceClient(conn)
+
+	poolProto, pool, poolPath := createObjectPool(t, ctx, cfg, repo)
+
+	// Inject transaction information so that FetchIntoObjectPool knows to perform
+	// transactional voting.
+	ctx, err = txinfo.InjectTransaction(peer.NewContext(ctx, &peer.Peer{}), 1, "node", true)
+	require.NoError(t, err)
+	ctx = metadata.IncomingToOutgoing(ctx)
+
+	t.Run("without changed data", func(t *testing.T) {
+		votes = nil
+
+		_, err = client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+			ObjectPool: poolProto,
+			Origin:     repo,
+		})
+		require.NoError(t, err)
+
+		require.Equal(t, []voting.Vote{
+			// We expect to see three votes that demonstrate we're voting on no deleted
+			// references.
+			voting.VoteFromData(nil), voting.VoteFromData(nil), voting.VoteFromData(nil),
+			// It is a bug though that we don't have a vote on the unchanged references
+			// in git-fetch(1).
+		}, votes)
+	})
+
+	t.Run("with a new reference", func(t *testing.T) {
+		votes = nil
+
+		// Create a new reference that we'd in fact fetch into the object pool so that we
+		// know that something will be voted on.
+		repoCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(), gittest.WithBranch("new-branch"))
+
+		_, err = client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+			ObjectPool: poolProto,
+			Origin:     repo,
+		})
+		require.NoError(t, err)
+
+		vote := voting.VoteFromData([]byte(fmt.Sprintf(
+			"%s %s refs/remotes/origin/heads/new-branch\n", gittest.DefaultObjectHash.ZeroOID, repoCommit,
+		)))
+		require.Equal(t, []voting.Vote{
+			// The first two votes stem from the fact that we're voting on no
+			// deleted references.
+			voting.VoteFromData(nil), voting.VoteFromData(nil), voting.VoteFromData(nil),
+			// And the other two votes are from the new branch we pull in.
+			vote, vote,
+		}, votes)
+	})
+
+	t.Run("with a stale reference in pool", func(t *testing.T) {
+		votes = nil
+
+		reference := "refs/remotes/origin/heads/to-be-pruned"
+
+		// Create a commit in the pool repository itself. Right now, we don't touch this
+		// commit at all, but this will change in one of the next commits.
+		gittest.WriteCommit(t, cfg, poolPath, gittest.WithParents(), gittest.WithReference(reference))
+
+		_, err = client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+			ObjectPool: poolProto,
+			Origin:     repo,
+		})
+		require.NoError(t, err)
+
+		// We expect a single vote on the reference we have deleted.
+		vote := voting.VoteFromData([]byte(fmt.Sprintf(
+			"%[1]s %[1]s %s\n", gittest.DefaultObjectHash.ZeroOID, reference,
+		)))
+		require.Equal(t, []voting.Vote{vote, vote, vote}, votes)
+
+		exists, err := pool.Repo.HasRevision(ctx, git.Revision(reference))
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+}
+
+func TestFetchIntoObjectPool_CollectLogStatistics(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	testcfg.BuildGitalyHooks(t, cfg)
+
+	locator := config.NewLocator(cfg)
+
+	logger := testhelper.NewLogger(t)
+	hook := testhelper.AddLoggerHook(logger)
+	cfg.SocketPath = runObjectPoolServer(t, cfg, locator, logger)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("branch"))
+
+	conn, err := client.New(ctx, cfg.SocketPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { testhelper.MustClose(t, conn) })
+	client := gitalypb.NewObjectPoolServiceClient(conn)
+
+	poolProto, _, _ := createObjectPool(t, ctx, cfg, repo)
+
+	req := &gitalypb.FetchIntoObjectPoolRequest{
+		ObjectPool: poolProto,
+		Origin:     repo,
+	}
+
+	_, err = client.FetchIntoObjectPool(ctx, req)
+	require.NoError(t, err)
+
+	for _, logEntry := range hook.AllEntries() {
+		if repoInfo, ok := logEntry.Data["repository_info"]; ok {
+			require.IsType(t, stats.RepositoryInfo{}, repoInfo)
+			return
+		}
+	}
+	require.FailNow(t, "no info about statistics")
+}
+
+func TestFetchIntoObjectPool_Failure(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, _, _, client := setup(t, ctx, testserver.WithDisablePraefect())
+	poolProto, _, _ := createObjectPool(t, ctx, cfg, repo)
+
+	poolWithDifferentStorage := proto.Clone(poolProto).(*gitalypb.ObjectPool)
+	poolWithDifferentStorage.Repository.StorageName = "some other storage"
+
+	for _, tc := range []struct {
+		description string
+		request     *gitalypb.FetchIntoObjectPoolRequest
+		code        codes.Code
+		errMsg      string
+	}{
+		{
+			description: "empty origin",
+			request: &gitalypb.FetchIntoObjectPoolRequest{
+				ObjectPool: poolProto,
+			},
+			code:   codes.InvalidArgument,
+			errMsg: "origin is empty",
+		},
+		{
+			description: "empty pool",
+			request: &gitalypb.FetchIntoObjectPoolRequest{
+				Origin: repo,
+			},
+			code:   codes.InvalidArgument,
+			errMsg: "object pool is empty",
+		},
+		{
+			description: "origin and pool do not share the same storage",
+			request: &gitalypb.FetchIntoObjectPoolRequest{
+				Origin:     repo,
+				ObjectPool: poolWithDifferentStorage,
+			},
+			code:   codes.InvalidArgument,
+			errMsg: "origin has different storage than object pool",
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			_, err := client.FetchIntoObjectPool(ctx, tc.request)
+			require.Error(t, err)
+			testhelper.RequireGrpcCode(t, err, tc.code)
+			assert.Contains(t, err.Error(), tc.errMsg)
+		})
+	}
+}
+
+func TestFetchIntoObjectPool_mvccOrigin(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, _, _, client := setup(t, ctx, testserver.WithDisablePraefect())
+	poolProto, _, _ := createObjectPool(t, ctx, cfg, repo)
+
+	mvccRepo, _ := gittest.CreateMVCCRepository(t, ctx, cfg)
+
+	_, err := client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+		ObjectPool: poolProto,
+		Origin:     mvccRepo,
+	})
+	testhelper.RequireGrpcError(t, structerr.NewInvalidArgument("object pools are not supported for repositories using the MVCC reference backend"), err)
+}
+
+func TestFetchIntoObjectPool_dfConflict(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, repo, repoPath, _, client := setup(t, ctx)
+	poolProto, _, poolPath := createObjectPool(t, ctx, cfg, repo)
+
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("branch"))
+
+	// Perform an initial fetch into the object pool with the given object that exists in the
+	// pool member's repository.
+	_, err := client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+		ObjectPool: poolProto,
+		Origin:     repo,
+	})
+	require.NoError(t, err)
+
+	// Now we delete the reference in the pool member and create a new reference that has the
+	// same prefix, but is stored in a subdirectory. This will create a D/F conflict.
+	gittest.Exec(t, cfg, "-C", repoPath, "update-ref", "-d", "refs/heads/branch")
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("branch/conflict"))
+
+	// Verify that we can still fetch into the object pool regardless of the D/F conflict. While
+	// it is not possible to store both references at the same time due to the conflict, we
+	// should know to delete the old conflicting reference and replace it with the new one.
+	_, err = client.FetchIntoObjectPool(ctx, &gitalypb.FetchIntoObjectPoolRequest{
+		ObjectPool: poolProto,
+		Origin:     repo,
+	})
+	require.NoError(t, err)
+
+	// Verify that the conflicting reference exists now.
+	gittest.Exec(t, cfg, "-C", poolPath, "rev-parse", "refs/remotes/origin/heads/branch/conflict")
+}

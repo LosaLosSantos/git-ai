@@ -1,0 +1,333 @@
+syntax = "proto3";
+
+package gitaly;
+
+import "google/protobuf/timestamp.proto";
+import "lint.proto";
+import "shared.proto";
+
+option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+
+// ReviewService is a minimal, agent-friendly code review system: reviews of a
+// commit range targeting a branch, comments, verdicts, and semantic approval
+// rules computed from a classification of every changed file (for example a
+// comment-only change can need fewer approvals than a logic change).
+service ReviewService {
+
+  // CreateReview opens a review of head_commit_id against target_branch.
+  rpc CreateReview(CreateReviewRequest) returns (CreateReviewResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+  // GetReview returns one review with its classification, approvals and the
+  // evaluation of the approval rules.
+  rpc GetReview(GetReviewRequest) returns (GetReviewResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // ListReviews lists reviews, newest first.
+  rpc ListReviews(ListReviewsRequest) returns (stream ListReviewsResponse) {
+    option (op_type) = {
+      op: ACCESSOR
+    };
+  }
+
+  // UpdateReview moves the review to a new head commit. Verdicts given on an
+  // older head are kept but no longer count, unless the approval rules say a
+  // verdict survives the kind of change made since.
+  rpc UpdateReview(UpdateReviewRequest) returns (UpdateReviewResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+  // AddReviewComment adds a comment, optionally anchored to a file line.
+  rpc AddReviewComment(AddReviewCommentRequest) returns (AddReviewCommentResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+  // SubmitReviewVerdict records an approval or a change request by the caller
+  // for the review's current head commit.
+  rpc SubmitReviewVerdict(SubmitReviewVerdictRequest) returns (SubmitReviewVerdictResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+  // CloseReview closes a review without landing it (or marks it landed).
+  rpc CloseReview(CloseReviewRequest) returns (CloseReviewResponse) {
+    option (op_type) = {
+      op: MUTATOR
+    };
+  }
+
+}
+
+// Review is one code review.
+message Review {
+  // State is the lifecycle state.
+  enum State {
+    // STATE_OPEN_UNSPECIFIED is an open review.
+    STATE_OPEN_UNSPECIFIED = 0;
+    // STATE_LANDED means the reviewed change landed.
+    STATE_LANDED = 1;
+    // STATE_CLOSED means the review was closed without landing.
+    STATE_CLOSED = 2;
+  }
+
+  // id identifies the review within the repository.
+  string id = 1;
+  // target_branch is the branch the change is meant to land on.
+  bytes target_branch = 2;
+  // base_commit_id is the commit the change is based on.
+  string base_commit_id = 3;
+  // head_commit_id is the current head of the change.
+  string head_commit_id = 4;
+  // author is the identity that created the review.
+  string author = 5;
+  // title is a one-line summary.
+  bytes title = 6;
+  // description is free text.
+  bytes description = 7;
+  // state is the lifecycle state.
+  State state = 8;
+  // files classifies every file changed between base and head.
+  repeated ReviewFile files = 9;
+  // verdicts are all verdicts ever given, oldest first.
+  repeated ReviewVerdict verdicts = 10;
+  // comments are all comments, oldest first.
+  repeated ReviewComment comments = 11;
+  // requirements is the evaluation of the approval rules for the current head.
+  repeated ReviewRequirement requirements = 12;
+  // approved is true when every requirement is satisfied and no current
+  // change request is pending.
+  bool approved = 13;
+  // created_at is when the review was created.
+  google.protobuf.Timestamp created_at = 14;
+  // updated_at is when the review last changed.
+  google.protobuf.Timestamp updated_at = 15;
+}
+
+// ReviewFile is the classification of one changed file.
+message ReviewFile {
+  // ChangeClass is the semantic class of a file change.
+  enum ChangeClass {
+    // CHANGE_CLASS_CODE_UNSPECIFIED is a change to code or anything not
+    // recognised as a narrower class (the most demanding class).
+    CHANGE_CLASS_CODE_UNSPECIFIED = 0;
+    // CHANGE_CLASS_COMMENT_ONLY changes only comments or whitespace of a
+    // source file whose language the classifier understands.
+    CHANGE_CLASS_COMMENT_ONLY = 1;
+    // CHANGE_CLASS_DOCS changes documentation.
+    CHANGE_CLASS_DOCS = 2;
+    // CHANGE_CLASS_TESTS changes tests.
+    CHANGE_CLASS_TESTS = 3;
+    // CHANGE_CLASS_GENERATED changes generated files.
+    CHANGE_CLASS_GENERATED = 4;
+    // CHANGE_CLASS_CONFIG changes configuration files.
+    CHANGE_CLASS_CONFIG = 5;
+  }
+
+  // path is the file path.
+  bytes path = 1;
+  // class is the semantic class of the change.
+  ChangeClass class = 2;
+  // reason explains the classification (for humans and agents).
+  string reason = 3;
+}
+
+// ReviewVerdict is one verdict.
+message ReviewVerdict {
+  // Kind is the verdict kind.
+  enum Kind {
+    // KIND_APPROVE_UNSPECIFIED approves the change.
+    KIND_APPROVE_UNSPECIFIED = 0;
+    // KIND_REQUEST_CHANGES requests changes.
+    KIND_REQUEST_CHANGES = 1;
+  }
+
+  // actor gave the verdict.
+  string actor = 1;
+  // kind is the verdict kind.
+  Kind kind = 2;
+  // commit_id is the head the verdict was given on.
+  string commit_id = 3;
+  // body is an optional message.
+  bytes body = 4;
+  // created_at is when the verdict was given.
+  google.protobuf.Timestamp created_at = 5;
+  // current is true when the verdict counts for the current head.
+  bool current = 6;
+}
+
+// ReviewComment is one comment.
+message ReviewComment {
+  // id identifies the comment within the review.
+  string id = 1;
+  // actor wrote the comment.
+  string actor = 2;
+  // body is the comment text.
+  bytes body = 3;
+  // path anchors the comment to a file (optional).
+  bytes path = 4;
+  // line anchors the comment to a 1-based line of path at commit_id (0: none).
+  int32 line = 5;
+  // commit_id is the head the comment was written on.
+  string commit_id = 6;
+  // created_at is when the comment was written.
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// ReviewRequirement is the evaluation of one approval rule.
+message ReviewRequirement {
+  // rule names the rule (from configuration).
+  string rule = 1;
+  // description explains what the rule requires.
+  string description = 2;
+  // required_approvals is the number of current approvals needed.
+  int32 required_approvals = 3;
+  // approvals is the number of current approvals that count for the rule.
+  int32 approvals = 4;
+  // satisfied is true when approvals >= required_approvals.
+  bool satisfied = 5;
+  // paths are the files the rule applies to.
+  repeated bytes paths = 6;
+}
+
+// CreateReviewRequest is a request for CreateReview.
+message CreateReviewRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // target_branch is the branch to land on (name, not fully qualified).
+  bytes target_branch = 2;
+  // head_commit_id is the head of the change.
+  string head_commit_id = 3;
+  // base_commit_id is the base; empty means the merge base of the head and
+  // the target branch tip.
+  string base_commit_id = 4;
+  // title is a one-line summary.
+  bytes title = 5;
+  // description is free text.
+  bytes description = 6;
+}
+
+// CreateReviewResponse is a response for CreateReview.
+message CreateReviewResponse {
+  // review is the created review.
+  Review review = 1;
+}
+
+// GetReviewRequest is a request for GetReview.
+message GetReviewRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // id identifies the review.
+  string id = 2;
+}
+
+// GetReviewResponse is a response for GetReview.
+message GetReviewResponse {
+  // review is the review.
+  Review review = 1;
+}
+
+// ListReviewsRequest is a request for ListReviews.
+message ListReviewsRequest {
+  // repository is the repository of the reviews.
+  Repository repository = 1 [(target_repository)=true];
+  // target_branch filters by target branch (empty: all).
+  bytes target_branch = 2;
+  // include_closed also lists landed and closed reviews.
+  bool include_closed = 3;
+  // limit bounds the number of reviews; 0 means 100.
+  uint32 limit = 4;
+}
+
+// ListReviewsResponse is a batch of reviews (without comments and verdict
+// bodies, to keep listings small).
+message ListReviewsResponse {
+  // reviews is a batch of reviews, newest first.
+  repeated Review reviews = 1;
+}
+
+// UpdateReviewRequest is a request for UpdateReview.
+message UpdateReviewRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // id identifies the review.
+  string id = 2;
+  // head_commit_id is the new head.
+  string head_commit_id = 3;
+  // expected_head_commit_id, if set, must equal the current head
+  // (compare-and-swap); otherwise FailedPrecondition.
+  string expected_head_commit_id = 4;
+}
+
+// UpdateReviewResponse is a response for UpdateReview.
+message UpdateReviewResponse {
+  // review is the updated review.
+  Review review = 1;
+}
+
+// AddReviewCommentRequest is a request for AddReviewComment.
+message AddReviewCommentRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // id identifies the review.
+  string id = 2;
+  // body is the comment text.
+  bytes body = 3;
+  // path anchors the comment to a file (optional).
+  bytes path = 4;
+  // line anchors the comment to a line of path (0: none).
+  int32 line = 5;
+}
+
+// AddReviewCommentResponse is a response for AddReviewComment.
+message AddReviewCommentResponse {
+  // comment is the stored comment.
+  ReviewComment comment = 1;
+}
+
+// SubmitReviewVerdictRequest is a request for SubmitReviewVerdict.
+message SubmitReviewVerdictRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // id identifies the review.
+  string id = 2;
+  // kind is the verdict.
+  ReviewVerdict.Kind kind = 3;
+  // body is an optional message.
+  bytes body = 4;
+  // head_commit_id must equal the review's current head, so a verdict is
+  // never applied to a head the reviewer has not seen.
+  string head_commit_id = 5;
+}
+
+// SubmitReviewVerdictResponse is a response for SubmitReviewVerdict.
+message SubmitReviewVerdictResponse {
+  // review is the review after the verdict.
+  Review review = 1;
+}
+
+// CloseReviewRequest is a request for CloseReview.
+message CloseReviewRequest {
+  // repository is the repository of the review.
+  Repository repository = 1 [(target_repository)=true];
+  // id identifies the review.
+  string id = 2;
+  // landed marks the review landed instead of closed.
+  bool landed = 3;
+}
+
+// CloseReviewResponse is a response for CloseReview.
+message CloseReviewResponse {
+  // review is the closed review.
+  Review review = 1;
+}

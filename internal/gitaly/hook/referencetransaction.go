@@ -1,0 +1,502 @@
+package hook
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha1"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/open_scion/internal/git/mvcc"
+	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/open_scion/internal/gitlab"
+	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/open_scion/internal/graft/identity"
+	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+)
+
+// ReferenceTransactionHook captures all reference updates taking place in the
+// repository.
+//
+// When using praefect, this allows us to vote on reference updates and ensure
+// that all nodes are in sync.
+//
+// When using WAL, this allows us to capture all the reference updates that take
+// place in a transaction and add it to the transaction.
+//
+// We only capture regular reference updates, and updates to the default branch.
+// Any other reference updates are ignored.
+func (m *GitLabHookManager) ReferenceTransactionHook(ctx context.Context, state ReferenceTransactionState, env []string, stdin io.Reader) error {
+	payload, err := gitcmd.HooksPayloadFromEnv(env)
+	if err != nil {
+		return fmt.Errorf("extracting hooks payload: %w", err)
+	}
+
+	objectHash, err := git.ObjectHashByFormat(payload.ObjectFormat)
+	if err != nil {
+		return fmt.Errorf("looking up object hash: %w", err)
+	}
+
+	changes, err := io.ReadAll(stdin)
+	if err != nil {
+		return fmt.Errorf("reading stdin from request: %w", err)
+	}
+
+	m.trackPendingTransaction(state, env, changes)
+
+	var phase voting.Phase
+	switch state {
+	// We're voting in preparing state to tell Praefect that the reference changes are ready,
+	// although they are not locked yet. At this stage, we can serialize write transactions by
+	// acquiring a lock for the transaction and releasing it only when the transaction is
+	// committed or aborted. Other transactions must wait for the lock.
+	case ReferenceTransactionPreparing:
+		phase = voting.Preparing
+	// We're voting in prepared state to tell Praefect we've locked the reference changes and
+	// queued them for the transaction. We can abort the transaction if needed.
+	case ReferenceTransactionPrepared:
+		phase = voting.Prepared
+
+	// We're also voting in committed state to tell Praefect we've actually persisted the
+	// changes. This is necessary as some RPCs fail return errors in the response body rather
+	// than as an error code. Praefect can't tell if these RPCs have failed. Voting on committed
+	// ensure Praefect sees either a missing vote or that the RPC did commit the changes.
+	case ReferenceTransactionCommitted:
+		phase = voting.Committed
+
+	// An aborted transaction gives up its place in the order of the changeset log, so that the
+	// transactions prepared after it do not wait for it.
+	case ReferenceTransactionAborted:
+		m.abortChangesets(ctx, payload, changes)
+		if m.storageVoter != nil {
+			m.storageVoter.Aborted(ctx, payload, changes)
+		}
+		return nil
+
+	default:
+		return nil
+	}
+
+	// When deleting references, git has to delete them both in the packed-refs backend as well
+	// as any loose refs -- if only the loose ref was deleted, it would potentially unshadow the
+	// value contained in the packed-refs file and vice versa. As a result, git will create two
+	// transactions when any ref exists in both backends: one session to force-delete all
+	// existing refs in the packed-refs backend, and then one transaction to update all loose
+	// refs. This is problematic for us, as our voting logic now requires all nodes to have the
+	// same packed state, which we do not and cannot guarantee.
+	//
+	// We're lucky though and can fix this quite easily: git only needs to cope with unshadowing
+	// refs when deleting loose refs, so it will only ever _delete_ refs from the packed-refs
+	// backend and never _update_ any refs. And if such a force-deletion happens, the same
+	// deletion will also get queued to the loose backend no matter whether the loose ref exists
+	// or not given that it must be locked during the whole transaction. As such, we can easily
+	// recognize those packed-refs cleanups: all queued ref updates are force deletions.
+	//
+	// The workaround is thus clear: we simply do not cast a vote on any reference transaction
+	// which consists only of force-deletions -- the vote will instead only happen on the loose
+	// backend transaction, which contains the full record of all refs which are to be updated.
+	// The changeset log records the updates once they are committed. Like the
+	// vote, it skips the packed-refs cleanup and records its deletions with the
+	// loose backend transaction (see pendingTransactions). Recording never fails
+	// the update, so its errors are only logged.
+	if state == ReferenceTransactionCommitted {
+		// In authoritative storage mode the changelog is written by the storage core, in the
+		// same database transaction as the reference change (see doc/graft/STORAGE.md).
+		if !m.storageAuthoritative() {
+			m.recordChangesets(ctx, objectHash, payload, env, changes)
+		}
+		if m.storageVoter != nil {
+			m.storageVoter.Committed(ctx, payload, changes)
+		}
+		m.observeCommitted(ctx, payload, changes)
+	}
+
+	// The standalone access policy is enforced here, while the references are
+	// locked but not yet updated, so that it holds for every reference update
+	// that Gitaly performs and not only for those that run the pre-receive hook.
+	// It runs before the vote and before the transaction takes its place in the
+	// order of the changeset log, as a denial aborts the transaction.
+	if state == ReferenceTransactionPrepared {
+		if err := m.enforceGraftPolicy(ctx, env, changes); err != nil {
+			return err
+		}
+
+		// The storage core commits the transaction while git holds the locks, after the
+		// policy allowed it. In authoritative mode this is the commit point: an error
+		// aborts the transaction (see doc/graft/PLAN6.md, "Write path").
+		if err := m.storagePrepared(ctx, payload, env, changes); err != nil {
+			return err
+		}
+	}
+
+	if !isForceDeletionsOnly(objectHash, bytes.NewReader(changes)) {
+		hash := sha1.Sum(changes)
+
+		if err := m.voteOnTransaction(ctx, hash, phase, payload); err != nil {
+			return fmt.Errorf("error voting on transaction: %w", err)
+		}
+	}
+
+	// Before git locks the references, the storage core builds and uploads the pack of the
+	// transaction, so that only the database commit runs under the locks in the Prepared phase
+	// (see doc/graft/PLAN6.md, "LOCK AND HISTORY RULE"). It runs after the vote, which it does
+	// not delay, and it never fails the transaction.
+	if state == ReferenceTransactionPreparing {
+		m.storagePreparing(ctx, payload, env, changes)
+	}
+
+	// The prepared transaction holds the locks of its references, so it takes its place in
+	// the order of the changeset log now. It does so only once the vote succeeded, because a
+	// failed hook aborts the transaction.
+	// In authoritative storage mode the file changelog is not written, so no order is kept for it.
+	if state == ReferenceTransactionPrepared && !m.storageAuthoritative() {
+		m.prepareChangesets(ctx, payload, changes)
+	}
+
+	return nil
+}
+
+// changesetRepoPath returns the path of the repository whose changeset log records the given
+// hook input, or false when nothing of it is recorded.
+func (m *GitLabHookManager) changesetRepoPath(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) (string, bool) {
+	if m.cfg.Graft.Changelog.Disabled || len(changelog.ParseUpdates(changes)) == 0 {
+		return "", false
+	}
+
+	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
+	if err != nil {
+		m.logger.WithError(err).ErrorContext(ctx, "ordering changesets: resolving repository path")
+		return "", false
+	}
+
+	return repoPath, true
+}
+
+// prepareChangesets gives the prepared transaction its place in the order of the changeset log,
+// see changesetTickets.
+func (m *GitLabHookManager) prepareChangesets(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if repoPath, ok := m.changesetRepoPath(ctx, payload, changes); ok {
+		takeChangesetTicket(repoPath, changes)
+	}
+}
+
+// abortChangesets gives up the place of the aborted transaction in the order of the changeset
+// log, see changesetTickets.
+func (m *GitLabHookManager) abortChangesets(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if repoPath, ok := m.changesetRepoPath(ctx, payload, changes); ok {
+		abortChangesetTicket(repoPath, changes)
+	}
+}
+
+// recordChangesets appends the committed reference updates to the changeset log
+// of the repository. It must never fail the reference update, so it recovers
+// from panics and only logs errors.
+//
+// The repository is verified like any other, so the log is only ever written
+// into an existing repository. Committed reference updates always happen in an
+// existing git directory, including the staging repositories of repoutil.Create.
+//
+// Trust model: the hook payload and the stdin come from the caller of the
+// HookService.ReferenceTransactionHook RPC, as they do for every upstream hook.
+// The operation, actor and updates recorded here are therefore only as
+// trustworthy as that caller. Entries can describe updates that never happened
+// when an authenticated client calls the RPC directly, so the log is an audit
+// trail of the server's own operations, not a proof against forged calls. The
+// RPC is meant for the internal socket that Git hooks use.
+func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git.ObjectHash, payload gitcmd.HooksPayload, env []string, changes []byte) {
+	if m.cfg.Graft.Changelog.Disabled {
+		return
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.WithFields(log.Fields{"panic": fmt.Sprint(r)}).ErrorContext(ctx, "recording changesets panicked")
+		}
+	}()
+
+	graftMeta, metaErr := gitcmd.ChangelogMetaFromEnv(env)
+
+	// The packed-refs cleanup of a deletion is recorded with the loose backend
+	// transaction that git commits right after it. Its prepared state is
+	// forgotten even when it updates nothing that is recorded.
+	packedCleanup := metaErr == nil && m.pendingTransactions.committed(objectHash, graftMeta.Invocation, changes)
+
+	updates := changelog.ParseUpdates(changes)
+	if len(updates) == 0 {
+		return
+	}
+
+	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
+	if err != nil {
+		m.logger.WithError(err).ErrorContext(ctx, "recording changesets: resolving repository path")
+		return
+	}
+
+	// The updates are recorded in the order in which their transactions were prepared, which
+	// is the order in which the references were updated. See changesetTickets. The ticket is
+	// released however recording ends, so that later transactions do not wait for it. A
+	// packed-refs cleanup records nothing, so it does not wait.
+	if ticket, earlier := findChangesetTicket(repoPath, changes); ticket != nil {
+		defer releaseChangesetTicket(repoPath, ticket)
+
+		if !packedCleanup && !waitForChangesetTickets(ctx, earlier) {
+			m.logger.WarnContext(ctx, "recording changesets without waiting for an earlier reference transaction, the changeset log may list them out of order")
+		}
+	}
+
+	if packedCleanup {
+		return
+	}
+
+	if metaErr != nil {
+		m.logger.WithError(metaErr).ErrorContext(ctx, "recording changesets: reading changelog metadata")
+		return
+	}
+
+	meta := changelogMetaOf(payload, graftMeta)
+
+	appendChangesets := func() {
+		if _, err := changelog.Append(repoPath, meta, updates); err != nil {
+			m.logger.WithError(err).ErrorContext(ctx, "recording changesets failed")
+		}
+	}
+
+	// On a repository that uses the MVCC reference backend, the updates are staged in the
+	// snapshot of the request that performs them, and are only published when that request
+	// commits its MVCC cache after its handler returned. The commit fails when a concurrent
+	// request committed first, and the updates are then thrown away, so they are only
+	// recorded once the commit succeeded.
+	if graftMeta.MVCCCommit != "" {
+		cache := mvcc.CacheByCommitHandle(graftMeta.MVCCCommit)
+		if cache == nil || !cache.AfterCommit(appendChangesets) {
+			m.logger.ErrorContext(ctx, "recording changesets: the MVCC cache that commits the updates is gone, not recording them")
+		}
+		return
+	}
+
+	appendChangesets()
+}
+
+// observeCommitted hands the committed reference updates to the eager observer,
+// see eager.Observer. It runs whether or not the changeset log records them, and
+// the observer only schedules the work, so it never fails or blocks the update.
+func (m *GitLabHookManager) observeCommitted(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if m.observer == nil || payload.Repo == nil {
+		return
+	}
+
+	updates := changelog.ParseUpdates(changes)
+	if len(updates) == 0 {
+		return
+	}
+
+	// The background work addresses the repository only. The payload may carry
+	// the object directory of a quarantine, which is gone once the work runs.
+	repo := &gitalypb.Repository{
+		StorageName:  payload.Repo.GetStorageName(),
+		RelativePath: payload.Repo.GetRelativePath(),
+	}
+
+	m.observer.ObserveCommitted(ctx, repo, updates)
+}
+
+// trackPendingTransaction keeps the transactions that the git process running
+// the hook has prepared and not yet committed or aborted, so that recordChangesets
+// recognizes the packed-refs cleanup of a deletion. Only transactions that git
+// runs the hook for itself are tracked: their hooks payload carries the
+// invocation of the git process.
+func (m *GitLabHookManager) trackPendingTransaction(state ReferenceTransactionState, env []string, changes []byte) {
+	if m.cfg.Graft.Changelog.Disabled || m.pendingTransactions == nil {
+		return
+	}
+
+	if state != ReferenceTransactionPrepared && state != ReferenceTransactionAborted {
+		return
+	}
+
+	graftMeta, err := gitcmd.ChangelogMetaFromEnv(env)
+	if err != nil || graftMeta.Invocation == "" {
+		return
+	}
+
+	switch state {
+	case ReferenceTransactionPrepared:
+		m.pendingTransactions.prepared(graftMeta.Invocation, changes)
+	case ReferenceTransactionAborted:
+		m.pendingTransactions.aborted(graftMeta.Invocation, changes)
+	}
+}
+
+// enforceGraftPolicy evaluates the standalone access policy ([[graft.policy]])
+// for reference updates that a request authenticated with a per-agent token
+// performs. It returns a PermissionDenied error when the policy denies one of
+// the updated references, which makes Git abort the whole reference
+// transaction.
+//
+// The pre-receive hook only runs for OperationService RPCs and pushes. Other
+// RPCs, such as RepositoryService.WriteRef, RefService.DeleteRefs and
+// RepositoryService.FetchRemote, update references with only this hook, so the
+// policy has to be enforced here for an agent not to bypass it.
+//
+// The policy decides on the agent of the token, as the pre-receive hook does.
+// Callers that did not authenticate with an agent token (the shared token,
+// unauthenticated setups, Gitaly's own internal operations) are not restricted
+// here: they are trusted, and their pushes and OperationService RPCs are still
+// checked by the pre-receive hook. The policy governs the references under
+// refs/ and HEAD, so that a symbolic update of the default branch is decided
+// like any other update. Other pseudo-references are not governed.
+//
+// Outside standalone mode, or with an empty policy, it does nothing.
+func (m *GitLabHookManager) enforceGraftPolicy(ctx context.Context, env []string, changes []byte) error {
+	message, err := m.graftPolicyDecision(env, changes)
+	if err != nil {
+		return err
+	}
+
+	if message != "" {
+		meta, _ := gitcmd.ChangelogMetaFromEnv(env)
+		m.logger.WithFields(log.Fields{
+			"actor":  meta.Actor,
+			"reason": message,
+		}).InfoContext(ctx, "standalone policy denied reference transaction")
+
+		return structerr.NewPermissionDenied("%s", message)
+	}
+
+	return nil
+}
+
+// graftPolicyDecision is the decision of enforceGraftPolicy: the message of the
+// denial of the transaction, or an empty message when the policy allows it or
+// does not apply to it.
+func (m *GitLabHookManager) graftPolicyDecision(env []string, changes []byte) (string, error) {
+	if !m.cfg.Graft.Standalone || len(m.cfg.Graft.Policy) == 0 {
+		return "", nil
+	}
+
+	meta, err := gitcmd.ChangelogMetaFromEnv(env)
+	if err != nil {
+		return "", fmt.Errorf("reading graft metadata: %w", err)
+	}
+
+	// A batched land has already checked the policy for every member in process,
+	// before the member entered the running tip of the batch (see
+	// executeLandBatch in the operations service), so the combined update is not
+	// checked again. The members are taken from the context that builds the hooks
+	// payload, so a client of an OperationService RPC cannot set them: the
+	// environment of the git process that runs this hook is built by Gitaly, and
+	// agents cannot set git configuration (see the trust model in recordChangesets).
+	// A direct caller of HookService.ReferenceTransactionHook supplies the payload,
+	// but it could already skip this check by setting agent to false, and such a
+	// call updates no references. The skip therefore gives it no new reach.
+	// Only the batch operation carries members, so any other update is still
+	// checked here.
+	if meta.Operation == changelog.OperationLandBatch && len(meta.Members) > 0 {
+		return "", nil
+	}
+
+	if !meta.Agent || meta.Actor == "" {
+		return "", nil
+	}
+
+	message, err := graftPolicyDenial(m.cfg.Graft.Policy, meta.Actor, changes)
+	if err != nil {
+		return "", fmt.Errorf("evaluating graft policy: %w", err)
+	}
+
+	return message, nil
+}
+
+// CheckAgentPolicy evaluates the standalone access policy for the reference
+// updates in changes, in the "<old-oid> <new-oid> <ref>" per-line format, that
+// the RPC of ctx performs without running the pre-receive hook, such as
+// OperationService.UserMergeToRef. The reference-transaction hook enforces the
+// policy on these updates too, but Git reports only that it failed, so the RPC
+// checks it first to return the policy message with PermissionDenied.
+//
+// Like enforceGraftPolicy, it decides only for a caller that authenticated with
+// a per-agent token, outside standalone mode or with an empty policy it does
+// nothing, and the decision is final: the hook still runs afterwards.
+func CheckAgentPolicy(ctx context.Context, graft config.Graft, changes string) error {
+	if !graft.Standalone || len(graft.Policy) == 0 {
+		return nil
+	}
+
+	id, ok := identity.FromContext(ctx)
+	if !ok || id.Source != identity.SourceAgent {
+		return nil
+	}
+
+	message, err := graftPolicyDenial(graft.Policy, id.Name, []byte(changes))
+	if err != nil {
+		return structerr.NewInternal("evaluating graft policy: %w", err)
+	}
+
+	if message != "" {
+		return structerr.NewPermissionDenied("%s", message)
+	}
+
+	return nil
+}
+
+// graftPolicyDenial returns the message of the denial of the update of the
+// governed references in changes by actor, or an empty message when the policy
+// allows the update. Only references under refs/ and HEAD are governed, see
+// isGovernedReference.
+func graftPolicyDenial(policy []config.GraftPolicyRule, actor string, changes []byte) (string, error) {
+	var governed strings.Builder
+	for _, line := range strings.Split(string(changes), "\n") {
+		// Lines that are not well formed are kept, so that the policy rejects them.
+		if _, _, reference, ok := changelog.ParseHookLine(line); ok && !isGovernedReference(reference) {
+			continue
+		}
+
+		governed.WriteString(line)
+		governed.WriteString("\n")
+	}
+
+	allowed, message, err := gitlab.EvaluatePolicy(policy, actor, governed.String())
+	if err != nil {
+		return "", err
+	}
+
+	if allowed {
+		return "", nil
+	}
+
+	return message, nil
+}
+
+// isGovernedReference reports whether the standalone access policy governs an
+// update of reference: every reference under refs/, and HEAD.
+func isGovernedReference(reference string) bool {
+	return reference == "HEAD" || strings.HasPrefix(reference, "refs/")
+}
+
+// isForceDeletionsOnly determines whether the given changes only consist of force-deletions.
+func isForceDeletionsOnly(objectHash git.ObjectHash, changes io.Reader) bool {
+	// forceDeletionPrefix is the prefix of a queued reference transaction which deletes a
+	// reference without checking its current value.
+	forceDeletionPrefix := fmt.Sprintf("%[1]s %[1]s ", objectHash.ZeroOID)
+
+	scanner := bufio.NewScanner(changes)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		if bytes.HasPrefix(line, []byte(forceDeletionPrefix)) {
+			continue
+		}
+
+		return false
+	}
+
+	return true
+}

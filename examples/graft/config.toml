@@ -1,0 +1,79 @@
+# Graft example configuration: standalone Gitaly with two agents and a policy
+# that protects main.
+#
+# Start with:  gitaly serve /etc/graft/config.toml
+#
+# The keys follow internal/gitaly/config (config_graft.go for the [graft]
+# section) and doc/graft/CONFIGURATION.md. The paths are examples; adjust them
+# for your host. internal/graft/e2e loads this file and validates it, so a key
+# that the server does not know fails the test suite.
+
+# Directory with the gitaly-hooks and gitaly-ssh binaries that Git calls back
+# into. The quickstart builds them here.
+bin_dir = "/var/lib/graft/bin"
+
+# Socket Gitaly listens on. graft-cache connects here (or to another tier)
+# with --upstream unix:/var/lib/graft/run/gitaly.sock.
+socket_path = "/var/lib/graft/run/gitaly.sock"
+
+# Directory for Gitaly's runtime files (sockets, temporary state).
+runtime_dir = "/var/lib/graft/run"
+
+# Shared token for administrative tools and for clients without an agent
+# token. Optional when [[graft.agent]] entries are present, but recommended.
+[auth]
+token = "change-me-shared-token"
+
+# Repository storage. Repositories are created below this path.
+[[storage]]
+name = "default"
+path = "/var/lib/graft/repos"
+
+[graft]
+# Run without GitLab. Access checks and hooks are answered from the policy
+# below; the GitLab URL and secret are not required.
+standalone = true
+
+# Agent credentials. Each agent name is the identity of its token, the actor
+# that the changeset log records for its updates, and the acting user ID of its
+# requests in standalone mode, whatever user ID the client sends. The policy
+# decides on the agent of the token (see doc/graft/LIMITATIONS.md, Security
+# limitations). Tokens are read from files at startup.
+[[graft.agent]]
+name = "planner"
+token_file = "/etc/graft/tokens/planner"
+
+[[graft.agent]]
+name = "builder"
+token_file = "/etc/graft/tokens/builder"
+
+# Policy rules are evaluated in order; the first rule whose actor and refs
+# both match decides.
+#
+# 1. The planner may update main.
+[[graft.policy]]
+actor = "planner"
+refs = ["refs/heads/main"]
+allow = true
+
+# 2. Nobody else may update main.
+[[graft.policy]]
+refs = ["refs/heads/main"]
+allow = false
+
+# 3. Everything else (feature branches, temporary work branches) is open to
+#    every authenticated actor.
+[[graft.policy]]
+refs = ["refs/heads/**"]
+allow = true
+
+[graft.object_service]
+max_objects = 1000
+chunk_size = 1048576
+
+[graft.changelog]
+disabled = false
+
+[graft.derived]
+disabled = false
+eager = false

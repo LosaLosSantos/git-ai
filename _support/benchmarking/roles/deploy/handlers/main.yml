@@ -1,0 +1,16 @@
+---
+- name: scan SSH keys
+  command: "ssh-keyscan {{ item }}"
+  register: ssh_keys
+  loop: "{{ tfstate.outputs.gitaly_ssh_ips.value.values() | list + [tfstate.outputs.client_ssh_ip.value] }}"
+  listen: add hostkeys
+  retries: 15
+  until: ssh_keys is not failed
+  delay: 10
+
+- name: add SSH keys to known hosts
+  known_hosts:
+    name: "{{ item.item }}"
+    key: "{{ item.stdout }}"
+  loop: "{{ ssh_keys.results }}"
+  listen: add hostkeys
