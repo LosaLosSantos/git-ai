@@ -22,7 +22,7 @@ func specBuildBench(t *testing.T) string {
 	t.Helper()
 
 	bin := filepath.Join(t.TempDir(), "graft-bench")
-	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".")
 	cmd.Dir = "."
 	out, err := cmd.CombinedOutput()
 	if err != nil {

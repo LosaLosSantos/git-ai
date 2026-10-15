@@ -42,7 +42,7 @@ const (
 func specBuild(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "graft-superfan")
-	cmd := exec.Command("go", "build", "-o", bin, specPkg)
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, specPkg)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", specPkg, err, out)
 	}

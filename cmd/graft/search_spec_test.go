@@ -16,7 +16,7 @@ func specBuildGraft(t *testing.T) string {
 	t.Helper()
 
 	bin := filepath.Join(t.TempDir(), "graft")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/feder-cr/open_scion/cmd/graft")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/feder-cr/open_scion/cmd/graft")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building graft: %v\n%s", err, out)
 	}
