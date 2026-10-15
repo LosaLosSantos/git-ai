@@ -1,11 +1,16 @@
 # open_scion
 
 **Source control for the age of coding agents.**
-open_scion is an open-source implementation of **Scion**, the version control
-design Anthropic described in
+
+Anthropic built **Scion**, a faster version control system for coding agents,
+and described it in
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control):
 a server-centric system built for hundreds of agents that read, write and land
-code at the same time.
+code at the same time. Scion is internal to Anthropic and is not available to
+the public.
+
+So I built **open_scion**: an open-source version of that design that anyone can
+run, and that the community can improve and maintain together.
 
 MIT licensed. Vendor neutral: the server never calls a language model, and every
 AI feature works with any provider, or none.
@@ -112,7 +117,13 @@ covered by unit, end-to-end, multi-node, crash and fuzz tests. Interfaces may
 still change before 1.0. Known gaps (for example garbage collection of packs in
 the storage core) are listed in [LIMITATIONS.md](doc/graft/LIMITATIONS.md).
 
-Contributions, issues and ideas are welcome.
+## Community
+
+open_scion is meant to be maintained by its community. Open an issue to report a
+bug or propose an idea, start a discussion before a large design change, and send
+pull requests: tests and a short description of the reasoning make them easy to
+review. The design documents in `doc/graft/PLAN*.md` explain why things are the
+way they are.
 
 ## Credits and license
 
