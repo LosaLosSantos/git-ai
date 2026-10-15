@@ -2,7 +2,7 @@
 
 How Gitaly emits logs. The conventions to follow when writing log statements, such as
 context-based logging, snake case fields, and the `log.Logger` interface, are in
-[`STYLE.md`](../STYLE.md#logging).
+[`STYLE.md`](contributing/STYLE.md#logging).
 
 ## Where logs go
 

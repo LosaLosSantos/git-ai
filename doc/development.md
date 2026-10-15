@@ -4,7 +4,7 @@ This document provides an overview of how to work in the Gitaly codebase. This i
 
 More specific guidance is available in the documents linked to from here.
 
-[STYLE.md](../STYLE.md) defines general Go style and conventions.
+[STYLE.md](contributing/STYLE.md) defines general Go style and conventions.
 
 ## Repository map
 

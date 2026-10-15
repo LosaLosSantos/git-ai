@@ -9,14 +9,14 @@ This document follows the [AGENTS.md](https://agents.md) format. [Agent Skills](
 Read the relevant context before starting a task:
 
 - Working in the codebase: layout, build/test/lint commands, Go/error/proto conventions →
-  [doc/development.md](doc/development.md), [STYLE.md](STYLE.md)
+  [doc/development.md](doc/development.md), [STYLE.md](doc/contributing/STYLE.md)
 - Adding or changing a CLI command or flag (`gitaly`/`praefect`) → [doc/help_text_style_guide.md](doc/help_text_style_guide.md)
-- Commits, merge requests, and code review → [CONTRIBUTING.md](CONTRIBUTING.md), [REVIEWING.md](REVIEWING.md), [STYLE.md](STYLE.md)
-- Running or writing tests → [doc/development.md](doc/development.md), [STYLE.md](STYLE.md)
+- Commits, merge requests, and code review → [CONTRIBUTING.md](CONTRIBUTING.md), [REVIEWING.md](doc/contributing/REVIEWING.md), [STYLE.md](doc/contributing/STYLE.md)
+- Running or writing tests → [doc/development.md](doc/development.md), [STYLE.md](doc/contributing/STYLE.md)
 - Observability: logs, metrics, traces, and Git-level instrumentation →
   [doc/observability.md](doc/observability.md) for which signal answers which question, then
   [doc/logging.md](doc/logging.md) or [doc/trace2_integration.md](doc/trace2_integration.md).
-  Logging *conventions* live in [`STYLE.md`](STYLE.md#logging) instead
+  Logging *conventions* live in [`STYLE.md`](doc/contributing/STYLE.md#logging) instead
 - Architecture → [doc/DESIGN.md](doc/DESIGN.md), [doc/design_ha.md](doc/design_ha.md)
 
 ## Always-on rules

@@ -16,7 +16,7 @@ Git processes emit a fifth, narrower signal of their own. See [Trace2 integratio
 
 Gitaly writes structured logs to `stdout`, with an access log entry per RPC and a correlation ID on
 every request-scoped message. [Logging in Gitaly](logging.md) covers the configuration, what gets
-logged, and how correlation IDs tie a request together. [`STYLE.md`](../STYLE.md#logging) covers the
+logged, and how correlation IDs tie a request together. [`STYLE.md`](contributing/STYLE.md#logging) covers the
 conventions to follow when adding log statements.
 
 ## Metrics

@@ -1,9 +1,0 @@
-defaultBaseImage: ko.local/gitaly-base:latest
-
-builds:
-- id: cmd/gitaly
-  env:
-  - CGO_ENABLED=0
-  - GOOS=linux
-  ldflags:
-  - -X github.com/feder-cr/open_scion/internal/version.version={{.Env.GITALY_VERSION}}

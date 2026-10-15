@@ -67,7 +67,7 @@ going on.
 After you have read the diff of your MR in the GitLab UI, take a moment
 to consider what the title of your MR should be, and update the MR title if needed.
 
-Imagine your title appearing as a [CHANGELOG](CHANGELOG.md) entry.
+Imagine your title appearing as a [CHANGELOG](../upstream/CHANGELOG-GITALY.md) entry.
 Will your title give a good indication of what changed?
 
 #### Your MR description should pass the lunch test

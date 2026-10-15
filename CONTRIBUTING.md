@@ -44,7 +44,7 @@ available at [https://contributor-covenant.org/version/1/1/0/](https://contribut
 
 ## Style guides
 
-For Gitaly code style, see [`STYLE.md`](STYLE.md).
+For Gitaly code style, see [`STYLE.md`](doc/contributing/STYLE.md).
 
 For help text style guidance for this project, see the [help text style guide](doc/help_text_style_guide.md).
 
@@ -169,7 +169,7 @@ pass formatting, linting, and our test suite.
 
 ### Changelog
 
-Gitaly keeps a [changelog](CHANGELOG.md) that is generated:
+Gitaly keeps a [changelog](doc/upstream/CHANGELOG-GITALY.md) that is generated:
 
 - When a new release is created.
 - From commit messages where a specific trailer is used.
@@ -246,7 +246,7 @@ member is equally responsible for a successful master pipeline and fixing securi
 issues.
 
 Merge requests are approved by [Gitaly team members](https://gitlab.com/groups/gl-gitaly/-/group_members);
-[REVIEWING.md](REVIEWING.md) describes how many approvals a change needs and how
+[REVIEWING.md](doc/contributing/REVIEWING.md) describes how many approvals a change needs and how
 reviewers are chosen.
 
 [eng-process]: https://handbook.gitlab.com/handbook/engineering/workflow/
@@ -254,7 +254,7 @@ reviewers are chosen.
 
 ### Review Process
 
-See [REVIEWING.md](REVIEWING.md).
+See [REVIEWING.md](doc/contributing/REVIEWING.md).
 
 ## Gitaly Developer Quick-start Guide
 

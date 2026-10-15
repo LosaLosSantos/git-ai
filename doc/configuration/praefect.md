@@ -38,7 +38,7 @@ name = 'praefect'
   token = 'secret_token'
 ```
 
-An example [config TOML](../../config.praefect.toml.example) is stored in this repository.
+An example [config TOML](../../examples/gitaly/config.praefect.toml.example) is stored in this repository.
 
 ## Timeout recommendation
 

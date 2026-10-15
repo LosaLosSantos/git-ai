@@ -133,5 +133,5 @@ It started as a fork of [Gitaly](https://gitlab.com/gitlab-org/gitaly), GitLab's
 Git RPC server (MIT, Copyright GitLab Inc.), which provides the Git plumbing
 underneath; every upstream Gitaly RPC keeps working. The non-MIT `ee/` directory
 of upstream Gitaly is not part of this repository. Gitaly's own README is kept in
-[doc/UPSTREAM-GITALY.md](doc/UPSTREAM-GITALY.md), and third-party notices are in
+[doc/UPSTREAM-GITALY.md](doc/upstream/README-GITALY.md), and third-party notices are in
 [NOTICE](NOTICE).

@@ -1,7 +1,7 @@
 # Upstream Gitaly README
 
 open_scion started as a fork of Gitaly. This is the README of upstream Gitaly,
-kept for reference; see the [open_scion README](../README.md) for this project.
+kept for reference; see the [open_scion README](../../README.md) for this project.
 
 ## Gitaly
 
@@ -46,7 +46,7 @@ The administration and reference guide is [documented in the GitLab project](htt
 
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) and a [list of quick win issues](https://gitlab.com/gitlab-org/gitaly/-/issues/?sort=due_date&state=opened&label_name%5B%5D=quick%20win&first_page_size=20).
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) and a [list of quick win issues](https://gitlab.com/gitlab-org/gitaly/-/issues/?sort=due_date&state=opened&label_name%5B%5D=quick%20win&first_page_size=20).
 
 ## Name
 
@@ -69,7 +69,7 @@ Gitaly offers a High Availability solution known as Gitaly Cluster ([product doc
 
 ## Further reading
 
-More about the project and its processes is [detailed in the docs](README.md).
+More about the project and its processes is [detailed in the docs](../README.md).
 
 ## Distributed Tracing
 

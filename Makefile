@@ -512,15 +512,15 @@ lint-fix: ${GOLANGCI_LINT} ${GITALY_PACKED_EXECUTABLES} ${GIT_PACKED_EXECUTABLES
 .PHONY: lint-docs
 ## Run markdownlint-cli2-config to lint the documentation and lychee to check for broken links.
 lint-docs:
-	${Q}markdownlint-cli2 AGENTS.md CLAUDE.md README.md REVIEWING.md STYLE.md doc/**/*.md doc/*.md skills/**/*.md
-	${Q}vale --minAlertLevel error AGENTS.md CLAUDE.md README.md REVIEWING.md STYLE.md doc skills
+	${Q}markdownlint-cli2 AGENTS.md CLAUDE.md README.md doc/**/*.md doc/*.md
+	${Q}vale --minAlertLevel error AGENTS.md CLAUDE.md README.md doc
 	${Q}lychee --version
-	${Q}lychee --offline --include-fragments AGENTS.md CLAUDE.md README.md REVIEWING.md STYLE.md doc/**/*.md doc/*.md skills/**/*.md
+	${Q}lychee --offline --include-fragments AGENTS.md CLAUDE.md README.md doc/**/*.md doc/*.md
 
 .PHONY: lint-docs-fix
 ## Run markdownlint-cli2-config to lint and fix the documentation.
 lint-docs-fix:
-	${Q}markdownlint-cli2 AGENTS.md CLAUDE.md README.md REVIEWING.md STYLE.md doc/**.md skills/**/*.md --fix
+	${Q}markdownlint-cli2 AGENTS.md CLAUDE.md README.md doc/**.md --fix
 
 .PHONY: lint-gitaly-linters
 ## Test Go tests in tools/golangci-lint/gitaly folder
