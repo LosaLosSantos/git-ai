@@ -5,7 +5,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ReadinessCheck runs the set of the checks to make sure service is in operational state.

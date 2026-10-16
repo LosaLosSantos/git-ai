@@ -3,11 +3,11 @@ package diff
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/gitaly/diff"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/gitaly/diff"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) CommitDelta(in *gitalypb.CommitDeltaRequest, stream gitalypb.DiffService_CommitDeltaServer) error {

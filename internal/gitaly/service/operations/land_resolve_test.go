@@ -18,17 +18,17 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/service"
-	"github.com/feder-cr/open_scion/internal/graft/identity"
-	"github.com/feder-cr/open_scion/internal/graft/resolver"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // resolverScript writes a resolver command into a new temporary directory and returns the

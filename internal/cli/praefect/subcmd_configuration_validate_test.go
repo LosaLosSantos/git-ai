@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +19,7 @@ func TestConfiguration_validate(t *testing.T) {
 
 	ctx := testhelper.Context(t)
 
-	praefectBin := testcfg.BuildBinary(t, testhelper.TempDir(t), "github.com/feder-cr/open_scion/cmd/praefect")
+	praefectBin := testcfg.BuildBinary(t, testhelper.TempDir(t), "github.com/feder-cr/git-ai/cmd/praefect")
 
 	for _, tc := range []struct {
 		name     string

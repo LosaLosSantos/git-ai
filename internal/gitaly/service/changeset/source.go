@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/dblog"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/dblog"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // changelogSource returns where the changelog of repo is read from: the

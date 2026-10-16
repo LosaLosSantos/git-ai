@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/objectpool"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/objectpool"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) FetchIntoObjectPool(ctx context.Context, req *gitalypb.FetchIntoObjectPoolRequest) (*gitalypb.FetchIntoObjectPoolResponse, error) {

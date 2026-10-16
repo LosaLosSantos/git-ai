@@ -9,11 +9,11 @@ import (
 	"io"
 	"net/url"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/internal/git/smudge"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/gitlab"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git/smudge"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/gitlab"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/git-lfs/git-lfs/v3/lfs"
 )
 

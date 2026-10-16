@@ -3,7 +3,7 @@ package hook
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/gitlab"
+	"github.com/feder-cr/git-ai/internal/gitlab"
 )
 
 //nolint:revive // This is unintentionally missing documentation.

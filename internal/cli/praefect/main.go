@@ -19,8 +19,8 @@ import (
 	"os/signal"
 	"slices"
 
-	"github.com/feder-cr/open_scion/internal/praefect/service"
-	"github.com/feder-cr/open_scion/internal/version"
+	"github.com/feder-cr/git-ai/internal/praefect/service"
+	"github.com/feder-cr/git-ai/internal/version"
 	"github.com/urfave/cli/v3"
 )
 

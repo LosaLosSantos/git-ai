@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 	"github.com/stretchr/testify/require"
 )
 

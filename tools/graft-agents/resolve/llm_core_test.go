@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // llmFake is a llm.Provider that records requests and answers with answer.

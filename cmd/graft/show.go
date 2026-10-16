@@ -11,11 +11,11 @@ import (
 
 	"google.golang.org/grpc"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/client"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/client"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // emptyTreeFor returns the empty tree of the object format of commitID, the left

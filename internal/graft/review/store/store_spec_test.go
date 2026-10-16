@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Spec: ids are decimal counters from next_id; Create assigns id and timestamps.

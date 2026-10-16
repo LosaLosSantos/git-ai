@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 )
 
 // FixDirectoryPermissions does a recursive directory walk to look for

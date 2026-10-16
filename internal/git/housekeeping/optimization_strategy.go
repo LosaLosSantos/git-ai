@@ -6,9 +6,9 @@ import (
 	"math"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	"github.com/feder-cr/git-ai/internal/git/stats"
 )
 
 const (

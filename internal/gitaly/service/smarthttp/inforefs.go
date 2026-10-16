@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/bundleuri"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/bundleuri"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 )
 
 const (

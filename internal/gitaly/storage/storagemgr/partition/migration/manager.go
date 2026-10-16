@@ -11,10 +11,10 @@ import (
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/metadata"
 )

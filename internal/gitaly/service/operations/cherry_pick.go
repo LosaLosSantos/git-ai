@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/hook/updateref"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook/updateref"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // UserCherryPick tries to perform a cherry-pick of a given commit onto a

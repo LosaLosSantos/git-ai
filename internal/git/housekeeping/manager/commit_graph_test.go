@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	gitalycfgprom "github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/stretchr/testify/require"
 )
 

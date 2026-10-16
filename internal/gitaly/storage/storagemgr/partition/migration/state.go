@@ -3,7 +3,7 @@ package migration
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // StateManager is used to manipulate the stored state of migrations.

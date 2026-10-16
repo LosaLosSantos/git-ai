@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
 )
 
 // Node describes an address that serves a storage

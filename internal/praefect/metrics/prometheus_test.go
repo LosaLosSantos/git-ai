@@ -3,8 +3,8 @@ package metrics
 import (
 	"testing"
 
-	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
+	gitalycfgprom "github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )

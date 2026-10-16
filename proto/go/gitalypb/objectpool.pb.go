@@ -602,7 +602,7 @@ const file_objectpool_proto_rawDesc = "" +
 	"\x1aLinkRepositoryToObjectPool\x12).gitaly.LinkRepositoryToObjectPoolRequest\x1a*.gitaly.LinkRepositoryToObjectPoolResponse\"\x06\xfa\x97(\x02\b\x01\x12r\n" +
 	"\x17DisconnectGitAlternates\x12&.gitaly.DisconnectGitAlternatesRequest\x1a'.gitaly.DisconnectGitAlternatesResponse\"\x06\xfa\x97(\x02\b\x01\x12f\n" +
 	"\x13FetchIntoObjectPool\x12\".gitaly.FetchIntoObjectPoolRequest\x1a#.gitaly.FetchIntoObjectPoolResponse\"\x06\xfa\x97(\x02\b\x01\x12T\n" +
-	"\rGetObjectPool\x12\x1c.gitaly.GetObjectPoolRequest\x1a\x1d.gitaly.GetObjectPoolResponse\"\x06\xfa\x97(\x02\b\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\rGetObjectPool\x12\x1c.gitaly.GetObjectPoolRequest\x1a\x1d.gitaly.GetObjectPoolResponse\"\x06\xfa\x97(\x02\b\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_objectpool_proto_rawDescOnce sync.Once

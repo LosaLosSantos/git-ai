@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 type summaryFake struct {

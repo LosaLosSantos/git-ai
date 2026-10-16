@@ -4,14 +4,14 @@ import (
 	"context"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
-	"github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/mvcc"
-	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/mvcc"
+	gitalycfgprom "github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

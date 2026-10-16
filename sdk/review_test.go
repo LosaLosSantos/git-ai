@@ -9,9 +9,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // reviewBaseSource is the base version of the Go file that the review tests change.

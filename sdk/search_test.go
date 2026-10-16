@@ -10,8 +10,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // fakeSearch implements SearchService. It records the requests it receives and

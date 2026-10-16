@@ -8,8 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 )
 
 // TestCLICommitReplacesDirectoryWithFile commits a tracked directory that was

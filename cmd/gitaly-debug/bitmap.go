@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/git/packfile"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/git/packfile"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 func listBitmapPack(logger log.Logger, idxFile string) {

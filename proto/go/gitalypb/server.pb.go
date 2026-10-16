@@ -764,7 +764,7 @@ const file_server_proto_rawDesc = "" +
 	"ServerInfo\x12\x19.gitaly.ServerInfoRequest\x1a\x1a.gitaly.ServerInfoResponse\x12O\n" +
 	"\x0eDiskStatistics\x12\x1d.gitaly.DiskStatisticsRequest\x1a\x1e.gitaly.DiskStatisticsResponse\x12O\n" +
 	"\x0eReadinessCheck\x12\x1d.gitaly.ReadinessCheckRequest\x1a\x1e.gitaly.ReadinessCheckResponse\x12R\n" +
-	"\x0fServerSignature\x12\x1e.gitaly.ServerSignatureRequest\x1a\x1f.gitaly.ServerSignatureResponse\x1a\x04\xf0\x97(\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0fServerSignature\x12\x1e.gitaly.ServerSignatureRequest\x1a\x1f.gitaly.ServerSignatureResponse\x1a\x04\xf0\x97(\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_server_proto_rawDescOnce sync.Once

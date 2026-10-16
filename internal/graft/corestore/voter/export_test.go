@@ -3,7 +3,7 @@ package voter
 import (
 	"time"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // The pending set is exported to the external tests of the package.

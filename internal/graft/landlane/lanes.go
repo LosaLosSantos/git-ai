@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 )
 
 // ErrClosed is returned by Submit after Close, and to the requests that were

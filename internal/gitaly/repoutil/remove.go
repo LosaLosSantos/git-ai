@@ -7,15 +7,15 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/counter"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/safe"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/counter"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/safe"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 // Remove will remove a repository in a race-free way with proper transactional semantics.

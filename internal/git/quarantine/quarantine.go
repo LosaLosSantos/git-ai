@@ -9,13 +9,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/safe"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/tempdir"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/safe"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/tempdir"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"google.golang.org/protobuf/proto"
 )
 

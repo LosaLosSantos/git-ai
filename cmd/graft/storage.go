@@ -9,7 +9,7 @@ import (
 	"io"
 	"unicode/utf8"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // storageSynopsis is the command line of graft storage.

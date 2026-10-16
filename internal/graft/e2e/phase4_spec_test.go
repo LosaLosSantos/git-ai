@@ -16,11 +16,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/landlane"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/landlane"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 func TestSpecPhase4ConfigDefaults(t *testing.T) {

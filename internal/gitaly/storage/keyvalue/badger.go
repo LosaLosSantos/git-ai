@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // NewBadgerStore returns a new Store backed by a Badger database at the given path.

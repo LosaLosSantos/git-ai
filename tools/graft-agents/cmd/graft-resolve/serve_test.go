@@ -10,8 +10,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
-	"github.com/feder-cr/open_scion/tools/graft-agents/resolve"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
 const testToken = "tok-s3cret"

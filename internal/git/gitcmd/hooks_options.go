@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/grpc/metadata"
-	"github.com/feder-cr/open_scion/internal/tracing"
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/grpc/metadata"
+	"github.com/feder-cr/git-ai/internal/tracing"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // envInjector is responsible for injecting environment variables required for tracing into

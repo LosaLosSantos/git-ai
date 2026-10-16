@@ -3,8 +3,8 @@
 package praefect
 
 import (
-	"github.com/feder-cr/open_scion/internal/praefect"
-	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
+	"github.com/feder-cr/git-ai/internal/praefect"
+	"github.com/feder-cr/git-ai/internal/testhelper/testserver"
 )
 
 // defaultServerOptions are only required by our testing infrastructure. When spawning Praefect as

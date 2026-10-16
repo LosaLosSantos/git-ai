@@ -7,11 +7,11 @@ import (
 	"io"
 	"time"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 	"github.com/urfave/cli/v3"
 	"google.golang.org/grpc"
 )

@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 func isPrimary(payload gitcmd.HooksPayload) bool {

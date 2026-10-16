@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ReadinessCheck is a stub that does nothing but exists to support single interface for gitaly

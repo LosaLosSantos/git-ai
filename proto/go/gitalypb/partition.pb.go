@@ -304,7 +304,7 @@ const file_partition_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value2\xcb\x01\n" +
 	"\x10PartitionService\x12\\\n" +
 	"\x0fBackupPartition\x12\x1e.gitaly.BackupPartitionRequest\x1a\x1f.gitaly.BackupPartitionResponse\"\b\xfa\x97(\x04\b\x02\x10\x03\x12Y\n" +
-	"\x0eListPartitions\x12\x1d.gitaly.ListPartitionsRequest\x1a\x1e.gitaly.ListPartitionsResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0eListPartitions\x12\x1d.gitaly.ListPartitionsRequest\x1a\x1e.gitaly.ListPartitionsResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_partition_proto_rawDescOnce sync.Once

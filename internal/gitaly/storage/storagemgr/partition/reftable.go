@@ -11,9 +11,9 @@ import (
 	"runtime/trace"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git/reftable"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/git-ai/internal/git/reftable"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/safe"
 )
 
 // reftableRecorder records the new reftables written during a transaction, and implements

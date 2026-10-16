@@ -2946,7 +2946,7 @@ const file_ref_proto_rawDesc = "" +
 	"\x10GetTagSignatures\x12\x1f.gitaly.GetTagSignaturesRequest\x1a .gitaly.GetTagSignaturesResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12Y\n" +
 	"\x0eGetTagMessages\x12\x1d.gitaly.GetTagMessagesRequest\x1a\x1e.gitaly.GetTagMessagesResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12G\n" +
 	"\bListRefs\x12\x17.gitaly.ListRefsRequest\x1a\x18.gitaly.ListRefsResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12T\n" +
-	"\rFindRefsByOID\x12\x1c.gitaly.FindRefsByOIDRequest\x1a\x1d.gitaly.FindRefsByOIDResponse\"\x06\xfa\x97(\x02\b\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\rFindRefsByOID\x12\x1c.gitaly.FindRefsByOIDRequest\x1a\x1d.gitaly.FindRefsByOIDResponse\"\x06\xfa\x97(\x02\b\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_ref_proto_rawDescOnce sync.Once

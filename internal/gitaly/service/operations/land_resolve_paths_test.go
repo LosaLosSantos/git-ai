@@ -6,12 +6,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/identity"
-	"github.com/feder-cr/open_scion/internal/graft/resolver"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // nestTreeEntries turns the entries whose paths contain slashes into the subtrees they belong to,

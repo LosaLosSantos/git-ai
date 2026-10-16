@@ -13,7 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // fakeBackend lands changes in memory. The first shared change lands; every

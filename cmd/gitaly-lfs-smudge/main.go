@@ -6,10 +6,10 @@ import (
 	"io"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/git/smudge"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/tracing"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/git/smudge"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/tracing"
 )
 
 func requireStdin(msg string) {

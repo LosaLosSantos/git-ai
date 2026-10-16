@@ -6,13 +6,13 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/relational"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/walk"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/relational"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/walk"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) ScanPoolMetadata(req *gitalypb.ScanPoolMetadataRequest, stream gitalypb.InternalGitaly_ScanPoolMetadataServer) error {

@@ -3,9 +3,9 @@ package gitaly
 import (
 	"context"
 
-	gitalycmd "github.com/feder-cr/open_scion/cmd"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/log"
+	gitalycmd "github.com/feder-cr/git-ai/cmd"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/urfave/cli/v3"
 )
 

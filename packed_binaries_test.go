@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 	"github.com/stretchr/testify/require"
 )
 

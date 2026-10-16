@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // Built-in strategy types. They are registered in init so that any program

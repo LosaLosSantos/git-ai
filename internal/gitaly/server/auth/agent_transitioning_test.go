@@ -3,8 +3,8 @@ package auth
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	gitalycfgauth "github.com/feder-cr/open_scion/internal/gitaly/config/auth"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	gitalycfgauth "github.com/feder-cr/git-ai/internal/gitaly/config/auth"
 	"github.com/stretchr/testify/require"
 )
 

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 var (

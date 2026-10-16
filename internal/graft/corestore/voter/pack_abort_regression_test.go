@@ -6,13 +6,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/gitops"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // bucketRepository indexes the pack of every changeset of the fixture's

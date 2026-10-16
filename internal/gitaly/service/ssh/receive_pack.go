@@ -9,17 +9,17 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 )
 
 func (s *server) SSHReceivePack(stream gitalypb.SSHService_SSHReceivePackServer) error {

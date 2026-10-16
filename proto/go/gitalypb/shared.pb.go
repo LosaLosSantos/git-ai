@@ -1402,7 +1402,7 @@ const file_shared_proto_rawDesc = "" +
 	"\rSortDirection\x12\r\n" +
 	"\tASCENDING\x10\x00\x12\x0e\n" +
 	"\n" +
-	"DESCENDING\x10\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"DESCENDING\x10\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_shared_proto_rawDescOnce sync.Once

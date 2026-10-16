@@ -1,8 +1,8 @@
 package refdb
 
 import (
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // Transaction appends updates to a History. The updates are only applied if

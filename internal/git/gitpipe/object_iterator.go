@@ -1,6 +1,6 @@
 package gitpipe
 
-import "github.com/feder-cr/open_scion/internal/git"
+import "github.com/feder-cr/git-ai/internal/git"
 
 // ObjectIterator is a common interface that is shared across the pipeline steps that work with
 // objects.

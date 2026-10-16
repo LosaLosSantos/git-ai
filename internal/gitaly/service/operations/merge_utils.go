@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // conflictingFileNames extracts the names of the conflicting files from a merge conflict error so

@@ -7,7 +7,7 @@
 package testproto
 
 import (
-	gitalypb "github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalypb "github.com/feder-cr/git-ai/proto/go/gitalypb"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -533,7 +533,7 @@ const file_testproto_valid_proto_rawDesc = "" +
 	" TestMaintenanceWithExplicitScope\x12\x17.testproto.ValidRequest\x1a\x18.testproto.ValidResponse\"\x06\xfa\x97(\x02\b\x03\x12c\n" +
 	" TestMaintenanceWithNestedRequest\x12\x1d.testproto.ValidNestedRequest\x1a\x18.testproto.ValidResponse\"\x06\xfa\x97(\x02\b\x03\x12o\n" +
 	"&TestMaintenanceWithNestedSharedRequest\x12#.testproto.ValidNestedSharedRequest\x1a\x18.testproto.ValidResponse\"\x06\xfa\x97(\x02\b\x03\x12i\n" +
-	"!TestMutatorWithInnerNestedRequest\x12\".testproto.ValidInnerNestedRequest\x1a\x18.testproto.ValidResponse\"\x06\xfa\x97(\x02\b\x03B<Z:github.com/feder-cr/open_scion/proto/go/gitalypb/testprotob\x06proto3"
+	"!TestMutatorWithInnerNestedRequest\x12\".testproto.ValidInnerNestedRequest\x1a\x18.testproto.ValidResponse\"\x06\xfa\x97(\x02\b\x03B8Z6github.com/feder-cr/git-ai/proto/go/gitalypb/testprotob\x06proto3"
 
 var (
 	file_testproto_valid_proto_rawDescOnce sync.Once

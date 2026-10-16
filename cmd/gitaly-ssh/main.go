@@ -8,12 +8,12 @@ import (
 	"strconv"
 	"strings"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/grpc/sidechannel"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/tracing"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/grpc/sidechannel"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/tracing"
 	"google.golang.org/grpc"
 )
 

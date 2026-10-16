@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/helper/text"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/helper/text"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // MergeStage denotes the stage indicated by git-merge-tree(1) in the conflicting

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // GetReferencesConfig is configuration that can be passed to GetReferences in order to change its default behaviour.

@@ -3,7 +3,7 @@ package repocleaner
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // LogWarnAction is an implementation of the Action interface that allows to log a warning message

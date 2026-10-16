@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/metrics"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/metrics"
 )
 
 // localElector relies on an in-memory datastore to track the primary

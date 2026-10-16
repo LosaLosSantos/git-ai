@@ -4,12 +4,12 @@ import (
 	"context"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mdfile"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode/permission"
-	"github.com/feder-cr/open_scion/internal/helper/fstype"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/version"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mdfile"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode/permission"
+	"github.com/feder-cr/git-ai/internal/helper/fstype"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/version"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) ServerInfo(ctx context.Context, in *gitalypb.ServerInfoRequest) (*gitalypb.ServerInfoResponse, error) {

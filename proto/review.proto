@@ -6,7 +6,7 @@ import "google/protobuf/timestamp.proto";
 import "lint.proto";
 import "shared.proto";
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // ReviewService is a minimal, agent-friendly code review system: reviews of a
 // commit range targeting a branch, comments, verdicts, and semantic approval

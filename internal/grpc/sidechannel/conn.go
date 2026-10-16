@@ -6,10 +6,10 @@ import (
 	"io"
 	"net"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/streamio"
 	"google.golang.org/grpc"
 )
 

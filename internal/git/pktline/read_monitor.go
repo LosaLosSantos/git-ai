@@ -7,8 +7,8 @@ import (
 	"os"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // ReadMonitor monitors an io.Reader, waiting for a specified packet. If the

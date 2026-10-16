@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // runMultiNode runs the benchmark over the repositories of a multi-node

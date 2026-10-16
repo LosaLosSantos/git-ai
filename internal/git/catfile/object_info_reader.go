@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // ObjectInfoReader returns information about an object referenced by a given revision.

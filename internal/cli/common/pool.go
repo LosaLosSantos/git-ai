@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // PoolMember represents a repository linked to an object pool.

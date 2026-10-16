@@ -7,9 +7,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 )
 

@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 )
 
 // countingBlobs counts the Put calls of a BlobStore.

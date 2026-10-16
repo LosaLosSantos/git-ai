@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // PruneOldGitalyProcessDirectories removes leftover temporary directories that belonged to processes that

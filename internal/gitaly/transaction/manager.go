@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

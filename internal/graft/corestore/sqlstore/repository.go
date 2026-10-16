@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // repoState is a repository row as the operations of a transaction see it.

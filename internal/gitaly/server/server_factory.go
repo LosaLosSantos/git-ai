@@ -3,13 +3,13 @@ package server
 import (
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/cache"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/housekeeping"
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/limithandler"
-	mvccmiddleware "github.com/feder-cr/open_scion/internal/grpc/middleware/mvcc"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/cache"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/housekeeping"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/limithandler"
+	mvccmiddleware "github.com/feder-cr/git-ai/internal/grpc/middleware/mvcc"
+	"github.com/feder-cr/git-ai/internal/log"
 	"google.golang.org/grpc"
 )
 

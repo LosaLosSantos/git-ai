@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/safe"
 )
 
 const (

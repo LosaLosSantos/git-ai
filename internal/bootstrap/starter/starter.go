@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/bootstrap"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/bootstrap"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

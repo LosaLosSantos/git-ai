@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // rerere reuses earlier resolutions, like git rerere. The key is the SHA-256

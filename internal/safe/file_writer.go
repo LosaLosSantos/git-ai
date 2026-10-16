@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // ErrAlreadyDone is returned when the safe file has already been closed

@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/archive"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/log"
-	"github.com/feder-cr/open_scion/internal/helper"
-	logging "github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/archive"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/log"
+	"github.com/feder-cr/git-ai/internal/helper"
+	logging "github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

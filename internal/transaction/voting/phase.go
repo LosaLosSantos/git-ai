@@ -3,7 +3,7 @@ package voting
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Phase is the transactional phase a given vote can be cast on.

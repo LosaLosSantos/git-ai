@@ -8,14 +8,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/gitaly/service/setup"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/coretest"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
-	"github.com/feder-cr/open_scion/internal/testhelper/testserver"
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/gitaly/service/setup"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/testhelper/testserver"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // TestCLIStorageAgainstServer drives graft storage against a real server whose

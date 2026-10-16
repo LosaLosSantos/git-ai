@@ -6,12 +6,12 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
-	"github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	housekeepingmgr "github.com/feder-cr/open_scion/internal/git/housekeeping/manager"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	housekeepingmgr "github.com/feder-cr/git-ai/internal/git/housekeeping/manager"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) OptimizeRepository(ctx context.Context, in *gitalypb.OptimizeRepositoryRequest) (*gitalypb.OptimizeRepositoryResponse, error) {

@@ -6,7 +6,7 @@ package resolve
 // reference programs (cmd/graft-resolve) and for any program that imports this
 // package. The SDK-based Anthropic backend stays inside this module.
 import (
-	_ "github.com/feder-cr/open_scion/tools/graft-agents/llm/anthropic"
-	_ "github.com/feder-cr/open_scion/tools/graft-agents/llm/command"
-	_ "github.com/feder-cr/open_scion/tools/graft-agents/llm/openai"
+	_ "github.com/feder-cr/git-ai/tools/graft-agents/llm/anthropic"
+	_ "github.com/feder-cr/git-ai/tools/graft-agents/llm/command"
+	_ "github.com/feder-cr/git-ai/tools/graft-agents/llm/openai"
 )

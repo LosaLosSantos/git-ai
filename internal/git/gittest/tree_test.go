@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 func TestWriteTree(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // BlobStore is the object storage of the storage core. Keys are

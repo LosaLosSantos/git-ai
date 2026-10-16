@@ -13,7 +13,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
 	"github.com/urfave/cli/v3"
 )
 

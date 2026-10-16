@@ -5,7 +5,7 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // lsnFormatBase is the base used when formatting an LSN as a string.

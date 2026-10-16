@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 )
 
 // TestRunResolveNeedsLand checks that --resolve, which asks the server to resolve conflicts while

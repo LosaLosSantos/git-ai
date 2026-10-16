@@ -1,11 +1,11 @@
 package repository
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/repoutil"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/gitaly/repoutil"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 )
 
 // CreateRepositoryFromBundle creates a Git repository at the specified storage and path, if it does

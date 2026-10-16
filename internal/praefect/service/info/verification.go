@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // MarkUnverified marks replicas as unverified. See the protobuf declarations for details.

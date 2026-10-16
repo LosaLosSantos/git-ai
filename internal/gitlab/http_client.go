@@ -12,13 +12,13 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/gitlab/client"
-	"github.com/feder-cr/open_scion/internal/grpc/metadata"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/prometheus/metrics"
-	"github.com/feder-cr/open_scion/internal/version"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	gitalycfgprom "github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/gitlab/client"
+	"github.com/feder-cr/git-ai/internal/grpc/metadata"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/prometheus/metrics"
+	"github.com/feder-cr/git-ai/internal/version"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

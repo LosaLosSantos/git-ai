@@ -7,11 +7,11 @@ import (
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )

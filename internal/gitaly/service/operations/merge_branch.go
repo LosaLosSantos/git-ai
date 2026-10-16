@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/mvcc"
-	"github.com/feder-cr/open_scion/internal/gitaly/hook"
-	"github.com/feder-cr/open_scion/internal/gitaly/hook/updateref"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/mvcc"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook/updateref"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // referenceUpdateConflictError is the error UserMergeBranch returns when the reference

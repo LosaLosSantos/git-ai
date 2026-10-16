@@ -6,10 +6,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/bootstrap/starter"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/bootstrap/starter"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/require"
 )

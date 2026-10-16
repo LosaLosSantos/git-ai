@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/pluginpb"
 
-	_ "github.com/feder-cr/open_scion/proto/go/gitalypb/testproto"
+	_ "github.com/feder-cr/git-ai/proto/go/gitalypb/testproto"
 )
 
 func TestLintFile(t *testing.T) {

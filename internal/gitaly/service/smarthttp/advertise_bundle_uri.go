@@ -3,7 +3,7 @@ package smarthttp
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // AdvertiseBundleURI serves the Git protocol v2 `command=bundle-uri` request, which Git sends as

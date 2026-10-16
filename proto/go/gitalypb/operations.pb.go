@@ -5556,7 +5556,7 @@ const file_operations_proto_rawDesc = "" +
 	"UserSquash\x12\x19.gitaly.UserSquashRequest\x1a\x1a.gitaly.UserSquashResponse\"\x06\xfa\x97(\x02\b\x01\x12Y\n" +
 	"\x0eUserApplyPatch\x12\x1d.gitaly.UserApplyPatchRequest\x1a\x1e.gitaly.UserApplyPatchResponse\"\x06\xfa\x97(\x02\b\x01(\x01\x12f\n" +
 	"\x13UserUpdateSubmodule\x12\".gitaly.UserUpdateSubmoduleRequest\x1a#.gitaly.UserUpdateSubmoduleResponse\"\x06\xfa\x97(\x02\b\x01\x12E\n" +
-	"\bUserLand\x12\x17.gitaly.UserLandRequest\x1a\x18.gitaly.UserLandResponse\"\x06\xfa\x97(\x02\b\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\bUserLand\x12\x17.gitaly.UserLandRequest\x1a\x18.gitaly.UserLandResponse\"\x06\xfa\x97(\x02\b\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_operations_proto_rawDescOnce sync.Once

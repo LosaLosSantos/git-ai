@@ -3,7 +3,7 @@ package datastore
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/datastructure"
+	"github.com/feder-cr/git-ai/internal/datastructure"
 )
 
 // MockRepositoryStore allows for mocking a RepositoryStore by parametrizing its behavior. All methods

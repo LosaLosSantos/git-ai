@@ -8,15 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git/catfile"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	housekeepingmgr "github.com/feder-cr/open_scion/internal/git/housekeeping/manager"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	housekeepingmgr "github.com/feder-cr/git-ai/internal/git/housekeeping/manager"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 var (

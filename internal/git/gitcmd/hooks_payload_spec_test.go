@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	// Module path assumed to be the Gitaly module root; adjust if the module differs.
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 )
 
 func specMemberList() []changelog.Member {

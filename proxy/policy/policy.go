@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ProfileReadonlyRepository identifies the profile that permits read-only RPCs

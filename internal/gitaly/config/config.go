@@ -18,14 +18,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/auth"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/cgroups"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/sentry"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/helper/duration"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/auth"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/cgroups"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/sentry"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/pelletier/go-toml/v2"
 )
 

@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/gitstorage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode/permission"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/gitstorage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode/permission"
 )
 
 // ModeReadOnlyDirectory is the mode given to directories in read-only snapshots.

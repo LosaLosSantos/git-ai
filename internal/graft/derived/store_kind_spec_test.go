@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // specStore returns a fresh, empty Store backed by a temp directory.

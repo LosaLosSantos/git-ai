@@ -529,7 +529,7 @@ const file_storage_core_proto_rawDesc = "" +
 	"\x12StorageCoreService\x12]\n" +
 	"\x10ImportRepository\x12\x1f.gitaly.ImportRepositoryRequest\x1a .gitaly.ImportRepositoryResponse\"\x06\xfa\x97(\x02\b\x01\x12Z\n" +
 	"\x0fGetStorageState\x12\x1e.gitaly.GetStorageStateRequest\x1a\x1f.gitaly.GetStorageStateResponse\"\x06\xfa\x97(\x02\b\x02\x12]\n" +
-	"\x10VerifyRepository\x12\x1f.gitaly.VerifyRepositoryRequest\x1a .gitaly.VerifyRepositoryResponse\"\x06\xfa\x97(\x02\b\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x10VerifyRepository\x12\x1f.gitaly.VerifyRepositoryRequest\x1a .gitaly.VerifyRepositoryResponse\"\x06\xfa\x97(\x02\b\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_storage_core_proto_rawDescOnce sync.Once

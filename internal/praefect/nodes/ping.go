@@ -8,10 +8,10 @@ import (
 	"strings"
 	"sync"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )

@@ -7,12 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/git/smudge"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/git/smudge"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/stretchr/testify/require"
 )
 

@@ -7,16 +7,16 @@ import (
 	"os"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/gitops"
-	"github.com/feder-cr/open_scion/internal/graft/identity"
-	reviewstore "github.com/feder-cr/open_scion/internal/graft/review/store"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
+	reviewstore "github.com/feder-cr/git-ai/internal/graft/review/store"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // importOperation is the operation of the changeset that imports a repository.

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 
-	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/git/stats"
 )
 
 var (

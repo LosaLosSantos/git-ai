@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/praefect/transactions"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/praefect/transactions"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 //nolint:revive // This is unintentionally missing documentation.

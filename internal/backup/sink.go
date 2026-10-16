@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/azureblob"
 	"gocloud.dev/blob/fileblob"

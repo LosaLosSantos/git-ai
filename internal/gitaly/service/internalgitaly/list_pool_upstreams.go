@@ -5,8 +5,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // objectPoolMembersBatchSize is the maximum number of pool disk paths to send in a single

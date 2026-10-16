@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/proxy/policy/testdata"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proxy/policy/testdata"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

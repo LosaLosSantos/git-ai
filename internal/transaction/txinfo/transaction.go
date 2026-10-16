@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
+	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
 	"google.golang.org/grpc/metadata"
 )
 

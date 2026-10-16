@@ -5,7 +5,7 @@ package gitaly;
 import "google/protobuf/duration.proto";
 import "lint.proto";
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // ServerService is a service that provides information about a Gitaly server.
 service ServerService {

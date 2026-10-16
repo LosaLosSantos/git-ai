@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 var (

@@ -5,7 +5,7 @@ import (
 	"os/exec"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/cgroups"
 )
 
 type mockCgroupManager struct {

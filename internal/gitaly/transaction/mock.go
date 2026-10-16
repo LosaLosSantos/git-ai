@@ -5,8 +5,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 // MockManager is a mock Manager for use in tests.

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // ManifestPruningConfig configures a manifest pruning run.

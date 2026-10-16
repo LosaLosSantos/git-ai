@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // errInvalidMigration is returned if a migration being run is improperly configured.

@@ -3,7 +3,7 @@ package loadmonitor
 import (
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/cgroups"
 )
 
 // Stats wraps statistics from different sources.

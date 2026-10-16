@@ -1,8 +1,8 @@
 package partition
 
 import (
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/snapshot"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/snapshot"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

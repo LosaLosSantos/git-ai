@@ -6,7 +6,7 @@ import (
 	"bufio"
 	"bytes"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 func Fuzz(data []byte) int {

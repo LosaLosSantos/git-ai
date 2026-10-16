@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/backoff"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/backoff"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 	grpccorrelation "gitlab.com/gitlab-org/labkit/correlation/grpc"

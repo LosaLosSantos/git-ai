@@ -7,10 +7,10 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/updateref"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // forEachFunc can be called for every entry in the filter-repo or BFG object

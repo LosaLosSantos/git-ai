@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/notify"
+	"github.com/feder-cr/git-ai/tools/graft-agents/notify"
 )
 
 func oid(c byte) string { return strings.Repeat(string(c), 40) }

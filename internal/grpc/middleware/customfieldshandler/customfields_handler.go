@@ -3,7 +3,7 @@ package customfieldshandler
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 	grpcmw "github.com/grpc-ecosystem/go-grpc-middleware"
 	"google.golang.org/grpc"
 )

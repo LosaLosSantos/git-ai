@@ -4,8 +4,8 @@
 package changeset
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/service"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // The changeset log is per node: behind Praefect, both ListChangesets and

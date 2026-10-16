@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	cli "github.com/feder-cr/open_scion/internal/cli/praefect"
+	cli "github.com/feder-cr/git-ai/internal/cli/praefect"
 )
 
 func main() {

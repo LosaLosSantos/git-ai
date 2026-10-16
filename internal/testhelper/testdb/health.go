@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 	"github.com/stretchr/testify/require"
 )
 

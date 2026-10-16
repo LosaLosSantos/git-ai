@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // CountDivergingCommits counts the diverging commits between from and to. Important to note that when --max-count is applied, the counts are not guaranteed to be

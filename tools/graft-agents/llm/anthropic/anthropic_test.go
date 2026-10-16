@@ -15,7 +15,7 @@ import (
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // fakeAPI is an httptest stand-in for POST /v1/messages. respond receives the

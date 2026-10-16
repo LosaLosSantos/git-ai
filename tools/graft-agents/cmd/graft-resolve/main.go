@@ -30,8 +30,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
-	"github.com/feder-cr/open_scion/tools/graft-agents/resolve"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
 // shutdownTimeout bounds the graceful shutdown of serve mode.

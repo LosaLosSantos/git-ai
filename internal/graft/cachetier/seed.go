@@ -14,9 +14,9 @@ import (
 	"io"
 	"math"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )

@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // ValidateURL validates Gitaly address URL having dns scheme. The URL follows three forms:

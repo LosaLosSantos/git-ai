@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/grpc/metadata"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/grpc/metadata"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
 )

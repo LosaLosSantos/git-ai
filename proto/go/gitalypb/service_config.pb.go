@@ -511,7 +511,7 @@ const file_service_config_proto_rawDesc = "" +
 	"\vmax_backoff\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"maxBackoff\x12-\n" +
 	"\x12backoff_multiplier\x18\x04 \x01(\x02R\x11backoffMultiplier\x124\n" +
-	"\x16retryable_status_codes\x18\x05 \x03(\tR\x14retryableStatusCodesB2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x16retryable_status_codes\x18\x05 \x03(\tR\x14retryableStatusCodesB.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_service_config_proto_rawDescOnce sync.Once

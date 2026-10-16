@@ -8,12 +8,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

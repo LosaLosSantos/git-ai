@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 )
 
 // FuzzParseChangedRefs fuzzes the parser of the change set that the standalone

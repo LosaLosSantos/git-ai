@@ -1293,7 +1293,7 @@ const file_blob_proto_rawDesc = "" +
 	"\fListAllBlobs\x12\x1b.gitaly.ListAllBlobsRequest\x1a\x1c.gitaly.ListAllBlobsResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12Y\n" +
 	"\x0eGetLFSPointers\x12\x1d.gitaly.GetLFSPointersRequest\x1a\x1e.gitaly.GetLFSPointersResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12\\\n" +
 	"\x0fListLFSPointers\x12\x1e.gitaly.ListLFSPointersRequest\x1a\x1f.gitaly.ListLFSPointersResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12e\n" +
-	"\x12ListAllLFSPointers\x12!.gitaly.ListAllLFSPointersRequest\x1a\".gitaly.ListAllLFSPointersResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x12ListAllLFSPointers\x12!.gitaly.ListAllLFSPointersRequest\x1a\".gitaly.ListAllLFSPointersResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_blob_proto_rawDescOnce sync.Once

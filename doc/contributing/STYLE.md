@@ -471,9 +471,9 @@ import (
     "io"
     "os/exec"
 
-    "github.com/feder-cr/open_scion/internal/command"
-    "github.com/feder-cr/open_scion/internal/git/alternates"
-    "github.com/feder-cr/open_scion/internal/git/repository"
+    "github.com/feder-cr/git-ai/internal/command"
+    "github.com/feder-cr/git-ai/internal/git/alternates"
+    "github.com/feder-cr/git-ai/internal/git/repository"
 )
 ```
 
@@ -486,10 +486,10 @@ import (
 
     "context"
 
-    "github.com/feder-cr/open_scion/internal/git/alternates"
-    "github.com/feder-cr/open_scion/internal/git/repository"
+    "github.com/feder-cr/git-ai/internal/git/alternates"
+    "github.com/feder-cr/git-ai/internal/git/repository"
 
-    "github.com/feder-cr/open_scion/internal/command"
+    "github.com/feder-cr/git-ai/internal/command"
 )
 ```
 

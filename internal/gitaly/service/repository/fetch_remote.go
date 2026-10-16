@@ -8,16 +8,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/git/quarantine"
-	"github.com/feder-cr/open_scion/internal/git/updateref"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/quarantine"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 var changeTypes = map[gitcmd.RefUpdateType]bool{

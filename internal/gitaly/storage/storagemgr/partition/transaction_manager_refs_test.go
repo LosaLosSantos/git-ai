@@ -4,15 +4,15 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	housekeepingcfg "github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/conflict/fshistory"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	housekeepingcfg "github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/conflict/fshistory"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 )
 
 func generateModifyReferencesTests(t *testing.T, setup testTransactionSetup) []transactionTestCase {

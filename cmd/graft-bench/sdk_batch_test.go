@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // TestSDKBackendReportsBatchPlacement lands one change on a real server. A

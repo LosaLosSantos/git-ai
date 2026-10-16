@@ -257,7 +257,7 @@ const file_analysis_proto_rawDesc = "" +
 	"\brevision\x18\x01 \x01(\fR\brevision\x12\x1c\n" +
 	"\tgenerated\x18\x02 \x01(\bR\tgenerated2}\n" +
 	"\x0fAnalysisService\x12j\n" +
-	"\x13CheckBlobsGenerated\x12\".gitaly.CheckBlobsGeneratedRequest\x1a#.gitaly.CheckBlobsGeneratedResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x13CheckBlobsGenerated\x12\".gitaly.CheckBlobsGeneratedRequest\x1a#.gitaly.CheckBlobsGeneratedResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_analysis_proto_rawDescOnce sync.Once

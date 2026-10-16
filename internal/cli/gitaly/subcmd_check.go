@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/feder-cr/open_scion"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
-	"github.com/feder-cr/open_scion/internal/gitaly/hook"
-	"github.com/feder-cr/open_scion/internal/gitlab"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook"
+	"github.com/feder-cr/git-ai/internal/gitlab"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/urfave/cli/v3"
 )
 

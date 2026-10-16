@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
 	"github.com/pelletier/go-toml/v2"
 )
 

@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/blobstore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/blobstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/stretchr/testify/require"
 )
 

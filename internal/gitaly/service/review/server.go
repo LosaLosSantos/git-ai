@@ -10,14 +10,14 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/service"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/dbreview"
-	"github.com/feder-cr/open_scion/internal/graft/review/rules"
-	"github.com/feder-cr/open_scion/internal/graft/review/store"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/dbreview"
+	"github.com/feder-cr/git-ai/internal/graft/review/rules"
+	"github.com/feder-cr/git-ai/internal/graft/review/store"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 const (

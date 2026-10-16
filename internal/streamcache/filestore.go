@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/dontpanic"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/helper/perm"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/dontpanic"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/helper/perm"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )

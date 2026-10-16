@@ -4,7 +4,7 @@
 // RECONCILIATION section, which keeps the draft Index):
 //   - newSpecStore: derived.NewStore over a temp dir.
 //   - specIndex: NewIndex(NewCatfileSource(reader), store.Kind("graph", 1)).
-//   - Module path github.com/feder-cr/open_scion.
+//   - Module path github.com/feder-cr/git-ai.
 //   - MergeBase(ctx, a, b) (git.ObjectID, error); the empty ID means no base.
 package graph
 
@@ -18,15 +18,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/catfile"
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/derived"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/derived"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 )
 

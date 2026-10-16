@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/require"
 )
 

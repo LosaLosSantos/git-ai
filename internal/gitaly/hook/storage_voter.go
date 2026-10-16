@@ -3,8 +3,8 @@ package hook
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 )
 
 // StorageVoter is the write path of the Graft storage core

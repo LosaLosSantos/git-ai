@@ -1,10 +1,10 @@
 package server
 
 import (
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/internal/praefect/service"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/praefect/service"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Server is a ServerService server

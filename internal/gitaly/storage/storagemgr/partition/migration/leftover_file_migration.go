@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	migrationid "github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/migration/id"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/snapshot"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	migrationid "github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/migration/id"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/snapshot"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // LostFoundPrefix is the garbage directory prefix where we put leftover files.

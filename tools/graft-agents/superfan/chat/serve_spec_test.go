@@ -31,7 +31,7 @@ import (
 //   - the Slack headers X-Slack-Request-Timestamp and X-Slack-Signature.
 
 const (
-	specPkg           = "github.com/feder-cr/open_scion/tools/graft-agents/cmd/graft-superfan"
+	specPkg           = "github.com/feder-cr/git-ai/tools/graft-agents/cmd/graft-superfan"
 	specSecretEnv     = "GRAFT_SUPERFAN_SLACK_SIGNING_SECRET" // gate wiring: the implementation's default env var
 	specSecret        = "spec-signing-secret"
 	specCommandsPath  = "/slack/commands"

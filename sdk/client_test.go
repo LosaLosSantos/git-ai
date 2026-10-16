@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 func TestDial_TokenIsSentAsAuthorization(t *testing.T) {

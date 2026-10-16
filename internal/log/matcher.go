@@ -4,7 +4,7 @@ import (
 	"context"
 	"regexp"
 
-	"github.com/feder-cr/open_scion/internal/helper/env"
+	"github.com/feder-cr/git-ai/internal/helper/env"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors"
 )
 

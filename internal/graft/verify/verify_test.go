@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 )
 
 // recordingBisector records the failures it is given and tests the good

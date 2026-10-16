@@ -4,9 +4,9 @@ import (
 	"context"
 	"runtime/trace"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/conflict/refdb"
 )
 
 // Transaction performs an atomic update against a repository's history under a single LSN.

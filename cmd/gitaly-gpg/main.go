@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/signature"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/signature"
 	"github.com/urfave/cli/v3"
 )
 

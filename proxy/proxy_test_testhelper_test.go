@@ -5,9 +5,9 @@ import (
 	"net"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/sentryhandler"
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/proxy"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/sentryhandler"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/proxy"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

@@ -3,8 +3,8 @@ package gitaly
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/stretchr/testify/require"
 )
 

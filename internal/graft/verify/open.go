@@ -6,7 +6,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // closers closes several resources in order and joins their errors.

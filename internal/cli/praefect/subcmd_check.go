@@ -7,8 +7,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/service"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/service"
 	"github.com/urfave/cli/v3"
 )
 

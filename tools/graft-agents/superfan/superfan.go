@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/notify"
+	"github.com/feder-cr/git-ai/tools/graft-agents/notify"
 )
 
 const (

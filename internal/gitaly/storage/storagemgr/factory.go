@@ -1,9 +1,9 @@
 package storagemgr
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue/databasemgr"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/node"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue/databasemgr"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/node"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // Factory is a factory type that can instantiate new storages.

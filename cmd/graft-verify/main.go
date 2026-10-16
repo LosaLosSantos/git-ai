@@ -22,7 +22,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/feder-cr/open_scion/internal/graft/verify"
+	"github.com/feder-cr/git-ai/internal/graft/verify"
 )
 
 const (

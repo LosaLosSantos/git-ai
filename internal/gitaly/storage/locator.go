@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // NewStorageNotFoundError returns a new error wrapping ErrStorageNotFound with an InvalidArgument

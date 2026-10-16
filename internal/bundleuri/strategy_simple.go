@@ -3,7 +3,7 @@ package bundleuri
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // SimpleStrategy  is a very simple strategy used

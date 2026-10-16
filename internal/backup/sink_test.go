@@ -15,8 +15,8 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/require"
 
 	_ "gocloud.dev/blob/memblob"
@@ -47,10 +47,10 @@ func TestResolveSink(t *testing.T) {
 	// credentials file it can parse to build the GCS client; nothing is signed.
 	gsCredsJSON, err := json.Marshal(map[string]string{
 		"type":           "service_account",
-		"project_id":     "open-scion-test",
+		"project_id":     "gitai-test",
 		"private_key_id": "0000000000000000000000000000000000000000",
 		"private_key":    "not-a-real-key",
-		"client_email":   "test@open-scion-test.iam.gserviceaccount.example",
+		"client_email":   "test@gitai-test.iam.gserviceaccount.example",
 		"client_id":      "000000000000000000000",
 		"auth_uri":       "https://accounts.google.com/o/oauth2/auth",
 		"token_uri":      "https://accounts.google.com/o/oauth2/token",

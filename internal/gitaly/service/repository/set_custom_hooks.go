@@ -1,10 +1,10 @@
 package repository
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/repoutil"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/gitaly/repoutil"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 )
 
 // SetCustomHooks sets the git hooks for a repository. The hooks are sent in a

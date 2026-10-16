@@ -1,6 +1,6 @@
 package sdk
 
-import "github.com/feder-cr/open_scion/proto/go/gitalypb"
+import "github.com/feder-cr/git-ai/proto/go/gitalypb"
 
 // BatchInfo describes the land batch a landing was part of. The server lands
 // concurrent changes on the same branch in batches, see

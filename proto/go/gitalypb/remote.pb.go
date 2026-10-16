@@ -527,7 +527,7 @@ const file_remote_proto_rawDesc = "" +
 	"\rRemoteService\x12e\n" +
 	"\x12UpdateRemoteMirror\x12!.gitaly.UpdateRemoteMirrorRequest\x1a\".gitaly.UpdateRemoteMirrorResponse\"\x06\xfa\x97(\x02\b\x02(\x01\x12k\n" +
 	"\x14FindRemoteRepository\x12#.gitaly.FindRemoteRepositoryRequest\x1a$.gitaly.FindRemoteRepositoryResponse\"\b\xfa\x97(\x04\b\x02\x10\x02\x12`\n" +
-	"\x11FindRemoteRootRef\x12 .gitaly.FindRemoteRootRefRequest\x1a!.gitaly.FindRemoteRootRefResponse\"\x06\xfa\x97(\x02\b\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x11FindRemoteRootRef\x12 .gitaly.FindRemoteRootRefRequest\x1a!.gitaly.FindRemoteRootRefResponse\"\x06\xfa\x97(\x02\b\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_remote_proto_rawDescOnce sync.Once

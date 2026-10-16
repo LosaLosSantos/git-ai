@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
 )
 
 // ResponseBody returns how long it took to receive the last bytes of the response body.

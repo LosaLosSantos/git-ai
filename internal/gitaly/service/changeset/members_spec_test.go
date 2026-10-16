@@ -7,7 +7,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	// Module path assumed to be the Gitaly module root; adjust if the module differs.
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // WP23 / Foundation: message ChangesetMember { string original_commit_id = 1;

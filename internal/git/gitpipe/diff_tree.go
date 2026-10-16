@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // diffTreeConfig is configuration for the DiffTree pipeline step.

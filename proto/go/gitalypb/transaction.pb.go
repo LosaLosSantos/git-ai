@@ -397,7 +397,7 @@ const file_transaction_proto_rawDesc = "" +
 	"\x17StopTransactionResponse2\xbe\x01\n" +
 	"\x0eRefTransaction\x12R\n" +
 	"\x0fVoteTransaction\x12\x1e.gitaly.VoteTransactionRequest\x1a\x1f.gitaly.VoteTransactionResponse\x12R\n" +
-	"\x0fStopTransaction\x12\x1e.gitaly.StopTransactionRequest\x1a\x1f.gitaly.StopTransactionResponse\x1a\x04\xf0\x97(\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0fStopTransaction\x12\x1e.gitaly.StopTransactionRequest\x1a\x1f.gitaly.StopTransactionResponse\x1a\x04\xf0\x97(\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_transaction_proto_rawDescOnce sync.Once

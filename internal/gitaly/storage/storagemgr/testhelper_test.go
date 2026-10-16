@@ -4,12 +4,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue/databasemgr"
-	"github.com/feder-cr/open_scion/internal/helper"
-	logging "github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue/databasemgr"
+	"github.com/feder-cr/git-ai/internal/helper"
+	logging "github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/require"
 )
 

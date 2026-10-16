@@ -3,8 +3,8 @@ package praefect
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/nodes"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/nodes"
 	"github.com/urfave/cli/v3"
 )
 

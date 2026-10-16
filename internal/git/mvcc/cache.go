@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/safe"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/safe"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"golang.org/x/sync/errgroup"
 )
 

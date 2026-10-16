@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // WriteCommitGraphIfIdle writes an incremental commit-graph of the repository unless housekeeping

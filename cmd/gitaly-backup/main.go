@@ -4,7 +4,7 @@ import (
 	"context"
 	"os"
 
-	cli "github.com/feder-cr/open_scion/internal/cli/gitalybackup"
+	cli "github.com/feder-cr/git-ai/internal/cli/gitalybackup"
 )
 
 func main() {

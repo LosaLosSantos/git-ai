@@ -40,7 +40,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // options are the parsed command-line options.

@@ -6,7 +6,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	// Module path assumed to be the Gitaly module root; adjust if the module differs.
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // WP23: the SDK exposes changeset members through its Changeset type with no

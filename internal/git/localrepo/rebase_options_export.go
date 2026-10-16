@@ -1,6 +1,6 @@
 package localrepo
 
-import "github.com/feder-cr/open_scion/internal/git"
+import "github.com/feder-cr/git-ai/internal/git"
 
 // RebaseSettings is the resolved form of a set of RebaseOptions. It lets packages that implement
 // a rebase on top of the localrepo primitives honor the same options as (*Repo).Rebase.

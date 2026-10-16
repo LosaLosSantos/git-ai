@@ -1,8 +1,8 @@
 package fshistory
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // ReadWriteConflictError is returned when transaction performed a read on an

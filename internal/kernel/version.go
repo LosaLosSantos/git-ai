@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // Version models a kernel version.

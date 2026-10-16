@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // ShowRefDecoder parses the output format of git-show-ref

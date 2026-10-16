@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // StorageFactory is responsible for instantiating a Storage.

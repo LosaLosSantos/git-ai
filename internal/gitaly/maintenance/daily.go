@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/dontpanic"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/dontpanic"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // StoragesJob runs a job on storages. The string slice param indicates which

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 )
 
 // catfileSource reads the parents of commits from the object database. Like the

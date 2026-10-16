@@ -3,7 +3,7 @@ package bundleuri
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // StrategyCallbackFn defines a function type that the `Evaluate` method

@@ -2,7 +2,7 @@
 
 package praefect
 
-import "github.com/feder-cr/open_scion/internal/praefect"
+import "github.com/feder-cr/git-ai/internal/praefect"
 
 // defaultServerOptions are only required by our testing infrastructure. When spawning Praefect as
 // an external, proxying executable we want to be able to use test-only interceptors. So if the

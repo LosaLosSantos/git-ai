@@ -639,7 +639,7 @@ const file_conflicts_proto_rawDesc = "" +
 	"\x10resolution_error\x18\x01 \x01(\tR\x0fresolutionError2\xd7\x01\n" +
 	"\x10ConflictsService\x12b\n" +
 	"\x11ListConflictFiles\x12 .gitaly.ListConflictFilesRequest\x1a!.gitaly.ListConflictFilesResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12_\n" +
-	"\x10ResolveConflicts\x12\x1f.gitaly.ResolveConflictsRequest\x1a .gitaly.ResolveConflictsResponse\"\x06\xfa\x97(\x02\b\x01(\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x10ResolveConflicts\x12\x1f.gitaly.ResolveConflictsRequest\x1a .gitaly.ResolveConflictsResponse\"\x06\xfa\x97(\x02\b\x01(\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_conflicts_proto_rawDescOnce sync.Once

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/resolver"

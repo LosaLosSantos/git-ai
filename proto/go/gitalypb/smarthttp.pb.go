@@ -560,7 +560,7 @@ const file_smarthttp_proto_rawDesc = "" +
 	"\x13InfoRefsReceivePack\x12\x17.gitaly.InfoRefsRequest\x1a\x18.gitaly.InfoRefsResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12\x84\x01\n" +
 	"\x1dPostUploadPackWithSidechannel\x12,.gitaly.PostUploadPackWithSidechannelRequest\x1a-.gitaly.PostUploadPackWithSidechannelResponse\"\x06\xfa\x97(\x02\b\x02\x12c\n" +
 	"\x12AdvertiseBundleURI\x12!.gitaly.AdvertiseBundleURIRequest\x1a\".gitaly.AdvertiseBundleURIResponse\"\x06\xfa\x97(\x02\b\x02\x12^\n" +
-	"\x0fPostReceivePack\x12\x1e.gitaly.PostReceivePackRequest\x1a\x1f.gitaly.PostReceivePackResponse\"\x06\xfa\x97(\x02\b\x01(\x010\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0fPostReceivePack\x12\x1e.gitaly.PostReceivePackRequest\x1a\x1f.gitaly.PostReceivePackResponse\"\x06\xfa\x97(\x02\b\x01(\x010\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_smarthttp_proto_rawDescOnce sync.Once

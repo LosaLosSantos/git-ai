@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/stretchr/testify/require"
 )
 

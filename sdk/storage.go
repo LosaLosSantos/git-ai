@@ -3,7 +3,7 @@ package sdk
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // StorageImport is the outcome of importing a repository into the storage core.

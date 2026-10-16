@@ -7,11 +7,11 @@ import (
 	"net"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/grpc/listenmux"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/grpc/listenmux"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

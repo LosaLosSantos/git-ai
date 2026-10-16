@@ -245,7 +245,7 @@ regional "cache" tier; chain tiers by pointing one at another):
   streaming), chained tiers.
 
 ### WP8 — Public Go SDK (`sdk/`)
-Owns: `sdk/**` (new top-level package `github.com/feder-cr/open_scion/sdk`;
+Owns: `sdk/**` (new top-level package `github.com/feder-cr/git-ai/sdk`;
 may import `client`, `auth`, `proto/go/gitalypb` but NOT `internal/` in
 non-test code).
 `sdk.Dial(ctx, address, opts...)` (`WithToken`, `WithAgentToken`,

@@ -3,7 +3,7 @@ package gitpipe
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // CatfileInfoIterator is an iterator returned by the Revlist function.

@@ -1,4 +1,4 @@
-module github.com/feder-cr/open_scion
+module github.com/feder-cr/git-ai
 
 go 1.26.0
 

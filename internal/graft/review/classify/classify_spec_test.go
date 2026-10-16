@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Spec: path rules are checked in order GENERATED, TESTS, DOCS, CONFIG; first match wins.

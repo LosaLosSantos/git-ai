@@ -10,7 +10,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // File classifies the change of one file. old or new is nil when the file was

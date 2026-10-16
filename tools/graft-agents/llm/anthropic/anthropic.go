@@ -20,7 +20,7 @@ import (
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 func init() {

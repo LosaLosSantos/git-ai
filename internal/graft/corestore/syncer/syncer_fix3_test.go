@@ -10,14 +10,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/internal/git/gittest"
-	"github.com/feder-cr/open_scion/internal/git/updateref"
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/gitops"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
-	reviewstore "github.com/feder-cr/open_scion/internal/graft/review/store"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	reviewstore "github.com/feder-cr/git-ai/internal/graft/review/store"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // A write of this node whose changeset is in the range of a catch-up can still

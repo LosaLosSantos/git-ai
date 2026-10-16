@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

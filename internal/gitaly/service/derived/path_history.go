@@ -3,12 +3,12 @@ package derived
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/catfile"
-	"github.com/feder-cr/open_scion/internal/graft/derived"
-	"github.com/feder-cr/open_scion/internal/graft/derived/changedpaths"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/graft/derived"
+	"github.com/feder-cr/git-ai/internal/graft/derived/changedpaths"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // PathHistory returns the commits that changed a path, newest first, following

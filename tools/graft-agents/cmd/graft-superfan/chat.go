@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/superfan/chat"
+	"github.com/feder-cr/git-ai/tools/graft-agents/superfan/chat"
 )
 
 // defaultChatListen is loopback so that the endpoints are not exposed by

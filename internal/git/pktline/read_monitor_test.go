@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )

@@ -3,7 +3,7 @@ package classify
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // TestOperatorsAreLanguageExact checks that each C-like lexer splits a run of

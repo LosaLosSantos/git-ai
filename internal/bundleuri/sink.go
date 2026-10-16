@@ -7,7 +7,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"gocloud.dev/blob"
 
 	_ "gocloud.dev/blob/azureblob" // register Azure driver

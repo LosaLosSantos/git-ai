@@ -7,17 +7,17 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/bundleuri"
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/internal/git/stats"
-	"github.com/feder-cr/open_scion/internal/grpc/sidechannel"
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/stream"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/bundleuri"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/grpc/sidechannel"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/stream"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) sshUploadPack(ctx context.Context, req *gitalypb.SSHUploadPackWithSidechannelRequest, stdin io.Reader, stdout, stderr io.Writer) (negotiation *stats.PackfileNegotiation, _ int, _ error) {

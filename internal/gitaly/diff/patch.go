@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // PatchParser defines the parser state required for parsing diffs. Patch output from a git diff

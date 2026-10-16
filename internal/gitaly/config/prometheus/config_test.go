@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
-	"github.com/feder-cr/open_scion/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
 	"github.com/stretchr/testify/require"
 )
 

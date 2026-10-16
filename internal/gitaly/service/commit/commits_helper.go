@@ -3,11 +3,11 @@ package commit
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	gitlog "github.com/feder-cr/open_scion/internal/git/log"
-	"github.com/feder-cr/open_scion/internal/helper/chunk"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	gitlog "github.com/feder-cr/git-ai/internal/git/log"
+	"github.com/feder-cr/git-ai/internal/helper/chunk"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) sendCommits(

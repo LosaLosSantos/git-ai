@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package gitaly;
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // PackfileNegotiationStatistics represents the git packfile negotiation.
 message PackfileNegotiationStatistics {

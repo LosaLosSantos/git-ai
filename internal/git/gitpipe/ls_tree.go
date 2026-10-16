@@ -7,8 +7,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 )
 
 // lsTreeConfig is configuration for the LsTree pipeline step.

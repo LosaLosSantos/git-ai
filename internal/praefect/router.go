@@ -3,7 +3,7 @@ package praefect
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 	"google.golang.org/grpc"
 )
 

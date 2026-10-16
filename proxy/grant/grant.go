@@ -1,7 +1,7 @@
 // Package grant defines the authorization contract consumed by the Gitaly proxy.
 package grant
 
-import "github.com/feder-cr/open_scion/proto/go/gitalypb"
+import "github.com/feder-cr/git-ai/proto/go/gitalypb"
 
 // Coordinates identify the Gitaly server authorized for a proxy connection.
 type Coordinates struct {

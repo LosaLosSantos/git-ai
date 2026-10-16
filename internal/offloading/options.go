@@ -4,7 +4,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/backoff"
+	"github.com/feder-cr/git-ai/internal/backoff"
 )
 
 var (

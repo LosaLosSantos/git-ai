@@ -1,8 +1,8 @@
 package wal
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // operations is a helper type around []*gitalypb.LogEntry_Operation.

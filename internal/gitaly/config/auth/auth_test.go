@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
 	"github.com/stretchr/testify/require"
 )
 

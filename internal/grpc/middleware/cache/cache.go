@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	diskcache "github.com/feder-cr/open_scion/internal/cache"
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
-	"github.com/feder-cr/open_scion/internal/log"
+	diskcache "github.com/feder-cr/git-ai/internal/cache"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/log"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/pelletier/go-toml/v2"
 )
 

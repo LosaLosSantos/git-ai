@@ -46,9 +46,9 @@ linters:
       exclude-functions:
         - (*database/sql.DB).Close
         - (*database/sql.Rows).Close
-        - (*github.com/feder-cr/open_scion/internal/grpc/sidechannel.ServerConn).Close
-        - (*github.com/feder-cr/open_scion/internal/streamcache.pipe).Close
-        - (*github.com/feder-cr/open_scion/internal/streamcache.pipeReader).Close
+        - (*github.com/feder-cr/git-ai/internal/grpc/sidechannel.ServerConn).Close
+        - (*github.com/feder-cr/git-ai/internal/streamcache.pipe).Close
+        - (*github.com/feder-cr/git-ai/internal/streamcache.pipeReader).Close
         - (*google.golang.org/grpc.ClientConn).Close
         - (*google.golang.org/grpc.ServerConn).Close
         - (*io.PipeReader).Close
@@ -169,16 +169,16 @@ linters:
           error_wrap:
             included-functions:
               - fmt.Errorf
-              - github.com/feder-cr/open_scion/internal/structerr.*
+              - github.com/feder-cr/git-ai/internal/structerr.*
           string_interpolation_quote:
             included-functions:
               - fmt.*
           testhelper_run:
             included-functions:
-              - github.com/feder-cr/open_scion/internal/testhelper.Run
+              - github.com/feder-cr/git-ai/internal/testhelper.Run
           unavailable_code:
             included-functions:
-              - github.com/feder-cr/open_scion/internal/structerr.NewUnavailable
+              - github.com/feder-cr/git-ai/internal/structerr.NewUnavailable
   exclusions:
     generated: lax
     rules:

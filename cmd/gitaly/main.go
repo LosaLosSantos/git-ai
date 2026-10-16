@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	cli "github.com/feder-cr/open_scion/internal/cli/gitaly"
+	cli "github.com/feder-cr/git-ai/internal/cli/gitaly"
 )
 
 func main() {

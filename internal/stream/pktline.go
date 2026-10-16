@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
 )
 
 // Conn represents a bi-directional client side connection.

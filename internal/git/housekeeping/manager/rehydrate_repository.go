@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // RehydrateRepository restores an offloaded repository by downloading objects from remote

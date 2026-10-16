@@ -324,7 +324,7 @@ const file_lint_proto_rawDesc = "" +
 	"repository:L\n" +
 	"\x11target_repository\x12\x1d.google.protobuf.FieldOptions\x18\xe3\xc8\x05 \x01(\bR\x10targetRepository:T\n" +
 	"\x15additional_repository\x12\x1d.google.protobuf.FieldOptions\x18\xe4\xc8\x05 \x01(\bR\x14additionalRepository:B\n" +
-	"\fpartition_id\x12\x1d.google.protobuf.FieldOptions\x18\xe5\xc8\x05 \x01(\bR\vpartitionIdB2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\fpartition_id\x12\x1d.google.protobuf.FieldOptions\x18\xe5\xc8\x05 \x01(\bR\vpartitionIdB.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_lint_proto_rawDescOnce sync.Once

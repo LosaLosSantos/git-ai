@@ -10,9 +10,9 @@ import (
 	"runtime/trace"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/safe"
 )
 
 // ErrLogEntryNotAppended is returned by CompareAndAppendLogEntry if the expected LSN

@@ -5,9 +5,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
-	"github.com/feder-cr/open_scion/internal/helper/duration"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/log"
 	grpcprometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 )

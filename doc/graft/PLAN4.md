@@ -5,7 +5,7 @@ commands" rules apply). Worktrees: WP31 … WP40. **Implement exactly the
 signatures below. Do not invent alternative designs. If something is
 impossible, stop and report it in `needs_outside_change`.**
 
-Module path: `github.com/feder-cr/open_scion` (NOT v16). Test helpers:
+Module path: `github.com/feder-cr/git-ai` (NOT v16). Test helpers:
 `testhelper.Context(t)`, `testcfg.Build(t)`, `testserver.RunGitalyServer(t, cfg, setup.RegisterAll, ...)`,
 `gittest.CreateRepository`, `gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(...), gittest.WithTreeEntries(...))`,
 `gittest.Exec(t, cfg, "-C", repoPath, ...)`, `gittest.DefaultObjectHash`. In
@@ -258,7 +258,7 @@ Depends on all.
 
 ## Spec-test writers
 Write `*_spec_test.go` files in the same package as the code, module path
-`github.com/feder-cr/open_scion`, using only exported identifiers named in
+`github.com/feder-cr/git-ai`, using only exported identifiers named in
 this spec plus the helpers listed at the top. Every test function starts
 with `TestSpec`.
 

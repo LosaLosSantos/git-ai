@@ -4,7 +4,7 @@ package gitaly;
 
 import "google/protobuf/descriptor.proto";
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // OperationMsg ...
 message OperationMsg {

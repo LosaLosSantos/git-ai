@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 type config struct {

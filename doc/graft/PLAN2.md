@@ -27,7 +27,7 @@ check commands) and auditable (commit trailers, logs).
   `Timeout`, `MaxFiles`, `MaxFileBytes`, `PathsAllow`, `PathsDeny`, `Actors`,
   helpers `TimeoutOrDefault`, `MaxFilesOrDefault`, `MaxFileBytesOrDefault`,
   validated in `Graft.Validate`) and `Graft.AgentRPCs []string`.
-- `tools/graft-agents/` module (`github.com/feder-cr/open_scion/tools/graft-agents`,
+- `tools/graft-agents/` module (`github.com/feder-cr/git-ai/tools/graft-agents`,
   stdlib only so far) with `llm/llm.go`: `Provider` interface (`Name`,
   `Complete(ctx, Request{System, Prompt, JSONSchema, SchemaName, MaxTokens})`
   → `Response{Text, JSON, Model, Usage}`), `Config` (`type`, `model`,

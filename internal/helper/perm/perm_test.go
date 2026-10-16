@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/helper/perm"
+	"github.com/feder-cr/git-ai/internal/helper/perm"
 	"github.com/stretchr/testify/require"
 )
 

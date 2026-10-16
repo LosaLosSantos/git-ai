@@ -6390,7 +6390,7 @@ const file_repository_proto_rawDesc = "" +
 	"\x11RestoreRepository\x12 .gitaly.RestoreRepositoryRequest\x1a!.gitaly.RestoreRepositoryResponse\"\x06\xfa\x97(\x02\b\x01\x12`\n" +
 	"\x11GetFileAttributes\x12 .gitaly.GetFileAttributesRequest\x1a!.gitaly.GetFileAttributesResponse\"\x06\xfa\x97(\x02\b\x02\x12M\n" +
 	"\n" +
-	"FastExport\x12\x19.gitaly.FastExportRequest\x1a\x1a.gitaly.FastExportResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"FastExport\x12\x19.gitaly.FastExportRequest\x1a\x1a.gitaly.FastExportResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_repository_proto_rawDescOnce sync.Once

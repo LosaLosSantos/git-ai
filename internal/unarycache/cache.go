@@ -11,7 +11,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 

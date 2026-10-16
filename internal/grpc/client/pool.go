@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
 	"google.golang.org/grpc"
 )
 

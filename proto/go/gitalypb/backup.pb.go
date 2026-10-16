@@ -245,7 +245,7 @@ const file_backup_proto_rawDesc = "" +
 	"\tbackup_id\x18\x01 \x01(\tR\bbackupId2\xce\x01\n" +
 	"\rBackupService\x12V\n" +
 	"\rWriteBackupID\x12\x1c.gitaly.WriteBackupIDRequest\x1a\x1d.gitaly.WriteBackupIDResponse\"\b\xfa\x97(\x04\b\x02\x10\x02\x12e\n" +
-	"\x12ReadLatestBackupID\x12!.gitaly.ReadLatestBackupIDRequest\x1a\".gitaly.ReadLatestBackupIDResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x12ReadLatestBackupID\x12!.gitaly.ReadLatestBackupIDRequest\x1a\".gitaly.ReadLatestBackupIDResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_backup_proto_rawDescOnce sync.Once

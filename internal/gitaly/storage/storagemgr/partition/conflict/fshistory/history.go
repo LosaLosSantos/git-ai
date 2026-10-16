@@ -1,7 +1,7 @@
 package fshistory
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 // Transaction collects changes against a History.

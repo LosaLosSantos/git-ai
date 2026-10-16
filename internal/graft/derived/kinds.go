@@ -3,7 +3,7 @@ package derived
 import (
 	"strconv"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // KindStore is a typed view of a Store for one kind and one version of that kind.

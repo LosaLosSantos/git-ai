@@ -6,8 +6,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 )
 
 // The changeset log is written by each Gitaly node for itself and is not

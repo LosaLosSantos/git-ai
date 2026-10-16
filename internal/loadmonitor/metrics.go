@@ -3,7 +3,7 @@ package loadmonitor
 import (
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/cgroups"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

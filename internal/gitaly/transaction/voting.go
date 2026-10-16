@@ -7,9 +7,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/safe"
-	"github.com/feder-cr/open_scion/internal/transaction/txinfo"
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/safe"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 // RunOnContext runs the given function if the context identifies a transaction.

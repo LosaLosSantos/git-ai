@@ -9,8 +9,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Committer of the automatic reverts when the configuration names none. The

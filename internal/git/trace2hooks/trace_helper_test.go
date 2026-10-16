@@ -3,7 +3,7 @@ package trace2hooks
 import (
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git/trace2"
+	"github.com/feder-cr/git-ai/internal/git/trace2"
 )
 
 func createExampleTrace(startTime time.Time) *trace2.Trace {

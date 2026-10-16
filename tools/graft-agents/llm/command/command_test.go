@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // helperEnv selects the behaviour of the helper process. The tests re-execute

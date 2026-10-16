@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	glcli "github.com/feder-cr/open_scion/internal/cli"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	glcli "github.com/feder-cr/git-ai/internal/cli"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/urfave/cli/v3"
 )
 

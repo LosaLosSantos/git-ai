@@ -3,7 +3,7 @@ package resolver
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/stretchr/testify/require"
 )
 

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // The stored value of a commit is:

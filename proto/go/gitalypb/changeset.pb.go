@@ -481,7 +481,7 @@ const file_changeset_proto_rawDesc = "" +
 	"\tchangeset\x18\x01 \x01(\v2\x11.gitaly.ChangesetR\tchangeset2\xcb\x01\n" +
 	"\x10ChangesetService\x12Y\n" +
 	"\x0eListChangesets\x12\x1d.gitaly.ListChangesetsRequest\x1a\x1e.gitaly.ListChangesetsResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12\\\n" +
-	"\x0fWatchChangesets\x12\x1e.gitaly.WatchChangesetsRequest\x1a\x1f.gitaly.WatchChangesetsResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0fWatchChangesets\x12\x1e.gitaly.WatchChangesetsRequest\x1a\x1f.gitaly.WatchChangesetsResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_changeset_proto_rawDescOnce sync.Once

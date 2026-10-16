@@ -3,8 +3,8 @@ package ref
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // FindDefaultBranchName returns the default branch name for the given repository

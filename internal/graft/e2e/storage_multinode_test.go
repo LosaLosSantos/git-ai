@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/gitops"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/sdk"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 // TestStorageWriteOnOneNodeReadOnAnother writes on node A and reads on node B,

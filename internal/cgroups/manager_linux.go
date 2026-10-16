@@ -18,8 +18,8 @@ import (
 	"time"
 
 	cgrps "github.com/containerd/cgroups/v3"
-	cgroupscfg "github.com/feder-cr/open_scion/internal/gitaly/config/cgroups"
-	"github.com/feder-cr/open_scion/internal/log"
+	cgroupscfg "github.com/feder-cr/git-ai/internal/gitaly/config/cgroups"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 

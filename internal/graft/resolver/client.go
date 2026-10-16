@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 )
 
 // ErrDisabled is returned by Resolve on a nil (disabled) Client.

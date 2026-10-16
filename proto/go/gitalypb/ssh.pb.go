@@ -465,7 +465,7 @@ const file_ssh_proto_rawDesc = "" +
 	"SSHService\x12\x81\x01\n" +
 	"\x1cSSHUploadPackWithSidechannel\x12+.gitaly.SSHUploadPackWithSidechannelRequest\x1a,.gitaly.SSHUploadPackWithSidechannelResponse\"\x06\xfa\x97(\x02\b\x02\x12[\n" +
 	"\x0eSSHReceivePack\x12\x1d.gitaly.SSHReceivePackRequest\x1a\x1e.gitaly.SSHReceivePackResponse\"\x06\xfa\x97(\x02\b\x01(\x010\x01\x12a\n" +
-	"\x10SSHUploadArchive\x12\x1f.gitaly.SSHUploadArchiveRequest\x1a .gitaly.SSHUploadArchiveResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x10SSHUploadArchive\x12\x1f.gitaly.SSHUploadArchiveRequest\x1a .gitaly.SSHUploadArchiveResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_ssh_proto_rawDescOnce sync.Once

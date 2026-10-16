@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr/partition/log"
-	logger "github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/offloading"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr/partition/log"
+	logger "github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/offloading"
 )
 
 // Factory is factory type that can create new partitions.

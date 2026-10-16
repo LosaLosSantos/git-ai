@@ -26,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/superfan"
+	"github.com/feder-cr/git-ai/tools/graft-agents/superfan"
 )
 
 const (

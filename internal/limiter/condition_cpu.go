@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/loadmonitor"
+	"github.com/feder-cr/git-ai/internal/loadmonitor"
 )
 
 const (

@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 )
 
 // TestRunRecoversFromRefusedLand checks the way out of a conflicting land: the

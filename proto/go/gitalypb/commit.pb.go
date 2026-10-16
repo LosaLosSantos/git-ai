@@ -4617,7 +4617,7 @@ const file_commit_proto_rawDesc = "" +
 	"\x18FilterShasWithSignatures\x12'.gitaly.FilterShasWithSignaturesRequest\x1a(.gitaly.FilterShasWithSignaturesResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01\x12h\n" +
 	"\x13GetCommitSignatures\x12\".gitaly.GetCommitSignaturesRequest\x1a#.gitaly.GetCommitSignaturesResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12b\n" +
 	"\x11GetCommitMessages\x12 .gitaly.GetCommitMessagesRequest\x1a!.gitaly.GetCommitMessagesResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12d\n" +
-	"\x11CheckObjectsExist\x12 .gitaly.CheckObjectsExistRequest\x1a!.gitaly.CheckObjectsExistResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x11CheckObjectsExist\x12 .gitaly.CheckObjectsExistRequest\x1a!.gitaly.CheckObjectsExistResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_commit_proto_rawDescOnce sync.Once

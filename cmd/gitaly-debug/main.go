@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 const (

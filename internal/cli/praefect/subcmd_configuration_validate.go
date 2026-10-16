@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/cmd"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
+	"github.com/feder-cr/git-ai/cmd"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
 	"github.com/urfave/cli/v3"
 )
 

@@ -23,7 +23,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"

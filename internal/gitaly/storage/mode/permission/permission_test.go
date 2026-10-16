@@ -3,7 +3,7 @@ package permission_test
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode/permission"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode/permission"
 	"github.com/stretchr/testify/require"
 )
 

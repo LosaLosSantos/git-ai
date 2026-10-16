@@ -3,8 +3,8 @@ package sentry
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/panichandler"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/panichandler"
+	"github.com/feder-cr/git-ai/internal/log"
 	sentry "github.com/getsentry/sentry-go"
 )
 

@@ -3,10 +3,10 @@ package migration
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/storagemgr"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/storagemgr"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // migrationFactory defines a partition factory that wraps another partition factory.

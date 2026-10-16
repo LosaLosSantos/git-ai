@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/requestinfohandler"
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/sentryskip"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/requestinfohandler"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/sentryskip"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	sentry "github.com/getsentry/sentry-go"
 	grpcmw "github.com/grpc-ecosystem/go-grpc-middleware/v2"
 	"google.golang.org/grpc"

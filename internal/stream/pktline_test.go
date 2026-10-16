@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
 	"github.com/stretchr/testify/require"
 )
 

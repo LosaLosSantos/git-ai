@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/stream"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
-	"github.com/feder-cr/open_scion/streamio"
+	"github.com/feder-cr/git-ai/internal/stream"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/streamio"
 	"google.golang.org/grpc"
 )
 

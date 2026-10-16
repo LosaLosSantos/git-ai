@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/tracing"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/tracing"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/protobuf/types/known/durationpb"
 )

@@ -7,8 +7,8 @@ import (
 
 	"google.golang.org/grpc/status"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // OperationReverter implements Reverter with the UserRevert RPC of the

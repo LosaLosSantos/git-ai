@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,7 +15,7 @@ import (
 func TestProxy_doesNotDependOnSentry(t *testing.T) {
 	t.Parallel()
 
-	output, err := exec.CommandContext(testhelper.Context(t), "go", "list", "-deps", "github.com/feder-cr/open_scion/proxy").Output()
+	output, err := exec.CommandContext(testhelper.Context(t), "go", "list", "-deps", "github.com/feder-cr/git-ai/proxy").Output()
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		require.FailNow(t, "go list failed", "%v: %s", err, exitErr.Stderr)

@@ -4,8 +4,8 @@ import (
 	"context"
 	"regexp"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/git/housekeeping"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
 )
 
 var (

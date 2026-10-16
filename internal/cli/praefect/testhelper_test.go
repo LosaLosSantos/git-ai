@@ -3,7 +3,7 @@ package praefect
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/urfave/cli/v3"
 )
 

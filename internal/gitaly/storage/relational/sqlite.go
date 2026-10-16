@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/relational/migrations"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/relational/migrations"
 	migrate "github.com/rubenv/sql-migrate"
 
 	_ "github.com/mattn/go-sqlite3" // SQL driver registration

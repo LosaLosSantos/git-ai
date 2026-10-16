@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func TestMain(m *testing.M) {

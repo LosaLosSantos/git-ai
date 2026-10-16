@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/praefect/metrics"
+	"github.com/feder-cr/git-ai/internal/praefect/metrics"
 )
 
 // newDisabledElector returns a stub that always returns the same shard where the

@@ -3,7 +3,7 @@ package limiter
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/server/auth"
+	"github.com/feder-cr/git-ai/internal/gitaly/server/auth"
 )
 
 // DualLimiter is a limiter that contains two separate limiters: one for authenticated

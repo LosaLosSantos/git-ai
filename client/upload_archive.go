@@ -4,8 +4,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/gitalyclient"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/gitalyclient"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"google.golang.org/grpc"
 )
 

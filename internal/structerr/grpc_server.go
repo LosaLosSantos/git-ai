@@ -3,7 +3,7 @@ package structerr
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // FieldsProducer extracts metadata from err if it contains a `structerr.Error` and exposes it as

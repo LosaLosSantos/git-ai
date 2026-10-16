@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // DefaultReferenceBackend is the default reftable backend used for running tests.

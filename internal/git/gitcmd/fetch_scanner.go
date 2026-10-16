@@ -8,7 +8,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // RefUpdateType represents the type of update a FetchStatusLine is. The

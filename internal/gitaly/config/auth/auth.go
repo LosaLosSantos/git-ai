@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/errors/cfgerror"
+	"github.com/feder-cr/git-ai/internal/errors/cfgerror"
 )
 
 // Config is a struct for an authentication config

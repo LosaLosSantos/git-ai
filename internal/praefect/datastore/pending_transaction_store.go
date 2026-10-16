@@ -3,7 +3,7 @@ package datastore
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 )
 
 // PendingTransaction is a record of an in-flight mutating transaction that

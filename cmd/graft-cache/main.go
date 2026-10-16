@@ -27,9 +27,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/cachetier"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/cachetier"
+	"github.com/feder-cr/git-ai/internal/log"
 	"google.golang.org/grpc"
 )
 

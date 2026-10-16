@@ -12,7 +12,7 @@ import (
 	"math/big"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/git/gitio"
+	"github.com/feder-cr/git-ai/internal/git/gitio"
 )
 
 // IndexBitmap is the in-memory representation of a .bitmap file.

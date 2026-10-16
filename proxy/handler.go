@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/sentryskip"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/sentryskip"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

@@ -144,7 +144,7 @@ const file_packfile_proto_rawDesc = "" +
 	"\x05haves\x18\x05 \x01(\x03R\x05haves\x12\x1a\n" +
 	"\bshallows\x18\x06 \x01(\x03R\bshallows\x12\x16\n" +
 	"\x06deepen\x18\a \x01(\tR\x06deepen\x12\x16\n" +
-	"\x06filter\x18\b \x01(\tR\x06filterB2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x06filter\x18\b \x01(\tR\x06filterB.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_packfile_proto_rawDescOnce sync.Once

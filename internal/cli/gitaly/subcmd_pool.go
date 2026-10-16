@@ -6,11 +6,11 @@ import (
 	"io"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/cli/common"
-	gitalycfg "github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/grpc/client"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/cli/common"
+	gitalycfg "github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/urfave/cli/v3"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // SQL driver registration

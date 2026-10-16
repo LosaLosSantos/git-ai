@@ -3,7 +3,7 @@ package storage
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // LogTransactionCommit is a helper to standardize logging of transaction commits, with a description

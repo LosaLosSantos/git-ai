@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // HTTPPush hosts information about a typical HTTP-based push.

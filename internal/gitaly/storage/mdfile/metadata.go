@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/feder-cr/open_scion/internal/safe"
+	"github.com/feder-cr/git-ai/internal/safe"
 	"github.com/google/uuid"
 )
 

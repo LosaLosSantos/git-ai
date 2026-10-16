@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
 )
 
 // ErrorTracker allows tracking how many read/write errors have occurred, and whether or not it has

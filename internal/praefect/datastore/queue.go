@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 )
 
 // CorrelationIDKey is the key that is used to store the correlation ID for a specific replication job as part of the

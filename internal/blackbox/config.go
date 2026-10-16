@@ -5,8 +5,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper/duration"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/pelletier/go-toml/v2"
 )
 

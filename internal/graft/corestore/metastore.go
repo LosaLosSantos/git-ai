@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ChangesetInput is a changeset to commit.

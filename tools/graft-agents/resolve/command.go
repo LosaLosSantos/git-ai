@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // maxCommandOutput bounds the result of a command run: the size of {out} or of

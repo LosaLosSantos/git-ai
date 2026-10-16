@@ -10,7 +10,7 @@ Phase 5b (after 4a): per-directory write permissions and the "approved
 review required to land" gate.
 
 All rules of PLAN.md "Environment and commands" apply. Module path
-`github.com/feder-cr/open_scion`. Worktrees WP41 … WP50. **Implement
+`github.com/feder-cr/git-ai`. Worktrees WP41 … WP50. **Implement
 exactly the signatures below; do not invent alternative designs; report
 impossibilities in `needs_outside_change`.** Test helpers:
 `testhelper.Context(t)`, `testcfg.Build(t)`, `testserver.RunGitalyServer(t, cfg, setup.RegisterAll, ...)`,
@@ -246,7 +246,7 @@ Owns new `tools/graft-agents/superfan/chat/**`, new subcommand `chat` in
 
 ## Spec-test writers
 Write `*_spec_test.go` files in the same package as the code (module path
-`github.com/feder-cr/open_scion`, or `github.com/feder-cr/open_scion/tools/graft-agents`
+`github.com/feder-cr/git-ai`, or `github.com/feder-cr/git-ai/tools/graft-agents`
 for WP50), using only exported identifiers named in this spec plus the
 helpers above. Every test function starts with `TestSpec`.
 

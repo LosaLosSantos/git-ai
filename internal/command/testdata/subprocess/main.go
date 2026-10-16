@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/command"
+	"github.com/feder-cr/git-ai/internal/command"
 )
 
 // main implements a helper binary for testing subprocess loggers. It sets up a subprocess logger and

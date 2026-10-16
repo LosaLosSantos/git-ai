@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/internal/helper/text"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/helper/text"
 )
 
 // Reference as used by the reference discovery protocol

@@ -4,14 +4,14 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	gitalyhook "github.com/feder-cr/open_scion/internal/gitaly/hook"
-	"github.com/feder-cr/open_scion/internal/gitaly/service"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/limiter"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/streamcache"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	gitalyhook "github.com/feder-cr/git-ai/internal/gitaly/hook"
+	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/limiter"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/streamcache"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 type server struct {

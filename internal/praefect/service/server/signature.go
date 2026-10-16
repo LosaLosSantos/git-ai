@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ServerSignature obtains the public key from all storage nodes and

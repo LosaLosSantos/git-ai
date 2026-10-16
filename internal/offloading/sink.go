@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/backoff"
+	"github.com/feder-cr/git-ai/internal/backoff"
 	"gocloud.dev/blob"
 	"golang.org/x/sync/errgroup"
 

@@ -11,9 +11,9 @@ import (
 	"errors"
 	"regexp"
 
-	"github.com/feder-cr/open_scion/proxy"
-	"github.com/feder-cr/open_scion/proxy/grant"
-	"github.com/feder-cr/open_scion/proxy/policy"
+	"github.com/feder-cr/git-ai/proxy"
+	"github.com/feder-cr/git-ai/proxy/grant"
+	"github.com/feder-cr/git-ai/proxy/policy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"

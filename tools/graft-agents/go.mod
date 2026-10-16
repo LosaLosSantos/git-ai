@@ -1,4 +1,4 @@
-module github.com/feder-cr/open_scion/tools/graft-agents
+module github.com/feder-cr/git-ai/tools/graft-agents
 
 go 1.26.0
 

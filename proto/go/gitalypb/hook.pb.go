@@ -1116,7 +1116,7 @@ const file_hook_proto_rawDesc = "" +
 	"\x18ReferenceTransactionHook\x12'.gitaly.ReferenceTransactionHookRequest\x1a(.gitaly.ReferenceTransactionHookResponse\"\x06\xfa\x97(\x02\b\x02(\x010\x01\x12\x87\x01\n" +
 	"\x1ePackObjectsHookWithSidechannel\x12-.gitaly.PackObjectsHookWithSidechannelRequest\x1a..gitaly.PackObjectsHookWithSidechannelResponse\"\x06\xfa\x97(\x02\b\x02\x12d\n" +
 	"\x11ReceiveReportHook\x12 .gitaly.ReceiveReportHookRequest\x1a!.gitaly.ReceiveReportHookResponse\"\x06\xfa\x97(\x02\b\x01(\x010\x01\x12q\n" +
-	"\x16SignalPostReceiveReady\x12%.gitaly.SignalPostReceiveReadyRequest\x1a&.gitaly.SignalPostReceiveReadyResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x16SignalPostReceiveReady\x12%.gitaly.SignalPostReceiveReadyRequest\x1a&.gitaly.SignalPostReceiveReadyResponse\"\b\xfa\x97(\x04\b\x02\x10\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_hook_proto_rawDescOnce sync.Once

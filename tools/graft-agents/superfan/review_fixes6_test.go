@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/notify"
+	"github.com/feder-cr/git-ai/tools/graft-agents/notify"
 )
 
 // oddPathsJSON is what `graft show --json` prints for a commit that touches a

@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/blobstore"
-	"github.com/feder-cr/open_scion/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/blobstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 )
 
 // Open returns nil (the storage core is off) when the mode is off, and

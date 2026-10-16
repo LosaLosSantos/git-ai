@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/grpc/backchannel"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // SignalPostReceiveReady signals that Praefect has completed transaction coordination

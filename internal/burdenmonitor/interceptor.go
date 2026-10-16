@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
 	grpcmw "github.com/grpc-ecosystem/go-grpc-middleware"
 	"google.golang.org/grpc"
 	grpchealth "google.golang.org/grpc/health/grpc_health_v1"

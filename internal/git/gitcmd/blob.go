@@ -6,9 +6,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // WriteBlobConfig is the configuration used to write blobs into the repository.

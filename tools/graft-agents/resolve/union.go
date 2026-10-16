@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // maxUnionCells bounds the LCS table (lines of the middle part of both

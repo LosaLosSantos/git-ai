@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 )
 
 // maxRememberedTrees bounds the trees that an ObjectReader keeps. A walk compares

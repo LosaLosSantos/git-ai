@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // The shipped programs must be able to build the llm summarizer from a

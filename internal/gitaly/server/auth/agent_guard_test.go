@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	gitalycfgauth "github.com/feder-cr/open_scion/internal/gitaly/config/auth"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalycfgauth "github.com/feder-cr/git-ai/internal/gitaly/config/auth"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

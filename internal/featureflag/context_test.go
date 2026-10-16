@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	gitaly_metadata "github.com/feder-cr/open_scion/internal/grpc/metadata"
+	gitaly_metadata "github.com/feder-cr/git-ai/internal/grpc/metadata"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 )

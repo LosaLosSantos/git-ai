@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/feder-cr/open_scion/internal/git/trace2"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/git/trace2"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 var receivePackTrace2ToLogFieldMapping = map[string]string{

@@ -4,7 +4,7 @@ package gitaly;
 
 import "lint.proto";
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // BackupService provides RPCs for managing backup run metadata.
 service BackupService {

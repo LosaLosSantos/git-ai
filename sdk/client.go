@@ -8,9 +8,9 @@ import (
 
 	"google.golang.org/grpc"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	"github.com/feder-cr/open_scion/client"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	"github.com/feder-cr/git-ai/client"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // DefaultStorage is the storage name used when WithStorage is not given.

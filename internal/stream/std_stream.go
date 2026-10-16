@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // StdoutStderrResponse is an interface for RPC responses that need to stream stderr and stdout

@@ -1275,7 +1275,7 @@ const file_praefect_proto_rawDesc = "" +
 	"\x17SetAuthoritativeStorage\x12&.gitaly.SetAuthoritativeStorageRequest\x1a'.gitaly.SetAuthoritativeStorageResponse\x12O\n" +
 	"\x0eMarkUnverified\x12\x1d.gitaly.MarkUnverifiedRequest\x1a\x1e.gitaly.MarkUnverifiedResponse\x12a\n" +
 	"\x14SetReplicationFactor\x12#.gitaly.SetReplicationFactorRequest\x1a$.gitaly.SetReplicationFactorResponse\x12d\n" +
-	"\x15GetRepositoryMetadata\x12$.gitaly.GetRepositoryMetadataRequest\x1a%.gitaly.GetRepositoryMetadataResponse\x1a\x04\xf0\x97(\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x15GetRepositoryMetadata\x12$.gitaly.GetRepositoryMetadataRequest\x1a%.gitaly.GetRepositoryMetadataResponse\x1a\x04\xf0\x97(\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_praefect_proto_rawDescOnce sync.Once

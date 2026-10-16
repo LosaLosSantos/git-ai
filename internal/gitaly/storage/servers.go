@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/helper/env"
+	"github.com/feder-cr/git-ai/internal/helper/env"
 	"google.golang.org/grpc/metadata"
 )
 

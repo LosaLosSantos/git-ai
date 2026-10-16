@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 )
 
 // ScanChangelog implements corestore.MetaStore.

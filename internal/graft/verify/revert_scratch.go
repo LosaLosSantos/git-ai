@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ScratchBranchPrefix is the namespace of the temporary branches that hold the

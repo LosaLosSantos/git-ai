@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 func fileConflict(path, base, ours, theirs string) protocol.FileConflict {

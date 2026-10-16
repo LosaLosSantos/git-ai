@@ -7,7 +7,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/git/pktline"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
 )
 
 // FetchPack is used to parse the response body of a git-fetch-pack(1) request.

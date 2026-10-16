@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"hash"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 var (

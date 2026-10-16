@@ -7,7 +7,7 @@
 package testproto
 
 import (
-	gitalypb "github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalypb "github.com/feder-cr/git-ai/proto/go/gitalypb"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
@@ -815,7 +815,7 @@ const file_testproto_invalid_proto_rawDesc = "" +
 	"#MaintenanceWithInvalidNestedRequest\x12\x1f.testproto.InvalidNestedRequest\x1a .testproto.InvalidMethodResponse\"\x06\xfa\x97(\x02\b\x03\x12u\n" +
 	"#MaintenanceWithStorageAndRepository\x12$.testproto.RequestWithStorageAndRepo\x1a .testproto.InvalidMethodResponse\"\x06\xfa\x97(\x02\b\x03\x12\x81\x01\n" +
 	")MaintenanceWithNestedStorageAndRepository\x12*.testproto.RequestWithNestedStorageAndRepo\x1a .testproto.InvalidMethodResponse\"\x06\xfa\x97(\x02\b\x03\x12r\n" +
-	"\x1bMaintenanceWithStorageScope\x12'.testproto.InvalidMethodRequestWithRepo\x1a .testproto.InvalidMethodResponse\"\b\xfa\x97(\x04\b\x03\x10\x02B<Z:github.com/feder-cr/open_scion/proto/go/gitalypb/testprotob\x06proto3"
+	"\x1bMaintenanceWithStorageScope\x12'.testproto.InvalidMethodRequestWithRepo\x1a .testproto.InvalidMethodResponse\"\b\xfa\x97(\x04\b\x03\x10\x02B8Z6github.com/feder-cr/git-ai/proto/go/gitalypb/testprotob\x06proto3"
 
 var (
 	file_testproto_invalid_proto_rawDescOnce sync.Once

@@ -1,7 +1,7 @@
 # Upstream Gitaly README
 
-open_scion started as a fork of Gitaly. This is the README of upstream Gitaly,
-kept for reference; see the [open_scion README](../../README.md) for this project.
+gitai started as a fork of Gitaly. This is the README of upstream Gitaly,
+kept for reference; see the [gitai README](../../README.md) for this project.
 
 ## Gitaly
 

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 func newTestRerere(t *testing.T, dir string) rerere {

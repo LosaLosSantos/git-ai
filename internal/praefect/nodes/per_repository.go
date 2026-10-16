@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 )
 
 // ErrNoPrimary is returned if the repository does not have a primary.

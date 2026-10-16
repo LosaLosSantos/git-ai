@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/stretchr/testify/require"
 )
 

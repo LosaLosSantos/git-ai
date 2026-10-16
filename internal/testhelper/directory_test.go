@@ -13,8 +13,8 @@ import (
 	"testing"
 	"testing/fstest"
 
-	"github.com/feder-cr/open_scion/internal/archive"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/archive"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 	"github.com/stretchr/testify/require"
 )
 

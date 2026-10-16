@@ -9,9 +9,9 @@ import (
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/gitstorage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/gitstorage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
 )
 
 // ErrRepositoriesAreInDifferentPartitions is returned when attempting to begin a transaction spanning

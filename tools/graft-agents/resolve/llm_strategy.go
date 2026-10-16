@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // The "llm" strategy resolves content conflicts with a language model. It is

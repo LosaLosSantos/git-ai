@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
 )
 
 // FuzzParseMergeTreeError fuzzes the parser of the git-merge-tree(1) conflict

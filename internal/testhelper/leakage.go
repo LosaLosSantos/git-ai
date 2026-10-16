@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/command/commandcounter"
-	"github.com/feder-cr/open_scion/internal/helper/text"
+	"github.com/feder-cr/git-ai/internal/command/commandcounter"
+	"github.com/feder-cr/git-ai/internal/helper/text"
 	"go.uber.org/goleak"
 )
 

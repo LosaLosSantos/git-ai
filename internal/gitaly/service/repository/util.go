@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 )
 
 func (s *server) removeOriginInRepo(ctx context.Context, repository gitcmd.RepositoryExecutor) error {

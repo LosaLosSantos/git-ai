@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/signature"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/signature"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ServerSignature reponds with PublicKey used by Gitaly for commit signature

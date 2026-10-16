@@ -6,8 +6,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/grpc/sidechannel"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/grpc/sidechannel"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 )

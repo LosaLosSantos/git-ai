@@ -364,7 +364,7 @@ const file_derived_proto_rawDesc = "" +
 	"\acommits\x18\x01 \x03(\v2\x11.gitaly.GitCommitR\acommits2\xa6\x01\n" +
 	"\x12DerivedDataService\x12>\n" +
 	"\x05Blame\x12\x14.gitaly.BlameRequest\x1a\x15.gitaly.BlameResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12P\n" +
-	"\vPathHistory\x12\x1a.gitaly.PathHistoryRequest\x1a\x1b.gitaly.PathHistoryResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\vPathHistory\x12\x1a.gitaly.PathHistoryRequest\x1a\x1b.gitaly.PathHistoryResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_derived_proto_rawDescOnce sync.Once

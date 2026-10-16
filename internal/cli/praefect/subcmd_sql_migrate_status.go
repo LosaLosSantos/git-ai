@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
 	"github.com/olekukonko/tablewriter"
 	"github.com/urfave/cli/v3"
 )

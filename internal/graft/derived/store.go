@@ -15,8 +15,8 @@ import (
 	"path/filepath"
 	"regexp"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 )
 
 // storeDirName is the directory below the repository's Git directory that holds

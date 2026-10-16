@@ -324,7 +324,7 @@ const file_cleanup_proto_rawDesc = "" +
 	"\x16RewriteHistoryResponse2\xe3\x01\n" +
 	"\x0eCleanupService\x12v\n" +
 	"\x17ApplyBfgObjectMapStream\x12&.gitaly.ApplyBfgObjectMapStreamRequest\x1a'.gitaly.ApplyBfgObjectMapStreamResponse\"\x06\xfa\x97(\x02\b\x01(\x010\x01\x12Y\n" +
-	"\x0eRewriteHistory\x12\x1d.gitaly.RewriteHistoryRequest\x1a\x1e.gitaly.RewriteHistoryResponse\"\x06\xfa\x97(\x02\b\x01(\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x0eRewriteHistory\x12\x1d.gitaly.RewriteHistoryRequest\x1a\x1e.gitaly.RewriteHistoryResponse\"\x06\xfa\x97(\x02\b\x01(\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_cleanup_proto_rawDescOnce sync.Once

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // helperArg marks a re-execution of the test binary as a fake external tool.

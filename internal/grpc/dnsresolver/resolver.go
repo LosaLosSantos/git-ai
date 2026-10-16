@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/backoff"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/backoff"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"google.golang.org/grpc/resolver"
 )
 

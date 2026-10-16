@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package gitalyproxytest;
 
-option go_package = "github.com/feder-cr/open_scion/proxy/policy/testdata;testdata";
+option go_package = "github.com/feder-cr/git-ai/proxy/policy/testdata;testdata";
 
 import "lint.proto";
 import "shared.proto";

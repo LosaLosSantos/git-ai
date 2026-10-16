@@ -906,7 +906,7 @@ const file_log_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03keyB\v\n" +
 	"\toperation\"\x1b\n" +
 	"\x03LSN\x12\x14\n" +
-	"\x05value\x18\x01 \x01(\x04R\x05valueB2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x05value\x18\x01 \x01(\x04R\x05valueB.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_log_proto_rawDescOnce sync.Once

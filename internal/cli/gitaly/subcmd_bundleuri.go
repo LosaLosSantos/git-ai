@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/urfave/cli/v3"
 )
 

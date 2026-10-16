@@ -3,7 +3,7 @@ package housekeeping
 import (
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
 )
 
 // MVCCConfig specifies MVCC-specific housekeeping configuration.

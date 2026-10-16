@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/cgroups"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/loadmonitor"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/cgroups"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/loadmonitor"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 const (

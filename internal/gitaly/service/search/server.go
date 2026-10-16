@@ -4,8 +4,8 @@
 package search
 
 import (
-	"github.com/feder-cr/open_scion/internal/gitaly/service"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 type server struct {

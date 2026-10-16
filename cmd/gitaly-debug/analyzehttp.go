@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/git/stats"
 )
 
 func analyzeHTTPClone(cloneURL string) {

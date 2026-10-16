@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/bootstrap"
-	"github.com/feder-cr/open_scion/internal/helper/env"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/ps"
+	"github.com/feder-cr/git-ai/internal/bootstrap"
+	"github.com/feder-cr/git-ai/internal/helper/env"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/ps"
 	"golang.org/x/sys/unix"
 )
 

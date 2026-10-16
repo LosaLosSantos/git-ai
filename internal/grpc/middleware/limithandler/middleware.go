@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/server/auth"
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/requestinfohandler"
-	"github.com/feder-cr/open_scion/internal/limiter"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/server/auth"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/requestinfohandler"
+	"github.com/feder-cr/git-ai/internal/limiter"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 )

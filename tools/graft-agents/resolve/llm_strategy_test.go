@@ -10,8 +10,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // wp19Fake is a concurrency-safe llm.Provider whose answers come from a

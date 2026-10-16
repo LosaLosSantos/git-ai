@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper/duration"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
 	"github.com/stretchr/testify/require"
 )
 

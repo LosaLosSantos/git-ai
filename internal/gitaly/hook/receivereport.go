@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // ReceiveReportHook runs after git-receive-pack(1) has updated the references but

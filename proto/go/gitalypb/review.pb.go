@@ -1695,7 +1695,7 @@ const file_review_proto_rawDesc = "" +
 	"\fUpdateReview\x12\x1b.gitaly.UpdateReviewRequest\x1a\x1c.gitaly.UpdateReviewResponse\"\x06\xfa\x97(\x02\b\x01\x12]\n" +
 	"\x10AddReviewComment\x12\x1f.gitaly.AddReviewCommentRequest\x1a .gitaly.AddReviewCommentResponse\"\x06\xfa\x97(\x02\b\x01\x12f\n" +
 	"\x13SubmitReviewVerdict\x12\".gitaly.SubmitReviewVerdictRequest\x1a#.gitaly.SubmitReviewVerdictResponse\"\x06\xfa\x97(\x02\b\x01\x12N\n" +
-	"\vCloseReview\x12\x1a.gitaly.CloseReviewRequest\x1a\x1b.gitaly.CloseReviewResponse\"\x06\xfa\x97(\x02\b\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\vCloseReview\x12\x1a.gitaly.CloseReviewRequest\x1a\x1b.gitaly.CloseReviewResponse\"\x06\xfa\x97(\x02\b\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_review_proto_rawDescOnce sync.Once

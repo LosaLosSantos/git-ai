@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/llm"
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // wp19SumFake is a concurrency-safe llm.Provider for the "llm" summarizer. It

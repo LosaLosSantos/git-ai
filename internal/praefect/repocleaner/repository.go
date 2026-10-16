@@ -7,11 +7,11 @@ import (
 	"io"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper"
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/helper"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // StateOwner performs check for the existence of the repositories.

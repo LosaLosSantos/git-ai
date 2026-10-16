@@ -48,7 +48,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/fileblob"
 	"gocloud.dev/blob/s3blob"

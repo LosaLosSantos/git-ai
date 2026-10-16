@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/datastructure"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/datastructure"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 )
 
 type storages map[string][]string

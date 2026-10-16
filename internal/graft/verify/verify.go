@@ -36,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 )
 
 // changesetPage is the number of changesets listed per call by RunOnce.

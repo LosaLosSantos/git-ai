@@ -9,11 +9,11 @@ import (
 	"io"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/command"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/updateref"
-	"github.com/feder-cr/open_scion/internal/gitaly/transaction"
+	"github.com/feder-cr/git-ai/internal/command"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
 )
 
 // ErrMismatchingState is similar to updateref.MismatchingStateError. It's declared separately to avoid

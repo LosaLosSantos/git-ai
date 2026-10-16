@@ -4,10 +4,10 @@ import (
 	"io"
 	"os/exec"
 
-	"github.com/feder-cr/open_scion/internal/dontpanic"
-	"github.com/feder-cr/open_scion/internal/gitaly/config/cgroups"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/dontpanic"
+	"github.com/feder-cr/git-ai/internal/gitaly/config/cgroups"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 type addCommandCfg struct {

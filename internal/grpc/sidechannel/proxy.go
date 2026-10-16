@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/grpc/metadata"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/grpc/metadata"
+	"github.com/feder-cr/git-ai/internal/log"
 	"google.golang.org/grpc"
 	grpcMetadata "google.golang.org/grpc/metadata"
 )

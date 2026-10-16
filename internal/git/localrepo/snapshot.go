@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"regexp"
 
-	"github.com/feder-cr/open_scion/internal/archive"
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/archive"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 var objectFiles = []*regexp.Regexp{

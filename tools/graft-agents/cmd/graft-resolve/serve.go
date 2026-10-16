@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
-	"github.com/feder-cr/open_scion/tools/graft-agents/resolve"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
 // newServer returns an HTTP server with conservative timeouts. The response

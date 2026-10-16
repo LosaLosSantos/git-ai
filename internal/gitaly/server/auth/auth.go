@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	gitalyauth "github.com/feder-cr/open_scion/auth"
-	gitalycfgauth "github.com/feder-cr/open_scion/internal/gitaly/config/auth"
+	gitalyauth "github.com/feder-cr/git-ai/auth"
+	gitalycfgauth "github.com/feder-cr/git-ai/internal/gitaly/config/auth"
 	grpcmwauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"

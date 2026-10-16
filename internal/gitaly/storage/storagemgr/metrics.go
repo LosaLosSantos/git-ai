@@ -1,7 +1,7 @@
 package storagemgr
 
 import (
-	gitalycfgprom "github.com/feder-cr/open_scion/internal/gitaly/config/prometheus"
+	gitalycfgprom "github.com/feder-cr/git-ai/internal/gitaly/config/prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

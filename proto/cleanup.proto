@@ -5,7 +5,7 @@ package gitaly;
 import "lint.proto";
 import "shared.proto";
 
-option go_package = "github.com/feder-cr/open_scion/proto/go/gitalypb";
+option go_package = "github.com/feder-cr/git-ai/proto/go/gitalypb";
 
 // CleanupService provides RPCs to clean up a repository's contents.
 service CleanupService {

@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"os"
 
-	"github.com/feder-cr/open_scion/internal/git/mvcc"
+	"github.com/feder-cr/git-ai/internal/git/mvcc"
 )
 
 func dumpMVCCManifest(manifestFile string) {

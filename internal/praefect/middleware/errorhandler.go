@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
-	"github.com/feder-cr/open_scion/internal/praefect/nodes/tracker"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/praefect/nodes/tracker"
 	"google.golang.org/grpc"
 )
 

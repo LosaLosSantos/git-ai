@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/feder-cr/open_scion/proxy/grant"
-	"github.com/feder-cr/open_scion/proxy/policy"
+	"github.com/feder-cr/git-ai/proxy/grant"
+	"github.com/feder-cr/git-ai/proxy/policy"
 	"github.com/stretchr/testify/require"
 )
 

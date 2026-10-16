@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
 )
 
 // InvalidArgumentError tags the error as being caused by an invalid argument.

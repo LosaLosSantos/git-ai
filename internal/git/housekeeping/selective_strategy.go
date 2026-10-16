@@ -3,8 +3,8 @@ package housekeeping
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	"github.com/feder-cr/open_scion/internal/git/stats"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	"github.com/feder-cr/git-ai/internal/git/stats"
 )
 
 // SelectiveOptimizationStrategy wraps HeuristicalOptimizationStrategy but only

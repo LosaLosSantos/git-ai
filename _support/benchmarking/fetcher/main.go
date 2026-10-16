@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	gitalyclient "github.com/feder-cr/open_scion/client"
-	"github.com/feder-cr/open_scion/internal/git/pktline"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	gitalyclient "github.com/feder-cr/git-ai/client"
+	"github.com/feder-cr/git-ai/internal/git/pktline"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/helper"
+	"github.com/feder-cr/git-ai/internal/helper"
 )
 
 // ClusterPath represents path on the cluster to the storage.

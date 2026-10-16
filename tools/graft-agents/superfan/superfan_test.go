@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/notify"
+	"github.com/feder-cr/git-ai/tools/graft-agents/notify"
 )
 
 // at returns base plus a duration in minutes.

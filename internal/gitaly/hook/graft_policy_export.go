@@ -3,7 +3,7 @@ package hook
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 )
 
 // EvaluateGraftPolicy evaluates the standalone access policy for the update of reference from oldOID

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/notify"
+	"github.com/feder-cr/git-ai/tools/graft-agents/notify"
 )
 
 var base = time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC)

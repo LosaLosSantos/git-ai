@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/featureflag"
 )
 
 // FeatureSet is a representation of a set of features that should be disabled.

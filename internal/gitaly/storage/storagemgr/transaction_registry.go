@@ -4,7 +4,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
 var errTransactionNotFound = errors.New("transaction not found")

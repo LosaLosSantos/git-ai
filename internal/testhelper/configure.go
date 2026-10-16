@@ -8,8 +8,8 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/mode"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 var testDirectory string

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 )
 
 // ErrParse is returned when the parse of an entry was unsuccessful

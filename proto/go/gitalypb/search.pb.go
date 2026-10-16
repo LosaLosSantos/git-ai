@@ -311,7 +311,7 @@ const file_search_proto_rawDesc = "" +
 	"\x0ffollowing_lines\x18\x05 \x03(\fR\x0efollowingLines2^\n" +
 	"\rSearchService\x12M\n" +
 	"\n" +
-	"SearchCode\x12\x19.gitaly.SearchCodeRequest\x1a\x1a.gitaly.SearchCodeResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"SearchCode\x12\x19.gitaly.SearchCodeRequest\x1a\x1a.gitaly.SearchCodeResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_search_proto_rawDescOnce sync.Once

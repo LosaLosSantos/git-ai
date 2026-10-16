@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus/ctxlogrus"
 	libp2pyamux "github.com/libp2p/go-yamux/v5"
 	"github.com/sirupsen/logrus"

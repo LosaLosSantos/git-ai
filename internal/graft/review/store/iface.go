@@ -1,6 +1,6 @@
 package store
 
-import "github.com/feder-cr/open_scion/proto/go/gitalypb"
+import "github.com/feder-cr/git-ai/proto/go/gitalypb"
 
 // ReviewStore is the storage of the reviews of one repository: the files of
 // the repository (*Store), or the storage core's database in authoritative

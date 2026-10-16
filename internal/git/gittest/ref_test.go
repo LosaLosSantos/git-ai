@@ -3,7 +3,7 @@ package gittest
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/git"
+	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/stretchr/testify/require"
 )
 

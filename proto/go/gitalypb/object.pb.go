@@ -462,7 +462,7 @@ const file_object_proto_rawDesc = "" +
 	"\rObjectService\x12M\n" +
 	"\n" +
 	"GetObjects\x12\x19.gitaly.GetObjectsRequest\x1a\x1a.gitaly.GetObjectsResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12D\n" +
-	"\aGetTree\x12\x16.gitaly.GetTreeRequest\x1a\x17.gitaly.GetTreeResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\aGetTree\x12\x16.gitaly.GetTreeRequest\x1a\x17.gitaly.GetTreeResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_object_proto_rawDescOnce sync.Once

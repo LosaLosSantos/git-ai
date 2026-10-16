@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	ff "github.com/feder-cr/open_scion/internal/featureflag"
+	ff "github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 )

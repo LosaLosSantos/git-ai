@@ -13,8 +13,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/feder-cr/open_scion/internal/grpc/grpcstats"
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/grpc/grpcstats"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )

@@ -3,7 +3,7 @@ package gitalybackup
 import (
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/version"
+	"github.com/feder-cr/git-ai/internal/version"
 	"github.com/urfave/cli/v3"
 )
 

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/metadata"
 	"github.com/stretchr/testify/require"
 )

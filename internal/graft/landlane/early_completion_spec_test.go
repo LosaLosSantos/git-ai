@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 )
 
 // Spec (WP37): CompleteEarly delivers the result of reqs[index] of the running

@@ -5,9 +5,9 @@ import (
 	"io"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/relational"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/relational"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 func (s *server) StorePoolMetadata(stream gitalypb.InternalGitaly_StorePoolMetadataServer) error {

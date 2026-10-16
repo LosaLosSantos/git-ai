@@ -1430,7 +1430,7 @@ const file_errors_proto_rawDesc = "" +
 	"\abad_oid\x18\x01 \x01(\fR\x06badOid\",\n" +
 	"\x14InvalidRevisionRange\x12\x14\n" +
 	"\x05range\x18\x01 \x01(\fR\x05range\"\x15\n" +
-	"\x13RemoteNotFoundErrorB2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x13RemoteNotFoundErrorB.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_errors_proto_rawDescOnce sync.Once

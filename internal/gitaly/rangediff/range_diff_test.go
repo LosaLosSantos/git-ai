@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/helper/text"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/helper/text"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 )
 

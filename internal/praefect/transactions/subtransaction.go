@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/feder-cr/open_scion/internal/transaction/voting"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 // VoteResult represents the outcome of a transaction for a single voter.

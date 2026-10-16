@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/grpc/middleware/sentryskip"
-	"github.com/feder-cr/open_scion/internal/structerr"
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/grpc/middleware/sentryskip"
+	"github.com/feder-cr/git-ai/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	sentry "github.com/getsentry/sentry-go"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"

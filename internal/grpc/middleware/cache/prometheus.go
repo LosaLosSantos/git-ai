@@ -1,7 +1,7 @@
 package cache
 
 import (
-	"github.com/feder-cr/open_scion/internal/grpc/protoregistry"
+	"github.com/feder-cr/git-ai/internal/grpc/protoregistry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )

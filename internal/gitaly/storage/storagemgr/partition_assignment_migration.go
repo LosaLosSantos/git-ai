@@ -7,11 +7,11 @@ import (
 	"io/fs"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue/databasemgr"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/walk"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue/databasemgr"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/walk"
 )
 
 var repoAssignedKey = []byte("repo_assigned_to_partition")

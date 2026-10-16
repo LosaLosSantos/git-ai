@@ -585,7 +585,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x10ScanPoolMetadata\x12\x1f.gitaly.ScanPoolMetadataRequest\x1a .gitaly.ScanPoolMetadataResponse\"\b\xfa\x97(\x04\b\x02\x10\x020\x01\x12d\n" +
 	"\x11StorePoolMetadata\x12 .gitaly.StorePoolMetadataRequest\x1a!.gitaly.StorePoolMetadataResponse\"\b\xfa\x97(\x04\b\x01\x10\x02(\x01\x12a\n" +
 	"\x10ListPoolMetadata\x12\x1f.gitaly.ListPoolMetadataRequest\x1a .gitaly.ListPoolMetadataResponse\"\b\xfa\x97(\x04\b\x02\x10\x020\x01\x12f\n" +
-	"\x11ListPoolUpstreams\x12 .gitaly.ListPoolUpstreamsRequest\x1a!.gitaly.ListPoolUpstreamsResponse\"\b\xfa\x97(\x04\b\x02\x10\x02(\x010\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\x11ListPoolUpstreams\x12 .gitaly.ListPoolUpstreamsRequest\x1a!.gitaly.ListPoolUpstreamsResponse\"\b\xfa\x97(\x04\b\x02\x10\x02(\x010\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once

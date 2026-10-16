@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups/v3/cgroup1"
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	cgroupscfg "github.com/feder-cr/open_scion/internal/gitaly/config/cgroups"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	cgroupscfg "github.com/feder-cr/git-ai/internal/gitaly/config/cgroups"
+	"github.com/feder-cr/git-ai/internal/log"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 

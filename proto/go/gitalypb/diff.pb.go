@@ -3291,7 +3291,7 @@ const file_diff_proto_rawDesc = "" +
 	"GetPatchID\x12\x19.gitaly.GetPatchIDRequest\x1a\x1a.gitaly.GetPatchIDResponse\"\x06\xfa\x97(\x02\b\x02\x12S\n" +
 	"\fRawRangeDiff\x12\x1b.gitaly.RawRangeDiffRequest\x1a\x1c.gitaly.RawRangeDiffResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12J\n" +
 	"\tRangeDiff\x12\x18.gitaly.RangeDiffRequest\x1a\x19.gitaly.RangeDiffResponse\"\x06\xfa\x97(\x02\b\x020\x01\x12J\n" +
-	"\tDiffBlobs\x12\x18.gitaly.DiffBlobsRequest\x1a\x19.gitaly.DiffBlobsResponse\"\x06\xfa\x97(\x02\b\x020\x01B2Z0github.com/feder-cr/open_scion/proto/go/gitalypbb\x06proto3"
+	"\tDiffBlobs\x12\x18.gitaly.DiffBlobsRequest\x1a\x19.gitaly.DiffBlobsResponse\"\x06\xfa\x97(\x02\b\x020\x01B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_diff_proto_rawDescOnce sync.Once

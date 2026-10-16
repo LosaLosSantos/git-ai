@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/log"
-	"github.com/feder-cr/open_scion/internal/praefect/config"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore/glsql"
-	"github.com/feder-cr/open_scion/internal/praefect/metrics"
+	"github.com/feder-cr/git-ai/internal/log"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore/glsql"
+	"github.com/feder-cr/git-ai/internal/praefect/metrics"
 	"github.com/google/uuid"
 )
 

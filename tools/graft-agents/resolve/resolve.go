@@ -33,7 +33,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
 // DefaultCheckTimeout bounds one check command when the check sets no timeout.

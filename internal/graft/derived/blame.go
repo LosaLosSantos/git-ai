@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 // BlameLine attributes one line of a file to the commit that introduced it.

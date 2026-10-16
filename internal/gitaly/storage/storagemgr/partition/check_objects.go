@@ -9,10 +9,10 @@ import (
 	"runtime/trace"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	"github.com/feder-cr/open_scion/internal/git/gitcmd"
-	"github.com/feder-cr/open_scion/internal/git/localrepo"
-	"github.com/feder-cr/open_scion/internal/structerr"
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
 func checkObjects(ctx context.Context, repository *localrepo.Repo, revisions []git.Revision, callback func(revision git.Revision, objectID git.ObjectID) error) (returnedErr error) {

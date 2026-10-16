@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/feder-cr/open_scion/internal/datastructure"
-	"github.com/feder-cr/open_scion/internal/praefect/datastore"
-	"github.com/feder-cr/open_scion/internal/praefect/nodes"
+	"github.com/feder-cr/git-ai/internal/datastructure"
+	"github.com/feder-cr/git-ai/internal/praefect/datastore"
+	"github.com/feder-cr/git-ai/internal/praefect/nodes"
 )
 
 type nodeManagerRouter struct {

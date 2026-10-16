@@ -3,7 +3,7 @@ package classify
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // nbsp and bom are the UTF-8 encodings of U+00A0 (no-break space) and U+FEFF

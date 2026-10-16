@@ -13,10 +13,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/feder-cr/open_scion/internal/git"
-	housekeepingcfg "github.com/feder-cr/open_scion/internal/git/housekeeping/config"
-	"github.com/feder-cr/open_scion/internal/gitaly/storage/keyvalue"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/git"
+	housekeepingcfg "github.com/feder-cr/git-ai/internal/git/housekeeping/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage/keyvalue"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 var (

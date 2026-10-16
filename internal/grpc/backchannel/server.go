@@ -7,7 +7,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/log"
 	hashicorpyamux "github.com/hashicorp/yamux"
 	libp2pyamux "github.com/libp2p/go-yamux/v5"
 	"google.golang.org/grpc"

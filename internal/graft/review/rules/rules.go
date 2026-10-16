@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/gitaly/config"
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Evaluate returns one requirement per rule that applies to at least one

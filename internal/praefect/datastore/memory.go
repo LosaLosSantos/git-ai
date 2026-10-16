@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/feder-cr/open_scion/internal/praefect/config"
+	"github.com/feder-cr/git-ai/internal/praefect/config"
 )
 
 var errDeadAckedAsFailed = errors.New("job acknowledged as failed with no attempts left, should be 'dead'")

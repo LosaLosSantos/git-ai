@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/feder-cr/open_scion/internal/featureflag"
-	"github.com/feder-cr/open_scion/internal/log"
+	"github.com/feder-cr/git-ai/internal/featureflag"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 // FieldsProducer adds feature_flags logging fields to gRPC logs. Only enabled flags are available.

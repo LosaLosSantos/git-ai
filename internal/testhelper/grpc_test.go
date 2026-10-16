@@ -3,7 +3,7 @@ package testhelper_test
 import (
 	"testing"
 
-	"github.com/feder-cr/open_scion/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )

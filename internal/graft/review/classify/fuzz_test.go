@@ -5,7 +5,7 @@ import (
 	"go/token"
 	"testing"
 
-	"github.com/feder-cr/open_scion/proto/go/gitalypb"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // FuzzGoMatchesGoScanner checks the Go lexer against the standard library: when

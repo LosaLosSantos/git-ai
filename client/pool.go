@@ -3,7 +3,7 @@ package client
 import (
 	"context"
 
-	"github.com/feder-cr/open_scion/internal/grpc/client"
+	"github.com/feder-cr/git-ai/internal/grpc/client"
 	"google.golang.org/grpc"
 )
 
