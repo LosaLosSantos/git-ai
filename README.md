@@ -1,6 +1,12 @@
-# gitai
-
-**Source control for the age of coding agents.**
+<div align="center">
+<picture>
+  <source media="(max-width: 1239px) and (prefers-color-scheme: dark)" srcset="doc/images/banner-phone-dark.gif">
+  <source media="(max-width: 1239px)" srcset="doc/images/banner-phone-light.gif">
+  <source media="(prefers-color-scheme: dark)" srcset="doc/images/banner-dark.gif">
+  <img alt="gitai, Git designed for AI agents. An animation: 50 agents on one branch retry and fail with push, rebase, retry; gitai lands their changes on the server; 100 against 200 changes landed; the log of who changed what; and nodes that share one database." src="doc/images/banner-light.gif" width="100%">
+</picture>
+<h3 align="center">Git designed for AI agents.</h3>
+</div>
 
 Anthropic built **Scion**, a faster version control system for coding agents,
 and described it in
