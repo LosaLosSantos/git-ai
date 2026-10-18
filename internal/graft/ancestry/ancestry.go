@@ -1,7 +1,8 @@
 // Package ancestry answers the ancestry questions of a landing: whether a commit is reachable from
-// another one, and what their merge base is. Git answers them by running git merge-base, and the
-// graph checker answers them from the stored graph index (see internal/graft/derived/graph). Both
-// answer the same questions with the same results, so a landing gives the same outcome with either.
+// another one, what their merge base is, and which commits a change adds to a branch. Git answers
+// them by running git merge-base and git rev-list, and the graph checker answers them from the
+// stored graph index (see internal/graft/derived/graph). Both answer the same questions with the
+// same results, so a landing gives the same outcome with either.
 package ancestry
 
 import (
@@ -41,6 +42,17 @@ type Checker interface {
 	// returns the one with the smallest object ID, so that Git and the graph checker agree. The
 	// boolean is false when a and b have no common ancestor.
 	MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error)
+	// Range returns the commits reachable from head and not from base, as git rev-list
+	// base..head lists them, each with all of its parents, in no particular order. It is empty
+	// when head is reachable from base.
+	Range(ctx context.Context, base, head git.ObjectID) ([]RangeCommit, error)
+}
+
+// RangeCommit is a commit of a range with all of its parents in order, as git rev-list --parents
+// prints it.
+type RangeCommit struct {
+	ID      git.ObjectID
+	Parents []git.ObjectID
 }
 
 // Git returns a Checker that runs git for each question. It is the behaviour without the graph
@@ -69,8 +81,9 @@ func Graph(ctx context.Context, repo *localrepo.Repo, reader catfile.ObjectConte
 		return nil, err
 	}
 
-	index := graph.NewIndex(graph.NewCatfileSource(reader), store.Kind(graphKindName, graphKindVersion))
-	return graphChecker{index: index}, nil
+	source := graph.NewCatfileSource(reader)
+	index := graph.NewIndex(source, store.Kind(graphKindName, graphKindVersion))
+	return graphChecker{index: index, source: source}, nil
 }
 
 // New returns the Graph checker when enabled, and the Git checker otherwise. When the graph
@@ -170,9 +183,52 @@ func (c gitChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.Objec
 	return git.ObjectID(best), true, nil
 }
 
+// Range lists the range with one git rev-list --parents process.
+func (c gitChecker) Range(ctx context.Context, base, head git.ObjectID) ([]RangeCommit, error) {
+	objectHash, err := c.repo.ObjectHash(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("detecting object hash: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := c.repo.ExecAndWait(ctx,
+		gitcmd.Command{
+			Name:  "rev-list",
+			Flags: []gitcmd.Option{gitcmd.Flag{Name: "--parents"}},
+			Args:  []string{base.String() + ".." + head.String()},
+		},
+		gitcmd.WithStdout(&stdout),
+		gitcmd.WithStderr(&stderr),
+	); err != nil {
+		return nil, fmt.Errorf("rev-list: %w, stderr: %q", err, stderr.String())
+	}
+
+	var commits []RangeCommit
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		ids := make([]git.ObjectID, 0, len(fields))
+		for _, field := range fields {
+			id, err := objectHash.FromHex(field)
+			if err != nil {
+				return nil, fmt.Errorf("parsing rev-list output %q: %w", line, err)
+			}
+			ids = append(ids, id)
+		}
+		commits = append(commits, RangeCommit{ID: ids[0], Parents: ids[1:]})
+	}
+
+	return commits, nil
+}
+
 // graphChecker answers the questions with the graph index.
 type graphChecker struct {
 	index *graph.Index
+	// source reads the parents of the commits of a range.
+	source graph.Source
 }
 
 func (c graphChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
@@ -189,4 +245,41 @@ func (c graphChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.Obj
 	}
 
 	return base, true, nil
+}
+
+// Range walks down from head through the parents of the commits that the index does not find
+// reachable from base. The ancestors of a commit reachable from base are all reachable from base, so
+// the walk stops there without missing a commit of the range.
+func (c graphChecker) Range(ctx context.Context, base, head git.ObjectID) ([]RangeCommit, error) {
+	var commits []RangeCommit
+	seen := map[git.ObjectID]bool{head: true}
+	pending := []git.ObjectID{head}
+
+	for len(pending) > 0 {
+		id := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+
+		reachable, err := c.index.IsAncestor(ctx, id, base)
+		if err != nil {
+			return nil, err
+		}
+		if reachable {
+			continue
+		}
+
+		parents, err := c.source.Parents(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, RangeCommit{ID: id, Parents: parents})
+
+		for _, parent := range parents {
+			if !seen[parent] {
+				seen[parent] = true
+				pending = append(pending, parent)
+			}
+		}
+	}
+
+	return commits, nil
 }

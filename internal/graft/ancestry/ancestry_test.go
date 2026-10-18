@@ -257,3 +257,70 @@ func TestNewChoosesCheckerAndFallsBack(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// rangeSet returns the range as a map from commit to its parents, which does not depend on the
+// order of the listing.
+func rangeSet(commits []RangeCommit) map[git.ObjectID][]git.ObjectID {
+	set := make(map[git.ObjectID][]git.ObjectID, len(commits))
+	for _, c := range commits {
+		set[c.ID] = c.Parents
+	}
+	return set
+}
+
+func TestRangeGraphMatchesGit(t *testing.T) {
+	t.Parallel()
+
+	for _, seed := range []int64{1, 2} {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			t.Parallel()
+
+			ctx := testhelper.Context(t)
+			cfg, repoPath, repo, reader := newAncestryEnv(t)
+			rnd := rand.New(rand.NewSource(seed))
+
+			// A criss-cross history with a second, unrelated tree on top of it.
+			parents := crissCrossHistory(rnd, 160)
+			for i := 0; i < 40; i++ {
+				if i == 0 {
+					parents = append(parents, nil)
+					continue
+				}
+				parents = append(parents, []int{len(parents) - 1})
+			}
+			ids := writeHistory(t, cfg, repoPath, parents)
+
+			graphChecker, err := Graph(ctx, repo, reader, derived.NewStore(repoPath))
+			require.NoError(t, err)
+			gitChecker := Git(repo)
+
+			type pair struct{ base, head git.ObjectID }
+			pairs := []pair{{ids[3], ids[4]}, {ids[4], ids[3]}, {ids[3], ids[3]}, {ids[0], ids[159]}, {ids[159], ids[len(ids)-1]}}
+			for range 150 {
+				pairs = append(pairs, pair{ids[rnd.Intn(len(ids))], ids[rnd.Intn(len(ids))]})
+			}
+
+			nonEmpty := 0
+			for _, p := range pairs {
+				want, err := gitChecker.Range(ctx, p.base, p.head)
+				require.NoError(t, err)
+				got, err := graphChecker.Range(ctx, p.base, p.head)
+				require.NoError(t, err)
+				require.Equal(t, rangeSet(want), rangeSet(got), "Range(%s, %s)", p.base, p.head)
+
+				// The git checker lists what git rev-list lists.
+				listed := strings.Fields(string(gittest.Exec(t, cfg, "-C", repoPath, "rev-list", p.base.String()+".."+p.head.String())))
+				require.Len(t, want, len(listed))
+
+				// A range is empty exactly when head is reachable from base.
+				reachable, err := gitChecker.IsAncestor(ctx, p.head, p.base)
+				require.NoError(t, err)
+				require.Equal(t, reachable, len(want) == 0)
+				if len(want) > 0 {
+					nonEmpty++
+				}
+			}
+			require.Positive(t, nonEmpty)
+		})
+	}
+}
