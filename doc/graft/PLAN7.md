@@ -713,13 +713,23 @@ method `func (c *Core) WriteDeadline() time.Duration` = `GCGrace − GCMargin` (
 // reachable from tips: `git rev-list --objects --stdin` (the tips on stdin, no
 // --not) piped into `git pack-objects --stdout`, hashed into a file in tmpDir.
 // Zero tips are ignored; no tips is an empty Pack. A tip that is not in the
-// repository is an error that IsMissingObject recognizes.
+// repository is an error: callers check the tips with MissingObjects first, so
+// that a missing object is reported precisely and never yields a partial pack.
 func BuildPackFrom(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID, tmpDir string) (Pack, error)
 
-// MissingObjects returns the tips that are not in the repository (one
-// `cat-file --batch-check` run).
+// MissingObjects returns the tips that are not in the repository, in the order
+// given (one `cat-file --batch-check` run).
 func MissingObjects(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID) ([]git.ObjectID, error)
+
+// IsReachable reports whether commit is reachable from one of tips (one
+// `rev-list --stdin --max-count=1` run with the tips negated; tips that are
+// blobs or trees reach nothing, annotated tags are peeled). For REVIEW ROOTS R1.
+func IsReachable(ctx context.Context, repo *localrepo.Repo, commit git.ObjectID, tips []git.ObjectID) (bool, error)
 ```
+
+(WP74: an earlier draft had BuildPackFrom report a missing tip through an
+`IsMissingObject` predicate; the build order checks with MissingObjects before
+any pack is built, so no caller needs to tell that error apart.)
 
 ### Writers (WP73, change A on the write path)
 
@@ -774,17 +784,26 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator,
 
 // Create builds a checkpoint of repo at the current database head and records
 // it. created is false when a checkpoint at the head exists already.
-func (c *Checkpointer) Create(ctx context.Context, repo storage.Repository) (cp corestore.Checkpoint, created bool, err error)
-
-// FaultHook is called at "after_upload" and "after_commit" (tests only).
-var FaultHook func(point string) error
+func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (cp corestore.Checkpoint, created bool, err error)
 ```
+
+The fault hook is an unexported field of the `Checkpointer` that tests set
+(`export_test.go`), like the syncer's test hook, not a package variable, so
+that parallel tests do not share it. Its points are `after_snapshot` (after
+step 1: a test writes a review at `S > N` there), `after_upload` and
+`after_commit`. `Create` takes `*gitalypb.Repository` because the repository
+factory builds from it; both callers (the RPC handler and the maintenance
+runner) have one.
 
 Binding order:
 
-1. Require authoritative mode (else `FailedPrecondition`, SHADOW SCOPE) and a
-   reftable local repository. Read `(refs, N) = Meta.Refs(repoID)` (one snapshot).
-   If `NewestCheckpoint` is at `N`: return it, `created = false`.
+1. Require authoritative mode (else `FailedPrecondition`, SHADOW SCOPE). Read
+   `(refs, N) = Meta.Refs(repoID)` (one snapshot). If `NewestCheckpoint` is at
+   `N`: return it, `created = false`. (WP74: the reftable check of the draft is
+   dropped. The local repository may not exist before step 3, and EnsureFresh
+   replaces a copy that is not reftable, so the check could only refuse a node
+   that has no copy yet. The build only reads objects, which does not depend on
+   the reference backend. The object hash comes from the repository record.)
 2. **Roots before freshness (PM check 1).** Read the open reviews
    (`ListReviews(repoID, "", false, 0)`): their `head_commit_id` and
    `base_commit_id` (each validated as an object ID of the repository's hash;
@@ -805,7 +824,8 @@ Binding order:
    object; a missing review root can only belong to a review written without R1
    (created before phase 7, or brought in by `ImportHistory` from the shadow-mode
    files) and is `FailedPrecondition` naming the review IDs, with the metric;
-   nothing is uploaded.
+   nothing is uploaded. A review commit that is not an object ID of the
+   repository's hash cannot be packed and is refused the same way.
 5. `pack = BuildPackFrom(local, tips ∪ roots, tmpDir)`. No object tips → return
    `created = false` (nothing to consolidate; hydration of such a repository is
    already trivial).
