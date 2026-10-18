@@ -56,7 +56,8 @@ type LandPlan struct {
 // reaches when committer dates are skewed, never fewer than the range (see revrange). Two facts
 // are exact from such a listing, so they cost nothing more:
 //
-//   - The listing is empty exactly when the range is: commit is already landed.
+//   - An empty listing means an empty range: commit is already landed. Not conversely: with skew
+//     an already landed commit can have a non-empty listing, and the merge bases below settle it.
 //   - tip is a parent of a listed commit exactly when tip is reachable from commit. A listed commit
 //     is reachable from commit, so tip is then reachable from commit; and on a path from commit down
 //     to tip, the commit right above tip is in the range, so it is listed. That is a fast-forward.

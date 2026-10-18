@@ -155,7 +155,6 @@ func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git
 	w := graphWalk{
 		checker: c,
 		flags:   map[git.ObjectID]uint8{},
-		queued:  map[git.ObjectID]bool{},
 		taken:   map[git.ObjectID]bool{},
 	}
 
@@ -175,7 +174,6 @@ func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git
 		if flags == fromHead {
 			w.headOnly--
 		}
-		delete(w.queued, next.id)
 		w.taken[next.id] = true
 
 		parents, err := c.source.Parents(ctx, next.id)
@@ -233,8 +231,6 @@ type graphWalk struct {
 	flags map[git.ObjectID]uint8
 	// queue holds the commits that the walk reached and did not take yet.
 	queue generationQueue
-	// queued holds the commits of queue.
-	queued map[git.ObjectID]bool
 	// taken holds the commits that the walk took from queue.
 	taken map[git.ObjectID]bool
 	// headOnly counts the commits of queue whose flags are fromHead alone.
@@ -267,7 +263,6 @@ func (w *graphWalk) add(ctx context.Context, id git.ObjectID, flags uint8) error
 	}
 
 	w.flags[id] = flags
-	w.queued[id] = true
 	if flags == fromHead {
 		w.headOnly++
 	}

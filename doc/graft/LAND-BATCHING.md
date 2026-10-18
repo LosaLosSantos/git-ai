@@ -88,7 +88,8 @@ outcomes.
 ### How a request is decided and rebased
 
 Since phase 4b ([PLAN8.md](PLAN8.md)), each request of an attempt costs one
-short git process, and one more when it diverges from the tip:
+short git process, one more when it diverges from the tip, and at most four in
+all when committer dates are skewed:
 
 1. The commit ID is peeled to a commit by an object info process of the
    attempt's quarantine (`git cat-file --batch-check`), taken from the catfile
@@ -96,17 +97,20 @@ short git process, and one more when it diverges from the tip:
    and at most the next one.
 2. One listing of the commits that the change adds to the running tip
    (`ancestry.Checker.List`, `git rev-list --parents commit ^tip`) decides the
-   landing (`rebase.Plan`): the change is already landed when the list is
-   empty; it fast-forwards the tip when the tip is a parent of a listed commit;
-   otherwise it diverges. Both facts are exact even when committer dates are
-   skewed. A skewed history can make `git rev-list` list commits that the tip
+   landing (`rebase.Plan`): an empty list means the change is already landed;
+   the tip being a parent of a listed commit means a fast-forward; both facts
+   hold even when committer dates are skewed. Otherwise the change diverges, or,
+   under skew, may still turn out to be already landed (see below). A skewed
+   history can make `git rev-list` list commits that the tip
    already has (its walk stops early when the commits it still has to visit are
    older than those it listed), never fewer. So for a diverging change one
    `git merge-base --independent tip <bottoms>` tells whether the listing is
    exact: it drops exactly the bottoms of the listing (listed commits none of
    whose parents is listed) that the tip reaches, and the listing has extra
    commits exactly when one of them is dropped. Without skew that is the only
-   extra process. With skew (counted by `graft_revrange_skewed_listings_total`)
+   extra process. With skew (counted by `graft_revrange_skewed_listings_total`;
+   the commits removed from listings of the repository rebase todo are counted
+   by `graft_revrange_skew_extra_commits_total`)
    `git merge-base --all` decides: the change is already landed when its only
    merge base is the commit itself; otherwise one listing below the merge
    bases either is a chain of commits with one parent each down to the only
