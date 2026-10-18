@@ -55,6 +55,8 @@ type CommitWriter struct {
 	// ctx is the context the writer was created with. Every hash-object process runs under it,
 	// including processes that replace a process that died, so that all of them end with it.
 	ctx context.Context
+	// gitOpts are the options of every hash-object process, from the HelperOptions of the writer.
+	gitOpts []gitcmd.CmdOpt
 
 	// process is the running hash-object process, or nil if it must be started before the next
 	// write because the previous one failed.
@@ -80,7 +82,7 @@ type commitWriterProcess struct {
 
 // NewCommitWriter starts the long-lived process used to write commit objects. The process, and any
 // process that replaces it, is terminated when ctx is done or when Close is called.
-func (repo *Repo) NewCommitWriter(ctx context.Context) (*CommitWriter, error) {
+func (repo *Repo) NewCommitWriter(ctx context.Context, opts ...HelperOption) (*CommitWriter, error) {
 	objectHash, err := repo.ObjectHash(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("detecting object hash: %w", err)
@@ -96,6 +98,7 @@ func (repo *Repo) NewCommitWriter(ctx context.Context) (*CommitWriter, error) {
 		objectHash: objectHash,
 		tempDir:    tempDir,
 		ctx:        ctx,
+		gitOpts:    resolveHelperOptions(opts),
 	}
 
 	if err := writer.startProcess(); err != nil {
@@ -130,8 +133,10 @@ func (w *CommitWriter) startProcess() error {
 				gitcmd.Flag{Name: "--stdin-paths"},
 			},
 		},
-		gitcmd.WithSetupStdin(),
-		gitcmd.WithSetupStdout(),
+		append([]gitcmd.CmdOpt{
+			gitcmd.WithSetupStdin(),
+			gitcmd.WithSetupStdout(),
+		}, w.gitOpts...)...,
 	)
 	if err != nil {
 		cancel()
