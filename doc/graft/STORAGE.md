@@ -602,11 +602,18 @@ show:
   macOS filesystem, and NFS): objects are published with link(2), see Packs. On
   a filesystem without hard links every write fails with an error that says so.
 - **Concurrent writes to one repository share one lock** in authoritative
-  mode: reftable has one reference lock per repository. The voter holds it only
-  for the expected values and the database commit (the pack is uploaded before
-  the lock is taken), and git waits up to 10 s for it, so concurrent writes
-  queue instead of failing; a write that waits longer than 10 s still fails with
-  "reference is already locked". See [Benchmark](#benchmark).
+  mode: reftable has one reference lock per repository. Writers take it in
+  arrival order, and the hold is the voter's expected values and database commit
+  plus a git write without fsync, about 15 ms with SQLite. The pack is uploaded
+  before the lock, and the references are made durable later, see
+  [Failures](#failures). So concurrent writes queue: about 125–190 ms of queue
+  at 50 and 100 agents on one repository, measured. A write whose turn does not
+  come within 10 s goes on to git's own wait, and fails with "reference is
+  already locked" if that also passes 10 s. See [Benchmark](#benchmark).
+- **A repository that is never idle for a second keeps its dirty marker**, so
+  after a power loss it is always hydrated again, even though its references
+  were made durable less than a second earlier: the marker does not record which
+  writes are already durable.
 - **SQLite serves one node.** SQLite has a single write lock. The writes of
   one gitaly process take it in the order they arrive, but several processes on
   one SQLite file (several nodes on one host) meet in SQLite's own lock wait,
