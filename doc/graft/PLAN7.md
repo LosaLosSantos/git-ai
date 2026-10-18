@@ -1032,12 +1032,40 @@ next run finishes it. No lease (the repository is gone and its ID is never reuse
 A missing checkpoint pack or a missing pack `> S` is an Internal error naming the
 key (corruption, GC BOUNDARY rule).
 
+*As implemented (WP76).* `syncer.seed` reads the newest checkpoint and its
+snapshot. It checks the pack key's repository ID and validates every name and
+target like a changeset's (names, targets, symbolic targets), then indexes the
+pack through the existing `indexPack` (SHA-256 against the key). Final
+references = snapshot overlaid by the fetched final values, where an absent
+value deletes. `graft_storage_sync_checkpoint_seeds_total` counts the seeded
+hydrations.
+
 ### Catch-up and the sync boundary (syncer, WP76, change C)
 
 In `sync()`, each round reads `C_sync = SyncBoundary(r.ID, gc_grace − sync_timeout −
 gc_margin)` and hydrates when `!ok || wm.RepoID != r.ID || !localCurrent ||
 wm.Seq < C_sync`; otherwise it catches up as in phase 6 (the WP55 RULE unchanged).
 `checkReplaceable` still runs before any hydration.
+
+*As implemented (WP76).*
+* `C_sync` is read only when a catch-up is needed: after the node's own noted
+  sequences advanced the watermark, and only when it is below the head. So a
+  fresh repository costs no extra query, and a node whose own writes carried it
+  past `C_sync` is not re-hydrated.
+* `install`'s errRestart condition is the exact negation of the new hydrate
+  condition (`wm.Seq >= C_sync` added). Without it, a current but lagging copy
+  would be sent back to sync forever.
+* The age `gc_grace − sync_timeout − gc_margin` is taken as 0 when it is not
+  positive (the configuration refuses that; only test cores have such
+  times). With age 0 every checkpoint counts, which is the conservative end:
+  more hydrations, never a collected pack.
+* Audit of the bound: every pack read and git process of a round (`fetch`,
+  `indexPack`, `applyBuild`, the catch-up loop, `install`'s lock) runs under
+  the round's context, which `EnsureFresh` bounds by `sync_timeout` per flight.
+  The only work outside it is the best-effort `ReportApplied` after the round
+  (at most 1 s, no pack read).
+* `TestSyncerRoundBoundedBySyncTimeout` shows that a bucket read is cancelled by
+  the round's deadline and nothing is installed.
 
 ### Verify after compaction (`verify_objects.go`, WP76)
 
@@ -1047,6 +1075,16 @@ check as today, and also checks the open reviews' head and base commits. It runs
 under a deadline of `W` from its start (a dry hydration that read checkpoint `S`
 must end before a checkpoint newer than `S` can become `C_gc`); a missing pack is
 reported as a connectivity failure starting with `storage core objects:`.
+
+*As implemented (WP76).*
+* `checkStoredObjects` reads the newest checkpoint before the references. A
+  checkpoint never exceeds the head at its creation, so the head read after it
+  is at or above it.
+* The open reviews' commits are checked through their keep-around references
+  (REVIEW ROOTS RULE), which are database references; there is no separate
+  review check.
+* Running out of `W` is `Unavailable` ("did not finish within the write
+  deadline").
 
 ### Background maintenance (`internal/graft/corestore/maintenance`, WP77)
 
