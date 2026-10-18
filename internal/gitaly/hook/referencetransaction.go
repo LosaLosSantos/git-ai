@@ -240,48 +240,75 @@ func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git
 	}
 
 	// The updates are recorded in the order in which their transactions were prepared, which
-	// is the order in which the references were updated. See changesetTickets. The ticket is
-	// released however recording ends, so that later transactions do not wait for it. A
-	// packed-refs cleanup records nothing, so it does not wait.
-	if ticket, earlier := findChangesetTicket(repoPath, changes); ticket != nil {
-		defer releaseChangesetTicket(repoPath, ticket)
-
-		if !packedCleanup && !waitForChangesetTickets(ctx, earlier) {
-			m.logger.WarnContext(ctx, "recording changesets without waiting for an earlier reference transaction, the changeset log may list them out of order")
+	// is the order in which the references were updated. See changesetTickets. A transaction
+	// that records nothing gives up its place at once, so that later transactions do not wait
+	// for it: a packed-refs cleanup, a transaction whose metadata cannot be read, and one on
+	// the MVCC reference backend, whose updates are recorded after its commit.
+	ticket := findChangesetTicket(repoPath, changes)
+	release := func() {
+		if ticket != nil {
+			releaseChangesetTicket(repoPath, ticket)
 		}
 	}
 
 	if packedCleanup {
+		release()
 		return
 	}
 
 	if metaErr != nil {
+		release()
 		m.logger.WithError(metaErr).ErrorContext(ctx, "recording changesets: reading changelog metadata")
 		return
 	}
 
-	meta := changelogMetaOf(payload, graftMeta)
-
-	appendChangesets := func() {
-		if _, err := changelog.Append(repoPath, meta, updates); err != nil {
-			m.logger.WithError(err).ErrorContext(ctx, "recording changesets failed")
-		}
-	}
+	record := changelog.Record{Meta: changelogMetaOf(payload, graftMeta), Updates: updates}
 
 	// On a repository that uses the MVCC reference backend, the updates are staged in the
 	// snapshot of the request that performs them, and are only published when that request
 	// commits its MVCC cache after its handler returned. The commit fails when a concurrent
 	// request committed first, and the updates are then thrown away, so they are only
-	// recorded once the commit succeeded.
+	// recorded once the commit succeeded, outside of the order of the tickets.
 	if graftMeta.MVCCCommit != "" {
+		release()
 		cache := mvcc.CacheByCommitHandle(graftMeta.MVCCCommit)
-		if cache == nil || !cache.AfterCommit(appendChangesets) {
+		if cache == nil || !cache.AfterCommit(func() {
+			if _, err := changelog.Append(repoPath, record.Meta, record.Updates); err != nil {
+				m.reportLostChangesets(ctx, updates, err)
+			}
+		}) {
 			m.logger.ErrorContext(ctx, "recording changesets: the MVCC cache that commits the updates is gone, not recording them")
 		}
 		return
 	}
 
-	appendChangesets()
+	// A transaction without a ticket, prepared before the changeset log was enabled or whose
+	// ticket expired, is recorded at once.
+	var recordErr error
+	if ticket == nil {
+		_, recordErr = changelog.Append(repoPath, record.Meta, record.Updates)
+	} else {
+		recordErr = recordInOrder(repoPath, ticket, record)
+	}
+	if recordErr != nil {
+		m.reportLostChangesets(ctx, updates, recordErr)
+	}
+}
+
+// reportLostChangesets reports committed reference updates that the changeset log does not
+// record because writing them failed. Recording never fails the reference update, which git
+// committed already, so the loss is made visible instead: it is counted
+// (graft_changelog_records_lost_total) and logged with the references.
+func (m *GitLabHookManager) reportLostChangesets(ctx context.Context, updates []changelog.Update, err error) {
+	changelogRecordsLostTotal.Add(float64(len(updates)))
+
+	references := make([]string, 0, len(updates))
+	for _, update := range updates {
+		references = append(references, update.Reference)
+	}
+
+	m.logger.WithError(err).WithField("references", references).ErrorContext(ctx,
+		"recording changesets failed: the changeset log misses these committed reference updates")
 }
 
 // observeCommitted hands the committed reference updates to the eager observer,

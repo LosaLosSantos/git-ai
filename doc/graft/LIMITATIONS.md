@@ -202,9 +202,20 @@ Git hooks use private.
 - Only reference updates that pass through Gitaly's transaction path are
   recorded. Updates made by other tools that write to the repository directly
   are not.
-- Recording errors are logged and never fail the update. In that case the log
-  has a gap in what clients expected. The log is dense only while recording
-  succeeds.
+- With the storage core off or in shadow mode, the file log is written by the
+  reference-transaction hook after git committed the update, so a recording
+  error cannot fail the update: the committed updates are then missing from the
+  log, and its consumers do not see them. Each loss is counted
+  (`graft_changelog_records_lost_total`) and logged with the references. The
+  sequences stay dense, because an entry that failed to be written was never
+  visible and the next entry takes its sequence. In authoritative mode the
+  storage core writes the changelog in the database transaction of the update,
+  so this cannot happen.
+- Entries become visible to `ListChangesets`, `WatchChangesets` and the storage
+  core only once they are fsynced, and an RPC returns only after its entries
+  are, so a reader never sees an entry that a crash could take back. The entries
+  of the transactions that commit together are written with one fsync, in the
+  order in which the transactions locked their references.
 - The log is stored per Gitaly node and is not replicated. Behind Praefect,
   every replica records the updates it applies itself, so sequence numbers and
   metadata differ between replicas. Praefect therefore always routes
