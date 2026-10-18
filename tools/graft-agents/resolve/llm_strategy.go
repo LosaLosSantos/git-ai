@@ -19,7 +19,6 @@ import (
 //	[[strategy]]
 //	type = "llm"
 //	paths = ["**/*.go", "docs/**"]
-//	min_confidence = "medium"      # optional: high, medium (default) or low
 //	max_prompt_bytes = 65536       # optional: largest prompt sent (whole file or region)
 //	context_lines = 8              # optional
 //	max_answer_bytes = 1048576     # optional
@@ -43,6 +42,10 @@ import (
 // max_prompt_bytes. A rejected or failed answer is a strategy failure and the
 // chain continues as well. Checks configured for the path still run on the
 // accepted answer.
+//
+// The prompt carries the commit messages of both sides (request.messages) as
+// the intent of each side. The model reports no confidence: an answer is
+// accepted on the checks alone, and min_confidence is no longer an option.
 func init() {
 	RegisterStrategy("llm", newLLMStrategy)
 }
@@ -56,15 +59,15 @@ type llmStrategy struct {
 }
 
 func newLLMStrategy(spec StrategySpec) (Strategy, error) {
-	if err := allowOnly(spec, "llm", "min_confidence", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions"); err != nil {
+	if _, ok := spec.Options["min_confidence"]; ok {
+		return nil, fmt.Errorf("strategy %q: min_confidence is gone: the model reports no confidence and an answer is accepted on the checks alone; remove the option", spec.Name)
+	}
+	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions"); err != nil {
 		return nil, err
 	}
 
 	var opt LLMOptions
 	var err error
-	if opt.MinConfidence, err = optString(spec, "min_confidence"); err != nil {
-		return nil, err
-	}
 	if opt.MaxPromptBytes, err = llmOptInt(spec, "max_prompt_bytes"); err != nil {
 		return nil, err
 	}
@@ -104,7 +107,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 }
 
 // Resolve implements Strategy.
-func (s *llmStrategy) Resolve(ctx context.Context, f File, _ protocol.Request) (Resolution, bool, error) {
+func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request) (Resolution, bool, error) {
 	if !regularFile(f.Ours) || !regularFile(f.Theirs) || f.Ours.Mode != f.Theirs.Mode {
 		return Resolution{}, false, nil
 	}
@@ -112,7 +115,13 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, _ protocol.Request) (
 		return Resolution{}, false, nil
 	}
 
-	lf := LLMFile{Path: f.Path, Ours: llmBytes(f.Ours.Content), Theirs: llmBytes(f.Theirs.Content)}
+	lf := LLMFile{
+		Path:          f.Path,
+		Ours:          llmBytes(f.Ours.Content),
+		Theirs:        llmBytes(f.Theirs.Content),
+		OursMessage:   req.Messages.Tip,
+		TheirsMessage: req.Messages.Commit,
+	}
 	if f.Base != nil {
 		lf.Base = llmBytes(f.Base.Content)
 	}

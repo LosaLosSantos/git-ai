@@ -19,7 +19,7 @@ func TestResolveLLMDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 		"add-add invalid": {Path: "x", Ours: []byte("\xff\n"), Theirs: []byte("t\n")},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := llmFixed("x\n", "high")
+			p := llmFixed("x\n")
 			if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); !errors.Is(err, ErrLLMNotApplicable) {
 				t.Fatalf("err = %v, want ErrLLMNotApplicable", err)
 			}
@@ -32,7 +32,7 @@ func TestResolveLLMDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 
 func TestResolveLLMAcceptsValidMultibyteUTF8(t *testing.T) {
 	// Valid multi-byte text ("é" as C3 A9) is still sent to the model.
-	p := llmFixed("café\nB\nC\n", "high")
+	p := llmFixed("café\nB\nC\n")
 	f := LLMFile{Path: "x", Base: []byte("café\nA\n"), Ours: []byte("café\nB\n"), Theirs: []byte("café\nC\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestLLMStrategyDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 	// Through the strategy chain: a Latin-1 side must not reach the provider,
 	// and no strategy may write the altered bytes.
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("caf\xe9\nB\nC\n", "high"), nil
+		return wp19Answer("caf\xe9\nB\nC\n"), nil
 	})
 	r := wp19Build(t, wp19LLMConfig)
 
@@ -97,7 +97,7 @@ func TestResolveLLMHunkModeKeepsCRLFLineEndings(t *testing.T) {
 	f := LLMFile{Path: "crlf.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
 	// The answer has no line terminator; the region is not the last line.
-	p := llmFixed("merged", "high")
+	p := llmFixed("merged")
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
 	if err != nil {
 		t.Fatal(err)
@@ -118,12 +118,12 @@ func TestLLMHunkPromptMarksAbsentBase(t *testing.T) {
 	base := []string{"x\n"}
 	r := &llmRegion{start: 0, end: 0, base: "", ours: "o\n", theirs: "t\n"}
 
-	absent := llmHunkPrompt("f.txt", base, r, 1, 1, 8, true, "nonce1")
+	absent := llmHunkPrompt(LLMFile{Path: "f.txt"}, base, r, 1, 1, 8, "nonce1")
 	if !strings.Contains(absent, "BEGIN BASE REGION nonce1 (absent) =====") {
 		t.Fatalf("absent base not marked:\n%s", absent)
 	}
 
-	present := llmHunkPrompt("f.txt", base, r, 1, 1, 8, false, "nonce1")
+	present := llmHunkPrompt(LLMFile{Path: "f.txt", Base: []byte("x\n")}, base, r, 1, 1, 8, "nonce1")
 	if strings.Contains(present, "(absent)") {
 		t.Fatalf("present base marked absent:\n%s", present)
 	}

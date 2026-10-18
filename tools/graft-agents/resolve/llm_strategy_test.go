@@ -45,15 +45,15 @@ func (f *wp19Fake) lastReq() llm.Request {
 }
 
 // wp19Answer returns a JSON answer in the shape of the llm strategy schema.
-func wp19Answer(content, confidence string) *llm.Response {
-	b, _ := json.Marshal(map[string]string{"content": content, "confidence": confidence, "explanation": "wp19"})
+func wp19Answer(content string) *llm.Response {
+	b, _ := json.Marshal(map[string]string{"content": content, "explanation": "wp19"})
 	return &llm.Response{JSON: b, Model: "wp19-model"}
 }
 
 var (
 	// wp19Current is the provider handed out by the test factory.
 	wp19Current = &wp19Fake{answer: func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("unused\n", "high"), nil
+		return wp19Answer("unused\n"), nil
 	}}
 	// wp19LastCfg is the configuration the factory last received.
 	wp19Mu      sync.Mutex
@@ -139,7 +139,7 @@ func wp19Conflict(path string) protocol.FileConflict {
 
 func TestLLMStrategyResolvesConflict(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("merged\n", "high"), nil
+		return wp19Answer("merged\n"), nil
 	})
 	r := wp19Build(t, wp19LLMConfig)
 
@@ -212,7 +212,7 @@ func TestLLMStrategyDeclinesWithoutCallingProvider(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
 				t.Error("provider called for a declined file")
-				return wp19Answer("x\n", "high"), nil
+				return wp19Answer("x\n"), nil
 			})
 			r := wp19Build(t, wp19LLMConfig)
 
@@ -233,13 +233,9 @@ func TestLLMStrategyRejectedAnswersAreFailures(t *testing.T) {
 		answer func(context.Context, llm.Request) (*llm.Response, error)
 		reason string
 	}{
-		"low confidence": {
-			answer: func(context.Context, llm.Request) (*llm.Response, error) { return wp19Answer("x\n", "low"), nil },
-			reason: "below medium",
-		},
 		"conflict marker": {
 			answer: func(context.Context, llm.Request) (*llm.Response, error) {
-				return wp19Answer("<<<<<<< ours\nx\n", "high"), nil
+				return wp19Answer("<<<<<<< ours\nx\n"), nil
 			},
 			reason: "conflict markers",
 		},
@@ -309,7 +305,7 @@ paths = ["*.txt", "**/*.txt"]
 command = ["sh", "-c", 'grep -q bad "$1" && exit 1; exit 0', "sh", "{file}"]
 `
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("bad idea\n", "high"), nil
+		return wp19Answer("bad idea\n"), nil
 	})
 	r := wp19Build(t, config)
 	_, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("x.txt")))
@@ -321,7 +317,7 @@ command = ["sh", "-c", 'grep -q bad "$1" && exit 1; exit 0', "sh", "{file}"]
 	// The provider is bound at build time, so a new resolver picks up the new
 	// answer.
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("good idea\n", "high"), nil
+		return wp19Answer("good idea\n"), nil
 	})
 	r = wp19Build(t, config)
 	if _, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("x.txt"))); err != nil {
@@ -331,7 +327,7 @@ command = ["sh", "-c", 'grep -q bad "$1" && exit 1; exit 0', "sh", "{file}"]
 
 func TestLLMStrategyConcurrentResolves(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("merged\n", "high"), nil
+		return wp19Answer("merged\n"), nil
 	})
 	r := wp19Build(t, wp19LLMConfig)
 
@@ -398,9 +394,9 @@ type = "llm"
 			config: base + "bogus = 1\n[strategy.llm]\ntype = \"wp19-resolve-fake\"\n",
 			want:   "unknown keys",
 		},
-		"invalid min_confidence": {
-			config: base + "min_confidence = \"sure\"\n[strategy.llm]\ntype = \"wp19-resolve-fake\"\n",
-			want:   "invalid llm min confidence",
+		"min_confidence is gone": {
+			config: base + "min_confidence = \"high\"\n[strategy.llm]\ntype = \"wp19-resolve-fake\"\n",
+			want:   "min_confidence is gone",
 		},
 		"negative max_prompt_bytes": {
 			config: base + "max_prompt_bytes = -1\n[strategy.llm]\ntype = \"wp19-resolve-fake\"\n",
@@ -437,10 +433,9 @@ type = "llm"
 }
 
 func TestLLMStrategyNoConfigDefaults(t *testing.T) {
-	// Only the table is needed; the defaults are medium confidence and the
-	// default timeout.
+	// Only the table is needed; the timeout is the default.
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("x\n", "medium"), nil
+		return wp19Answer("x\n"), nil
 	})
 	r := wp19Build(t, `
 [[strategy]]
@@ -450,7 +445,7 @@ type = "llm"
 type = "wp19-resolve-fake"
 `)
 	if _, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("x.txt"))); err != nil {
-		t.Fatalf("medium confidence rejected by default: %v", err)
+		t.Fatalf("answer rejected with the defaults: %v", err)
 	}
 
 	wp19Mu.Lock()
@@ -483,7 +478,7 @@ timeout = "20ms"
 func TestLLMPromptDelimitersCarryNonce(t *testing.T) {
 	var prompts []string
 	p := &wp19Fake{answer: func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("x\n", "high"), nil
+		return wp19Answer("x\n"), nil
 	}}
 	// Ours tries to close the OURS section and to inject instructions.
 	f := LLMFile{
@@ -517,7 +512,7 @@ func TestLLMPromptDelimitersCarryNonce(t *testing.T) {
 
 func TestLLMExplanationIsBounded(t *testing.T) {
 	long := strings.Repeat("é", 2000)
-	b, _ := json.Marshal(map[string]string{"content": "x\n", "confidence": "high", "explanation": long})
+	b, _ := json.Marshal(map[string]string{"content": "x\n", "explanation": long})
 	p := &wp19Fake{answer: func(context.Context, llm.Request) (*llm.Response, error) {
 		return &llm.Response{JSON: b}, nil
 	}}

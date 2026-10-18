@@ -24,14 +24,14 @@ func (f *llmFake) Complete(_ context.Context, req llm.Request) (*llm.Response, e
 	return f.answer(len(f.reqs)-1, req)
 }
 
-func llmFakeAnswer(content, confidence string) *llm.Response {
-	b, _ := json.Marshal(map[string]string{"content": content, "confidence": confidence, "explanation": "fake"})
+func llmFakeAnswer(content string) *llm.Response {
+	b, _ := json.Marshal(map[string]string{"content": content, "explanation": "fake"})
 	return &llm.Response{Text: string(b), JSON: b, Model: "fake-model"}
 }
 
-func llmFixed(content, confidence string) *llmFake {
+func llmFixed(content string) *llmFake {
 	return &llmFake{answer: func(int, llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer(content, confidence), nil
+		return llmFakeAnswer(content), nil
 	}}
 }
 
@@ -96,7 +96,7 @@ func TestResolveLLMNotApplicable(t *testing.T) {
 		"binary":        {Path: "x", Base: []byte("a\x00"), Ours: []byte("b\n"), Theirs: []byte("c\n")},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := llmFixed("x", "high")
+			p := llmFixed("x")
 			if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); !errors.Is(err, ErrLLMNotApplicable) {
 				t.Fatalf("err = %v", err)
 			}
@@ -108,14 +108,14 @@ func TestResolveLLMNotApplicable(t *testing.T) {
 }
 
 func TestResolveLLMWholeFile(t *testing.T) {
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	f := LLMFile{Path: "a/b.go", Base: []byte("base\n"), Ours: []byte("ours\n"), Theirs: []byte("theirs\n")}
 
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(res.Content) != "merged\n" || res.Confidence != LLMConfidenceHigh || res.Model != "fake-model" || res.Hunks != 0 {
+	if string(res.Content) != "merged\n" || res.Model != "fake-model" || res.Hunks != 0 {
 		t.Fatalf("result = %+v", res)
 	}
 	if res.Explanation != "fake" {
@@ -138,13 +138,13 @@ func TestResolveLLMWholeFile(t *testing.T) {
 		t.Fatal("schema not requested")
 	}
 	required, _ := json.Marshal(req.JSONSchema["required"])
-	if string(required) != `["content","confidence","explanation"]` {
+	if string(required) != `["content","explanation"]` {
 		t.Fatalf("schema required = %s", required)
 	}
 }
 
 func TestResolveLLMAddAddBaseAbsent(t *testing.T) {
-	p := llmFixed("new\n", "medium")
+	p := llmFixed("new\n")
 	f := LLMFile{Path: "new.txt", Ours: []byte("o\n"), Theirs: []byte("t\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
@@ -161,14 +161,11 @@ func TestResolveLLMRejections(t *testing.T) {
 		resp *llm.Response
 		opt  LLMOptions
 	}{
-		"low confidence by default":          {resp: llmFakeAnswer("x\n", "low")},
-		"medium rejected when high required": {resp: llmFakeAnswer("x\n", "medium"), opt: LLMOptions{MinConfidence: "high"}},
-		"unknown confidence":                 {resp: llmFakeAnswer("x\n", "certain")},
-		"conflict marker":                    {resp: llmFakeAnswer("<<<<<<< ours\nx\n", "high")},
-		"separator marker":                   {resp: llmFakeAnswer("x\n=======\ny\n", "high")},
-		"answer too large":                   {resp: llmFakeAnswer(strings.Repeat("x", 100), "high"), opt: LLMOptions{MaxAnswerBytes: 10}},
-		"invalid JSON":                       {resp: &llm.Response{Text: "no json here"}},
-		"wrong JSON type":                    {resp: &llm.Response{JSON: json.RawMessage(`{"content": 3}`)}},
+		"conflict marker":  {resp: llmFakeAnswer("<<<<<<< ours\nx\n")},
+		"separator marker": {resp: llmFakeAnswer("x\n=======\ny\n")},
+		"answer too large": {resp: llmFakeAnswer(strings.Repeat("x", 100)), opt: LLMOptions{MaxAnswerBytes: 10}},
+		"invalid JSON":     {resp: &llm.Response{Text: "no json here"}},
+		"wrong JSON type":  {resp: &llm.Response{JSON: json.RawMessage(`{"content": 3}`)}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return tc.resp, nil }}
@@ -185,7 +182,7 @@ func TestResolveLLMAcceptsSetextUnderline(t *testing.T) {
 	// server accepts it; the answer check must not reject it.
 	f := LLMFile{Path: "README.md", Base: []byte("Title\n==========\nbody\n"), Ours: []byte("Title\n==========\nours\n"), Theirs: []byte("Title\n==========\ntheirs\n")}
 	want := "Title\n==========\nmerged\n"
-	res, err := ResolveLLM(context.Background(), llmFixed(want, "high"), f, LLMOptions{})
+	res, err := ResolveLLM(context.Background(), llmFixed(want), f, LLMOptions{})
 	if err != nil {
 		t.Fatalf("ResolveLLM: %v", err)
 	}
@@ -213,8 +210,8 @@ func TestResolveLLMProviderError(t *testing.T) {
 
 func TestResolveLLMInvalidOptions(t *testing.T) {
 	f := LLMFile{Path: "x", Base: []byte("a\n"), Ours: []byte("b\n"), Theirs: []byte("c\n")}
-	if _, err := ResolveLLM(context.Background(), llmFixed("x", "high"), f, LLMOptions{MinConfidence: "sure"}); err == nil {
-		t.Fatal("invalid min confidence accepted")
+	if _, err := ResolveLLM(context.Background(), llmFixed("x"), f, LLMOptions{MaxTokens: -1}); err == nil {
+		t.Fatal("negative max tokens accepted")
 	}
 	if _, err := ResolveLLM(context.Background(), nil, f, LLMOptions{}); err == nil {
 		t.Fatal("nil provider accepted")
@@ -231,7 +228,7 @@ func TestResolveLLMHunkModeReassemblesRegions(t *testing.T) {
 	theirs = strings.Replace(theirs, "line 80\n", "theirs 80\n", 1)
 
 	p := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer("merged 80\n", "high"), nil
+		return llmFakeAnswer("merged 80\n"), nil
 	}}
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
@@ -272,7 +269,7 @@ func TestResolveLLMHunkModeNoConflictSkipsModel(t *testing.T) {
 	ours := strings.Replace(base, "line 3\n", "ours 3\n", 1)
 	theirs := strings.Replace(base, "line 40\n", "theirs 40\n", 1)
 
-	p := llmFixed("unused\n", "high")
+	p := llmFixed("unused\n")
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
@@ -294,7 +291,7 @@ func TestResolveLLMHunkModeTwoConflicts(t *testing.T) {
 	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 50\n", "t50\n").Replace(base)
 
 	p := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer(fmt.Sprintf("resolved %d", i), map[int]string{0: "high", 1: "medium"}[i]), nil
+		return llmFakeAnswer(fmt.Sprintf("resolved %d", i)), nil
 	}}
 	f := LLMFile{Path: "two.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
@@ -304,9 +301,6 @@ func TestResolveLLMHunkModeTwoConflicts(t *testing.T) {
 	}
 	if len(p.reqs) != 2 || res.Hunks != 2 {
 		t.Fatalf("calls = %d, hunks = %d", len(p.reqs), res.Hunks)
-	}
-	if res.Confidence != LLMConfidenceMedium {
-		t.Fatalf("confidence = %s, want the lowest of the answers", res.Confidence)
 	}
 	want := strings.NewReplacer(
 		"line 5\n", "resolved 0\n",
@@ -325,7 +319,7 @@ func TestResolveLLMHunkModeRejectsBadRegionAnswer(t *testing.T) {
 	ours := strings.Replace(base, "line 15\n", "o\n", 1)
 	theirs := strings.Replace(base, "line 15\n", "t\n", 1)
 
-	p := llmFixed("<<<<<<< ours\n", "high")
+	p := llmFixed("<<<<<<< ours\n")
 	f := LLMFile{Path: "x", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500}); !errors.Is(err, ErrLLMRejected) {
 		t.Fatalf("err = %v", err)
@@ -337,7 +331,7 @@ func TestResolveLLMHunkModeAddsMissingNewline(t *testing.T) {
 	ours := strings.Replace(base, "line 15\n", "o\n", 1)
 	theirs := strings.Replace(base, "line 15\n", "t\n", 1)
 
-	p := llmFixed("resolved", "high")
+	p := llmFixed("resolved")
 	f := LLMFile{Path: "x", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
 	if err != nil {
@@ -365,7 +359,7 @@ func TestLLMRegionsCleanWhenSidesAgree(t *testing.T) {
 }
 
 func TestLLMEmptyFileSides(t *testing.T) {
-	p := llmFixed("", "high")
+	p := llmFixed("")
 	f := LLMFile{Path: "empty.txt", Base: []byte("x\n"), Ours: []byte{}, Theirs: []byte{}}
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {

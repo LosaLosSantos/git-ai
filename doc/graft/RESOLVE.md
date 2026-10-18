@@ -259,13 +259,18 @@ Run modes of `graft-resolve`:
 The `llm` strategy is registered by `tools/graft-agents` and uses an
 `llm.Provider` configured in `resolve.toml`. Providers are anthropic, any
 OpenAI-compatible endpoint, or any command. The strategy sends the three
-versions of a file to the model and asks for a JSON answer:
+versions of a file and the commit messages of both sides (the tip's and the
+change's, as the intent of each side, at most 4 KiB each) to the model and
+asks for a JSON answer:
 
 ```json
-{"content": "<complete file>", "confidence": "high|medium|low", "explanation": "..."}
+{"content": "<complete file>", "explanation": "..."}
 ```
 
-- Low confidence is rejected by default.
+- The model is not asked how sure it is, and nothing it says about its answer
+  decides whether the answer is used: other fields in the answer are ignored,
+  and acceptance comes from the checks alone. The former `min_confidence`
+  option is gone; a configuration that still sets it fails at startup.
 - Any answer containing conflict markers is rejected.
 - The configured checks still run afterwards.
 - For large files the strategy sends only the conflict hunks with context and
@@ -273,8 +278,8 @@ versions of a file to the model and asks for a JSON answer:
 
 The provider's API keys are withheld from the model: they are read from the
 environment or a file by the provider, never put in the prompt. Everything
-else is sent to the provider, so the three versions of a file are shared with
-it, and any secret that the file itself contains goes with them. Do not send
+else is sent to the provider, so the three versions of a file and both commit
+messages are shared with it, and any secret that they contain goes with them. Do not send
 files you would not send to that provider. The server never calls the model.
 Turn AI on only if you accept that the resolution is produced by a model.
 Every AI resolution carries the `Graft-Resolved-By` trailer, so it can be

@@ -24,10 +24,9 @@ func TestLLMAnswerRequiresSchemaFields(t *testing.T) {
 	theirs := []byte("theirs\n")
 
 	for name, text := range map[string]string{
-		"missing content":     `{"confidence":"high","explanation":"done"}`,
-		"missing confidence":  `{"content":"merged\n","explanation":"done"}`,
-		"missing explanation": `{"content":"merged\n","confidence":"high"}`,
-		"merged instead":      `{"merged":"base\nours\ntheirs\n","confidence":"high","explanation":"done"}`,
+		"missing content":     `{"explanation":"done"}`,
+		"missing explanation": `{"content":"merged\n"}`,
+		"merged instead":      `{"merged":"base\nours\ntheirs\n","explanation":"done"}`,
 		"null answer":         `null`,
 		"empty object":        `{}`,
 	} {
@@ -50,7 +49,7 @@ func TestLLMAnswerRequiresSchemaFieldsInHunkMode(t *testing.T) {
 	theirs := strings.Replace(base, "line 15\n", "theirs 15\n", 1)
 
 	// The region answer omits content: the region must not be deleted.
-	p := llmTextOnly(`{"confidence":"high","explanation":"done"}`)
+	p := llmTextOnly(`{"explanation":"done"}`)
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 	_, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
 	if !errors.Is(err, ErrLLMRejected) {
@@ -60,7 +59,7 @@ func TestLLMAnswerRequiresSchemaFieldsInHunkMode(t *testing.T) {
 
 func TestLLMAnswerEmptyContentRejectedWhenSidesNonEmpty(t *testing.T) {
 	// One reply must not truncate a file that both sides kept.
-	p := llmTextOnly(`{"content":"","confidence":"high","explanation":"both removed it"}`)
+	p := llmTextOnly(`{"content":"","explanation":"both removed it"}`)
 	f := LLMFile{Path: "a.txt", Base: []byte("x\n"), Ours: []byte("y\n"), Theirs: []byte("z\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); !errors.Is(err, ErrLLMRejected) {
 		t.Fatalf("err = %v, want ErrLLMRejected", err)
@@ -69,13 +68,13 @@ func TestLLMAnswerEmptyContentRejectedWhenSidesNonEmpty(t *testing.T) {
 
 func TestLLMAnswerEmptyContentAcceptedWhenASideIsEmpty(t *testing.T) {
 	// An empty side makes an empty answer plausible (the other side deleted it).
-	p := llmTextOnly(`{"content":"","confidence":"high","explanation":"deleted"}`)
+	p := llmTextOnly(`{"content":"","explanation":"deleted"}`)
 	f := LLMFile{Path: "a.txt", Base: []byte("x\n"), Ours: []byte{}, Theirs: []byte("z\n")}
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Content) != 0 || res.Confidence != LLMConfidenceHigh {
+	if len(res.Content) != 0 {
 		t.Fatalf("result = %+v", res)
 	}
 }
@@ -84,7 +83,7 @@ func TestLLMStrategyRejectsAnswerWithoutContent(t *testing.T) {
 	// The repro of the review: the answer is the wrong shape, so the land must
 	// not write an empty file.
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return &llm.Response{Text: `{"merged":"base\nours\ntheirs\n","confidence":"high","explanation":"done"}`}, nil
+		return &llm.Response{Text: `{"merged":"base\nours\ntheirs\n","explanation":"done"}`}, nil
 	})
 	r := wp19Build(t, wp19LLMConfig)
 
@@ -99,7 +98,7 @@ func TestLLMStrategyRejectsAnswerWithoutContent(t *testing.T) {
 
 func TestLLMMaxTokensIsSentToProvider(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("merged\n", "high"), nil
+		return wp19Answer("merged\n"), nil
 	})
 	config := strings.Replace(wp19LLMConfig, "max_tokens = 512", "max_tokens = 64000", 1)
 	r := wp19Build(t, config)
@@ -114,7 +113,7 @@ func TestLLMMaxTokensIsSentToProvider(t *testing.T) {
 
 func TestLLMMaxTokensUnsetLeavesProviderDefault(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("merged\n", "high"), nil
+		return wp19Answer("merged\n"), nil
 	})
 	config := strings.Replace(wp19LLMConfig, "max_tokens = 512\n", "", 1)
 	r := wp19Build(t, config)
@@ -131,7 +130,7 @@ func TestResolveLLMMaxTokensInHunkMode(t *testing.T) {
 	base := numbered("line", 100)
 	ours := strings.Replace(base, "line 15\n", "o\n", 1)
 	theirs := strings.Replace(base, "line 15\n", "t\n", 1)
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500, MaxTokens: 9000}); err != nil {
@@ -163,7 +162,7 @@ func TestResolveLLMHunkModeCapsRegions(t *testing.T) {
 
 	// 50 conflicting regions: above the default cap of 32, so declined before
 	// any model call.
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	_, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
 	if !errors.Is(err, ErrLLMNotApplicable) {
 		t.Fatalf("err = %v, want ErrLLMNotApplicable", err)
@@ -173,7 +172,7 @@ func TestResolveLLMHunkModeCapsRegions(t *testing.T) {
 	}
 
 	// An explicit cap that admits the file answers each region once.
-	p = llmFixed("merged\n", "high")
+	p = llmFixed("merged\n")
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500, MaxRegions: 50}); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +187,7 @@ func TestResolveLLMHunkModeBoundsRegionPrompt(t *testing.T) {
 	theirs := strings.Repeat("theirs line with some padding text too\n", 800)
 	f := LLMFile{Path: "new.txt", Ours: []byte(ours), Theirs: []byte(theirs)}
 
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	_, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1024})
 	if !errors.Is(err, ErrLLMNotApplicable) {
 		t.Fatalf("err = %v, want ErrLLMNotApplicable", err)
@@ -215,7 +214,7 @@ func llmSectionBody(t *testing.T, prompt, title string) string {
 }
 
 func TestLLMPromptSectionsAreExact(t *testing.T) {
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	f := LLMFile{Path: "a.txt", Base: []byte("a\nb"), Ours: []byte{}, Theirs: []byte("x\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
@@ -238,7 +237,7 @@ func TestLLMPromptSectionsAreExact(t *testing.T) {
 }
 
 func TestLLMPromptMarksAbsentBase(t *testing.T) {
-	p := llmFixed("merged\n", "high")
+	p := llmFixed("merged\n")
 	f := LLMFile{Path: "new.txt", Ours: []byte("(empty)"), Theirs: []byte("t\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
