@@ -166,6 +166,8 @@ func (s *Server) userSquash(ctx context.Context, req *gitalypb.UserSquashRequest
 				},
 			)
 		}
+
+		return "", structerr.NewInternal("squashing commits: %w", err)
 	}
 
 	if err := transaction.VoteOnContext(
