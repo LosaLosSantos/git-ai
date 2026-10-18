@@ -113,8 +113,9 @@ With `[graft.land] graph_ancestry = true` the listing walks the stored `graph`
 index in process instead of running `git rev-list`; both return the same
 commits. The graph checker refuses repositories with shallow commits, grafts or
 replace refs, because git walks their history differently; for those it logs a
-warning and uses `git`. The single-land path answers its ancestry questions with
-the same switch, and still rebases with the repository's `Rebase`.
+warning and uses `git`. A land that is not batched is decided, rebased and
+published the same way, by the same code (`landingAttempt`): it only differs in
+its update, which runs with the request's own identity and hooks.
 
 ### Durability of the objects of a batch
 

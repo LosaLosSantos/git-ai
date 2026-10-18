@@ -268,12 +268,16 @@ commitment.
    (seed 1, conflict rate 0.2; see [BENCH](BENCH.md#measured-phase-4b-results)).
    The runs vary a lot, the benchmark saturates the machine, and the stretch goal
    passed by only 3.7% in one of the two runs.
-2. Batches still run one at a time per lane. Each batch now spends most of its time
+2. Batches still run one at a time per lane, and each batch spends most of its time
    publishing (packing its objects and the update with its hooks and the
-   changeset log). Why the update takes much longer under load than at low load is
-   not yet known; overlapping the publish of one batch with the work of the next
-   (pipelined batches) is not implemented and is only planned if that cost turns
-   out to be inherent to a batch.
+   changeset log). Pipelined batches, which would overlap the publish of one batch
+   with the work of the next, are not built: a profile showed that the inherent part
+   of the publish (about 65-70 ms) is smaller than the member work of a batch, and
+   that its growth under load comes from two causes outside the lane, which are
+   planned next: the quarantine migration fsyncs again every file that is already
+   durable, and every reference update of a repository waits for the changeset-log
+   order of the updates before it (shared with `UserCommitFiles`). See PLAN8,
+   section 9.
 3. Each published batch adds one small pack to the repository, as a push does.
    Housekeeping repacks them like the packs of pushes, so busy branches make
    repacks more frequent.
@@ -281,13 +285,13 @@ commitment.
    written before the update. An operator who sets `core.fsync` in the `[git]`
    configuration overrides this for the helper processes too (the configuration
    of the administrator is applied last), which keeps the old per-object fsyncs.
-5. Until phase 4b's single-land work (WP86 of PLAN8) lands, an unbatched land still
-   decides with several history walks and rebases with `localrepo.Rebase`, without
-   the pack of a batch.
+5. An unbatched land decides, rebases and publishes like a batch attempt (one range
+   listing, the rebase engine, one pack), but it is still bounded by its own
+   compare-and-swap retries under contention (`max_attempts`).
 
 ## Phase 4a limitations
 
-(Item 1 is resolved by phase 4b, see above. The text describes phase 4a.)
+(Items 1 and 2 are resolved by phase 4b, see above. The text describes phase 4a.)
 
 1. Batches still run one at a time per lane. Pipelined batches (phase 4b) are not
    implemented, so a lane's throughput is bounded by its batch duration. The

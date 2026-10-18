@@ -1,7 +1,8 @@
 # Graft phase 4b: land batch latency, root causes first (binding plan)
 
-Status: proposal of the p4b workstream, waiting for the PM's approval. Nothing in
-this plan is implemented. Owner: p4b (Opus). Branch `p4b-pipelined-batches`.
+Status: approved by the PM; stage 1 implemented and accepted (window 1), stage 2
+closed by measurement (section 9); amendments in section 13a. Owner: p4b (Opus).
+Branch `p4b-pipelined-batches`.
 
 Phase 4a is in [PLAN4.md](PLAN4.md); its acceptance and the measured misses are in
 [BENCH.md](BENCH.md#measured-phase-4a-results) and
@@ -441,6 +442,29 @@ phase table shows the publish as the largest share of the lane time. Otherwise i
 is not built: it would add two batches in flight per lane for a gain the
 acceptance does not need.
 
+**G1 decision (after window 1): closed by measurement, stage 2 is not built.**
+Window 1 (two acceptance runs on `1899a0d`, see BENCH.md) passed A1, A2, A3, S and
+T in both runs. By the letter G1 opened: the stretch margin was 3.7% in run 1, and
+the publish (pack + update) was about 70% of a batch at 100 agents. The rule asks
+whether that publish is inherent per-batch work, so the update phase was profiled
+(probes, batching on, 50 and 100 agents, load 5-8 at the start):
+
+| part of the publish, per batch | 50 agents | 100 agents | nature |
+|---|---:|---:|---|
+| pack (pack-objects, 3 fsyncs) | 53 ms | 46 ms | inherent |
+| quarantine migrate (3 pack files and 2 directories, fsynced again) | 38 ms | 42 ms | redundant: the pack files are already fsynced |
+| committed hook: changeset-log ticket wait | ~40 ms | ~22 ms | contention with the transactions of `UserCommitFiles` |
+| committed hook: changeset-log append | 11 ms | 11 ms | inherent |
+| update-ref (lock, prepare, commit) | 11 ms | 11 ms | inherent |
+
+The inherent publish is about 65-70 ms against about 170 ms of member work per batch
+(14 members of 12 ms), so overlapping it would hide less than it costs in
+complexity, and the growth of the update under load (135-212 ms in window 1) is
+the redundant fsyncs and the ticket wait. Both have their cause outside the lane:
+the durability contract of `quarantine.Migrate` (it re-fsyncs every file it links,
+for every writer) and the per-repository changeset-log order. They move to the
+next workstream (p5w, PLAN9), with WP87.
+
 ## 10. Test plan
 
 Unit and package tests:
@@ -518,6 +542,35 @@ publish (durability) and every concurrency-related test, and reviews all Haiku
 output. Haiku (one at a time, never two in this worktree) drafts the `TestSpec*`
 files from an exact spec, the `bench-batch.sh` table rows and the first drafts of
 the doc sections, all checked by Opus.
+
+## 13a. Amendments after approval (binding, recorded by p4b with the PM's decisions)
+
+* **WP86 (single-land path, in p4b):** after p4b there is one land decision and one
+  replay. `landingAttempt` (`land_attempt.go`) is the attempt of every land: quarantine,
+  peel through the object info process, `ancestry.Checker.Range` +
+  `rebase.PlanLanding`, `Engine.Replay`, the merge and fast-forward-only strategies,
+  and `publish` (the pack). The batch stepper embeds it and adds the in-process
+  admission and the combined update; `landAttempt` (unbatched) uses it with the
+  request's own update and hooks. Deleted: `computeLandedTip`,
+  `rejectMergeCommitsInRange`, `hasMergeBase`, the `localrepo.Rebase` call of the
+  single path, and `IsAncestor` / `MergeBase` of `ancestry.Checker` (no caller was
+  left; their tests now check `Range`). The unbatched land observes no batch phase.
+* **WP88 (command factory, in p4b):** a git command outside the attr.tree whitelist
+  no longer starts `git rev-parse --show-object-format` first; the object format is
+  read from the configuration file of the common git directory (resolving `.git`
+  files and `commondir` like git), and a failure to read it fails the command.
+  `cmdCfg.worktreePath` is never set in this tree (dead upstream code that predates
+  gitai); the resolution is implemented and tested for it anyway.
+* **Engine.Replay** takes `committer *git.Signature` instead of rebase options (only
+  the committer applied); `localrepo/rebase_options_export.go` was deleted as dead.
+* **Peel errors:** only `catfile.NotFoundError` is `InvalidArgument` ("cannot resolve
+  commit ID"); a failure of the object info process is `Internal`.
+* **G1:** closed by measurement (section 9).
+* **Not in p4b (moved to p5w, PLAN9):** writing the pack straight into
+  `objects/pack` was rejected (it would make a rejected attempt's objects
+  addressable before the hooks accept the update); the root cause, the re-fsync in
+  `quarantine.Migrate`, the Migrate-versus-housekeeping race (WP87) and the
+  changeset-log ordering go to p5w.
 
 ## 14. Risks and open questions
 
