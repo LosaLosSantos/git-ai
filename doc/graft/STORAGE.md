@@ -27,7 +27,7 @@ design is [PLAN6.md](PLAN6.md).
        +-----------+  +--------------------------+
        | database  |  | object storage (bucket)  |
        | SQLite or |  | repos/<id>/packs/        |
-       | Postgres  |  |   <sha256>.pack          |
+       | Postgres  |  |   <sha256>-<nonce>.pack  |
        +-----------+  +--------------------------+
 ```
 
@@ -37,9 +37,21 @@ design is [PLAN6.md](PLAN6.md).
   in `graft_refs`, `HEAD` included (a symbolic reference is stored as
   `ref:<target>`).
 - **Packs.** The new objects of a changeset are uploaded **before** the
-  changeset is committed, as one content-addressed, immutable pack
-  (`repos/<repo_id>/packs/<sha256>.pack`). A changeset never references a pack
-  that is not completely uploaded.
+  changeset is committed, as one immutable pack under a key of its own,
+  `repos/<repo_id>/packs/<sha256>-<nonce>.pack`: the SHA-256 of its bytes,
+  checked on every write and read, and a random nonce drawn for that upload.
+  A pack object belongs to exactly one changeset: two writes with byte-identical
+  packs store two objects, and a write never relies on an object it did not
+  upload. Objects are created only if their key is absent, atomically: on S3,
+  GCS and Azure by a conditional request (untested here); on file buckets by
+  link(2), because gocloud's file driver does not make its own create-only write
+  atomic (it checks that the key is absent, then renames onto it, so two writers
+  of one key would both succeed). A file bucket therefore needs a filesystem
+  with hard links. A changeset never references a pack that is not completely
+  uploaded. Changesets written by v0.1.0 keep their keys
+  (`repos/<repo_id>/packs/<sha256>.pack`, shared by identical packs), which
+  stay readable; the database refuses such a key in a new changeset, so every
+  node must run the same version.
 - **Write path (the voter).** Gitaly runs the reference-transaction hook for
   every reference update. In the Preparing phase, before git locks the
   references, the voter builds the pack of the new objects and uploads it: the
@@ -502,16 +514,9 @@ show:
 - **S3, GCS and Azure are untested here.** The bucket is any gocloud URL, but
   the test suite and the benchmark use `file://` and `mem://` buckets only;
   the S3 tests run only when `GRAFT_TEST_S3_URL` points at a test bucket.
-- **File buckets need hard links.** The create-only write of gocloud's file
-  driver (v0.46.0, `IfNotExist`) is not atomic: its writer checks that the key
-  is absent and then renames its temporary file onto it, under a lock that
-  each writer creates for itself (`fileblob.go`, lines 764 and 789), so two
-  concurrent writers of one key both succeed and the second overwrites the
-  first. The storage core does not rely on it: it publishes each object of a
-  file bucket with link(2), which the filesystem makes atomic for every writer,
-  on one host or several sharing the directory over NFS. A file bucket therefore
-  needs a filesystem with hard links (every local Linux or macOS filesystem,
-  NFS); on one without them every write fails with an error that says so.
+- **File buckets need a filesystem with hard links** (every local Linux or
+  macOS filesystem, and NFS): objects are published with link(2), see Packs. On
+  a filesystem without hard links every write fails with an error that says so.
 - **Concurrent writes to one repository share one lock** in authoritative
   mode: reftable has one reference lock per repository. The voter holds it only
   for the expected values and the database commit (the pack is uploaded before
