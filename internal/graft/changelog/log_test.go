@@ -820,9 +820,12 @@ func TestAppend_syncsDirectoriesUntilAnAppendSucceeds(t *testing.T) {
 		_, err = os.Stat(Path(repoPath))
 		require.NoError(t, err)
 
+		// The failed append cut its entry off again: the entry was never durable, since the
+		// directories that hold the log were not, so no reader saw it and the next append takes
+		// its sequence.
 		entries, err := Append(repoPath, Meta{}, update)
 		require.NoError(t, err)
-		require.Equal(t, uint64(2), entries[0].Sequence, "the entry of the failed append was written")
+		require.Equal(t, uint64(1), entries[0].Sequence, "the entry of the failed append was cut off")
 		require.Equal(t, []string{graftDir, repoPath}, takeSynced(), "the directories are synced again")
 
 		_, err = Append(repoPath, Meta{}, update)
