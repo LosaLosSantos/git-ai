@@ -5,6 +5,7 @@
 //
 //	graft-resolve [--config FILE] [--max-request-bytes N] < request.json > response.json
 //	graft-resolve serve --listen ADDR [--config FILE] [--token-file FILE] [--max-request-bytes N]
+//	graft-resolve bench mine|run [flags]   (see bench.go and doc/graft/PLAN10.md)
 //
 // In command mode the request is read from stdin and the response written to
 // stdout. An unresolvable request exits 1 with the reason on stderr. In serve
@@ -44,6 +45,9 @@ func main() {
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "serve" {
 		return runServe(args[1:], stderr)
+	}
+	if len(args) > 0 && args[0] == "bench" {
+		return runBench(args[1:], stdout, stderr)
 	}
 	return runCommand(args, stdin, stdout, stderr)
 }

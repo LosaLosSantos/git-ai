@@ -279,3 +279,17 @@ func TestReportCounts(t *testing.T) {
 		t.Fatalf("markdown:\n%s", b.String())
 	}
 }
+
+// TestCommittedCorpusLoads checks the corpus file of the benchmark: permissive licenses, no
+// duplicate, a pinned commit for every repository.
+func TestCommittedCorpusLoads(t *testing.T) {
+	c, err := LoadCorpus("corpus.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range c.Repos {
+		if len(r.Commit) != 40 {
+			t.Errorf("%s: commit %q is not a full object ID", r.Name, r.Commit)
+		}
+	}
+}
