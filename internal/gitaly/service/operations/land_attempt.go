@@ -52,8 +52,6 @@ type landingAttempt struct {
 	quarantineDir *quarantine.Dir
 	repo          *localrepo.Repo
 	objectHash    git.ObjectHash
-	// info peels the commit IDs of the requests. It serves the whole attempt.
-	info catfile.ObjectInfoReader
 	// rebaser replays the rebased changes of the attempt. It serves the whole attempt.
 	rebaser batchRebaser
 	// ancestry lists the commits that a change adds to the tip, with the graph index when it is
@@ -108,15 +106,6 @@ func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Rep
 		return nil, nil, err
 	}
 
-	// The commit IDs of the requests are peeled by the object info process of the quarantine,
-	// which the attempt starts once.
-	info, releaseInfo, err := s.catfileCache.ObjectInfoReader(ctx, quarantineRepo)
-	if err != nil {
-		releaseChecker()
-		cleanup()
-		return nil, nil, structerr.NewInternal("reading object info: %w", err)
-	}
-
 	// One rebase engine serves the whole attempt, and the attempt ends with it.
 	rebaser := newBatchRebaser(quarantineRepo, mode)
 
@@ -126,13 +115,11 @@ func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Rep
 			quarantineDir: quarantineDir,
 			repo:          quarantineRepo,
 			objectHash:    objectHash,
-			info:          info,
 			rebaser:       rebaser,
 			ancestry:      checker,
 			observe:       observe,
 			mode:          mode,
 		}, func() {
-			releaseInfo()
 			releaseChecker()
 			if err := rebaser.Close(); err != nil {
 				s.logger.WithError(err).Error("graft: closing the rebaser of a landing attempt")
@@ -241,11 +228,23 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 	return landStep{commit: commitID, tip: newTip, rewritten: true, resolution: resolution}, nil
 }
 
-// peel returns the commit that commitID is or peels to, through the object info process of the
-// attempt. commitID is a full object ID, so nothing is abbreviated or ambiguous. An object that does
-// not exist or does not peel to a commit is a catfile.NotFoundError.
+// peel returns the commit that commitID is or peels to, through an object info process of the
+// quarantine. commitID is a full object ID, so nothing is abbreviated or ambiguous. An object that
+// does not exist or does not peel to a commit is a catfile.NotFoundError.
+//
+// Each peel takes the process from the catfile cache and gives it back, which checks out the same
+// process while it works. A process that fails is not handed to later peels for long: the cache
+// drops a closed process, and one that died leaves its next request outstanding, so the cache drops
+// it as dirty after that request fails. A dead process thus fails the request that met it and at
+// most the next one, not every later request of the attempt.
 func (a *landingAttempt) peel(ctx context.Context, commitID git.ObjectID) (git.ObjectID, error) {
-	info, err := a.info.Info(ctx, git.Revision(commitID.String()+"^{commit}"))
+	reader, release, err := a.server.catfileCache.ObjectInfoReader(ctx, a.repo)
+	if err != nil {
+		return "", fmt.Errorf("reading object info: %w", err)
+	}
+	defer release()
+
+	info, err := reader.Info(ctx, git.Revision(commitID.String()+"^{commit}"))
 	if err != nil {
 		return "", err
 	}
