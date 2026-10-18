@@ -34,6 +34,9 @@ import (
 //	[strategy.llm.options]         # optional, provider specific
 //	...
 //
+//	[strategy.llm.budget]          # optional: monthly spending cap (budget_strategy.go)
+//	...
+//
 // The strategy declines (the chain continues, no model call is made) for files
 // it cannot merge: a side that is absent, a symlink, a mode conflict, binary
 // content, a diff too large to split (the LCS table of the changed middle of
@@ -54,9 +57,14 @@ func init() {
 // llmStrategy is immutable after construction. Resolve may run concurrently
 // (HTTP mode), so the provider must be safe for concurrent use.
 type llmStrategy struct {
+	// provider is base, or base behind the budget.
 	provider llm.Provider
-	opt      LLMOptions
-	timeout  time.Duration
+	base     llm.Provider
+	budget   *Budget
+	// model is the configured model name.
+	model   string
+	opt     LLMOptions
+	timeout time.Duration
 }
 
 func newLLMStrategy(spec StrategySpec) (Strategy, error) {
@@ -104,7 +112,20 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
 	}
-	return &llmStrategy{provider: p, opt: opt, timeout: timeout}, nil
+	s := &llmStrategy{provider: p, base: p, model: cfg.Model, opt: opt, timeout: timeout}
+
+	budget, err := llmBudgetConfig(spec, spec.Options["llm"].(map[string]any))
+	if err != nil {
+		return nil, err
+	}
+	if budget != nil {
+		if opt.MaxTokens <= 0 {
+			return nil, fmt.Errorf("strategy %q: llm.budget needs max_tokens in [strategy.llm]: it bounds the worst case of a call", spec.Name)
+		}
+		s.budget = budget
+		s.provider = budgetProvider{p: p, b: budget}
+	}
+	return s, nil
 }
 
 // Resolve implements Strategy.
@@ -166,7 +187,7 @@ func llmProviderConfig(spec StrategySpec) (llm.Config, error) {
 	var unknown []string
 	for k := range tbl {
 		switch k {
-		case "type", "model", "base_url", "api_key_env", "command", "timeout", "max_tokens", "effort", "options":
+		case "type", "model", "base_url", "api_key_env", "command", "timeout", "max_tokens", "effort", "options", "budget":
 		default:
 			unknown = append(unknown, k)
 		}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Counts aggregates the outcomes of a set of cases.
@@ -68,9 +69,13 @@ type Report struct {
 	Families map[string]Counts `json:"families"`
 	// NotSent counts the cases that were not sent, by reason.
 	NotSent map[string]int `json:"not_sent"`
-	// Spend is the AI spend of the run in USD, when a budget was used.
-	SpendUSD float64  `json:"spend_usd,omitempty"`
-	Results  []Result `json:"results"`
+	// SpendUSD is the AI spend of the run in USD, when a budget was used: the usage the provider
+	// reported, and the worst case of the calls whose usage was not reported. MaxUSD is the cap.
+	SpendUSD float64 `json:"spend_usd,omitempty"`
+	MaxUSD   float64 `json:"max_usd,omitempty"`
+	// Pricing is the price the spend was computed with, as read at run time.
+	Pricing *Pricing `json:"pricing,omitempty"`
+	Results []Result `json:"results"`
 }
 
 // NewReport aggregates results.
@@ -92,11 +97,19 @@ func NewReport(label string, results []Result) Report {
 func (rep Report) WriteMarkdown(w io.Writer) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## graft-resolve bench: %s\n\n", rep.Label)
-	fmt.Fprintf(&b, "Cases run: %d", rep.Total.Cases)
-	if rep.SpendUSD > 0 {
-		fmt.Fprintf(&b, ", AI spend $%.2f", rep.SpendUSD)
+	fmt.Fprintf(&b, "Cases sampled: %d; run: %d", rep.Total.Cases, rep.Total.Cases-rep.Total.NotRun)
+	if rep.Total.NotRun > 0 {
+		fmt.Fprintf(&b, " (%d not run: the cap was reached)", rep.Total.NotRun)
+	}
+	if rep.MaxUSD > 0 {
+		fmt.Fprintf(&b, "; AI spend $%.4f of the $%.2f cap", rep.SpendUSD, rep.MaxUSD)
 	}
 	b.WriteString(".\n\n")
+	if p := rep.Pricing; p != nil {
+		fmt.Fprintf(&b, "Model %s, priced at run time (%s, %s, highest of %d endpoints): $%g per million input tokens, $%g per million output tokens (completion $%g + internal reasoning $%g), $%g per request.\n\n",
+			p.Model, p.Source, p.FetchedAt.Format(time.RFC3339), p.Endpoints,
+			p.Prompt*1e6, (p.Completion+p.Reasoning)*1e6, p.Completion*1e6, p.Reasoning*1e6, p.Request)
+	}
 	b.WriteString("| family | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | abstained | error rate |\n")
 	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	families := make([]string, 0, len(rep.Families))

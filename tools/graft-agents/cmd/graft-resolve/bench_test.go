@@ -26,9 +26,10 @@ func gitIn(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// TestBenchMineAndRun mines a repository with one hand-resolved conflict through a file:// clone
-// and runs the default chain (trivial only) on it, which abstains.
-func TestBenchMineAndRun(t *testing.T) {
+// mineFixture mines a repository with one hand-resolved conflict (a.py, resolved "x = 2 + 3")
+// through a file:// clone and returns the work directory, the corpus, the clones and the manifest.
+func mineFixture(t *testing.T) (work, corpus, clones, manifest string) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
@@ -53,13 +54,13 @@ func TestBenchMineAndRun(t *testing.T) {
 	gitIn(t, src, "commit", "-q", "-m", "merge feature")
 	head := gitIn(t, src, "rev-parse", "HEAD")
 
-	work := t.TempDir()
-	corpus := filepath.Join(work, "corpus.json")
+	work = t.TempDir()
+	corpus = filepath.Join(work, "corpus.json")
 	data, _ := json.Marshal(bench.Corpus{Repos: []bench.Repo{{Name: "local/fixture", URL: "file://" + src, Commit: head, License: "MIT"}}})
 	if err := os.WriteFile(corpus, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	clones, manifest := filepath.Join(work, "clones"), filepath.Join(work, "manifest.json")
+	clones, manifest = filepath.Join(work, "clones"), filepath.Join(work, "manifest.json")
 
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"bench", "mine", "--corpus", corpus, "--clones", clones, "--manifest", manifest}, nil, &stdout, &stderr); code != 0 {
@@ -68,6 +69,14 @@ func TestBenchMineAndRun(t *testing.T) {
 	if !strings.Contains(stdout.String(), "1 cases in") {
 		t.Fatalf("mine output: %s", stdout.String())
 	}
+	return work, corpus, clones, manifest
+}
+
+// TestBenchMineAndRun mines the fixture, resumes the mining from its part, and runs the default
+// chain (trivial only) on it, which abstains.
+func TestBenchMineAndRun(t *testing.T) {
+	work, corpus, clones, manifest := mineFixture(t)
+	var stdout, stderr bytes.Buffer
 
 	// A second run takes the repository from its part, without the clone.
 	moved := filepath.Join(work, "moved")

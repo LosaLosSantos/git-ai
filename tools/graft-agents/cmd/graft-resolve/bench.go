@@ -7,12 +7,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/bench"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
@@ -20,6 +23,8 @@ import (
 // runBench runs the benchmark subcommands:
 //
 //	graft-resolve bench mine --corpus FILE --clones DIR --manifest OUT [--max-cases-per-repo N]
+//	graft-resolve bench run ... --max-usd USD [--pricing openrouter|fixed]
+//	                        [--input-usd-per-million P --output-usd-per-million P]
 //	graft-resolve bench run --config FILE --manifest FILE --clones DIR [--sample N] [--seed S]
 //	                        [--label L] [--json-out FILE] [--md-out FILE]
 func runBench(args []string, stdout, stderr io.Writer) int {
@@ -120,6 +125,11 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	label := fs.String("label", "", "name of the run in the report")
 	jsonOut := fs.String("json-out", "", "report as JSON")
 	mdOut := fs.String("md-out", "", "report as Markdown")
+	maxUSD := fs.Float64("max-usd", 0, "hard cap on the AI spend of the run in USD (required when the chain has an llm strategy)")
+	pricingSource := fs.String("pricing", "openrouter", "where the model's price comes from: openrouter (read at run time) or fixed (the two price flags)")
+	inputPrice := fs.Float64("input-usd-per-million", 0, "input price, with --pricing fixed")
+	outputPrice := fs.Float64("output-usd-per-million", 0, "output price, reasoning included, with --pricing fixed")
+	openRouterAPI := fs.String("openrouter-api", bench.DefaultOpenRouterAPI, "OpenRouter API base, for --pricing openrouter")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -143,6 +153,54 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 
+	// A chain with a model runs under a hard cap: every call reserves its worst case first
+	// (resolve.Budget), and the calls that would pass the cap are not made.
+	var budget *resolve.Budget
+	var pricing *bench.Pricing
+	if models := res.LLMModels(); len(models) > 0 {
+		if *maxUSD <= 0 {
+			fmt.Fprintln(stderr, "graft-resolve bench run: the chain calls a model, so --max-usd is required")
+			return 2
+		}
+		var prices resolve.Prices
+		switch *pricingSource {
+		case "openrouter":
+			distinct := map[string]bool{}
+			for _, m := range models {
+				distinct[m] = true
+			}
+			if len(distinct) != 1 {
+				fmt.Fprintf(stderr, "graft-resolve bench run: --pricing openrouter prices one model, the chain has %v\n", models)
+				return 2
+			}
+			var model string
+			for m := range distinct {
+				model = m
+			}
+			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model)
+			if err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+				return 1
+			}
+			pricing, prices = &p, p.Prices()
+		case "fixed":
+			prices = resolve.Prices{InputPerMillion: *inputPrice, OutputPerMillion: *outputPrice}
+		default:
+			fmt.Fprintf(stderr, "graft-resolve bench run: unknown --pricing %q, want openrouter or fixed\n", *pricingSource)
+			return 2
+		}
+		if budget, err = resolve.NewBudget(*maxUSD, prices, ""); err != nil {
+			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+			return 1
+		}
+		if _, err := res.UseBudget(budget); err != nil {
+			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stderr, "cap $%.2f; $%g per million input tokens, $%g per million output tokens, $%g per request\n",
+			*maxUSD, prices.InputPerMillion, prices.OutputPerMillion, prices.PerRequest)
+	}
+
 	cases := bench.Sample(manifest.Cases, *sample, *seed)
 	runner := bench.Runner{
 		Resolver: res,
@@ -153,6 +211,14 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	results, runErr := runner.Run(ctx, cases)
 	report := bench.NewReport(*label, results)
+	if budget != nil {
+		snap, err := budget.Snapshot()
+		if err != nil {
+			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+			return 1
+		}
+		report.SpendUSD, report.MaxUSD, report.Pricing = snap.SpentUSD, *maxUSD, pricing
+	}
 
 	if *jsonOut != "" {
 		data, err := json.MarshalIndent(report, "", "  ")

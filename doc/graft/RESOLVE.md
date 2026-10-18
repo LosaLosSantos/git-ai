@@ -303,6 +303,55 @@ Turn AI on only if you accept that the resolution is produced by a model.
 Every AI resolution carries the `Graft-Resolved-By` trailer, so it can be
 audited with `graft log` and reverted with `graft-verify` if it breaks tests.
 
+### Monthly AI spending cap
+
+An `llm` strategy can carry a monthly cap:
+
+```toml
+[strategy.llm]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6.1-sol"
+max_tokens = 8000                  # required with a budget: it bounds a call's output
+
+[strategy.llm.budget]
+monthly_usd = 50                   # the cap; 0 or absent: none, the spend is still tracked
+input_usd_per_million = 2.0        # the model's prices; keep them current
+output_usd_per_million = 10.0      # output tokens, reasoning included
+request_usd = 0                    # optional: a fixed price per call
+state = "/var/lib/graft/resolve-budget.json"
+```
+
+Before each model call graft-resolve books the call's worst case: its input
+counted as one token per byte of the prompt (an upper bound), plus a margin,
+and `max_tokens` of output. If that would take the month's spend past the
+cap, the call is not made. The file then fails with the reason "AI budget
+exhausted", which the server puts in the conflict package for the agent.
+After the call the worst case is replaced by the cost of the usage the
+provider reports. A provider that reports no usage, or a call that fails, is
+left at its worst case. So the recorded spend is never below the real one.
+A new calendar month (UTC) starts at zero.
+
+The spend is kept in the `state` file (`{"month": "2026-10", "spent_usd":
+...}`). Every update takes an exclusive `flock` on `<state>.lock` and
+rewrites the file atomically (temporary file, fsync, rename), so the spend
+survives restarts and is shared by every graft-resolve process that uses the
+same file. The state file needs a platform with `flock` (Linux, macOS, the
+BSDs). The prices are configuration values: graft-resolve does not look them
+up, and they should be set from the provider's price page.
+
+The spend is reported in three places:
+
+- In HTTP mode, `GET /metrics` (with the same bearer token) serves
+  `graft_resolve_ai_spend_usd` (gauge, the month's spend),
+  `graft_resolve_ai_budget_usd` (gauge, the cap) and
+  `graft_resolve_ai_budget_exhausted_total` (counter, the calls not made),
+  labelled by strategy.
+- In command mode, the spend is in the state file.
+- In both modes, the answer's `explanation` gives the spend of each strategy
+  that answered.
+
 ## Bounds and failure modes
 
 | Limit | Default | Where |

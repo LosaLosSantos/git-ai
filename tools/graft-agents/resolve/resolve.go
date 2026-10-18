@@ -299,6 +299,15 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 	if len(notes) > 0 {
 		resp.Explanation = "resolved " + strings.Join(notes, ", ")
 	}
+	// The month's AI spend of the strategies that answered, so that command mode reports it too.
+	budgets := r.Budgets()
+	for _, name := range used {
+		if b := budgets[name]; b != nil {
+			if snap, err := b.Snapshot(); err == nil {
+				resp.Explanation += "; " + name + ": " + snap.String()
+			}
+		}
+	}
 	return resp, nil
 }
 
