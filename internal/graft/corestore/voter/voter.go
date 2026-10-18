@@ -674,7 +674,7 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 		return uploadedPack{}, nil
 	}
 
-	key := corestore.PackKey(repoID, pack.SHA256)
+	key := corestore.NewPackKey(repoID, pack.SHA256)
 	if err := v.uploadPack(ctx, key, pack); err != nil {
 		return uploadedPack{}, err
 	}

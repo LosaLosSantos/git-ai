@@ -45,7 +45,7 @@ func openStore(t *testing.T, bucketURL string) *blobstore.Store {
 }
 
 func packKeyOf(content []byte) string {
-	return corestore.PackKey(1, sha256.Sum256(content))
+	return corestore.NewPackKey(1, sha256.Sum256(content))
 }
 
 // failingReader fails the test when it is read.
@@ -191,7 +191,7 @@ func TestGetMissingKey(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, exists)
 
-			_, err = s.Get(ctx, corestore.PackKey(7, sha256.Sum256([]byte("absent"))))
+			_, err = s.Get(ctx, corestore.NewPackKey(7, sha256.Sum256([]byte("absent"))))
 			require.ErrorIs(t, err, corestore.ErrBlobNotFound)
 		})
 	}

@@ -182,7 +182,7 @@ func (h *harness) commitElsewhere(repoID int64, ref string) git.ObjectID {
 	pack, err := gitops.BuildPack(h.ctx, localrepo.NewTestRepo(h.t, h.cfg, otherProto), []git.ObjectID{oid}, h.t.TempDir())
 	require.NoError(h.t, err)
 	require.False(h.t, pack.Empty())
-	key := corestore.PackKey(repoID, pack.SHA256)
+	key := corestore.NewPackKey(repoID, pack.SHA256)
 	f, err := pack.Open()
 	require.NoError(h.t, err)
 	require.NoError(h.t, h.core.Blobs.Put(h.ctx, key, f))

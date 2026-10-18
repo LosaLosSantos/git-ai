@@ -103,7 +103,7 @@ func testSyncerIncompleteImport(t *testing.T, dialect sqlstore.Dialect, backend 
 	pack, err := gitops.BuildFullPack(e.ctx, local, t.TempDir())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, pack.Remove()) }()
-	packKey := corestore.PackKey(registered.ID, pack.SHA256)
+	packKey := corestore.NewPackKey(registered.ID, pack.SHA256)
 	rc, err := pack.Open()
 	require.NoError(t, err)
 	require.NoError(t, e.core.Blobs.Put(e.ctx, packKey, rc))

@@ -39,7 +39,7 @@ func TestVerifyRepositoryReportsObjectsMissingFromStorage(t *testing.T) {
 		pack, err := gitops.BuildPack(h.ctx, localrepo.NewTestRepo(t, h.cfg, h.repo), []git.ObjectID{c}, t.TempDir())
 		require.NoError(t, err)
 		require.False(t, pack.Empty())
-		key := corestore.PackKey(repoID, pack.SHA256)
+		key := corestore.NewPackKey(repoID, pack.SHA256)
 		f, err := pack.Open()
 		require.NoError(t, err)
 		require.NoError(t, h.core.Blobs.Put(h.ctx, key, f))

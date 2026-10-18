@@ -112,7 +112,7 @@ func TestGateHistoryGuardWithRealSyncerOnFilesBackendCopy(t *testing.T) {
 	pack, err := gitops.BuildFullPack(ctx, local, t.TempDir())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, pack.Remove()) }()
-	packKey := corestore.PackKey(rec.ID, pack.SHA256)
+	packKey := corestore.NewPackKey(rec.ID, pack.SHA256)
 	rc, err := pack.Open()
 	require.NoError(t, err)
 	require.NoError(t, core.Blobs.Put(ctx, packKey, rc))

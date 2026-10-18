@@ -30,7 +30,7 @@ func openFileStoreForTest(t *testing.T, dir string, hook func(path string, isDir
 func TestPutSyncsFileBeforeCommitAndSyncsDirectories(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("pack content, synced before the commit")
-	key := corestore.PackKey(1, sha256.Sum256(content))
+	key := corestore.NewPackKey(1, sha256.Sum256(content))
 	final := filepath.Join(dir, filepath.FromSlash(key))
 
 	var fileSyncs int
@@ -73,7 +73,7 @@ func TestPutSyncsFileBeforeCommitAndSyncsDirectories(t *testing.T) {
 func TestPutFailedFileSyncLeavesNoObject(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("pack content whose sync fails")
-	key := corestore.PackKey(1, sha256.Sum256(content))
+	key := corestore.NewPackKey(1, sha256.Sum256(content))
 	final := filepath.Join(dir, filepath.FromSlash(key))
 
 	syncErr := errors.New("disk on fire")
@@ -110,7 +110,7 @@ func TestPutWithoutFileSyncHookSucceeds(t *testing.T) {
 	ctx := testhelper.Context(t)
 
 	content := []byte("durable content")
-	key := corestore.PackKey(2, sha256.Sum256(content))
+	key := corestore.NewPackKey(2, sha256.Sum256(content))
 	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
 	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
 
@@ -129,7 +129,7 @@ func TestPutMemBucketWithoutFileSync(t *testing.T) {
 	t.Cleanup(func() { syncHook = nil })
 
 	content := []byte("mem content")
-	key := corestore.PackKey(3, sha256.Sum256(content))
+	key := corestore.NewPackKey(3, sha256.Sum256(content))
 	require.NoError(t, s.Put(testhelper.Context(t), key, bytes.NewReader(content)))
 }
 

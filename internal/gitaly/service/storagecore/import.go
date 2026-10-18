@@ -149,7 +149,7 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	var packKey string
 	var packBytes int64
 	if !pack.Empty() {
-		packKey = corestore.PackKey(reg.repo.ID, pack.SHA256)
+		packKey = corestore.NewPackKey(reg.repo.ID, pack.SHA256)
 		if err := uploadPack(ctx, core, packKey, pack); err != nil {
 			return nil, structerr.NewUnavailable("storage core: upload pack: %w; %s", err, resumeHint)
 		}

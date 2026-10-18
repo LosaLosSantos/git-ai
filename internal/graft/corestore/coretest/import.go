@@ -50,7 +50,7 @@ func Import(tb testing.TB, core *corestore.Core, repo *localrepo.Repo, repoProto
 
 	var packKey string
 	if !pack.Empty() {
-		packKey = corestore.PackKey(registered.ID, pack.SHA256)
+		packKey = corestore.NewPackKey(registered.ID, pack.SHA256)
 		f, err := pack.Open()
 		require.NoError(tb, err)
 		require.NoError(tb, core.Blobs.Put(ctx, packKey, f))

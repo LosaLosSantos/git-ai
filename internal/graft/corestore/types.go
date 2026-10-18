@@ -16,6 +16,7 @@
 package corestore
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -186,41 +187,85 @@ var (
 	ErrBlobCorrupt = errors.New("storage core: blob content does not match its key")
 )
 
-// PackKey returns the bucket key of a pack of the repository with the given
-// SHA-256 of its bytes: "repos/<repo_id>/packs/<hex sha256>.pack".
-func PackKey(repoID int64, sha256 [32]byte) string {
-	return fmt.Sprintf("repos/%d/packs/%x.pack", repoID, sha256)
+// packNonceSize is the number of random bytes that make a pack key unique.
+const packNonceSize = 16
+
+// NewPackKey returns a new owned bucket key for a pack of the repository whose
+// bytes have the given SHA-256: "repos/<repo_id>/packs/<hex sha256>-<hex
+// nonce>.pack", with a random nonce drawn for this one upload. Every upload uses a
+// new key, so a pack object is never shared between two rows and a write never
+// relies on an object it did not write (doc/graft/PLAN7.md, PACK OWNERSHIP RULE).
+func NewPackKey(repoID int64, sum [32]byte) string {
+	var nonce [packNonceSize]byte
+	// crypto/rand.Read never fails: it aborts the program instead.
+	_, _ = rand.Read(nonce[:])
+	return ownedPackKey(repoID, sum, nonce)
 }
 
-// ParsePackKey returns the repository ID and the SHA-256 encoded in a key
-// made by PackKey, and false when key is not exactly such a key.
+func ownedPackKey(repoID int64, sum [32]byte, nonce [packNonceSize]byte) string {
+	return fmt.Sprintf("repos/%d/packs/%x-%x.pack", repoID, sum, nonce)
+}
+
+func legacyPackKey(repoID int64, sum [32]byte) string {
+	return fmt.Sprintf("repos/%d/packs/%x.pack", repoID, sum)
+}
+
+// ParsePackKey returns the repository ID and the SHA-256 encoded in an owned
+// pack key (NewPackKey) or in a legacy one, "repos/<repo_id>/packs/<hex
+// sha256>.pack", written by v0.1.0 and still referenced by its changesets. It
+// returns false for anything else, including non-canonical spellings (uppercase
+// hex, leading zeros).
 func ParsePackKey(key string) (repoID int64, sum [32]byte, ok bool) {
+	repoID, sum, _, ok = parsePackKey(key)
+	return repoID, sum, ok
+}
+
+// IsOwnedPackKey reports whether key is an owned pack key, the only kind a
+// writer may produce.
+func IsOwnedPackKey(key string) bool {
+	_, _, owned, ok := parsePackKey(key)
+	return ok && owned
+}
+
+func parsePackKey(key string) (repoID int64, sum [32]byte, owned, ok bool) {
 	rest, found := strings.CutPrefix(key, "repos/")
 	if !found {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
 	idPart, rest, found := strings.Cut(rest, "/packs/")
 	if !found {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
-	hexSum, found := strings.CutSuffix(rest, ".pack")
-	if !found || len(hexSum) != 64 {
-		return 0, sum, false
+	name, found := strings.CutSuffix(rest, ".pack")
+	if !found {
+		return 0, sum, false, false
 	}
+	hexSum, hexNonce, owned := strings.Cut(name, "-")
+	if len(hexSum) != 2*len(sum) || (owned && len(hexNonce) != 2*packNonceSize) {
+		return 0, sum, false, false
+	}
+
 	id, err := strconv.ParseInt(idPart, 10, 64)
 	if err != nil || id <= 0 {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
-	decoded, err := hex.DecodeString(hexSum)
-	if err != nil {
-		return 0, sum, false
+	if _, err := hex.Decode(sum[:], []byte(hexSum)); err != nil {
+		return 0, [32]byte{}, false, false
 	}
-	copy(sum[:], decoded)
+
 	// Only the canonical spelling is a pack key (lowercase hex, no leading zeros).
-	if PackKey(id, sum) != key {
-		return 0, [32]byte{}, false
+	canonical := legacyPackKey(id, sum)
+	if owned {
+		var nonce [packNonceSize]byte
+		if _, err := hex.Decode(nonce[:], []byte(hexNonce)); err != nil {
+			return 0, [32]byte{}, false, false
+		}
+		canonical = ownedPackKey(id, sum, nonce)
 	}
-	return id, sum, true
+	if canonical != key {
+		return 0, [32]byte{}, false, false
+	}
+	return id, sum, owned, true
 }
 
 // IsChangelogRef reports whether updates of the reference are recorded in the

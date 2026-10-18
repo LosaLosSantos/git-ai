@@ -148,7 +148,7 @@ func TestAuthoritativeServer(t *testing.T) {
 
 			packFile, err := pack.Open()
 			require.NoError(t, err)
-			key := corestore.PackKey(repoID, pack.SHA256)
+			key := corestore.NewPackKey(repoID, pack.SHA256)
 			require.NoError(t, core.Blobs.Put(ctx, key, packFile))
 			require.NoError(t, packFile.Close())
 
