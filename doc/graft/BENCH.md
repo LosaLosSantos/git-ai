@@ -454,6 +454,46 @@ Reading it:
   off p99 at 50 agents rose is not explained; its p99 covers only the 97 changes
   that landed, out of 250.
 
+##### Final tree (window 3)
+
+After window 1 the unbatched land was moved onto the same landing attempt as a
+batch (PLAN8 WP86). A second window (tree `59d8fda`) passed every criterion but
+showed a regression of the "off" column at 100 agents (p99 33.9 and 34.8 s, 60
+lands/min): every unbatched attempt published its objects as a pack, and under
+the contention of 100 agents about 98% of the ~6600 attempts lose the
+compare-and-swap and each left a pack in the repository (120 packs at the end of
+the run against 4 in window 1, `pack-objects` 1484 s and `update-ref` 840 s of
+real time against 1 s and 56 s). Unbatched lands now publish their few objects
+loose (PLAN8 section 13a). The runs of record of the final tree, commit
+`9bf4742`, are window 3 (same workload and defaults as above; load average 10.7
+at the start, 53 and 57 at the end of the runs):
+
+| criterion | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| attempts/landed (on), run 1 / run 2 | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 / 1.00 |
+| failed = planned conflicts (on) | 22 / 22 | 50 / 50 | 108 / 108 |
+| p99 on vs off (ms), run 1 | 819 vs 4707 | 1880 vs 8267 | 4640 vs 14641 |
+| p99 on vs off (ms), run 2 | 748 vs 4813 | 9171 vs 17868 | 5390 vs 26692 |
+| stretch: p99 on-100 <= 0.5 x off-100 | | | 4640 <= 7321 (run 1), 5390 <= 13346 (run 2) |
+
+| metric, run 1 / run 2 | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| lands/min, batching on | 1366 / 1476 | 1690 / 620 | 1459 / 1678 |
+| lands/min, batching off | 332 / 336 | 230 / 151 | 158 / 114 |
+| p50 landed on (ms) | 599 / 639 | 1326 / 1794 | 2927 / 2537 |
+| member (land_member, mean) | 10.8 / 11.1 ms | 14.9 / 21.1 ms | 14.2 / 13.1 ms |
+| pack per batch (mean) | 39 / 34 ms | 51 / 210 ms | 62 / 50 ms |
+| update per batch (mean) | 65 / 52 ms | 89 / 155 ms | 114 / 107 ms |
+
+All criteria pass in both runs, the stretch goal included (by 37% and 60%). The 50
+agents of run 2 are an outlier on both sides (pack 210 ms and update 155 ms per
+batch, p99 on 9171 ms, lands/min 620): the load average was above 40 during that
+part of the run. The off column at 100 agents recovered from window 2 (p99 14641 and
+26692 ms, 158 and 114 lands/min; window 1: 10077 and 11905 ms, about 170 lands/min)
+and its repository ended with 3 packs and 232 loose objects, but it still varies a
+lot between runs and was slower than in window 1 in run 2, for a reason not
+established.
+
 ## Reading the numbers
 
 - Compare `land` and `land-resolve` at the same `--conflict-rate`. The first

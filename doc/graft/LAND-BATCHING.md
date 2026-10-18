@@ -402,20 +402,22 @@ the running tip, so it cannot delay or block the other requests of its batch.
 
 ### Phase 4b
 
-Two runs of `examples/graft/demo/acceptance-phase4.sh` on the phase 4b tree (one
-benchmark window; full tables, phases and the machine in
+The runs of `examples/graft/demo/acceptance-phase4.sh` on the phase 4b trees
+(three benchmark windows; full tables, phases and the machine in
 [BENCH.md](BENCH.md#measured-phase-4b-results)) **meet the phase 4a acceptance**,
 the stretch goal included: one attempt per landed change, only planned conflicts
-fail, and p99 with batching on is below off at every size.
+fail, and p99 with batching on is below off at every size. The final tree
+(`9bf4742`, window 3):
 
 | p99 landed (ms), run 1 / run 2 | 20 agents | 50 agents | 100 agents |
 |---|---|---|---|
-| batching on | 1347 / 1193 | 2525 / 4839 | 4854 / 2897 |
-| batching off | 7437 / 6741 | 12030 / 12746 | 10077 / 11905 |
-| lands/min, batching on | 1020 / 1070 | 1230 / 944 | 1616 / 2325 |
+| batching on | 819 / 748 | 1880 / 9171 | 4640 / 5390 |
+| batching off | 4707 / 4813 | 8267 / 17868 | 14641 / 26692 |
+| lands/min, batching on | 1366 / 1476 | 1690 / 620 | 1459 / 1678 |
 
-The stretch goal (p99 on at 100 agents at most half of off) passed by 3.7% in run 1
-and by 51% in run 2; the runs vary a lot, and the benchmark saturates the machine.
+The stretch goal (p99 on at 100 agents at most half of off) passed by 37% and 60%
+(in window 1 by 3.7% and 51%). The runs vary a lot, and the benchmark saturates the
+machine; the 50 agents of window 3, run 2, are an outlier on both sides.
 A batched request now costs about 8 ms (one range listing and a replay without
 fsync per object, see *How a request is decided and rebased*), and most of a batch
 is its publish: the pack of its objects and the update.
