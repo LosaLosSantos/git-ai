@@ -34,6 +34,11 @@ func TestGraftStorageValidate(t *testing.T) {
 		{desc: "node id with slash", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, NodeID: "a/b"}, err: "node_id"},
 		{desc: "bad sync timeout", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, SyncTimeout: "0s"}, err: "sync_timeout"},
 		{desc: "bad shadow timeout", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, ShadowTimeout: "soon"}, err: "shadow_timeout"},
+		{desc: "gc times", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "30m", GCMargin: "1m"}},
+		{desc: "bad gc_grace", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "-1h"}, err: "gc_grace"},
+		{desc: "bad gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCMargin: "0"}, err: "gc_margin"},
+		{desc: "gc_grace not above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "6m", GCMargin: "5m", SyncTimeout: "1m"}, err: "gc_grace 6m0s must be greater than sync_timeout 1m0s + gc_margin 5m0s"},
+		{desc: "gc_grace just above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "361s", GCMargin: "5m", SyncTimeout: "1m"}},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
@@ -61,6 +66,15 @@ func TestGraftStorageDefaults(t *testing.T) {
 	shadow, err := s.ShadowTimeoutOrDefault()
 	require.NoError(t, err)
 	require.Equal(t, DefaultGraftStorageShadowTimeout, shadow)
+
+	grace, err := s.GCGraceOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, DefaultGraftStorageGCGrace, grace)
+
+	margin, err := s.GCMarginOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, DefaultGraftStorageGCMargin, margin)
+	require.NoError(t, s.validateGC(), "the defaults are consistent")
 
 	s = GraftStorage{Mode: "shadow", SyncTimeout: "250ms"}
 	require.True(t, s.Enabled())

@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
@@ -146,14 +147,28 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 		}
 	}()
 
-	var packKey string
-	var packBytes int64
+	// The write deadline of the pack starts at a read of the record taken right
+	// before the upload, so that the build above, however long, does not consume
+	// it (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	var upload corestore.PackUpload
 	if !pack.Empty() {
-		packKey = corestore.NewPackKey(reg.repo.ID, pack.SHA256)
-		if err := uploadPack(ctx, core, packKey, pack); err != nil {
+		readAt := time.Now()
+		if _, err := core.Meta.GetRepository(ctx, key); err != nil {
+			if errors.Is(err, corestore.ErrRepositoryNotFound) {
+				return nil, errRegistrationRemoved()
+			}
+			return nil, structerr.NewUnavailable("storage core: %w; %s", err, resumeHint)
+		}
+
+		f, err := pack.Open()
+		if err != nil {
+			return nil, structerr.NewInternal("open pack: %w; %s", err, resumeHint)
+		}
+		upload, err = core.UploadPack(ctx, reg.repo.ID, readAt, pack.SHA256, pack.Size, f)
+		_ = f.Close()
+		if err != nil {
 			return nil, structerr.NewUnavailable("storage core: upload pack: %w; %s", err, resumeHint)
 		}
-		packBytes = pack.Size
 	}
 
 	// Step 3.
@@ -166,14 +181,20 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 			New:    refs[name],
 		})
 	}
-	res, err := core.Meta.CommitChangeset(ctx, corestore.ChangesetInput{
+	commitCtx, cancel, err := upload.CommitContext(ctx)
+	if err != nil {
+		return nil, structerr.NewUnavailable("%w; %s", err, resumeHint)
+	}
+	defer cancel()
+
+	res, err := core.Meta.CommitChangeset(commitCtx, corestore.ChangesetInput{
 		RepoID:    reg.repo.ID,
 		Updates:   updates,
 		Operation: importOperation,
 		Actor:     identity.Actor(ctx, importOperation),
 		NodeID:    core.NodeID,
-		PackKey:   packKey,
-		PackBytes: packBytes,
+		PackKey:   upload.Key,
+		PackBytes: upload.Bytes,
 	})
 	if err != nil {
 		var conflict *corestore.ErrRefConflict
@@ -184,9 +205,7 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 			// can have recorded references.
 			return nil, errAlreadyImported()
 		case errors.Is(err, corestore.ErrRepositoryNotFound):
-			// Not Aborted: Gitaly replaces the message of that code with a generic
-			// one, and this one tells the operator what to do.
-			return nil, structerr.NewFailedPrecondition("storage core: the registration of the import was removed concurrently; run ImportRepository again")
+			return nil, errRegistrationRemoved()
 		default:
 			return nil, structerr.NewUnavailable("storage core: commit import changeset: %w; %s", err, resumeHint)
 		}
@@ -214,7 +233,7 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	return &gitalypb.ImportRepositoryResponse{
 		Sequence:         res.Seq,
 		References:       uint32(len(refs)),
-		PackBytes:        packBytes,
+		PackBytes:        upload.Bytes,
 		ChangelogEntries: uint32(reg.changelogEntries),
 		Reviews:          uint32(reg.reviews),
 	}, nil
@@ -385,14 +404,11 @@ func acquireImport(core *corestore.Core, key corestore.RepoKey) (release func(),
 	}, true
 }
 
-// uploadPack stores the pack under key.
-func uploadPack(ctx context.Context, core *corestore.Core, key string, pack gitops.Pack) error {
-	f, err := pack.Open()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	return core.Blobs.Put(ctx, key, f)
+// errRegistrationRemoved is the error of an import whose registration was
+// removed while it ran. Not Aborted: Gitaly replaces the message of that code
+// with a generic one, and this one tells the operator what to do.
+func errRegistrationRemoved() error {
+	return structerr.NewFailedPrecondition("storage core: the registration of the import was removed concurrently; run ImportRepository again")
 }
 
 // scanChangelog returns every entry of the file changelog of the repository,

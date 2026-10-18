@@ -2,6 +2,7 @@ package coretest
 
 import (
 	"testing"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
@@ -48,12 +49,18 @@ func Import(tb testing.TB, core *corestore.Core, repo *localrepo.Repo, repoProto
 	require.NoError(tb, err)
 	defer func() { _ = pack.Remove() }()
 
-	var packKey string
+	// As ImportRepository: the write deadline starts at a read of the record
+	// right before the upload (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	var upload corestore.PackUpload
 	if !pack.Empty() {
-		packKey = corestore.NewPackKey(registered.ID, pack.SHA256)
+		readAt := time.Now()
+		_, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repoProto))
+		require.NoError(tb, err)
+
 		f, err := pack.Open()
 		require.NoError(tb, err)
-		require.NoError(tb, core.Blobs.Put(ctx, packKey, f))
+		upload, err = core.UploadPack(ctx, registered.ID, readAt, pack.SHA256, pack.Size, f)
+		require.NoError(tb, err)
 		require.NoError(tb, f.Close())
 	}
 
@@ -62,14 +69,18 @@ func Import(tb testing.TB, core *corestore.Core, repo *localrepo.Repo, repoProto
 		updates = append(updates, corestore.RefUpdate{Name: name, Expect: corestore.ExpectValue, New: target})
 	}
 
-	res, err := core.Meta.CommitChangeset(ctx, corestore.ChangesetInput{
+	commitCtx, cancel, err := upload.CommitContext(ctx)
+	require.NoError(tb, err)
+	defer cancel()
+
+	res, err := core.Meta.CommitChangeset(commitCtx, corestore.ChangesetInput{
 		RepoID:    registered.ID,
 		Updates:   updates,
 		Operation: "import",
 		Actor:     "import",
 		NodeID:    core.NodeID,
-		PackKey:   packKey,
-		PackBytes: pack.Size,
+		PackKey:   upload.Key,
+		PackBytes: upload.Bytes,
 	})
 	require.NoError(tb, err)
 	require.Equal(tb, uint64(1), res.Seq, "the import is changeset 1")

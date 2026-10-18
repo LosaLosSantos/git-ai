@@ -107,23 +107,26 @@ type committedEntry struct {
 	seq    uint64
 }
 
-// uploadedPack is a changeset pack in the bucket. An empty key means that the
-// transaction brings no new objects.
-type uploadedPack struct {
-	key   string
-	bytes int64
-}
-
 // preparedPack is the outcome of the Preparing phase of a transaction.
 type preparedPack struct {
 	// ok tells that pack was built and uploaded for the repository repoID.
 	// When it is false, Preparing failed and Prepared does the work itself.
 	ok     bool
 	repoID int64
-	pack   uploadedPack
+	// pack is the uploaded pack, with an empty key when the transaction brings
+	// no new objects.
+	pack corestore.PackUpload
 	// spent is the time Preparing took. In shadow mode it counts against the
 	// shadow timeout, which is the budget of the whole transaction.
 	spent time.Duration
+}
+
+// usable reports whether Prepared may commit the pack of the Preparing phase:
+// its write deadline has not passed (doc/graft/PLAN7.md, PACK OWNERSHIP RULE
+// 4). A pack whose deadline passed may be an orphan that garbage collection
+// deletes, so Prepared uploads a new one instead.
+func (p preparedPack) usable(now time.Time) bool {
+	return p.pack.Key == "" || now.Before(p.pack.Deadline)
 }
 
 // New returns the voter of core. applier is told about local commits (it may
@@ -237,6 +240,9 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 		return nil, nil
 	}
 
+	// The write deadline of the pack starts before this read of the record
+	// (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	readAt := time.Now()
 	record, err := v.core.Meta.GetRepository(ctx, corestore.KeyOf(payload.Repo))
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return nil, nil
@@ -248,7 +254,7 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 		return nil, nil
 	}
 
-	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, updates)
+	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, readAt, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +398,9 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		return nil
 	}
 
+	// The write deadline of a pack uploaded here starts before this read of the
+	// record (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	readAt := time.Now()
 	record, err := v.core.Meta.GetRepository(ctx, corestore.KeyOf(payload.Repo))
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		if shadow {
@@ -431,14 +440,14 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 	}
 
 	// The pack prepared before git took the locks is used when it was uploaded
-	// for this repository (not for a removed one that had the same path).
-	// Otherwise it is built and uploaded now, as before the LOCK AND HISTORY
-	// RULE.
-	var pack uploadedPack
-	if prepared != nil && prepared.ok && prepared.repoID == record.ID {
+	// for this repository (not for a removed one that had the same path) and its
+	// write deadline has not passed. Otherwise it is built and uploaded now, as
+	// before the LOCK AND HISTORY RULE.
+	var pack corestore.PackUpload
+	if prepared != nil && prepared.ok && prepared.repoID == record.ID && prepared.usable(time.Now()) {
 		pack = prepared.pack
 	} else {
-		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, updates)
+		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, readAt, updates)
 		if err != nil {
 			return v.unavailable(err)
 		}
@@ -451,8 +460,8 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		Actor:     meta.Actor,
 		NodeID:    v.core.NodeID,
 		Force:     shadow,
-		PackKey:   pack.key,
-		PackBytes: pack.bytes,
+		PackKey:   pack.Key,
+		PackBytes: pack.Bytes,
 	}
 
 	if err := v.fault(faultAfterUpload); err != nil {
@@ -464,7 +473,15 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		in.Changelog = &metaCopy
 	}
 
-	res, err := v.core.Meta.CommitChangeset(ctx, in)
+	// The changeset that references the pack commits before the pack's write
+	// deadline, or not at all.
+	commitCtx, cancel, err := pack.CommitContext(ctx)
+	if err != nil {
+		return v.unavailable(err)
+	}
+	defer cancel()
+
+	res, err := v.core.Meta.CommitChangeset(commitCtx, in)
 
 	var conflict *corestore.ErrRefConflict
 	if errors.As(err, &conflict) {
@@ -631,27 +648,29 @@ func newTips(updates []inputUpdate) []git.ObjectID {
 }
 
 // buildAndUpload builds the pack of the objects reachable from the new tips of
-// updates and not from what is already in the bucket, and uploads it under the
-// pack key of repoID. An empty pack is not uploaded.
+// updates and not from what is already in the bucket, and uploads it under a
+// new owned key of repoID with the write deadline that starts at readAt, the
+// time taken before the read of the repository record (Core.UploadPack). An
+// empty pack is not uploaded.
 //
 // What is already in the bucket: in authoritative mode, everything any current
 // local reference reaches (invariant I1, gitops.BuildPack); in shadow mode,
 // everything that the values the database records reach (buildPackAgainst),
 // because local references can hold values the storage core never recorded.
-func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, repoID int64, updates []inputUpdate) (uploadedPack, error) {
+func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, repoID int64, readAt time.Time, updates []inputUpdate) (corestore.PackUpload, error) {
 	tips := newTips(updates)
 	if len(tips) == 0 {
-		return uploadedPack{}, nil
+		return corestore.PackUpload{}, nil
 	}
 
 	tmpDir, err := v.locator.TempDir(storageName)
 	if err != nil {
-		return uploadedPack{}, err
+		return corestore.PackUpload{}, err
 	}
 	// The server creates the temporary directory when it starts, but it may have
 	// been cleaned up since.
 	if err := os.MkdirAll(tmpDir, mode.Directory); err != nil {
-		return uploadedPack{}, fmt.Errorf("creating the temporary directory: %w", err)
+		return corestore.PackUpload{}, fmt.Errorf("creating the temporary directory: %w", err)
 	}
 
 	var pack gitops.Pack
@@ -661,37 +680,32 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 		var known map[string]corestore.Target
 		known, _, err = v.core.Meta.Refs(ctx, repoID)
 		if err != nil {
-			return uploadedPack{}, fmt.Errorf("reading the database references: %w", err)
+			return corestore.PackUpload{}, fmt.Errorf("reading the database references: %w", err)
 		}
 		pack, err = buildPackAgainst(ctx, repo, tips, known, tmpDir)
 	}
 	if err != nil {
-		return uploadedPack{}, err
+		return corestore.PackUpload{}, err
 	}
 	defer func() { _ = pack.Remove() }()
 
 	if pack.Empty() {
-		return uploadedPack{}, nil
+		return corestore.PackUpload{}, nil
 	}
 
-	key := corestore.NewPackKey(repoID, pack.SHA256)
-	if err := v.uploadPack(ctx, key, pack); err != nil {
-		return uploadedPack{}, err
-	}
-	v.metrics.packBytes.Add(float64(pack.Size))
-
-	return uploadedPack{key: key, bytes: pack.Size}, nil
-}
-
-// uploadPack stores the pack under key, see BlobStore.Put.
-func (v *Voter) uploadPack(ctx context.Context, key string, pack gitops.Pack) error {
 	r, err := pack.Open()
 	if err != nil {
-		return err
+		return corestore.PackUpload{}, err
 	}
 	defer func() { _ = r.Close() }()
 
-	return v.core.Blobs.Put(ctx, key, r)
+	upload, err := v.core.UploadPack(ctx, repoID, readAt, pack.SHA256, pack.Size, r)
+	if err != nil {
+		return corestore.PackUpload{}, err
+	}
+	v.metrics.packBytes.Add(float64(pack.Size))
+
+	return upload, nil
 }
 
 // fault calls FaultHook and exits the process when CrashEnv selects the point.

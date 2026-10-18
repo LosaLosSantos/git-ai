@@ -2,6 +2,8 @@ package corestore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"path"
 	"strings"
@@ -88,6 +90,78 @@ type Core struct {
 	// one reference transaction.
 	SyncTimeout   time.Duration
 	ShadowTimeout time.Duration
+	// GCGrace is how long garbage collection waits before it deletes a pack it
+	// observed unreferenced, and how old a checkpoint must be before the packs it
+	// covers are deleted. GCMargin is the safety margin of the writers' deadline,
+	// WriteDeadline() = GCGrace - GCMargin (doc/graft/PLAN7.md, PACK OWNERSHIP
+	// RULE 4). Both are set whenever the storage core is on: garbage collection
+	// runs in shadow mode too.
+	GCGrace  time.Duration
+	GCMargin time.Duration
+}
+
+// WriteDeadline is W of doc/graft/PLAN7.md: a writer uploads a pack and
+// commits the row that references it within W of a read of the repository
+// record that found the repository.
+func (c *Core) WriteDeadline() time.Duration { return c.GCGrace - c.GCMargin }
+
+// PackUpload is a pack uploaded under a new owned key (NewPackKey) and the
+// deadline before which a row may reference it.
+type PackUpload struct {
+	// Key is the owned key, empty when there was nothing to upload (the
+	// transaction brings no new objects).
+	Key   string
+	Bytes int64
+	// Deadline is the time of the repository-record read that preceded the
+	// upload plus WriteDeadline(). It keeps the monotonic clock reading of that
+	// read, so that it is compared on the monotonic clock.
+	Deadline time.Time
+}
+
+// UploadPack uploads the pack read from r (size bytes whose SHA-256 is sum)
+// under a new owned key of the repository. readAt is the time of a read of the
+// repository record that found the repository, taken before that read and
+// before the upload; the upload must end before readAt + WriteDeadline(), else
+// it is cancelled (nothing is stored) and the error wraps ErrPackDeadline. It is
+// the only way the storage core uploads a pack (doc/graft/PLAN7.md, RULE 26).
+func (c *Core) UploadPack(ctx context.Context, repoID int64, readAt time.Time, sum [32]byte, size int64, r io.Reader) (PackUpload, error) {
+	if c.GCGrace <= 0 || c.GCMargin <= 0 || c.WriteDeadline() <= 0 {
+		return PackUpload{}, fmt.Errorf("storage core: invalid write deadline: gc_grace %s, gc_margin %s", c.GCGrace, c.GCMargin)
+	}
+
+	deadline := readAt.Add(c.WriteDeadline())
+	if !time.Now().Before(deadline) {
+		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: %w", repoID, ErrPackDeadline)
+	}
+
+	putCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	key := NewPackKey(repoID, sum)
+	if err := c.Blobs.Put(putCtx, key, r); err != nil {
+		if ctx.Err() == nil && errors.Is(putCtx.Err(), context.DeadlineExceeded) {
+			return PackUpload{}, fmt.Errorf("storage core: upload %q: %w: %w", key, ErrPackDeadline, err)
+		}
+		return PackUpload{}, fmt.Errorf("storage core: upload %q: %w", key, err)
+	}
+
+	return PackUpload{Key: key, Bytes: size, Deadline: deadline}, nil
+}
+
+// CommitContext returns ctx bounded by the upload's deadline, for the commit of
+// the row that references the pack. When the deadline has passed it returns
+// ErrPackDeadline: the caller must not start the commit and must not reference
+// the key. An upload without a key (nothing uploaded) has no deadline.
+func (u PackUpload) CommitContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if u.Key == "" {
+		ctx, cancel := context.WithCancel(ctx)
+		return ctx, cancel, nil
+	}
+	if !time.Now().Before(u.Deadline) {
+		return nil, nil, fmt.Errorf("storage core: commit the changeset of pack %q: %w", u.Key, ErrPackDeadline)
+	}
+	ctx, cancel := context.WithDeadline(ctx, u.Deadline)
+	return ctx, cancel, nil
 }
 
 // Enabled reports whether the storage core is on (shadow or authoritative).

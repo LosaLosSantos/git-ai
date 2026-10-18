@@ -135,6 +135,11 @@ type Options struct {
 	BucketURL   string
 	// NodeID is the node name; empty means "node-a".
 	NodeID string
+	// GCGrace and GCMargin are the garbage collection times; zero means the
+	// production defaults (1h and 5m). A test of the writers' deadline sets them
+	// short.
+	GCGrace  time.Duration
+	GCMargin time.Duration
 }
 
 // Open opens a storage core for the test and closes it when the test ends.
@@ -156,6 +161,12 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 	if opts.NodeID == "" {
 		opts.NodeID = "node-a"
 	}
+	if opts.GCGrace == 0 {
+		opts.GCGrace = time.Hour
+	}
+	if opts.GCMargin == 0 {
+		opts.GCMargin = 5 * time.Minute
+	}
 
 	ctx := context.Background()
 
@@ -172,6 +183,8 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 		Blobs:         blobs,
 		SyncTimeout:   10 * time.Second,
 		ShadowTimeout: 5 * time.Second,
+		GCGrace:       opts.GCGrace,
+		GCMargin:      opts.GCMargin,
 	}
 	tb.Cleanup(func() { _ = core.Close() })
 

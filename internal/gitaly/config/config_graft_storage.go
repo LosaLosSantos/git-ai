@@ -31,6 +31,15 @@ type GraftStorage struct {
 	// ShadowTimeout bounds the shadow-mode work of one reference transaction
 	// (Go duration). Empty means DefaultGraftStorageShadowTimeout.
 	ShadowTimeout string `json:"shadow_timeout" toml:"shadow_timeout,omitempty"`
+	// GCGrace is how long garbage collection waits before it deletes a pack it
+	// observed unreferenced, and how old a checkpoint must be before the packs it
+	// covers are deleted (Go duration). Empty means DefaultGraftStorageGCGrace.
+	GCGrace string `json:"gc_grace" toml:"gc_grace,omitempty"`
+	// GCMargin is the safety margin of the writers' deadline: a writer uploads a
+	// pack and commits its changeset within gc_grace - gc_margin (Go duration).
+	// Empty means DefaultGraftStorageGCMargin. See doc/graft/STORAGE.md for the
+	// clock assumption it covers.
+	GCMargin string `json:"gc_margin" toml:"gc_margin,omitempty"`
 }
 
 const (
@@ -38,6 +47,10 @@ const (
 	DefaultGraftStorageSyncTimeout = 10 * time.Second
 	// DefaultGraftStorageShadowTimeout is the default GraftStorage.ShadowTimeout.
 	DefaultGraftStorageShadowTimeout = 5 * time.Second
+	// DefaultGraftStorageGCGrace is the default GraftStorage.GCGrace.
+	DefaultGraftStorageGCGrace = time.Hour
+	// DefaultGraftStorageGCMargin is the default GraftStorage.GCMargin.
+	DefaultGraftStorageGCMargin = 5 * time.Minute
 )
 
 // Enabled reports whether the storage core is on.
@@ -51,6 +64,40 @@ func (s GraftStorage) SyncTimeoutOrDefault() (time.Duration, error) {
 // ShadowTimeoutOrDefault parses ShadowTimeout, applying the default.
 func (s GraftStorage) ShadowTimeoutOrDefault() (time.Duration, error) {
 	return positiveDurationOrDefault("shadow_timeout", s.ShadowTimeout, DefaultGraftStorageShadowTimeout)
+}
+
+// GCGraceOrDefault parses GCGrace, applying the default.
+func (s GraftStorage) GCGraceOrDefault() (time.Duration, error) {
+	return positiveDurationOrDefault("gc_grace", s.GCGrace, DefaultGraftStorageGCGrace)
+}
+
+// GCMarginOrDefault parses GCMargin, applying the default.
+func (s GraftStorage) GCMarginOrDefault() (time.Duration, error) {
+	return positiveDurationOrDefault("gc_margin", s.GCMargin, DefaultGraftStorageGCMargin)
+}
+
+// validateGC checks that the garbage collection times leave the writers a
+// positive deadline, and that a sync can never meet a pack the collector
+// deletes during it: gc_grace > sync_timeout + gc_margin
+// (doc/graft/PLAN7.md, GC BOUNDARY rule).
+func (s GraftStorage) validateGC() error {
+	grace, err := s.GCGraceOrDefault()
+	if err != nil {
+		return err
+	}
+	margin, err := s.GCMarginOrDefault()
+	if err != nil {
+		return err
+	}
+	sync, err := s.SyncTimeoutOrDefault()
+	if err != nil {
+		return err
+	}
+
+	if grace <= sync+margin {
+		return fmt.Errorf("graft storage: gc_grace %s must be greater than sync_timeout %s + gc_margin %s", grace, sync, margin)
+	}
+	return nil
 }
 
 func positiveDurationOrDefault(name, value string, def time.Duration) (time.Duration, error) {
@@ -107,5 +154,5 @@ func (s GraftStorage) validate(standalone bool) error {
 		return err
 	}
 
-	return nil
+	return s.validateGC()
 }

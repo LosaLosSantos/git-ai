@@ -232,6 +232,11 @@ var (
 	// include: the review was created or moved during the build
 	// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
 	ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
+	// ErrPackDeadline is returned when a pack upload, or the commit of the row
+	// that references it, would end after the write deadline: garbage collection
+	// may then already treat the pack as an orphan (doc/graft/PLAN7.md, PACK
+	// OWNERSHIP RULE 4). The write fails like any storage failure.
+	ErrPackDeadline = errors.New("storage core: the pack upload is older than the write deadline")
 	// ErrBlobCorrupt is returned by the reader of BlobStore.Get when the content
 	// does not hash to its key.
 	ErrBlobCorrupt = errors.New("storage core: blob content does not match its key")
