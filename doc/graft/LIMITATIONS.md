@@ -149,9 +149,12 @@ Git hooks use private.
   written just before a crash may be missing although the write succeeded.
 - Custom hooks get the server's `core.fsync` configuration, so the objects that
   their git commands write into a quarantine are durable. When a custom hook
-  runs with a quarantine, the migration of that quarantine also fsyncs its files,
+  runs with a quarantine of the server's own write RPCs (land, commit, merge and
+  the other operations), the migration of that quarantine also fsyncs its files,
   because a hook may write objects without git; that costs about one fsync per
-  file of the write.
+  file of the write. Pushes over SSH or HTTP are different: git's receive-pack
+  migrates its own quarantine, so objects that a custom hook writes there
+  without git are only as durable as the hook makes them.
 - The objects of an update that fails after the quarantine migration remain in
   the repository unreferenced until housekeeping prunes them. They have passed
   the pre-receive hook. Until pruned, they can be read by object ID by anyone

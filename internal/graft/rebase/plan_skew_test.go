@@ -211,7 +211,10 @@ func TestPlanOfAMergeOfTheTipIntoTheChange(t *testing.T) {
 	_, err = plan.Replay()
 	require.ErrorIs(t, err, ErrMergesInRange)
 
-	require.LessOrEqual(t, checker.processes(), 4)
+	// The skew path must run: the plain listing alone already refuses this merge, so only the
+	// exact counts show that the skew handling (one merge-base, one listing below it) was taken.
+	require.Equal(t, 4, checker.processes())
+	require.Equal(t, 1, checker.mergeBases)
 	require.Zero(t, checker.reachables)
 	require.Less(t, elapsed, 10*time.Second)
 	t.Logf("%d listed below the merge base by git rev-list; %d processes, %v", len(relisted), checker.processes(), elapsed)

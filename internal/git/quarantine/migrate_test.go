@@ -101,6 +101,52 @@ func TestMigrateRecreatesTargetDirectoriesThatVanish(t *testing.T) {
 	require.NoDirExists(t, source)
 }
 
+// TestMigrateSyncsTheDirectoryThatHoldsTheLink removes each target fan-out directory right before
+// the first link into it and creates it again, as housekeeping and then another writer may. The
+// link then succeeds into the new directory. The second pass must fsync that directory, not the
+// removed one: every descriptor it fsyncs is of the directory now at its path.
+func TestMigrateSyncsTheDirectoryThatHoldsTheLink(t *testing.T) {
+	ctx := testhelper.Context(t)
+	root := t.TempDir()
+	source, target := filepath.Join(root, "quarantine"), filepath.Join(root, "objects")
+	fanouts := []string{"0a", "1b", "2c"}
+	files := writeQuarantine(t, source, fanouts)
+	require.NoError(t, os.MkdirAll(target, 0o755))
+
+	var recreated sync.Map
+	replaceHooks(t, func(targetPath string) {
+		dir := filepath.Dir(targetPath)
+		if filepath.Base(dir) == "pack" {
+			return
+		}
+		if _, done := recreated.LoadOrStore(dir, true); !done {
+			require.NoError(t, os.Remove(dir))
+			require.NoError(t, os.Mkdir(dir, 0o755))
+		}
+	})
+
+	var synced []string
+	originalSyncDir := syncDirFile
+	syncDirFile = func(f *os.File) error {
+		descriptor, err := f.Stat()
+		require.NoError(t, err)
+		current, err := os.Stat(f.Name())
+		require.NoError(t, err)
+		require.True(t, os.SameFile(descriptor, current), "the second pass fsyncs a removed directory: %s", f.Name())
+		synced = append(synced, f.Name())
+		return originalSyncDir(f)
+	}
+
+	require.NoError(t, migrate(ctx, source, target, false))
+
+	for _, file := range files {
+		require.FileExists(t, filepath.Join(target, file))
+	}
+	for _, fanout := range fanouts {
+		require.Contains(t, synced, filepath.Join(target, fanout))
+	}
+}
+
 // TestMigrateSyncsEachDirectoryOnce counts the fsyncs: one per target directory that received a
 // link, one for the object directory, and none per file, whose writers made them durable.
 func TestMigrateSyncsEachDirectoryOnce(t *testing.T) {

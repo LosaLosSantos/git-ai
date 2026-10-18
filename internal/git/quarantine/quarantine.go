@@ -168,9 +168,17 @@ func (d *Dir) Migrate(ctx context.Context) error {
 // empty and stays. Each round needs another removal between the creation and the link, so the loop
 // ends; it also ends with the context.
 //
+// The descriptor of a target directory is taken right after a link into it succeeded, never
+// before: the link pins the directory, so the descriptor is of the directory that holds the link.
+// A descriptor taken earlier could be of a directory that housekeeping removes, and that another
+// writer then creates again, before the link (the link then succeeds into the new directory, which
+// the second pass would not fsync). If the directory is gone even after the link, housekeeping
+// removed the linked object because a pack holds it (git prune-packed), and nothing of the
+// migration is left there to make durable.
+//
 // The second pass, unless a transaction manager owns durability (storage.NeedsSync), fsyncs each
-// target directory that received a link, once, through a descriptor opened in the first pass, and
-// the object directory itself. The files are not fsynced: they are durable before the migration
+// target directory that received a link, once, through those descriptors, and the object
+// directory itself. The files are not fsynced: they are durable before the migration
 // (see Dir), unless untrustedWriter is set, in which case they are fsynced in parallel before the
 // first pass.
 //
@@ -192,8 +200,16 @@ func migrate(ctx context.Context, sourcePath, targetPath string, untrustedWriter
 	m := migration{ctx: ctx, dirs: map[string]*os.File{}}
 	defer m.closeDirs()
 
-	if err := m.openDir(targetPath); err != nil {
+	// The object directory is not a fan-out directory, so housekeeping never removes it. Its
+	// descriptor is taken first, so the second pass fsyncs it last.
+	if err := ensureDir(targetPath); err != nil {
 		return err
+	}
+	if err := m.track(targetPath); err != nil {
+		return err
+	}
+	if _, ok := m.dirs[targetPath]; !ok {
+		return fmt.Errorf("opening target directory %q: %w", targetPath, fs.ErrNotExist)
 	}
 	if err := m.link(sourcePath, targetPath); err != nil {
 		return err
@@ -223,19 +239,45 @@ type migration struct {
 	order []string
 }
 
-// openDir creates the target directory dir if it does not exist and opens a descriptor of it,
-// replacing the descriptor of a directory of the same path that was removed.
-func (m *migration) openDir(dir string) error {
+// ensureDir creates the target directory dir. An existing entry at dir is accepted as it is, as
+// before: a file there (a conflict with the quarantine's directory) is left to the links into it
+// to report.
+func ensureDir(dir string) error {
 	if err := os.Mkdir(dir, mode.Directory); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("creating target directory %q: %w", dir, err)
+	}
+	return nil
+}
+
+// track keeps a descriptor of the target directory dir for the second pass. It runs after a link
+// into dir succeeded (see migrate). It keeps the descriptor it has when that is still of the
+// directory at dir, and replaces it otherwise. A dir that no longer exists holds nothing of the
+// migration (housekeeping removed the linked object because a pack holds it), so it is skipped.
+func (m *migration) track(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("checking target directory %q: %w", dir, err)
+	}
+
+	old, known := m.dirs[dir]
+	if known {
+		if oldInfo, err := old.Stat(); err == nil && os.SameFile(oldInfo, info) {
+			return nil
+		}
 	}
 
 	f, err := os.Open(dir)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
 		return fmt.Errorf("opening target directory %q: %w", dir, err)
 	}
 
-	if old, ok := m.dirs[dir]; ok {
+	if known {
 		_ = old.Close()
 	} else {
 		m.order = append(m.order, dir)
@@ -264,7 +306,10 @@ func (m *migration) link(sourcePath, targetPath string) error {
 		nestedSourcePath := filepath.Join(sourcePath, entry.Name())
 
 		if entry.IsDir() {
-			if err := m.openDir(nestedTargetPath); err != nil {
+			// The directory structure is migrated as it is, empty directories included. Its
+			// descriptor is taken only after a link into it (linkFile), which also creates it
+			// again if housekeeping removed it in between.
+			if err := ensureDir(nestedTargetPath); err != nil {
 				return err
 			}
 			if err := m.link(nestedSourcePath, nestedTargetPath); err != nil {
@@ -288,12 +333,17 @@ func (m *migration) link(sourcePath, targetPath string) error {
 // linkFile links the file at sourcePath to targetPath, creating the target directory again when
 // it was removed (see migrate).
 func (m *migration) linkFile(sourcePath, targetPath string) error {
+	dir := filepath.Dir(targetPath)
 	for {
+		if err := ensureDir(dir); err != nil {
+			return err
+		}
+
 		beforeLink(targetPath)
 
 		err := finalizeObjectFile(sourcePath, targetPath)
 		if err == nil {
-			return nil
+			return m.track(dir)
 		}
 		if !errors.Is(err, fs.ErrNotExist) {
 			return err
@@ -306,10 +356,7 @@ func (m *migration) linkFile(sourcePath, targetPath string) error {
 			return fmt.Errorf("%w (%w)", err, ctxErr)
 		}
 
-		// The source exists, so the target directory is gone.
-		if err := m.openDir(filepath.Dir(targetPath)); err != nil {
-			return err
-		}
+		// The source exists, so the target directory is gone: create it again and link again.
 	}
 }
 

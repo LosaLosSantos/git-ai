@@ -114,14 +114,34 @@ configuration section, the `graft` CLI, `internal/graft` and `doc/graft`.
 - [Review](doc/graft/REVIEW.md), [search](doc/graft/SEARCH.md), [verification](doc/graft/VERIFY.md), [superfans](doc/graft/SUPERFAN.md) and [Slack chat](doc/graft/SUPERFAN-CHAT.md)
 - [Agent security](doc/graft/AGENT-SECURITY.md), [benchmarks](doc/graft/BENCH.md), [fuzzing](doc/graft/FUZZING.md)
 - [Limitations and roadmap](doc/graft/LIMITATIONS.md)
-- Design documents of each phase: [PLAN.md](doc/graft/PLAN.md) to [PLAN6.md](doc/graft/PLAN6.md)
+- Design documents of each phase: [PLAN.md](doc/graft/PLAN.md) to [PLAN6.md](doc/graft/PLAN6.md), and [PLAN8.md](doc/graft/PLAN8.md) (faster landing)
+
+## Benchmark
+
+50 agents land 5 changes each on one branch; 20% of the changes conflict on
+purpose. "Classic" is the same server with batching off: every agent rebases
+and retries its own compare-and-swap, up to 20 attempts. Measured with
+[`acceptance-phase4.sh`](examples/graft/demo/acceptance-phase4.sh) on one
+16-core machine, two runs:
+
+| 50 agents, 250 changes | classic | gitai |
+|---|---|---|
+| changes landed | 100-101 | 200 |
+| attempts per landed change | 27 | 1.0 |
+| lands per minute | 240-272 | 1,862-2,544 |
+| p99 latency | 6.3-7.0 s | 1.5-1.8 s |
+
+The 50 changes gitai does not land are the planned conflicts: these runs use no
+conflict resolver. With the deterministic resolver of
+[`resolve.toml`](examples/graft/demo/resolve.toml) every conflict is resolved
+and all 250 changes land. Details and more sizes in [BENCH.md](doc/graft/BENCH.md).
 
 ## Status
 
-Version 0.1.0, the first public release. Everything above is implemented and
-covered by unit, end-to-end, multi-node, crash and fuzz tests. Interfaces may
-still change before 1.0. Known gaps (for example garbage collection of packs in
-the storage core) are listed in [LIMITATIONS.md](doc/graft/LIMITATIONS.md).
+Version 0.2.0. Everything above is implemented and covered by unit,
+end-to-end, multi-node, crash and fuzz tests. Interfaces may still change
+before 1.0. Known gaps (for example garbage collection of packs in the storage
+core) are listed in [LIMITATIONS.md](doc/graft/LIMITATIONS.md).
 
 ## Community
 
