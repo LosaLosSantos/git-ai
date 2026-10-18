@@ -1,8 +1,8 @@
-# Graft c1: AI conflict resolution with checks, measured (plan for approval)
+# Graft c1: AI conflict resolution with checks, measured (approved plan)
 
-Status: proposed, waiting for the PM's approval of the plan and of the exact proto
-changes of section 6.1; nothing below is implemented. Owner: c1 (Opus). Worktree
-`owt/c1`, branch `c1-conflicts` from `main` at v0.2.0 (`7baee7e`).
+Status: approved by the PM with the amendments of section 12; WP1 to WP4 under
+way. Owner: c1 (Opus). Worktree `owt/c1`, branch `c1-conflicts` from `main` at
+v0.2.0 (`7baee7e`).
 
 c1 owns `tools/graft-agents/resolve/**`, `tools/graft-agents/cmd/graft-resolve`,
 `doc/graft/RESOLVE.md` and this plan; for the conflict package only, the land
@@ -490,3 +490,40 @@ way.
   only as right as the configured price.
 * A resolution larger than the 4 MiB gRPC limit cannot be re-landed through the
   request (a stated limit).
+
+## 12. Amendments after approval (the PM's and Federico's decisions)
+
+* **Model.** `openai/gpt-6.1-sol`, the current GPT on OpenRouter, replaces
+  `openai/gpt-5-mini`. The model is a configuration value, so another current model
+  (for example `openai/gpt-6-luna`) can be measured later without a code change.
+  Its price is never taken from memory: `graft-resolve bench run` reads it at run
+  time from OpenRouter's model API (`https://openrouter.ai/api/v1/models`, the
+  `pricing` of the model's endpoints: prompt, completion and, when listed, internal
+  reasoning, in USD per token), takes the highest of the endpoints as the worst
+  case, writes it into the report, and refuses to run when the model or its price
+  cannot be read. The production budget (3.5) keeps configured prices, which the
+  operator sets from the same page. The hard $10 cap and the per-call worst-case
+  reservation stay; with third-party figures of about $2 input and $10 output per
+  million tokens the sample shrinks to what fits (about 150 to 200 cases), and the
+  report states the final N.
+* **Re-land with a resolution** (6.1, condition 1). The server accepts
+  `LandResolution` only when `resolution.tip` equals the branch's current tip and
+  `resolution.commit` equals `commit_id`; it may write only the paths that conflict at
+  that tip, each exactly once, no other path; it runs the same validation as a
+  resolver answer, the syntax check (3.2) included, besides markers, modes and sizes;
+  and it records the merge commit with `Graft-Resolved-By: agent/<actor>`. Otherwise
+  the land fails with a fresh package, never a partial write. (This replaces "no
+  syntax check" in 3.3.) The syntax check therefore also runs in the server for an
+  agent's resolution; since the main module takes no tree-sitter dependency, the
+  server asks graft-resolve to check it (a `check` request of the resolver protocol)
+  when a resolver is configured, and applies the marker rule only otherwise; WP6
+  details it for the PM before implementing.
+* **Hunk ranges** (6.1, condition 2). Each `LineRange` of a `LandConflictHunk` is
+  relative to the side it names: `base` counts the lines of the base side's file,
+  `ours` of the tip's, `theirs` of the landed commit's; 1-based, half-open
+  ([start, end)), an empty range being an insertion point before line `start`. The
+  proto comments state it.
+* **The 4 MiB limit** (6.1, condition 3). RESOLVE.md states it, and the SDK refuses a
+  resolution whose encoded request would exceed it, with a clear error, instead of a
+  transport failure.
+* **Order.** WP1 to WP4 first; WP96 of PLAN9 after them.
