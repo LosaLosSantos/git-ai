@@ -280,14 +280,17 @@ commitment.
    section 9.
 3. Each published batch adds one small pack to the repository, as a push does.
    Housekeeping repacks them like the packs of pushes, so busy branches make
-   repacks more frequent.
+   repacks more frequent. A batch attempt that loses its compare-and-swap (to
+   another node or an external writer) also leaves its pack in the repository,
+   unreferenced, until housekeeping prunes it: at most one per lost batch attempt.
+   Unbatched lands publish loose objects and leave no pack.
 4. The objects of a batch are written without fsync and made durable by the pack
    written before the update. An operator who sets `core.fsync` in the `[git]`
    configuration overrides this for the helper processes too (the configuration
    of the administrator is applied last), which keeps the old per-object fsyncs.
-5. An unbatched land decides, rebases and publishes like a batch attempt (one range
-   listing, the rebase engine, one pack), but it is still bounded by its own
-   compare-and-swap retries under contention (`max_attempts`).
+5. An unbatched land decides and rebases like a batch attempt (one range listing and
+   the rebase engine) and publishes its objects loose, but it is still bounded by its
+   own compare-and-swap retries under contention (`max_attempts`).
 
 ## Phase 4a limitations
 

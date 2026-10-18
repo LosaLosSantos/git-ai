@@ -136,6 +136,13 @@ CAS*), and the branch does not move. Each published batch adds one pack to the
 repository, like a push; housekeeping repacks them as it repacks the packs of
 pushes.
 
+A land that is not batched writes the few objects of its change with the server's
+fsync configuration and publishes them as loose objects, without a pack: a pack
+would cost a process and as many fsyncs for so few objects, and under contention
+every attempt that loses the compare-and-swap would leave a pack in the repository.
+In both cases every object file of the quarantine is durable before the quarantine
+migration moves it.
+
 ### Hooks and identity of the combined update
 
 The combined update is made as the synthetic user `graft-batch` (name `Graft`,

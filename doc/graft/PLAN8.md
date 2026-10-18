@@ -565,6 +565,20 @@ the doc sections, all checked by Opus.
   the committer applied); `localrepo/rebase_options_export.go` was deleted as dead.
 * **Peel errors:** only `catfile.NotFoundError` is `InvalidArgument` ("cannot resolve
   commit ID"); a failure of the object info process is `Internal`.
+* **Publish mode (after window 2):** window 2 showed that publishing every unbatched
+  attempt as a pack regresses contended unbatched lands: at 100 agents about 98% of
+  the ~6600 attempts lose the compare-and-swap, each left a migrated, unreferenced
+  pack (`pack-objects` 1 s → 1484 s, `update-ref` 56 s → 840 s, 120 packs against 4
+  at the end), and the off p99 went from 10-12 s to 34-35 s. A pack makes objects
+  durable cheaply only when it amortizes many of them. So the attempt has one mode
+  value, chosen by the caller: `landPublishPack` (batch attempts: the rebaser writes
+  without fsync, publish packs with fsync before the update) and `landPublishLoose`
+  (unbatched attempts: the rebaser writes with the server's fsync configuration,
+  nothing is packed, the migration moves the loose objects). No combination of
+  "no write-time fsync" with "loose migration" exists. Both keep the quarantine's
+  durability contract, stated in the code: every object file of a quarantine is
+  durable before the migration, which is not relied on to fsync it (p5w will make
+  the migration fsync only the directories).
 * **G1:** closed by measurement (section 9).
 * **Not in p4b (moved to p5w, PLAN9):** writing the pack straight into
   `objects/pack` was rejected (it would make a rejected attempt's objects
