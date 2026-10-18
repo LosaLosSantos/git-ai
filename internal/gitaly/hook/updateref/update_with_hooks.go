@@ -140,6 +140,19 @@ func (e Error) Proto() *gitalypb.ReferenceUpdateError {
 	}
 }
 
+// deferredDurability is implemented by a hook manager whose storage core writes the references
+// of the transactions it commits without fsync (hook.GitLabHookManager).
+type deferredDurability interface {
+	DeferredReferenceDurability() bool
+}
+
+// deferReferenceDurability reports whether the reference transactions driven with hookManager
+// may write their references without fsync: only when its storage voter says so.
+func deferReferenceDurability(hookManager hook.Manager) bool {
+	d, ok := hookManager.(deferredDurability)
+	return ok && d.DeferredReferenceDurability()
+}
+
 // NewUpdaterWithHooks creates a new instance of a struct that will update a Git reference.
 func NewUpdaterWithHooks(
 	cfg config.Cfg,
@@ -257,7 +270,13 @@ func (u *UpdaterWithHooks) UpdateReference(
 	// is packed, which is obviously a bad thing as Gitaly nodes may be differently packed. We
 	// thus continue to manually drive the reference-transaction hook here, which doesn't have
 	// this problem.
-	updater, err := updateref.New(ctx, repo, updateref.WithDisabledTransactions())
+	updaterOpts := []updateref.UpdaterOpt{updateref.WithDisabledTransactions()}
+	// The storage core's authoritative mode makes the references durable itself: its database
+	// commit in the prepared phase is the durable point of the transaction.
+	if deferReferenceDurability(u.hookManager) {
+		updaterOpts = append(updaterOpts, updateref.WithDeferredReferenceDurability())
+	}
+	updater, err := updateref.New(ctx, repo, updaterOpts...)
 	if err != nil {
 		return fmt.Errorf("creating updater: %w", err)
 	}

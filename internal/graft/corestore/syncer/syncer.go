@@ -66,6 +66,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	reviewstore "github.com/feder-cr/git-ai/internal/graft/review/store"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/internal/structerr"
@@ -1161,7 +1162,8 @@ func (s *Syncer) applyLocked(ctx context.Context, repo *localrepo.Repo, hash git
 		return applyOutcome{done: true}, nil
 	}
 
-	if err := applyMoves(ctx, repo, hash, moves); err != nil {
+	w := refWriter{core: s.core, repo: localrefs.RepoRef{Storage: r.Key.Storage, RelativePath: r.Key.RelativePath}, path: path}
+	if err := applyMoves(ctx, repo, w, hash, moves); err != nil {
 		var txErr *refTxError
 		if errors.As(err, &txErr) && txErr.locked {
 			return applyOutcome{lockErr: err}, nil
@@ -1225,7 +1227,7 @@ func movedSince(ctx context.Context, repo *localrepo.Repo, moves map[string]move
 //
 // The references other than HEAD are moved first, HEAD alone afterwards: git
 // refuses one transaction that updates HEAD and the reference it points to.
-func applyMoves(ctx context.Context, repo *localrepo.Repo, hash git.ObjectHash, moves map[string]move) error {
+func applyMoves(ctx context.Context, repo *localrepo.Repo, w refWriter, hash git.ObjectHash, moves map[string]move) error {
 	var names []string
 	moveHead := false
 	for name, m := range moves {
@@ -1246,12 +1248,12 @@ func applyMoves(ctx context.Context, repo *localrepo.Repo, hash git.ObjectHash, 
 	sort.Strings(names)
 
 	if len(names) > 0 {
-		if err := applyChecked(ctx, repo, hash, names, moves); err != nil {
+		if err := applyChecked(ctx, repo, w, hash, names, moves); err != nil {
 			return err
 		}
 	}
 	if moveHead {
-		return applyChecked(ctx, repo, hash, []string{"HEAD"}, moves)
+		return applyChecked(ctx, repo, w, hash, []string{"HEAD"}, moves)
 	}
 	return nil
 }
@@ -1264,7 +1266,7 @@ func applyMoves(ctx context.Context, repo *localrepo.Repo, hash git.ObjectHash, 
 // removed and a created name (refs/a and refs/a/b). Between the two
 // transactions a removed reference is absent; the second transaction requires
 // that, so a local write in between still fails it.
-func applyChecked(ctx context.Context, repo *localrepo.Repo, hash git.ObjectHash, names []string, moves map[string]move) error {
+func applyChecked(ctx context.Context, repo *localrepo.Repo, w refWriter, hash git.ObjectHash, names []string, moves map[string]move) error {
 	var removals, others []string
 	twoSteps := false
 	for _, name := range names {
@@ -1281,17 +1283,28 @@ func applyChecked(ctx context.Context, repo *localrepo.Repo, hash git.ObjectHash
 	}
 
 	if !twoSteps {
-		err := refTransaction(ctx, repo, append(append([]string{}, removals...), others...))
+		err := refTransaction(ctx, repo, w, append(append([]string{}, removals...), others...))
 		var txErr *refTxError
 		if err == nil || !errors.As(err, &txErr) || !txErr.fdConflict || len(removals) == 0 || len(others) == 0 {
 			return err
 		}
 	}
 
-	if err := refTransaction(ctx, repo, removals); err != nil {
+	if err := refTransaction(ctx, repo, w, removals); err != nil {
 		return fmt.Errorf("apply removals: %w", err)
 	}
-	return refTransaction(ctx, repo, others)
+	return refTransaction(ctx, repo, w, others)
+}
+
+// refWriter runs the reference transactions of the catch-up on the local
+// repository at path, under the syncer's repository lock: admitted to git's
+// reference lock like the hook's writers, and without fsync when the node
+// defers the durability of its reference writes (doc/graft/PLAN7.md, LOCAL
+// REFERENCE WRITES RULE).
+type refWriter struct {
+	core *corestore.Core
+	repo localrefs.RepoRef
+	path string
 }
 
 // nul terminates the fields of update-ref -z.
@@ -1353,8 +1366,10 @@ func (e *refTxError) Unwrap() error { return e.err }
 // refTransaction runs the commands (casSteps) as one transaction of
 // `git update-ref -z --stdin --no-deref`, without hooks (the database has the
 // changes already: no reference-transaction hook may run for them). An empty
-// command list does nothing.
-func refTransaction(ctx context.Context, repo *localrepo.Repo, commands []string) error {
+// command list does nothing. With deferred durability the repository gets its
+// dirty marker before git writes; the caller holds the syncer's repository
+// lock, which the durable step holds too.
+func refTransaction(ctx context.Context, repo *localrepo.Repo, w refWriter, commands []string) error {
 	if len(commands) == 0 {
 		return nil
 	}
@@ -1362,6 +1377,17 @@ func refTransaction(ctx context.Context, repo *localrepo.Repo, commands []string
 	backend, err := repo.ReferenceBackend(ctx)
 	if err != nil {
 		return fmt.Errorf("reference backend: %w", err)
+	}
+
+	var durability []gitcmd.CmdOpt
+	if w.core.RefDurability.Enabled() {
+		if err := w.core.RefDurability.MarkDirty(ctx, w.repo, w.path); err != nil {
+			return err
+		}
+		durability = append(durability, gitcmd.WithConfig(gitcmd.ConfigPair{Key: "core.fsync", Value: gitcmd.FsyncComponentsWithoutReferences}))
+	}
+	if release := w.core.RefAdmission.AcquireUnique(ctx, w.path, localrefs.WriterSyncer); release != nil {
+		defer release()
 	}
 
 	var stdin bytes.Buffer
@@ -1381,10 +1407,12 @@ func refTransaction(ctx context.Context, repo *localrepo.Repo, commands []string
 				gitcmd.Flag{Name: "--no-deref"},
 			},
 		},
-		gitcmd.WithDisabledHooks(),
-		gitcmd.WithStdin(&stdin),
-		gitcmd.WithStdout(io.Discard),
-		gitcmd.WithStderr(&stderr),
+		append([]gitcmd.CmdOpt{
+			gitcmd.WithDisabledHooks(),
+			gitcmd.WithStdin(&stdin),
+			gitcmd.WithStdout(io.Discard),
+			gitcmd.WithStderr(&stderr),
+		}, durability...)...,
 	)
 	if err == nil {
 		return nil

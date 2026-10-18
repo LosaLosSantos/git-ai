@@ -90,6 +90,9 @@ type fixtureOptions struct {
 	// files makes the repository use the files reference backend instead of
 	// the package's default, reftable (see TestMain).
 	files bool
+	// localRefs gives the core the admission and the deferred durability of
+	// the local reference writes (coretest.EnableLocalRefs).
+	localRefs bool
 }
 
 func newFixture(t *testing.T, opts fixtureOptions) *fixture {
@@ -130,6 +133,9 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 
 	logger := testhelper.NewLogger(t)
 	locator := config.NewLocator(cfg)
+	if opts.localRefs {
+		coretest.EnableLocalRefs(t, core, locator)
+	}
 	cache := catfile.NewCache(cfg)
 	t.Cleanup(cache.Stop)
 	factory := localrepo.NewFactory(logger, locator, gittest.NewCommandFactory(t, cfg), cache)

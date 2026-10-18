@@ -504,6 +504,134 @@ guarded nor swept).
   * disabling the roots requirement fails the sqlstore test and both review
     race tests.
 
+### LOCAL REFERENCE WRITES RULE (binding; WP76b, approved by the PM)
+
+**Problem (measured).** A reftable repository has one lock for all its references
+(`tables.list.lock`). In authoritative mode `UserCommitFiles` spent most of its time
+waiting for it: with SQLite and a file bucket, at 50 and 100 agents, `u.prepare`
+(the wait) was 643 and 1198 ms mean, `u.commit` 252 and 230 ms, the voter's Prepared
+phase 19–26 ms. With `core.fsync` without `reference`, `u.commit` fell to 17 and 7 ms
+and the wait to 248 and 238 ms. So the hold is git's fsync of the new table and of
+`tables.list`, inside the lock. The wait that is left, about 6 holds, is git's lock
+wait: a polling sleep that grows with each failed try (`reftable.lockTimeout` =
+10 s). There is no queue, so newcomers win over long waiters and the lock sits free
+between polls. The same unfairness starved the syncer's catch-up behind writers
+(the flake of `TestSyncerConcurrentLocalWritesAreNeverReverted`).
+
+**Root cause.** In authoritative mode the durable commit point of a reference
+update is the database commit in the voter's Prepared phase; the local repository
+is a cache that any node rebuilds from the database and the bucket. Each
+transaction then made the same update durable a second time, inside the
+repository-wide lock.
+
+**Rule.**
+1. *Admission* (`corestore/localrefs.Admission`). The reference writers of a node
+   wait in a FIFO queue per local repository in front of git's lock:
+   * the hook's transactions from the end of the voter's Preparing phase (after
+     the pack upload, before git takes the lock) to Committed or Aborted;
+   * the syncer around each catch-up `update-ref`.
+
+   Admission orders writers only; git's lock stays the only mutual exclusion. A
+   writer that waited `reftable.lockTimeout` goes on to git's lock as before
+   (`bypassed`). An admission not released within the same bound ends
+   (`expired`; git may die between phases). A writer whose context ends leaves
+   the queue. Lock order: the syncer's repository lock, then the admission. No
+   admitted writer waits for the syncer lock: `NoteCommitted` only tries it, and
+   runs after the release.
+2. *Deferred durability* (`corestore/localrefs.Durability`). The hook's
+   `UpdateWithHooks` transactions and the syncer's catch-up write references with
+   `core.fsync` without `reference`. Only the voter can turn this on
+   (`DeferredReferenceDurability`: authoritative mode and the kernel's boot
+   identity readable). Objects stay durable as before.
+   * *Dirty marker.* Before the first such write after a durable step, the
+     repository gets a marker, written durably, with the kernel's boot identity
+     (`<storage>/+gitaly/graft-ref-durability/<sha256(path)>.json`, not the state
+     directory, whose files the cache walker removes).
+     * The hook path writes it in Prepared, after the database commit and before
+       git writes anything, so only repositories the database tracks get one. If
+       the marker cannot be written, Prepared fails and git aborts; catch-up
+       repairs the database's write, like any local failure.
+     * The syncer writes it under its repository lock.
+     * A hook transaction counts as in flight from Prepared to Committed.
+       Reasons from git's source: the new table is written in
+       `transaction_finish` after "prepared", and auto-compaction runs inside
+       `reftable_addition_commit`, before "committed". An abort after Prepared
+       is not counted as an end (two transactions with the same input cannot be
+       told apart), so the repository stays dirty.
+   * *Durable step* (`Settle`, every second for every dirty repository, under the
+     syncer's repository lock).
+     * It fsyncs the tables not yet fsynced, `tables.list` and the directory.
+     * When the repository has been idle for a second and nothing is in flight,
+       it takes git's lock without waiting (the lock is created with a tag, by
+       linking a temporary file). It then fsyncs what was written since, marks
+       the state clean, and releases the lock. Last, it removes the marker,
+       under a per-repository file lock that `MarkDirty` waits for.
+     * A busy lock leaves the marker for the next step.
+   * *Write failure.* A failed fsync in the durable step means the kernel may
+     have dropped writes. The repository is moved aside at once, under the
+     repository lock: the move is made durable, then the marker removed. The
+     failure is logged and counted (`sync_failed`), and the next request
+     hydrates the repository.
+   * *Recovery* (`Syncer.RecoverLocalReferences`). `gitaly serve` runs it before
+     any listener opens and before any background worker.
+     * A marker of another boot means the kernel restarted with writes that may
+       not have reached the disk. git reads a torn stack as an empty repository
+       with exit code 0 (experiment 1, kept as
+       `TestTornReftableStackReadsAsAnEmptyRepository`). So the repository is
+       moved aside before anything reads it (`reboot`), and the next request
+       hydrates it.
+     * The move only happens when the database holds the repository with
+       changesets and the local copy has a watermark; any other marker is
+       dropped, keeping a repository whose local copy may be the only one.
+     * A marker of the same boot is a process restart: the page cache kept
+       every write, so the repository stays dirty to be settled.
+     * A lock with the durable step's tag, left by a process that died, is
+       removed.
+     * A corrupt marker fails the startup: its repository is unknown.
+   * Not Linux (no boot identity): references stay durable per transaction.
+3. *Read paths.* After the recovery, no read path in authoritative mode can see
+   a stack torn by a kernel restart: the gRPC listeners (unix, TCP, TLS), the
+   Prometheus listener, the maintenance workers, the bundle generation, the
+   tempdir cleaner and the repository counter all start after it. Within the
+   same boot the stack is never torn (the page cache has every write). A failed
+   writeback is caught by the durable step within a second and the repository is
+   moved aside. Outside `gitaly serve`, only `gitaly-debug simulate-http-clone`,
+   `gitaly-debug dump-mvcc-manifest` and the `gitaly git` passthrough, pointed
+   at a repository by an operator, read references from disk. STORAGE.md says
+   not to run them on a node after an unclean shutdown before the server has
+   started once.
+
+**As implemented.**
+* `localrefs` (`admission.go`, `durability.go`); `Core.RefAdmission`/`RefDurability`.
+* `voter` (`admit`, `deferDurability`, Committed/Aborted).
+* `syncer` (`refWriter`, `durability.go`).
+* `serve.go`: `openLocalReferenceWrites`, the recovery before the listeners, the
+  durable-step loop.
+* PM grant: `updateref.WithDeferredReferenceDurability`; the `gitcmd` constants
+  `FsyncComponents`, `FsyncComponentsWithoutReferences` and
+  `ReftableLockTimeoutMilliseconds`; `hook/storage_voter.go`
+  (`DeferredReferenceDurability`); the optional interface asserted in
+  `UpdateWithHooks`.
+
+**Tests.**
+* `localrefs`: FIFO order, a cancelled waiter, the wait bound, the hold bound,
+  unique keys; the marker, the durable step (idle, in flight, git's lock held,
+  failed fsync, repository gone), recovery (process restart, kernel restart,
+  stale lock, corrupt marker), the torn-stack experiment.
+* `voter`: committed, aborted and rejected transactions; a marker that cannot be
+  written; durability per mode (off, shadow and authoritative without boot
+  identity keep the fsync).
+* `updateref`: the effective `core.fsync` of `update-ref`.
+* `hook/updateref`: only a voter that defers turns it off.
+* `syncer`: catch-up marks; reboot recovery hydrates (a read before it lists
+  nothing); process-restart recovery keeps; non-caches are kept; a failed fsync
+  moves aside and hydrates.
+* e2e with the real `gitaly` binary: SIGKILL after writes (same boot, kept,
+  settled); SIGKILL in the durable step (the lock is removed at restart, writes
+  go on); a simulated power loss (torn table, other boot: moved aside, every
+  write served); stack depth under 4×30 concurrent writes (git's geometric
+  compaction, at most 2⌈log₂ n⌉+2 tables; measured 4 for 122 updates).
+
 ### Data model (new migration, both dialects)
 
 Migration `20261018000000_graft_storage_gc`, appended to `sqliteMigrations` and
@@ -1418,6 +1546,7 @@ every entry point returns `FailedPrecondition`.
 | WP74b | REVIEW ROOTS RULE: `reviewroots` (Protect, Sweep, Backfill), the review service, `dbreview.WithRequiredRoots`, the two database checks | WP74 |
 | WP75 | `gc` package | WP71–WP73 |
 | WP76 | syncer (seed, `C_sync`), `verify_objects.go` | WP71, WP74 |
+| WP76b | LOCAL REFERENCE WRITES RULE: `localrefs` (admission, deferred durability), voter, syncer, `serve.go` recovery and durable steps | WP76 |
 | WP77 | config, `maintenance` package, `serve.go` wiring | WP74–WP76 |
 | WP78 | proto, handlers, SDK, CLI | WP74, WP75 |
 | WP79 | e2e, STORAGE.md and CONFIGURATION.md, benchmark | all |
@@ -1478,7 +1607,11 @@ New (m3): `corestore/checkpoint/**`, `corestore/gc/**`, `corestore/maintenance/*
 `cmd/graft/storage.go`, `proto/storage_core.proto` (+ generated code),
 `config_graft_storage.go`, `doc/graft/STORAGE.md`, `corestore/dbreview/**`,
 `corestore/reviewroots/**`, and `internal/gitaly/service/review/**` (the REVIEW
-ROOTS RULE writes only, assigned to m3 by the PM). Shared, my section only:
+ROOTS RULE writes only, assigned to m3 by the PM), `corestore/localrefs/**`
+(WP76b). Granted by the PM for WP76b only: `internal/git/updateref` (the deferred
+durability option), `internal/git/gitcmd` (the fsync and lock-timeout constants),
+`internal/gitaly/hook/storage_voter.go` (and its test double) and the updater call
+in `internal/gitaly/hook/updateref/update_with_hooks.go`. Shared, my section only:
 `internal/cli/gitaly/serve.go`, `doc/graft/CONFIGURATION.md`. No change to the land
 path: the voter is m3's; the land paths call it unchanged.
 
@@ -1508,3 +1641,8 @@ path: the voter is m3's; the land paths call it unchanged.
     repository row lock.
 26. **One upload path**: every production upload goes through `Core.UploadPack`, and
     every row that references an upload is committed under its `CommitContext`.
+27. **Local references are a cache of the database**: in authoritative mode a local
+    reference write without fsync happens only after its repository has a durable
+    dirty marker; a marker is removed only after the stack is durable, under git's
+    lock with no transaction in flight; a repository dirty at a kernel restart, or
+    whose durable step failed, is moved aside and hydrated, never served.

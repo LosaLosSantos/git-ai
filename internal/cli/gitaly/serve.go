@@ -37,6 +37,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitlab"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gate"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	corestoreopen "github.com/feder-cr/git-ai/internal/graft/corestore/open"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	corestoresyncer "github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
@@ -615,6 +616,12 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		storageGate   *gate.Gate
 	)
 	if storageCore.Enabled() {
+		if storageCore.Authoritative() {
+			if err := openLocalReferenceWrites(storageCore, locator, logger); err != nil {
+				return err
+			}
+		}
+
 		syncer := corestoresyncer.New(storageCore, logger, locator, localrepoFactory, gitCmdFactory)
 		prometheus.MustRegister(syncer)
 		storageSyncer = syncer
@@ -624,6 +631,20 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		hookManagerOpts = append(hookManagerOpts, hook.WithStorageVoter(storageVoter))
 
 		if storageCore.Authoritative() {
+			// Before any listener opens: a repository whose references may be torn
+			// by a kernel restart is moved aside, so nothing reads it before it is
+			// hydrated again (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
+			storageNames := make([]string, 0, len(cfg.Storages))
+			for _, s := range cfg.Storages {
+				storageNames = append(storageNames, s.Name)
+			}
+			if err := syncer.RecoverLocalReferences(ctx, storageNames); err != nil {
+				return err
+			}
+			durableCtx, stopDurableSteps := context.WithCancel(ctx)
+			defer stopDurableSteps()
+			go syncer.RunDurableSteps(durableCtx, localrefs.DurableStepInterval)
+
 			storageGate = gate.New(storageCore, syncer, logger, locator, localrepoFactory, protoregistry.GitalyProtoPreregistered)
 		}
 
@@ -892,9 +913,6 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	return waitErr
 }
 
-// newPackObjectsAdaptiveLimit builds the adaptive limit backing a pack objects limiter. The limit
-// only moves when the configuration asks for an adaptive one, and is otherwise pinned to the
-// configured concurrency.
 // housekeepReviewRoots runs the backstop of the review roots after the daily
 // housekeeping of a repository: it writes the keep-around references that
 // open reviews lack and deletes those no open review uses (in authoritative
@@ -921,6 +939,32 @@ func housekeepReviewRoots(ctx context.Context, logger log.Logger, core *corestor
 	return nil
 }
 
+// openLocalReferenceWrites sets up the admission and the deferred durability
+// of the local reference writes of the storage core in authoritative mode
+// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). Without the kernel's boot
+// identity (not Linux) the durability is not deferred: every reference write
+// is made durable by git, as in the other modes.
+func openLocalReferenceWrites(core *corestore.Core, locator storage.Locator, logger log.Logger) error {
+	lockTimeout := gitcmd.ReftableLockTimeoutMilliseconds * time.Millisecond
+	core.RefAdmission = localrefs.NewAdmission(lockTimeout, lockTimeout)
+	prometheus.MustRegister(core.RefAdmission)
+
+	durability, err := localrefs.NewDurability(locator, localrefs.DurableStepIdle)
+	if err != nil {
+		return fmt.Errorf("graft storage core: %w", err)
+	}
+	if durability == nil {
+		logger.Info("graft storage core: the kernel exposes no boot identity, every reference write is made durable by git")
+		return nil
+	}
+	core.RefDurability = durability
+	prometheus.MustRegister(durability)
+	return nil
+}
+
+// newPackObjectsAdaptiveLimit builds the adaptive limit backing a pack objects limiter. The limit
+// only moves when the configuration asks for an adaptive one, and is otherwise pinned to the
+// configured concurrency.
 func newPackObjectsAdaptiveLimit(name string, limits config.ConcurrencyLimits) *limiter.AdaptiveLimit {
 	if !limits.Adaptive {
 		return limiter.NewAdaptiveLimit(name, limiter.AdaptiveSetting{

@@ -25,6 +25,19 @@ type StorageVoter interface {
 	// Authoritative reports whether the storage core's database replaces the
 	// file changelog.
 	Authoritative() bool
+	// DeferredReferenceDurability reports whether reference transactions that
+	// the voter commits may write their references without fsync: the database
+	// commit is their durable point, and the storage core makes the local
+	// references durable later (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
+	DeferredReferenceDurability() bool
+}
+
+// DeferredReferenceDurability reports whether the reference transactions that
+// the manager drives itself (UpdateWithHooks) may write their references
+// without fsync. It is false without a storage voter, so only the storage
+// core's authoritative mode ever turns the fsync of references off.
+func (m *GitLabHookManager) DeferredReferenceDurability() bool {
+	return m.storageVoter != nil && m.storageVoter.DeferredReferenceDurability()
 }
 
 // WithStorageVoter makes the manager commit every reference transaction to

@@ -431,6 +431,45 @@ or re-import the repository from scratch (see
   whose key the database no longer has; it is moved into the storage's
   temporary directory, and the repository is reported missing on that node too.
 
+- **Local reference writes and unclean shutdowns (authoritative mode).** In
+  authoritative mode the database commit is the durable point of a reference
+  update. A node therefore writes its local references without fsync, and makes
+  them durable in a background step a second after a repository goes idle
+  (`doc/graft/PLAN7.md`, LOCAL REFERENCE WRITES RULE). Until then the
+  repository has a dirty marker in `<storage>/+gitaly/graft-ref-durability/`,
+  which holds the kernel's boot identity.
+  - *Process crash or restart* (same kernel boot): nothing is lost, because the
+    page cache kept every write. The restarted node settles the markers.
+  - *Kernel crash or power loss*: the references written since the last durable
+    step may be lost or torn, and git reads a torn reftable stack as an empty
+    repository without an error. At startup, before it opens any listener,
+    `gitaly serve` moves aside every repository that was dirty under the
+    previous boot, and the first request hydrates it again from the database and
+    the bucket. This hydration starts from the newest checkpoint when there is
+    one, so its cost is bounded by how recent the checkpoints are (the
+    maintenance that creates them is WP77; until then, by the full history).
+    Nothing acknowledged is lost. Cost after a power
+    loss: one hydration per repository that had a write in the second before the
+    loss, or that was still being written. On a busy node that can be every
+    active repository. A repository is only moved when the database holds it
+    with changesets and the local copy has a watermark; other markers are
+    dropped.
+  - *A write the kernel reports as failed* (a writeback error, same boot): the
+    durable step's fsync fails, the repository is moved aside at once and logged,
+    and the next request hydrates it.
+  - Offline tools that read a repository from disk (`gitaly git -C <repo>`,
+    `gitaly-debug simulate-http-clone`) must not be pointed at a repository of
+    a node after an unclean shutdown before `gitaly serve` has started once:
+    they would read the torn stack.
+  - Scope: Linux only (the boot identity is `/proc/sys/kernel/random/boot_id`).
+    Elsewhere, and in off and shadow modes, git makes every reference write
+    durable as before.
+  - The node's reference writers (hook transactions and catch-up) wait for the
+    repository's reference lock in arrival order instead of git's polling.
+- **A corrupt dirty marker** stops `gitaly serve` at startup with the marker's
+  path: the repository it named cannot be identified. Check the storage, then
+  remove the marker; the repository's next request hydrates it if it is stale.
+
 These behaviours are proved by the end-to-end tests
 `internal/graft/e2e/storage_*_test.go`, with several real servers sharing one
 database and one bucket, on SQLite and Postgres: writes on one node and reads
@@ -456,6 +495,14 @@ without a single divergence.
 | `graft_storage_sync_total{result}` | Catch-ups before a request; results `fresh`, `caught_up`, `hydrated`, `error`. |
 | `graft_storage_sync_seconds` | Duration of the catch-up before a request. |
 | `graft_storage_sync_changesets_total`, `graft_storage_sync_bytes_total` | Changesets applied and pack bytes downloaded by catch-up and hydration. |
+| `graft_storage_ref_admission_wait_seconds{writer}` | Wait of a local reference writer (`hook`, `syncer`) for its turn at the repository's reference lock. |
+| `graft_storage_ref_admission_waiting` | Writers waiting for their turn, all repositories. |
+| `graft_storage_ref_admission_bypassed_total{writer}` | Writers that went on to git's lock without their turn after `reftable.lockTimeout` (10 s). |
+| `graft_storage_ref_admission_expired_total` | Turns ended by the 10 s bound instead of their release (a git process that died between its phases). |
+| `graft_storage_ref_dirty_repositories` | Repositories with reference writes not yet made durable. |
+| `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written and removed by the durable step. |
+| `graft_storage_ref_writes_inflight` | Hook transactions between their Prepared and Committed phases; one that never commits keeps its repository dirty. |
+| `graft_storage_ref_untrusted_total{reason}` | Repositories moved aside to be hydrated again: `reboot` (dirty at a kernel restart), `sync_failed` (the durable step's fsync failed). |
 
 ## Benchmark
 

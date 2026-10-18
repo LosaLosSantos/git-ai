@@ -20,8 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/blobstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/stretchr/testify/require"
 )
@@ -196,3 +198,20 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 
 	return core
 }
+
+// EnableLocalRefs gives the core the admission and the deferred durability of
+// the local reference writes, as gitaly serve does in authoritative mode
+// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). The boot identity is a
+// fixed test value unless opts set another one.
+func EnableLocalRefs(tb testing.TB, core *corestore.Core, locator storage.Locator, opts ...localrefs.DurabilityOption) {
+	tb.Helper()
+
+	core.RefAdmission = localrefs.NewAdmission(10*time.Second, 10*time.Second)
+	durability, err := localrefs.NewDurability(locator, 0, append([]localrefs.DurabilityOption{localrefs.WithBootID(TestBootID)}, opts...)...)
+	require.NoError(tb, err)
+	core.RefDurability = durability
+}
+
+// TestBootID is the boot identity EnableLocalRefs gives the deferred
+// durability by default.
+const TestBootID = "test-boot"

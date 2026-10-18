@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 )
 
 // BlobStore is the object storage of the storage core. Objects are immutable
@@ -99,6 +100,13 @@ type Core struct {
 	// runs in shadow mode too.
 	GCGrace  time.Duration
 	GCMargin time.Duration
+	// RefAdmission orders the local reference writers of the node and
+	// RefDurability defers the durability of their writes to a durable step
+	// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). Both are set in
+	// authoritative mode only; nil admits nothing and keeps every reference write
+	// durable by itself.
+	RefAdmission  *localrefs.Admission
+	RefDurability *localrefs.Durability
 }
 
 // WriteDeadline is W of doc/graft/PLAN7.md: a writer uploads a pack and

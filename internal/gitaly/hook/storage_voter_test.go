@@ -59,6 +59,8 @@ func (v *recordingVoter) Aborted(context.Context, gitcmd.HooksPayload, []byte) {
 
 func (v *recordingVoter) Authoritative() bool { return true }
 
+func (v *recordingVoter) DeferredReferenceDurability() bool { return false }
+
 // TestReferenceTransactionHook_storageVoterPhases checks that the hook manager
 // hands every phase of a reference transaction to the storage core, the
 // Preparing phase included (doc/graft/PLAN6.md, LOCK AND HISTORY RULE), and
