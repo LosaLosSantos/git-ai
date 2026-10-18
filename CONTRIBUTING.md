@@ -50,7 +50,7 @@ For help text style guidance for this project, see the [help text style guide](d
 
 ## Commits
 
-In this project we value good commit hygiene. Clean commits makes it much
+In this project we value good commit hygiene. Clean commits make it much
 easier to discover when bugs have been introduced, why changes have been made,
 and what their reasoning was.
 
