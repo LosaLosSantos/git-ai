@@ -41,11 +41,16 @@ type LandPlan struct {
 	kind LandKind
 	// commit is the commit that lands.
 	commit git.ObjectID
-	// parents are the parents of every commit of the range tip..commit.
+	// parents are the parents of every commit of the range tip..commit. It is empty when
+	// mergesInRange is set.
 	parents map[git.ObjectID][]git.ObjectID
+	// mergesInRange is set when the range is known to hold a merge commit without being listed
+	// exactly (see Plan).
+	mergesInRange bool
 }
 
-// Plan decides how commit lands onto tip, with the answers of checker.
+// Plan decides how commit lands onto tip, with the answers of checker, in at most four
+// questions whatever the size of the history.
 //
 // The listing of the commits that commit adds to tip (checker.List) may hold commits that tip
 // reaches when committer dates are skewed, never fewer than the range (see revrange). Two facts
@@ -56,9 +61,19 @@ type LandPlan struct {
 //     is reachable from commit, so tip is then reachable from commit; and on a path from commit down
 //     to tip, the commit right above tip is in the range, so it is listed. That is a fast-forward.
 //
-// Whether the change has merge commits, whether it shares history with tip and which commits a
-// rebase replays need the exact range, so a diverged change has its listing made exact by
-// revrange.Refine first, which checks the bottoms of the listing once without skew.
+// Otherwise the change diverges, and one question for all the bottoms of the listing
+// (checker.ReachedBottoms) tells whether the listing is exact. Without skew it is, and the plan is
+// made from it. With skew:
+//
+//   - The merge bases of tip and commit are commit alone exactly when tip reaches commit: the
+//     change is already landed.
+//   - Otherwise only a rebase needs more than the kind, and a rebase needs a range without merge
+//     commits. Such a range is a chain from commit down to the one commit p where it leaves the
+//     range; p is a common ancestor, and every common ancestor is reachable from commit through
+//     the chain, so through p: p is the only merge base. A listing of commit that excludes p then
+//     lists the chain and nothing else, because every path from commit runs through p. So the
+//     listing below the merge bases is either such a chain, and exact, or the range has a merge
+//     commit, and a rebase refuses the change (ErrMergesInRange) without the exact range.
 func Plan(ctx context.Context, checker ancestry.Checker, tip, commit git.ObjectID) (LandPlan, error) {
 	listed, err := checker.List(ctx, commit, []git.ObjectID{tip})
 	if err != nil {
@@ -70,14 +85,67 @@ func Plan(ctx context.Context, checker ancestry.Checker, tip, commit git.ObjectI
 		return plan, err
 	}
 
-	rng, err := revrange.Refine(ctx, checker, tip, commit, listed)
+	bottoms, err := revrange.Bottoms(listed)
 	if err != nil {
-		return LandPlan{}, fmt.Errorf("making the range of the change exact: %w", err)
+		return LandPlan{}, fmt.Errorf("listing the commits of the change: %w", err)
+	}
+	reached, err := checker.ReachedBottoms(ctx, tip, bottoms)
+	if err != nil {
+		return LandPlan{}, fmt.Errorf("checking the listing of the change: %w", err)
+	}
+	if len(reached) == 0 {
+		return plan, nil
 	}
 
-	// The exact range is empty when every listed commit was reachable from tip: the commit is
-	// already landed. It cannot be a fast-forward, which the listing would have shown.
-	return planLanding(tip, commit, rng)
+	revrange.CountSkewedListing()
+
+	bases, err := checker.MergeBases(ctx, tip, commit)
+	if err != nil {
+		return LandPlan{}, fmt.Errorf("finding the merge bases of the change: %w", err)
+	}
+	switch {
+	case len(bases) == 0:
+		// A bottom of the listing is reachable from tip, and every listed commit from commit.
+		return LandPlan{}, fmt.Errorf("%s and %s have no merge base although they share history", tip, commit)
+	case len(bases) == 1 && bases[0] == commit:
+		return LandPlan{kind: LandAlreadyLanded, commit: commit}, nil
+	case len(bases) > 1:
+		// A range without merge commits leaves through one commit, the only merge base.
+		return LandPlan{kind: LandDiverged, commit: commit, mergesInRange: true}, nil
+	}
+
+	relisted, err := checker.List(ctx, commit, bases)
+	if err != nil {
+		return LandPlan{}, fmt.Errorf("listing the commits of the change: %w", err)
+	}
+	if !isChainDownTo(relisted, commit, bases[0]) {
+		return LandPlan{kind: LandDiverged, commit: commit, mergesInRange: true}, nil
+	}
+
+	return planLanding(tip, commit, relisted)
+}
+
+// isChainDownTo reports whether listed is a chain of commits with one parent each, from commit
+// down to a commit whose parent is base, and nothing else.
+func isChainDownTo(listed []ancestry.RangeCommit, commit, base git.ObjectID) bool {
+	parents := make(map[git.ObjectID][]git.ObjectID, len(listed))
+	for _, c := range listed {
+		parents[c.ID] = c.Parents
+	}
+
+	visited := 0
+	for id := commit; ; {
+		ps, ok := parents[id]
+		if !ok || len(ps) != 1 || visited == len(listed) {
+			return false
+		}
+		visited++
+
+		if ps[0] == base {
+			return visited == len(listed)
+		}
+		id = ps[0]
+	}
 }
 
 // planLanding decides how commit lands onto tip from rng, the exact range tip..commit:
@@ -139,6 +207,10 @@ func (p LandPlan) Kind() LandKind {
 func (p LandPlan) Replay() ([]git.ObjectID, error) {
 	if p.kind != LandDiverged {
 		return nil, fmt.Errorf("replay of a landing that is not diverged (kind %d)", p.kind)
+	}
+
+	if p.mergesInRange {
+		return nil, ErrMergesInRange
 	}
 
 	for _, parents := range p.parents {

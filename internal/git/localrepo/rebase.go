@@ -105,10 +105,20 @@ func (repo *Repo) Rebase(ctx context.Context, upstream, branch string, options .
 // that is not on the side of upstream. The listing therefore also excludes the boundaries of both
 // sides, computed exactly: every path from either tip into the shared history runs through one of
 // them, so the walk lists exactly the commits of each side.
+//
+// Both sides come from one listing (revrange.Sides), and one question for the bottoms of each side
+// tells whether it is exact (revrange.Refine): without skew that is two or three processes more
+// than the listing alone, whatever the size of the history. A skewed side costs one more process,
+// which walks the history of the other tip.
 func (repo *Repo) rebaseTodo(ctx context.Context, upstreamOID, branchOID git.ObjectID, reapplyCherryPicks bool) ([]string, error) {
 	walker := revrange.Git(repo)
 
-	branchSide, err := revrange.Exact(ctx, walker, upstreamOID, branchOID)
+	upstreamSide, branchSide, err := revrange.Sides(ctx, repo, upstreamOID, branchOID)
+	if err != nil {
+		return nil, structerr.NewInternal("listing the commits of both sides: %w", err)
+	}
+
+	branchSide, err = revrange.Refine(ctx, walker, upstreamOID, branchSide)
 	if err != nil {
 		return nil, structerr.NewInternal("listing the commits of the branch: %w", err)
 	}
@@ -116,7 +126,7 @@ func (repo *Repo) rebaseTodo(ctx context.Context, upstreamOID, branchOID git.Obj
 
 	// The side of upstream only matters to --cherry-pick, which compares the branch with it.
 	if !reapplyCherryPicks {
-		upstreamSide, err := revrange.Exact(ctx, walker, branchOID, upstreamOID)
+		upstreamSide, err = revrange.Refine(ctx, walker, branchOID, upstreamSide)
 		if err != nil {
 			return nil, structerr.NewInternal("listing the commits of upstream: %w", err)
 		}

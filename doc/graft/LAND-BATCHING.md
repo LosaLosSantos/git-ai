@@ -101,19 +101,21 @@ short git process, and one more when it diverges from the tip:
    otherwise it diverges. Both facts are exact even when committer dates are
    skewed. A skewed history can make `git rev-list` list commits that the tip
    already has (its walk stops early when the commits it still has to visit are
-   older than those it listed), never fewer. So a diverging change has its
-   listing made exact first (`revrange.Refine`): one
-   `git merge-base --is-ancestor` per bottom of the listing (a listed commit
-   none of whose parents is listed), usually one. If a bottom is reachable from
-   the tip, the listing held extra commits: it is listed again below the exact
-   merge bases (`git merge-base --all`), and the bottoms that the tip reaches
-   are removed one check at a time (counted by
-   `graft_revrange_skewed_listings_total` and
-   `graft_revrange_skew_checks_total`). For the rebase strategy, a merge commit
-   in the exact range refuses the change (`InvalidArgument`, use
-   `STRATEGY_MERGE`), a range that ends at a root commit means unrelated
-   history (`InvalidArgument`), and otherwise its commits, oldest first, are
-   the commits to replay.
+   older than those it listed), never fewer. So for a diverging change one
+   `git merge-base --independent tip <bottoms>` tells whether the listing is
+   exact: it drops exactly the bottoms of the listing (listed commits none of
+   whose parents is listed) that the tip reaches, and the listing has extra
+   commits exactly when one of them is dropped. Without skew that is the only
+   extra process. With skew (counted by `graft_revrange_skewed_listings_total`)
+   `git merge-base --all` decides: the change is already landed when its only
+   merge base is the commit itself; otherwise one listing below the merge
+   bases either is a chain of commits with one parent each down to the only
+   merge base, which is then the exact range, or the range has a merge commit.
+   A land therefore costs at most four git processes, whatever the size of the
+   history. For the rebase strategy, a merge commit in the range refuses the
+   change (`InvalidArgument`, use `STRATEGY_MERGE`), a range that ends at a root
+   commit means unrelated history (`InvalidArgument`), and otherwise its
+   commits, oldest first, are the commits to replay.
 3. The commits are replayed by the `rebase.Engine` of the attempt, which keeps
    one `git merge-tree --stdin` process and one `git hash-object --stdin-paths`
    process running for the whole attempt. The replay has the rules, errors and
