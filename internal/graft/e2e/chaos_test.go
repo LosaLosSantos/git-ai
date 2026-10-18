@@ -633,6 +633,10 @@ func TestChaosLanding(t *testing.T) {
 
 	view := chaosViewOf(t, s, s.repoAs(t, tokens[workerName(0)]), base)
 	require.Empty(t, checkChaosInvariants(reqs, results, view), "the chaos invariants hold")
+
+	// Every object that a reference reaches is in the repository: the batches published their
+	// objects as packs before moving the branches (doc/graft/PLAN8.md, invariant D).
+	s.git(t, "fsck", "--connectivity-only", "--no-dangling")
 }
 
 // TestChaosPlanIsSeeded checks that the plan of the scenario depends on the
