@@ -389,7 +389,7 @@ Reading it:
 - `batch_size_mean` above 1 means concurrent lands shared one reference
   update. With batching disabled every land reports 1.
 - In `queue` mode, `p95` and `p99` grow with the number of changes ahead in
-  the queue times `--test-duration`. That is the cost of serialization, which
+  the queue, times `--test-duration`. That is the cost of serialization, which
   the rebase-based land avoids for changes that do not conflict.
 - Results depend on the machine, the storage and whether hooks run. Report
   the full JSON output with any number you quote.
