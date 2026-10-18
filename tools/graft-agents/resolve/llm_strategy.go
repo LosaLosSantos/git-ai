@@ -32,8 +32,8 @@ import (
 //	timeout = "120s"
 //	max_tokens = 4096              # optional: answer limit; unset = provider default
 //
-//	[strategy.llm.options]         # optional, provider specific
-//	...
+//	[strategy.llm.options]         # provider specific; the built-in providers take none
+//	...                            # and fail at startup when any is set
 //
 //	[strategy.llm.budget]          # optional: monthly spending cap (budget_strategy.go)
 //	...
