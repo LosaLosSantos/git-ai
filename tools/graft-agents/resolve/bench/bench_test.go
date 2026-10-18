@@ -3,6 +3,7 @@ package bench
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -258,6 +259,56 @@ func TestNotSentReason(t *testing.T) {
 		got := notSentReason(tc.path, [][]byte{[]byte(tc.side)}, maxBytes, tc.generated)
 		if got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestSampleSeparatesRustFromJava mirrors the mined corpus: few Rust and Python cases, many of the
+// others. Rust and Python are taken whole and the rest is split evenly over TS/JS, Go and Java.
+func TestSampleSeparatesRustFromJava(t *testing.T) {
+	var cases []Case
+	add := func(n int, family, path string) {
+		for i := 0; i < n; i++ {
+			cases = append(cases, Case{ID: fmt.Sprintf("%s-%s-%d", family, path, i), Family: family, Path: path})
+		}
+	}
+	add(983, FamilyTSJS, "a.ts")
+	add(96, FamilyPython, "a.py")
+	add(457, FamilyGo, "a.go")
+	add(22, FamilyRustJava, "a.rs")
+	add(1625, FamilyRustJava, "A.java")
+
+	counts := map[string]int{}
+	for _, c := range Sample(cases, 600, 1) {
+		counts[LanguageOf(c.Path)]++
+	}
+	if counts["rust"] != 22 || counts["python"] != 96 {
+		t.Fatalf("counts %v: Rust and Python must be taken whole", counts)
+	}
+	rest := 600 - 22 - 96
+	for _, l := range []string{"typescript", "go", "java"} {
+		if counts[l] < rest/3 || counts[l] > rest/3+1 {
+			t.Fatalf("counts %v: the rest must be split evenly (%d each)", counts, rest/3)
+		}
+	}
+}
+
+func TestReportByLanguageAndKind(t *testing.T) {
+	rep := NewReport("test", []Result{
+		{Family: FamilyRustJava, Language: "rust", Kind: protocol.KindContent, Outcome: OutcomeCorrect},
+		{Family: FamilyRustJava, Language: "java", Kind: protocol.KindContent, Outcome: OutcomeWrong},
+		{Family: FamilyRustJava, Language: "java", Kind: protocol.KindModifyDelete, Outcome: OutcomeAbstained},
+	})
+	if rep.Languages["java"].Cases != 2 || rep.Kinds[protocol.KindContent].ErrorRate() != 0.5 || rep.Kinds[protocol.KindModifyDelete].Abstained != 1 {
+		t.Fatalf("languages %+v, kinds %+v", rep.Languages, rep.Kinds)
+	}
+	var b strings.Builder
+	if err := rep.WriteMarkdown(&b); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"| language | cases", "| rust (low n) | 1 |", "| kind | cases", "| content (low n) | 2 | 1 (0) | 1 |", "| modify-delete (low n) | 1 |"} {
+		if !strings.Contains(b.String(), want) {
+			t.Fatalf("markdown lacks %q:\n%s", want, b.String())
 		}
 	}
 }

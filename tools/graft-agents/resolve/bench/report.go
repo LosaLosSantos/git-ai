@@ -67,6 +67,11 @@ type Report struct {
 	Label    string            `json:"label"`
 	Total    Counts            `json:"total"`
 	Families map[string]Counts `json:"families"`
+	// Languages and Kinds count the same results by language (bench.LanguageOf) and by kind of
+	// conflict: the llm strategy declines a modify-delete file, so the content row is what the
+	// model attempted.
+	Languages map[string]Counts `json:"languages"`
+	Kinds     map[string]Counts `json:"kinds"`
 	// NotSent counts the cases that were not sent, by reason.
 	NotSent map[string]int `json:"not_sent"`
 	// SpendUSD is the AI spend of the run in USD, when a budget was used: the usage the provider
@@ -78,14 +83,23 @@ type Report struct {
 	Results []Result `json:"results"`
 }
 
+// LowN is the number of cases below which a row is marked as low-n in the Markdown report.
+const LowN = 30
+
 // NewReport aggregates results.
 func NewReport(label string, results []Result) Report {
-	rep := Report{Label: label, Families: map[string]Counts{}, NotSent: map[string]int{}, Results: results}
+	rep := Report{Label: label, Families: map[string]Counts{}, Languages: map[string]Counts{}, Kinds: map[string]Counts{},
+		NotSent: map[string]int{}, Results: results}
 	for _, r := range results {
 		rep.Total.add(r)
-		fc := rep.Families[r.Family]
-		fc.add(r)
-		rep.Families[r.Family] = fc
+		for _, g := range []struct {
+			m   map[string]Counts
+			key string
+		}{{rep.Families, r.Family}, {rep.Languages, r.Language}, {rep.Kinds, r.Kind}} {
+			c := g.m[g.key]
+			c.add(r)
+			g.m[g.key] = c
+		}
 		if r.Outcome == OutcomeNotSent {
 			rep.NotSent[r.Reason]++
 		}
@@ -125,6 +139,34 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		row(f, rep.Families[f])
 	}
 	row("total", rep.Total)
+
+	// The same results by language and by kind of conflict.
+	for _, group := range []struct {
+		title string
+		m     map[string]Counts
+	}{{"language", rep.Languages}, {"kind", rep.Kinds}} {
+		if len(group.m) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "\n| %s | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | abstained | error rate |\n", group.title)
+		b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		keys := make([]string, 0, len(group.m))
+		for k := range group.m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			name := k
+			if name == "" {
+				name = "other"
+			}
+			if group.m[k].Cases < LowN {
+				name += " (low n)"
+			}
+			row(name, group.m[k])
+		}
+	}
+	fmt.Fprintf(&b, "\nRows marked low n have fewer than %d cases; their rates are not significant. The llm strategy declines a modify-delete or mode conflict (a side is absent), which goes to the agent as abstained: the content row is what the model attempted.\n", LowN)
 	b.WriteString("\nThe error rate is wrong / (correct + wrong): the share of the results that would land and differ from the human resolution. Correct means equal after normalizing line endings and trailing whitespace; exact means byte-identical.\n")
 	syntaxParts := make([]string, 0, len(families))
 	for _, f := range families {

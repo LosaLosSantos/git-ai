@@ -25,6 +25,38 @@ const (
 )
 
 // familyOf returns the family of a path by its extension, or "" for other files.
+// LanguageOf returns the language of a benchmark path, by extension: typescript, javascript,
+// python, go, rust or java; "" for any other path.
+func LanguageOf(p string) string {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".ts", ".tsx", ".mts", ".cts":
+		return "typescript"
+	case ".js", ".jsx", ".mjs", ".cjs":
+		return "javascript"
+	case ".py", ".pyi":
+		return "python"
+	case ".go":
+		return "go"
+	case ".rs":
+		return "rust"
+	case ".java":
+		return "java"
+	}
+	return ""
+}
+
+// stratumOf returns the sampling stratum of a case: its family, except that Rust and Java,
+// one family, are two strata, so that the few Rust cases are not drowned by the Java ones.
+func stratumOf(c Case) string {
+	if c.Family == FamilyRustJava {
+		if LanguageOf(c.Path) == "rust" {
+			return "rust"
+		}
+		return "java"
+	}
+	return c.Family
+}
+
 func familyOf(p string) string {
 	switch strings.ToLower(path.Ext(p)) {
 	case ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs":

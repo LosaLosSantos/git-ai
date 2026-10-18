@@ -40,6 +40,8 @@ type Result struct {
 	ID       string  `json:"id"`
 	Repo     string  `json:"repo"`
 	Family   string  `json:"family"`
+	Language string  `json:"language"`
+	Kind     string  `json:"kind"`
 	Path     string  `json:"path"`
 	Outcome  string  `json:"outcome"`
 	Exact    bool    `json:"exact,omitempty"`
@@ -55,10 +57,14 @@ type Result struct {
 // Sample returns n cases of cases, stratified by family: each family's cases are shuffled with the
 // seed and the families are taken in turn, so that the sample is the same for the same manifest and
 // seed. n <= 0 takes every case.
+//
+// The strata are the families, with Rust and Java apart (stratumOf): a stratum with fewer cases
+// than its share is taken whole, and the rest is split evenly over the others.
 func Sample(cases []Case, n int, seed int64) []Case {
 	byFamily := map[string][]Case{}
 	for _, c := range cases {
-		byFamily[c.Family] = append(byFamily[c.Family], c)
+		s := stratumOf(c)
+		byFamily[s] = append(byFamily[s], c)
 	}
 	families := make([]string, 0, len(byFamily))
 	for f := range byFamily {
@@ -130,7 +136,7 @@ func (r Runner) Run(ctx context.Context, cases []Case) ([]Result, error) {
 }
 
 func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, error) {
-	res := Result{ID: c.ID, Repo: c.Repo, Family: c.Family, Path: c.Path}
+	res := Result{ID: c.ID, Repo: c.Repo, Family: c.Family, Language: LanguageOf(c.Path), Kind: c.Kind, Path: c.Path}
 	g := gitRepo{dir: r.Clone(c.Repo)}
 
 	sides := map[string]*protocol.Side{}
