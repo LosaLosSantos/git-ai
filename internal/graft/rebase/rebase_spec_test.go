@@ -140,8 +140,9 @@ func TestSpecRebaseConflictReturnsRebaseConflictError(t *testing.T) {
 
 // TestSpecRebaseSkipsCherryPickedCommits: a branch commit whose change is
 // already in upstream becomes empty when it is replayed and is dropped, so the
-// result is upstream itself. (Landing reapplies cherry-picks, see
-// computeLandedTip; the commit is dropped as empty, not by patch ID.)
+// result is upstream itself. (Landing reapplies cherry-picks, see computeTip in
+// internal/gitaly/service/operations/land_attempt.go; the commit is dropped as empty, not by
+// patch ID.)
 func TestSpecRebaseSkipsCherryPickedCommits(t *testing.T) {
 	ctx, cfg, repoPath, repo := specSetup(t)
 

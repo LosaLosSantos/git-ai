@@ -8,6 +8,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/ancestry"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
@@ -86,13 +87,13 @@ func TestSpecAncestryNewEnabledAgreesWithGit(t *testing.T) {
 	checker := ancestry.New(ctx, true, repo, nil, nil, testhelper.NewLogger(t))
 	require.NotNil(t, checker)
 
-	// Phase 4b: the checker answers one question, the range of a change (PLAN8).
+	// Phase 4b: the checker answers the range of a change (PLAN8), exact through revrange.
 	pairs := [][2]git.ObjectID{{base, merge}, {merge, base}, {left, right}, {right, left}, {base, base}}
 	for _, p := range pairs {
-		want, wantErr := reference.Range(ctx, p[0], p[1])
-		got, gotErr := checker.Range(ctx, p[0], p[1])
+		want, wantErr := revrange.Exact(ctx, reference, p[0], p[1])
+		got, gotErr := revrange.Exact(ctx, checker, p[0], p[1])
 		require.Equal(t, wantErr != nil, gotErr != nil)
-		require.ElementsMatch(t, want, got, "Range(%s, %s)", p[0], p[1])
+		require.ElementsMatch(t, want, got, "range %s..%s", p[0], p[1])
 	}
 }
 

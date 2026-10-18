@@ -260,10 +260,11 @@ func commandCount(ctx context.Context) int {
 	return count
 }
 
-// TestLandBatchStepperLandsWithOneProcessPerMember drives one batch attempt: every request is decided
-// from one range listing, the long-lived processes of the attempt serve the rest, and the publish
-// makes the objects of the attempt durable as one pack before the reference moves.
-func TestLandBatchStepperLandsWithOneProcessPerMember(t *testing.T) {
+// TestLandBatchStepperProcessesPerMember drives one batch attempt: every request is decided from one
+// range listing, made exact with one more check when the request diverges, the long-lived
+// processes of the attempt serve the rest, and the publish makes the objects of the attempt
+// durable as one pack before the reference moves.
+func TestLandBatchStepperProcessesPerMember(t *testing.T) {
 	t.Parallel()
 
 	ctx := log.InitContextCustomFields(featureflag.ContextWithFeatureFlag(testhelper.Context(t), featureflag.GPGSigning, false))
@@ -309,14 +310,18 @@ func TestLandBatchStepperLandsWithOneProcessPerMember(t *testing.T) {
 		return step, commandCount(ctx) - before
 	}
 
-	// A rebase onto the running tip, a request already landed, and a fast-forward of the starting
-	// tip each run one short git process: the range listing (git rev-list). The command factory
-	// reads the object format for attr.tree from the repository's files, without a process.
+	// A request already landed and a fast-forward of the starting tip each run one short git
+	// process: the range listing (git rev-list), from which both facts are exact. A rebase onto the
+	// running tip runs one more, the check of the one bottom of its listing (git merge-base
+	// --is-ancestor), which makes the range it replays exact under skewed committer dates (see
+	// revrange). The command factory reads the object format for attr.tree from the repository's
+	// files, without a process.
 	const rangeListingProcesses = 1
+	const exactRangeProcesses = rangeListingProcesses + 1
 
 	second, processes := landWithProcesses(first.tip, f.diverged2)
 	require.True(t, second.rewritten)
-	require.Equal(t, rangeListingProcesses, processes, "rebase")
+	require.Equal(t, exactRangeProcesses, processes, "rebase")
 
 	landed, processes := landWithProcesses(second.tip, f.base)
 	require.True(t, landed.alreadyLanded)

@@ -15,11 +15,11 @@ func TestSpecEmptyRangeIsAlreadyLanded(t *testing.T) {
 
 	tip, commit := git.ObjectID("tip"), git.ObjectID("commit")
 
-	plan, err := PlanLanding(tip, commit, nil)
+	plan, err := planLanding(tip, commit, nil)
 	require.NoError(t, err)
 	require.Equal(t, LandAlreadyLanded, plan.Kind())
 
-	plan, err = PlanLanding(tip, commit, []ancestry.RangeCommit{})
+	plan, err = planLanding(tip, commit, []ancestry.RangeCommit{})
 	require.NoError(t, err)
 	require.Equal(t, LandAlreadyLanded, plan.Kind())
 }
@@ -33,7 +33,7 @@ func TestSpecTipAsParentIsFastForward(t *testing.T) {
 		{ID: commit, Parents: []git.ObjectID{"tip"}},
 	}
 
-	plan, err := PlanLanding(tip, commit, rng)
+	plan, err := planLanding(tip, commit, rng)
 	require.NoError(t, err)
 	require.Equal(t, LandFastForward, plan.Kind())
 }
@@ -49,7 +49,7 @@ func TestSpecMergeWithTipParentIsFastForward(t *testing.T) {
 		{ID: "c2", Parents: []git.ObjectID{"tip"}},
 	}
 
-	plan, err := PlanLanding(tip, commit, rng)
+	plan, err := planLanding(tip, commit, rng)
 	require.NoError(t, err)
 	require.Equal(t, LandFastForward, plan.Kind())
 }
@@ -64,7 +64,7 @@ func TestSpecUnmergedRangeIsDiverged(t *testing.T) {
 		{ID: "c1", Parents: []git.ObjectID{"base"}},
 	}
 
-	plan, err := PlanLanding(tip, commit, rng)
+	plan, err := planLanding(tip, commit, rng)
 	require.NoError(t, err)
 	require.Equal(t, LandDiverged, plan.Kind())
 }
@@ -81,7 +81,7 @@ func TestSpecMergeInDivergedRangeFails(t *testing.T) {
 		{ID: "c1", Parents: []git.ObjectID{"base"}},
 		{ID: "c2", Parents: []git.ObjectID{"base"}},
 	}
-	plan, err := PlanLanding(tip, commit, mergeOnly)
+	plan, err := planLanding(tip, commit, mergeOnly)
 	require.NoError(t, err)
 	require.Equal(t, LandDiverged, plan.Kind())
 	_, err = plan.Replay()
@@ -92,7 +92,7 @@ func TestSpecMergeInDivergedRangeFails(t *testing.T) {
 		{ID: "c1", Parents: []git.ObjectID{"base"}},
 		{ID: "c2"},
 	}
-	plan, err = PlanLanding(tip, commit, mergeAndRoot)
+	plan, err = planLanding(tip, commit, mergeAndRoot)
 	require.NoError(t, err)
 	_, err = plan.Replay()
 	require.ErrorIs(t, err, ErrMergesInRange)
@@ -108,7 +108,7 @@ func TestSpecRootInDivergedRangeIsUnrelated(t *testing.T) {
 		{ID: "c1"},
 	}
 
-	plan, err := PlanLanding(tip, commit, rng)
+	plan, err := planLanding(tip, commit, rng)
 	require.NoError(t, err)
 	require.Equal(t, LandDiverged, plan.Kind())
 	_, err = plan.Replay()
@@ -134,7 +134,7 @@ func TestSpecReplayOrderIndependentOldestFirst(t *testing.T) {
 	}
 
 	for _, rng := range [][]ancestry.RangeCommit{inOrder, shuffled} {
-		plan, err := PlanLanding(tip, commit, rng)
+		plan, err := planLanding(tip, commit, rng)
 		require.NoError(t, err)
 		todo, err := plan.Replay()
 		require.NoError(t, err)
@@ -148,7 +148,7 @@ func TestSpecReplayRejectsNonDivergedPlan(t *testing.T) {
 
 	tip, commit := git.ObjectID("tip"), git.ObjectID("commit")
 
-	landed, err := PlanLanding(tip, commit, nil)
+	landed, err := planLanding(tip, commit, nil)
 	require.NoError(t, err)
 	_, err = landed.Replay()
 	require.Error(t, err)
@@ -156,7 +156,7 @@ func TestSpecReplayRejectsNonDivergedPlan(t *testing.T) {
 	fastForward := []ancestry.RangeCommit{
 		{ID: commit, Parents: []git.ObjectID{"tip"}},
 	}
-	ff, err := PlanLanding(tip, commit, fastForward)
+	ff, err := planLanding(tip, commit, fastForward)
 	require.NoError(t, err)
 	require.Equal(t, LandFastForward, ff.Kind())
 	_, err = ff.Replay()
@@ -172,14 +172,14 @@ func TestSpecPlanLandingRejectsBadRange(t *testing.T) {
 	missingCommit := []ancestry.RangeCommit{
 		{ID: "c1", Parents: []git.ObjectID{"base"}},
 	}
-	_, err := PlanLanding(tip, commit, missingCommit)
+	_, err := planLanding(tip, commit, missingCommit)
 	require.Error(t, err)
 
 	duplicated := []ancestry.RangeCommit{
 		{ID: commit, Parents: []git.ObjectID{"base"}},
 		{ID: commit, Parents: []git.ObjectID{"base"}},
 	}
-	_, err = PlanLanding(tip, commit, duplicated)
+	_, err = planLanding(tip, commit, duplicated)
 	require.Error(t, err)
 }
 
@@ -192,7 +192,7 @@ func TestSpecSingleCommitReplaysItself(t *testing.T) {
 		{ID: commit, Parents: []git.ObjectID{"base"}},
 	}
 
-	plan, err := PlanLanding(tip, commit, rng)
+	plan, err := planLanding(tip, commit, rng)
 	require.NoError(t, err)
 	require.Equal(t, LandDiverged, plan.Kind())
 	todo, err := plan.Replay()

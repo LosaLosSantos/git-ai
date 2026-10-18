@@ -253,17 +253,12 @@ func (a *landingAttempt) peel(ctx context.Context, commitID git.ObjectID) (git.O
 	return info.Oid, nil
 }
 
-// plan decides how commitID lands onto tip from one listing of the commits it adds to tip (see
-// rebase.PlanLanding).
+// plan decides how commitID lands onto tip (see rebase.Plan): from one listing of the commits it
+// adds to tip, made exact when the change diverges.
 func (a *landingAttempt) plan(ctx context.Context, tip, commitID git.ObjectID) (rebase.LandPlan, error) {
 	defer a.observe(landBatchPhasePlan, time.Now())
 
-	rng, err := a.ancestry.Range(ctx, tip, commitID)
-	if err != nil {
-		return rebase.LandPlan{}, structerr.NewInternal("listing the commits of the change: %w", err)
-	}
-
-	plan, err := rebase.PlanLanding(tip, commitID, rng)
+	plan, err := rebase.Plan(ctx, a.ancestry, tip, commitID)
 	if err != nil {
 		return rebase.LandPlan{}, structerr.NewInternal("planning the landing: %w", err)
 	}

@@ -1,10 +1,12 @@
 package rebase
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/graft/ancestry"
 )
 
@@ -43,8 +45,42 @@ type LandPlan struct {
 	parents map[git.ObjectID][]git.ObjectID
 }
 
-// PlanLanding decides how commit lands onto tip from rng, the range tip..commit as
-// ancestry.Checker.Range lists it:
+// Plan decides how commit lands onto tip, with the answers of checker.
+//
+// The listing of the commits that commit adds to tip (checker.List) may hold commits that tip
+// reaches when committer dates are skewed, never fewer than the range (see revrange). Two facts
+// are exact from such a listing, so they cost nothing more:
+//
+//   - The listing is empty exactly when the range is: commit is already landed.
+//   - tip is a parent of a listed commit exactly when tip is reachable from commit. A listed commit
+//     is reachable from commit, so tip is then reachable from commit; and on a path from commit down
+//     to tip, the commit right above tip is in the range, so it is listed. That is a fast-forward.
+//
+// Whether the change has merge commits, whether it shares history with tip and which commits a
+// rebase replays need the exact range, so a diverged change has its listing made exact by
+// revrange.Refine first, which checks the bottoms of the listing once without skew.
+func Plan(ctx context.Context, checker ancestry.Checker, tip, commit git.ObjectID) (LandPlan, error) {
+	listed, err := checker.List(ctx, commit, []git.ObjectID{tip})
+	if err != nil {
+		return LandPlan{}, fmt.Errorf("listing the commits of the change: %w", err)
+	}
+
+	plan, err := planLanding(tip, commit, listed)
+	if err != nil || plan.Kind() != LandDiverged {
+		return plan, err
+	}
+
+	rng, err := revrange.Refine(ctx, checker, tip, commit, listed)
+	if err != nil {
+		return LandPlan{}, fmt.Errorf("making the range of the change exact: %w", err)
+	}
+
+	// The exact range is empty when every listed commit was reachable from tip: the commit is
+	// already landed. It cannot be a fast-forward, which the listing would have shown.
+	return planLanding(tip, commit, rng)
+}
+
+// planLanding decides how commit lands onto tip from rng, the exact range tip..commit:
 //
 //   - The range is empty exactly when commit is reachable from tip: LandAlreadyLanded.
 //   - tip is a parent of a commit of the range exactly when tip is reachable from commit: on a path
@@ -53,8 +89,9 @@ type LandPlan struct {
 //   - Otherwise LandDiverged.
 //
 // A non-empty range must contain commit and list every commit once; anything else is an error,
-// because the range does not come from tip..commit.
-func PlanLanding(tip, commit git.ObjectID, rng []ancestry.RangeCommit) (LandPlan, error) {
+// because the range does not come from tip..commit. Only Plan calls it, with a listing for the two
+// facts that a listing gives exactly and with the exact range otherwise.
+func planLanding(tip, commit git.ObjectID, rng []ancestry.RangeCommit) (LandPlan, error) {
 	if len(rng) == 0 {
 		return LandPlan{kind: LandAlreadyLanded, commit: commit}, nil
 	}

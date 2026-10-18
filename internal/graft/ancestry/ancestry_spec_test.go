@@ -8,8 +8,9 @@ package ancestry
 //   - gittest.TreeEntry{Mode, Path, Content} is the tree-entry type for WithTreeEntries.
 //   - testhelper.NewLogger(t) returns a log.Logger.
 //
-// Phase 4b (PLAN8): the checker answers one question, Range; IsAncestor and MergeBase were removed
-// with the land decision that used them. These tests check Range with the same fixtures.
+// Phase 4b (PLAN8) and the fix of committer-date skew: the checker is a revrange.Walker whose
+// listing only revrange.Exact makes exact. These tests check the exact range of each checker with
+// the same fixtures.
 //   - objectReader and derivedStore are placeholders for the catfile reader and the
 //     derived store of the test repo; they fail the test until wired.
 
@@ -24,6 +25,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/derived"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -96,8 +98,8 @@ func testLogger(t *testing.T) log.Logger {
 func assertSameAnswers(t *testing.T, fx *specFixture, want, got Checker, x, y git.ObjectID) {
 	t.Helper()
 
-	wRange, wErr := want.Range(fx.ctx, x, y)
-	gRange, gErr := got.Range(fx.ctx, x, y)
+	wRange, wErr := revrange.Exact(fx.ctx, want, x, y)
+	gRange, gErr := revrange.Exact(fx.ctx, got, x, y)
 	if wErr != nil || gErr != nil {
 		t.Fatalf("Range(%s, %s): want err %v, got err %v", x, y, wErr, gErr)
 	}
@@ -106,11 +108,11 @@ func assertSameAnswers(t *testing.T, fx *specFixture, want, got Checker, x, y gi
 	}
 }
 
-// mustRange returns the range base..head of chk as a set.
+// mustRange returns the exact range base..head of chk as a set.
 func mustRange(t *testing.T, fx *specFixture, chk Checker, base, head git.ObjectID) map[git.ObjectID][]git.ObjectID {
 	t.Helper()
 
-	rng, err := chk.Range(fx.ctx, base, head)
+	rng, err := revrange.Exact(fx.ctx, chk, base, head)
 	if err != nil {
 		t.Fatalf("Range(%s, %s): %v", base, head, err)
 	}

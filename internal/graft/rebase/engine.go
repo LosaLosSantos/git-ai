@@ -1,6 +1,6 @@
-// Package rebase decides how a change lands onto a branch and replays its commits. PlanLanding
-// makes the decision from one listing of the range the change adds (see ancestry.Checker.Range),
-// and an Engine replays the commits of a rebase through long-lived git helper processes. Together
+// Package rebase decides how a change lands onto a branch and replays its commits. Plan makes the
+// decision from one listing of the range the change adds, made exact when the change diverges (see
+// revrange), and an Engine replays the commits of a rebase through long-lived git helper processes. Together
 // they produce the same commits as (*localrepo.Repo).Rebase with reapplied cherry-picks, without
 // starting several git processes per commit.
 package rebase

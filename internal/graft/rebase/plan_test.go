@@ -2,9 +2,9 @@ package rebase
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
-	"strings"
 	"testing"
 
 	"github.com/feder-cr/git-ai/internal/git"
@@ -96,7 +96,7 @@ func TestPlanLanding(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
-			plan, err := PlanLanding(tip, commit, tc.rng)
+			plan, err := planLanding(tip, commit, tc.rng)
 			if tc.wantErr != "" {
 				require.ErrorContains(t, err, tc.wantErr)
 				return
@@ -125,7 +125,7 @@ func TestPlanLandingRejectsRangesThatAreNotHistories(t *testing.T) {
 	t.Parallel()
 
 	commit := git.ObjectID("commit")
-	plan, err := PlanLanding("tip", commit, []ancestry.RangeCommit{
+	plan, err := planLanding("tip", commit, []ancestry.RangeCommit{
 		{ID: commit, Parents: []git.ObjectID{"a"}},
 		{ID: "a", Parents: []git.ObjectID{commit}},
 	})
@@ -134,7 +134,7 @@ func TestPlanLandingRejectsRangesThatAreNotHistories(t *testing.T) {
 	_, err = plan.Replay()
 	require.ErrorContains(t, err, "cycle")
 
-	plan, err = PlanLanding("tip", commit, []ancestry.RangeCommit{
+	plan, err = planLanding("tip", commit, []ancestry.RangeCommit{
 		{ID: commit, Parents: []git.ObjectID{"base"}},
 		{ID: "stray", Parents: []git.ObjectID{"base"}},
 	})
@@ -177,9 +177,33 @@ func forestHistory(rnd *rand.Rand, n int) [][]int {
 	return parents
 }
 
-// writeForest creates the commits with git fast-import. Commit i has the parents parents[i] and is
-// reachable as refs/heads/c<i>.
-func writeForest(t *testing.T, cfg config.Cfg, repoPath string, parents [][]int) []git.ObjectID {
+// increasingDates returns committer dates that grow with the index of the commit, so that every
+// commit is younger than its parents.
+func increasingDates(n int) []int64 {
+	dates := make([]int64, n)
+	for i := range dates {
+		dates[i] = 1600000000 + int64(i)
+	}
+	return dates
+}
+
+// skewedDates returns increasing dates in which random runs of commits are dated a year before
+// the first commit, as commits written by a client whose clock is behind or whose dates were set
+// explicitly. git rev-list a..b then lists commits that a reaches.
+func skewedDates(rnd *rand.Rand, n int) []int64 {
+	dates := increasingDates(n)
+	for run := 0; run < n/16; run++ {
+		start := rnd.Intn(n)
+		for k := 0; k < 6+rnd.Intn(12) && start+k < n; k++ {
+			dates[start+k] = 1568000000 + int64(k)
+		}
+	}
+	return dates
+}
+
+// writeForest creates the commits with git fast-import. Commit i has the parents parents[i] and the
+// committer date dates[i], and is reachable as refs/heads/c<i>.
+func writeForest(t *testing.T, cfg config.Cfg, repoPath string, parents [][]int, dates []int64) []git.ObjectID {
 	t.Helper()
 
 	var stream bytes.Buffer
@@ -187,7 +211,7 @@ func writeForest(t *testing.T, cfg config.Cfg, repoPath string, parents [][]int)
 		name := fmt.Sprintf("c%d", i)
 		fmt.Fprintf(&stream, "commit refs/heads/%s\n", name)
 		fmt.Fprintf(&stream, "mark :%d\n", i+1)
-		fmt.Fprintf(&stream, "committer Tester <tester@example.com> %d +0000\n", 1600000000+i)
+		fmt.Fprintf(&stream, "committer Tester <tester@example.com> %d +0000\n", dates[i])
 		fmt.Fprintf(&stream, "data %d\n%s\n", len(name), name)
 		for j, parent := range list {
 			if j == 0 {
@@ -208,119 +232,260 @@ func writeForest(t *testing.T, cfg config.Cfg, repoPath string, parents [][]int)
 	return ids
 }
 
-// phase4aDecision is how landing decided before the plan, one git command per question, in the
-// order of the batch stepper and the engine: already landed, fast-forward, merges in the range,
-// common ancestor, and the todo list of the rebase.
-type phase4aDecision struct {
+// exactDecision is how a commit lands onto a tip, computed from the history itself: the ancestors of
+// both commits, from the parents that the history was written with.
+type exactDecision struct {
 	kind      LandKind
 	replayErr error
 	todo      []git.ObjectID
 }
 
-func decideAsPhase4a(t *testing.T, cfg config.Cfg, repoPath string, tip, commit git.ObjectID) phase4aDecision {
-	t.Helper()
-
-	exitCode := func(args ...string) int {
-		cmd := gittest.NewCommand(t, cfg, append([]string{"-C", repoPath}, args...)...)
-		if err := cmd.Run(); err != nil {
-			return cmd.ProcessState.ExitCode()
+// ancestorsOf returns the indexes of the commits reachable from commit x, x included.
+func ancestorsOf(parents [][]int, x int) map[int]bool {
+	seen := map[int]bool{x: true}
+	stack := []int{x}
+	for len(stack) > 0 {
+		c := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, p := range parents[c] {
+			if !seen[p] {
+				seen[p] = true
+				stack = append(stack, p)
+			}
 		}
-		return 0
 	}
-
-	if exitCode("merge-base", "--is-ancestor", commit.String(), tip.String()) == 0 {
-		return phase4aDecision{kind: LandAlreadyLanded}
-	}
-	if exitCode("merge-base", "--is-ancestor", tip.String(), commit.String()) == 0 {
-		return phase4aDecision{kind: LandFastForward}
-	}
-
-	if out := strings.TrimSpace(string(gittest.Exec(t, cfg, "-C", repoPath, "rev-list", "--merges", tip.String()+".."+commit.String()))); out != "" {
-		return phase4aDecision{kind: LandDiverged, replayErr: ErrMergesInRange}
-	}
-
-	switch code := exitCode("merge-base", "--all", tip.String(), commit.String()); code {
-	case 0:
-	case 1:
-		return phase4aDecision{kind: LandDiverged, replayErr: ErrUnrelated}
-	default:
-		t.Fatalf("merge-base --all exited with %d", code)
-	}
-
-	var todo []git.ObjectID
-	for _, line := range strings.Fields(string(gittest.Exec(t, cfg, "-C", repoPath,
-		"rev-list", "--right-only", "--no-merges", "--topo-order", "--reverse", tip.String()+"..."+commit.String()))) {
-		todo = append(todo, git.ObjectID(line))
-	}
-
-	return phase4aDecision{kind: LandDiverged, todo: todo}
+	return seen
 }
 
-// TestPlanLandingMatchesPhase4aDecisions compares, on seeded random forests, the plan made from one
-// range listing with the decisions landing made before it with one git command per question, for
-// the git and the graph checker.
-func TestPlanLandingMatchesPhase4aDecisions(t *testing.T) {
+func decideExactly(parents [][]int, ids []git.ObjectID, tip, commit int) exactDecision {
+	tipAncestors, commitAncestors := ancestorsOf(parents, tip), ancestorsOf(parents, commit)
+	switch {
+	case tipAncestors[commit]:
+		return exactDecision{kind: LandAlreadyLanded}
+	case commitAncestors[tip]:
+		return exactDecision{kind: LandFastForward}
+	}
+
+	inRange := map[int]bool{}
+	shared := false
+	for x := range commitAncestors {
+		if tipAncestors[x] {
+			shared = true
+		} else {
+			inRange[x] = true
+		}
+	}
+	for x := range inRange {
+		if len(parents[x]) > 1 {
+			return exactDecision{kind: LandDiverged, replayErr: ErrMergesInRange}
+		}
+	}
+	if !shared {
+		return exactDecision{kind: LandDiverged, replayErr: ErrUnrelated}
+	}
+
+	// Without merge commits the range is the chain from commit down to the history of tip.
+	var todo []git.ObjectID
+	for x := commit; inRange[x]; x = parents[x][0] {
+		todo = append([]git.ObjectID{ids[x]}, todo...)
+	}
+	return exactDecision{kind: LandDiverged, todo: todo}
+}
+
+// TestPlanMatchesTheExactHistory compares, on seeded random forests, the plan with the decision
+// computed from the history itself, for the git and the graph checker, with committer dates that
+// grow along the history and with skewed ones. The kinds are also checked against git merge-base
+// --is-ancestor, so that the history the test computes from is the one git sees.
+func TestPlanMatchesTheExactHistory(t *testing.T) {
 	t.Parallel()
 
-	for _, seed := range []int64{1, 2, 3} {
-		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
-			t.Parallel()
+	for _, skewed := range []bool{false, true} {
+		for _, seed := range []int64{1, 2, 3} {
+			t.Run(fmt.Sprintf("skewed %v seed %d", skewed, seed), func(t *testing.T) {
+				t.Parallel()
 
-			f := newFixture(t)
-			rnd := rand.New(rand.NewSource(seed))
-			ids := writeForest(t, f.cfg, f.repoPath, forestHistory(rnd, 160))
-
-			catfileCache := catfile.NewCache(f.cfg)
-			t.Cleanup(catfileCache.Stop)
-			reader, cancel, err := catfileCache.ObjectReader(f.ctx, f.repo)
-			require.NoError(t, err)
-			t.Cleanup(cancel)
-
-			graphChecker, err := ancestry.Graph(f.ctx, f.repo, reader, derived.NewStore(f.repoPath))
-			require.NoError(t, err)
-
-			checkers := map[string]ancestry.Checker{"git": ancestry.Git(f.repo), "graph": graphChecker}
-
-			type pair struct{ tip, commit git.ObjectID }
-			pairs := []pair{{ids[3], ids[4]}, {ids[4], ids[3]}, {ids[3], ids[3]}, {ids[0], ids[len(ids)-1]}}
-			for range 200 {
-				pairs = append(pairs, pair{ids[rnd.Intn(len(ids))], ids[rnd.Intn(len(ids))]})
-			}
-
-			seen := map[string]int{}
-			for _, p := range pairs {
-				want := decideAsPhase4a(t, f.cfg, f.repoPath, p.tip, p.commit)
-
-				for name, checker := range checkers {
-					rng, err := checker.Range(f.ctx, p.tip, p.commit)
-					require.NoError(t, err)
-
-					plan, err := PlanLanding(p.tip, p.commit, rng)
-					require.NoError(t, err)
-					require.Equal(t, want.kind, plan.Kind(), "%s: kind of %s onto %s", name, p.commit, p.tip)
-
-					if want.kind != LandDiverged {
-						continue
-					}
-
-					todo, err := plan.Replay()
-					if want.replayErr != nil {
-						require.ErrorIs(t, err, want.replayErr, "%s: replay of %s onto %s", name, p.commit, p.tip)
-						continue
-					}
-					require.NoError(t, err)
-					require.Equal(t, want.todo, todo, "%s: todo of %s onto %s", name, p.commit, p.tip)
+				f := newFixture(t)
+				rnd := rand.New(rand.NewSource(seed))
+				parents := forestHistory(rnd, 160)
+				dates := increasingDates(len(parents))
+				if skewed {
+					dates = skewedDates(rnd, len(parents))
+				}
+				ids := writeForest(t, f.cfg, f.repoPath, parents, dates)
+				index := make(map[git.ObjectID]int, len(ids))
+				for i, id := range ids {
+					index[id] = i
 				}
 
+				catfileCache := catfile.NewCache(f.cfg)
+				t.Cleanup(catfileCache.Stop)
+				reader, cancel, err := catfileCache.ObjectReader(f.ctx, f.repo)
+				require.NoError(t, err)
+				t.Cleanup(cancel)
+
+				graphChecker, err := ancestry.Graph(f.ctx, f.repo, reader, derived.NewStore(f.repoPath))
+				require.NoError(t, err)
+
+				checkers := map[string]ancestry.Checker{"git": ancestry.Git(f.repo), "graph": graphChecker}
+
+				isAncestor := func(a, b git.ObjectID) bool {
+					cmd := gittest.NewCommand(t, f.cfg, "-C", f.repoPath, "merge-base", "--is-ancestor", a.String(), b.String())
+					if err := cmd.Run(); err != nil {
+						require.Equal(t, 1, cmd.ProcessState.ExitCode())
+						return false
+					}
+					return true
+				}
+
+				type pair struct{ tip, commit int }
+				pairs := []pair{{3, 4}, {4, 3}, {3, 3}, {0, len(ids) - 1}}
+				for range 200 {
+					pairs = append(pairs, pair{rnd.Intn(len(ids)), rnd.Intn(len(ids))})
+				}
+
+				seen := map[string]int{}
+				overListed := 0
+				for _, p := range pairs {
+					tip, commit := ids[p.tip], ids[p.commit]
+					want := decideExactly(parents, ids, p.tip, p.commit)
+					require.Equal(t, want.kind == LandAlreadyLanded, isAncestor(commit, tip))
+					require.Equal(t, want.kind == LandFastForward, !isAncestor(commit, tip) && isAncestor(tip, commit))
+
+					listed, err := checkers["git"].List(f.ctx, commit, []git.ObjectID{tip})
+					require.NoError(t, err)
+					tipAncestors := ancestorsOf(parents, p.tip)
+					for _, c := range listed {
+						if tipAncestors[index[c.ID]] {
+							overListed++
+							break
+						}
+					}
+
+					for name, checker := range checkers {
+						plan, err := Plan(f.ctx, checker, tip, commit)
+						require.NoError(t, err)
+						require.Equal(t, want.kind, plan.Kind(), "%s: kind of c%d onto c%d", name, p.commit, p.tip)
+
+						if want.kind != LandDiverged {
+							continue
+						}
+
+						todo, err := plan.Replay()
+						if want.replayErr != nil {
+							require.ErrorIs(t, err, want.replayErr, "%s: replay of c%d onto c%d", name, p.commit, p.tip)
+							continue
+						}
+						require.NoError(t, err)
+						require.Equal(t, want.todo, todo, "%s: todo of c%d onto c%d", name, p.commit, p.tip)
+					}
+
+					label := fmt.Sprint(want.kind)
+					if want.replayErr != nil {
+						label += want.replayErr.Error()
+					}
+					seen[label]++
+				}
+
+				// The forests must exercise every decision, and the skewed ones listings that git
+				// rev-list gets wrong.
+				require.Len(t, seen, 5, "decisions seen: %v", seen)
+				if skewed {
+					require.NotZero(t, overListed, "no listing of git rev-list held a commit outside of its range")
+				} else {
+					require.Zero(t, overListed)
+				}
+			})
+		}
+	}
+}
+
+// overListingChecker answers from a history held in memory. Its List adds to the exact range
+// every commit that an excluded commit reaches and head reaches too, the most that git rev-list can
+// list under committer-date skew.
+type overListingChecker struct {
+	parents [][]int
+	ids     []git.ObjectID
+	index   map[git.ObjectID]int
+}
+
+func (c overListingChecker) List(_ context.Context, head git.ObjectID, _ []git.ObjectID) ([]ancestry.RangeCommit, error) {
+	var commits []ancestry.RangeCommit
+	for x := range ancestorsOf(c.parents, c.index[head]) {
+		var parents []git.ObjectID
+		for _, p := range c.parents[x] {
+			parents = append(parents, c.ids[p])
+		}
+		commits = append(commits, ancestry.RangeCommit{ID: c.ids[x], Parents: parents})
+	}
+	return commits, nil
+}
+
+func (c overListingChecker) IsAncestor(_ context.Context, ancestor, descendant git.ObjectID) (bool, error) {
+	return ancestorsOf(c.parents, c.index[descendant])[c.index[ancestor]], nil
+}
+
+func (c overListingChecker) MergeBases(_ context.Context, a, b git.ObjectID) ([]git.ObjectID, error) {
+	aAncestors, bAncestors := ancestorsOf(c.parents, c.index[a]), ancestorsOf(c.parents, c.index[b])
+	var bases []git.ObjectID
+	for x := range aAncestors {
+		if !bAncestors[x] {
+			continue
+		}
+		best := true
+		for y := range aAncestors {
+			if y != x && bAncestors[y] && ancestorsOf(c.parents, y)[x] {
+				best = false
+				break
+			}
+		}
+		if best {
+			bases = append(bases, c.ids[x])
+		}
+	}
+	return bases, nil
+}
+
+// TestPlanWithAListingOfTheWholeHistory plans every pair of random forests with a checker whose
+// listing holds the whole history of the commit, the shared part included: the plan must still
+// match the exact decision.
+func TestPlanWithAListingOfTheWholeHistory(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	seen := map[string]int{}
+	for _, seed := range []int64{1, 2, 3} {
+		rnd := rand.New(rand.NewSource(seed))
+		parents := forestHistory(rnd, 80)
+		ids := make([]git.ObjectID, len(parents))
+		index := make(map[git.ObjectID]int, len(parents))
+		for i := range ids {
+			ids[i] = git.ObjectID(fmt.Sprintf("c%02d", i))
+			index[ids[i]] = i
+		}
+		checker := overListingChecker{parents: parents, ids: ids, index: index}
+
+		for tip := range ids {
+			for commit := range ids {
+				want := decideExactly(parents, ids, tip, commit)
+
+				plan, err := Plan(ctx, checker, ids[tip], ids[commit])
+				require.NoError(t, err)
+				require.Equal(t, want.kind, plan.Kind(), "seed %d: kind of c%d onto c%d", seed, commit, tip)
+
 				label := fmt.Sprint(want.kind)
-				if want.replayErr != nil {
-					label += want.replayErr.Error()
+				if want.kind == LandDiverged {
+					todo, err := plan.Replay()
+					if want.replayErr != nil {
+						require.ErrorIs(t, err, want.replayErr, "seed %d: replay of c%d onto c%d", seed, commit, tip)
+						label += want.replayErr.Error()
+					} else {
+						require.NoError(t, err)
+						require.Equal(t, want.todo, todo, "seed %d: todo of c%d onto c%d", seed, commit, tip)
+					}
 				}
 				seen[label]++
 			}
-
-			// The forests must exercise every decision.
-			require.Len(t, seen, 5, "decisions seen: %v", seen)
-		})
+		}
 	}
+	require.Len(t, seen, 5, "decisions seen: %v", seen)
 }

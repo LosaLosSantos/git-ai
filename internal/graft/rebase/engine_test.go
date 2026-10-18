@@ -121,16 +121,11 @@ func buildHistories(f *fixture, rng *rand.Rand) (upstream, branch git.ObjectID) 
 	return upTip, brTip
 }
 
-// landRebase rebases branch onto upstream the way landing does: one range listing, the plan, and
-// the replay of the engine. Like (*localrepo.Repo).Rebase it returns branch when upstream is
+// landRebase rebases branch onto upstream the way landing does: the plan and the replay of the
+// engine. Like (*localrepo.Repo).Rebase it returns branch when upstream is
 // reachable from it and upstream when branch is reachable from upstream.
 func landRebase(ctx context.Context, repo *localrepo.Repo, engine *Engine, upstream, branch git.ObjectID, committer *git.Signature) (git.ObjectID, error) {
-	rng, err := ancestry.Git(repo).Range(ctx, upstream, branch)
-	if err != nil {
-		return "", err
-	}
-
-	plan, err := PlanLanding(upstream, branch, rng)
+	plan, err := Plan(ctx, ancestry.Git(repo), upstream, branch)
 	if err != nil {
 		return "", err
 	}
