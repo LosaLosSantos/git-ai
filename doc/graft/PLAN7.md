@@ -954,10 +954,25 @@ func (c *Collector) CollectRepository(ctx context.Context, repoID int64, dryRun 
 // tombstones.
 func (c *Collector) CollectRemoved(ctx context.Context, storage string, dryRun bool) (Report, error)
 
-// FaultHook is called at "after_drop_row", "after_delete", "mid_sweep" and
-// "after_prefix" (tests only).
-var FaultHook func(point string) error
 ```
+
+The fault hook is an unexported field set by tests (as for the checkpointer),
+with the points `after_drop_row` (a superseded checkpoint's row deleted, its
+pack not yet), `mid_sweep` (after the first deletion of the sweep),
+`after_delete` (the sweep's deletions done, the observations not yet updated)
+and `after_prefix` (a removed repository's objects deleted, its tombstone not
+yet). Errors carry gRPC codes: `NotFound` for an untracked repository,
+`Unavailable` for the database and the bucket, `FailedPrecondition` for
+invalid GC times.
+
+**List under concurrent deletion (found by the WP75 race test).** fileblob's
+own listing reads a directory and then stats each entry, and fails with
+`NotFound` when an entry was deleted in between, which is exactly what two
+overlapping collections do. `blobstore.List` on a file bucket therefore walks
+the directory itself: an entry that vanished is an object that is gone and is
+not listed. The `BlobStore.List` contract states that an object deleted during
+a listing is listed or not, never an error
+(`TestListWhileDeleting`, which fails with fileblob's listing).
 
 `CollectRepository` (binding):
 
