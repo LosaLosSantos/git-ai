@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/bench"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // runBench runs the benchmark subcommands:
@@ -127,6 +128,10 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 2
 	}
 
+	if !syntax.Available {
+		fmt.Fprintln(stderr, "graft-resolve bench run: this graft-resolve was built without cgo, so the syntax check would reject every answer; build it with CGO_ENABLED=1")
+		return 1
+	}
 	res, err := loadResolver(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)

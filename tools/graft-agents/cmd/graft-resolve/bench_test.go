@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/bench"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // gitIn runs git in dir with a fixed identity, given on the command line.
@@ -89,6 +90,13 @@ func TestBenchMineAndRun(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
+	if !syntax.Available {
+		// Without cgo the syntax check would reject every answer: the run refuses to start.
+		if code := run([]string{"bench", "run", "--manifest", manifest, "--clones", clones}, nil, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "without cgo") {
+			t.Fatalf("run without cgo exited %d: %s", code, stderr.String())
+		}
+		return
+	}
 	jsonOut := filepath.Join(work, "report.json")
 	if code := run([]string{"bench", "run", "--manifest", manifest, "--clones", clones, "--label", "trivial", "--json-out", jsonOut}, nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("run exited %d: %s", code, stderr.String())

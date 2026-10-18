@@ -290,7 +290,9 @@ The grammars are C code compiled with cgo (the MIT-licensed
 `github.com/tree-sitter/go-tree-sitter` bindings and the grammar modules of
 those languages, in the `tools/graft-agents` module only; the gitai server
 has no such dependency). Building graft-resolve therefore needs a C compiler
-and `CGO_ENABLED=1`, the default when a compiler is installed.
+and `CGO_ENABLED=1`, the default when a compiler is installed. A
+graft-resolve built without cgo fails closed: it rejects every `llm` answer
+for a file that has a grammar, and `graft-resolve bench run` refuses to start.
 
 The provider's API keys are withheld from the model: they are read from the
 environment or a file by the provider, never put in the prompt. Everything
