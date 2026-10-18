@@ -247,6 +247,13 @@ func TestPhase3ExternalWriterRacesLane(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	// The race is ordered by construction, not by timing: a pre-receive hook parks the first batch
+	// of the branch, after it was built on the tip and before its compare-and-swap, until the test
+	// releases it. The external writer wins while the batch is parked, so the batch's
+	// compare-and-swap must lose and the batch must be rebuilt on the writer's tip.
+	tipBefore := s.git(t, "rev-parse", "refs/heads/"+branch)
+	gate := newParkGate(t, s, branch)
+
 	results := make([]*sdk.LandResult, changes)
 	var tally loadTally
 	landsDone := make(chan struct{})
@@ -259,22 +266,20 @@ func TestPhase3ExternalWriterRacesLane(t *testing.T) {
 		})
 	}()
 
+	gate.waitParked(t)
+
 	// The external writer wins a few races. Its wins are small enough for the
 	// lane to rebuild a batch at most a few times, far below the limit of ten
-	// rebuilds, so every change still lands.
+	// rebuilds, so every change still lands. Nothing else moves the branch while
+	// the batch is parked, so every compare-and-swap of the writer wins.
 	const externalWins = 5
-	const maxWriterAttempts = 1000
 	var externals []string
 	winsWhilePending := 0
-	for attempt := 1; len(externals) < externalWins; attempt++ {
-		require.LessOrEqual(t, attempt, maxWriterAttempts, "the external writer never won enough races")
-
+	for attempt := 1; attempt <= externalWins; attempt++ {
 		old := s.git(t, "rev-parse", "refs/heads/"+branch)
 		next, err := sharedChange(ctx, repo, "external", old, attempt, false)
 		require.NoError(t, err)
-		if !casUpdateRef(t, s, branch, old, next) {
-			continue
-		}
+		require.True(t, casUpdateRef(t, s, branch, old, next), "the external writer wins while the batch is parked")
 
 		externals = append(externals, next)
 		select {
@@ -283,9 +288,17 @@ func TestPhase3ExternalWriterRacesLane(t *testing.T) {
 			winsWhilePending++
 		}
 	}
-	require.Positive(t, winsWhilePending, "the external writer won while the lands were still pending")
+	require.Equal(t, externalWins, winsWhilePending, "every external win happened while the lands were pending")
 
+	gate.release(t)
 	<-landsDone
+
+	// The parked batch was built on the tip before the writer's wins, and it was built again on
+	// the writer's last commit after its compare-and-swap lost.
+	updates := gate.updates(t)
+	require.NotEmpty(t, updates)
+	require.Equal(t, tipBefore, updates[0], "the first batch was built on the tip before the writer's wins")
+	require.Contains(t, updates[1:], externals[len(externals)-1], "the batch was rebuilt on the writer's tip after its compare-and-swap lost")
 	require.NoError(t, tally.check(changes))
 	require.Equal(t, loadTally{Landed: changes}, tally, "every change lands despite the writer")
 
@@ -302,6 +315,77 @@ func TestPhase3ExternalWriterRacesLane(t *testing.T) {
 	for _, external := range externals {
 		s.git(t, "merge-base", "--is-ancestor", external, branch)
 	}
+}
+
+// parkGate parks the updates of one branch in a pre-receive hook while a hold file exists, so that
+// a test orders a race by construction: the updates of every other reference pass through. The
+// hook records the old value of each update of the branch it sees, in order. A hook that is held
+// longer than parkGateBound gives up with an error, so a broken test fails instead of hanging.
+type parkGate struct {
+	hold, parked, log string
+}
+
+// parkGateBound bounds how long the hook waits for the hold to be released, and how long
+// waitParked waits for an update to be parked.
+const parkGateBound = 30 * time.Second
+
+func newParkGate(t *testing.T, s gitalyStack, branch string) parkGate {
+	t.Helper()
+
+	dir := testhelper.TempDir(t)
+	g := parkGate{
+		hold:   filepath.Join(dir, "hold"),
+		parked: filepath.Join(dir, "parked"),
+		log:    filepath.Join(dir, "updates"),
+	}
+	require.NoError(t, os.WriteFile(g.hold, nil, 0o600))
+
+	steps := int(parkGateBound / (10 * time.Millisecond))
+	hook := gittest.WriteCustomHook(t, s.repoPath, "pre-receive", []byte(`#!/bin/sh
+while read old new ref; do
+	[ "$ref" = "refs/heads/`+branch+`" ] || continue
+	echo "$old" >> '`+g.log+`'
+	i=0
+	while [ -e '`+g.hold+`' ]; do
+		: > '`+g.parked+`'
+		i=$((i + 1))
+		if [ "$i" -gt `+fmt.Sprint(steps)+` ]; then
+			echo "park gate: the hold was not released within `+parkGateBound.String()+`" >&2
+			exit 1
+		fi
+		sleep 0.01
+	done
+done
+exit 0
+`))
+	t.Cleanup(func() { require.NoError(t, os.Remove(hook)) })
+
+	return g
+}
+
+// waitParked waits until an update of the branch is parked in the hook.
+func (g parkGate) waitParked(t *testing.T) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(g.parked)
+		return err == nil
+	}, parkGateBound, 10*time.Millisecond, "no update of the branch was parked")
+}
+
+// release lets the parked update and every later one pass.
+func (g parkGate) release(t *testing.T) {
+	t.Helper()
+	require.NoError(t, os.Remove(g.hold))
+}
+
+// updates returns the old values of the updates of the branch that the hook saw, in order.
+func (g parkGate) updates(t *testing.T) []string {
+	t.Helper()
+
+	content, err := os.ReadFile(g.log)
+	require.NoError(t, err)
+	return strings.Fields(string(content))
 }
 
 // hookFallbackPrefix is the prefix of the branches that forbiddenHookScript

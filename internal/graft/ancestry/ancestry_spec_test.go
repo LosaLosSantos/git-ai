@@ -7,7 +7,10 @@ package ancestry
 //   - gittest.CreateRepository(t, ctx, cfg) returns (*gitalypb.Repository, repoPath).
 //   - gittest.TreeEntry{Mode, Path, Content} is the tree-entry type for WithTreeEntries.
 //   - testhelper.NewLogger(t) returns a log.Logger.
-//   - MergeBase's bool result means "a merge base was found".
+//
+// Phase 4b (PLAN8) and the fix of committer-date skew: the checker is a revrange.Walker whose
+// listing only revrange.Exact makes exact. These tests check the exact range of each checker with
+// the same fixtures.
 //   - objectReader and derivedStore are placeholders for the catfile reader and the
 //     derived store of the test repo; they fail the test until wired.
 
@@ -15,12 +18,14 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"testing"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/derived"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -89,27 +94,29 @@ func testLogger(t *testing.T) log.Logger {
 	return testhelper.NewLogger(t)
 }
 
-// assertSameAnswers checks that got and want agree on IsAncestor and MergeBase for (x, y).
+// assertSameAnswers checks that got and want list the same range x..y.
 func assertSameAnswers(t *testing.T, fx *specFixture, want, got Checker, x, y git.ObjectID) {
 	t.Helper()
 
-	wAnc, wErr := want.IsAncestor(fx.ctx, x, y)
-	gAnc, gErr := got.IsAncestor(fx.ctx, x, y)
+	wRange, wErr := revrange.Exact(fx.ctx, want, x, y)
+	gRange, gErr := revrange.Exact(fx.ctx, got, x, y)
 	if wErr != nil || gErr != nil {
-		t.Fatalf("IsAncestor(%s, %s): want err %v, got err %v", x, y, wErr, gErr)
+		t.Fatalf("Range(%s, %s): want err %v, got err %v", x, y, wErr, gErr)
 	}
-	if wAnc != gAnc {
-		t.Fatalf("IsAncestor(%s, %s): want %v, got %v", x, y, wAnc, gAnc)
+	if !reflect.DeepEqual(rangeSet(wRange), rangeSet(gRange)) {
+		t.Fatalf("Range(%s, %s): want %v, got %v", x, y, rangeSet(wRange), rangeSet(gRange))
 	}
+}
 
-	wBase, wOK, wErr := want.MergeBase(fx.ctx, x, y)
-	gBase, gOK, gErr := got.MergeBase(fx.ctx, x, y)
-	if wErr != nil || gErr != nil {
-		t.Fatalf("MergeBase(%s, %s): want err %v, got err %v", x, y, wErr, gErr)
+// mustRange returns the exact range base..head of chk as a set.
+func mustRange(t *testing.T, fx *specFixture, chk Checker, base, head git.ObjectID) map[git.ObjectID][]git.ObjectID {
+	t.Helper()
+
+	rng, err := revrange.Exact(fx.ctx, chk, base, head)
+	if err != nil {
+		t.Fatalf("Range(%s, %s): %v", base, head, err)
 	}
-	if wOK != gOK || wBase != gBase {
-		t.Fatalf("MergeBase(%s, %s): want (%s, %v), got (%s, %v)", x, y, wBase, wOK, gBase, gOK)
-	}
+	return rangeSet(rng)
 }
 
 // buildForkDAG builds root -> {left, right} -> merged plus an unrelated lone root.
@@ -123,9 +130,9 @@ func buildForkDAG(t *testing.T, fx *specFixture) (root, left, right, merged, lon
 	return
 }
 
-// TestSpecGitIsAncestorAndMergeBaseLinear: Git(repo) answers IsAncestor and MergeBase
-// on a linear history as Git does.
-func TestSpecGitIsAncestorAndMergeBaseLinear(t *testing.T) {
+// TestSpecGitRangeLinear: on a linear history Git(repo) lists the commits above the base with
+// their parents, and nothing when the head is reachable from the base.
+func TestSpecGitRangeLinear(t *testing.T) {
 	fx := newSpecFixture(t)
 	chk := Git(fx.repo)
 
@@ -133,63 +140,29 @@ func TestSpecGitIsAncestorAndMergeBaseLinear(t *testing.T) {
 	b := fx.commit(t, 2, a)
 	c := fx.commit(t, 3, b)
 
-	cases := []struct {
-		name       string
-		anc, desc  git.ObjectID
-		wantAncest bool
-	}{
-		{"root is ancestor of tip", a, c, true},
-		{"parent is ancestor of child", b, c, true},
-		{"tip is not ancestor of root", c, a, false},
+	if got, want := mustRange(t, fx, chk, a, c), map[git.ObjectID][]git.ObjectID{b: {a}, c: {b}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Range(root, tip) = %v, want %v", got, want)
 	}
-	for _, tc := range cases {
-		got, err := chk.IsAncestor(fx.ctx, tc.anc, tc.desc)
-		if err != nil {
-			t.Fatalf("%s: IsAncestor: %v", tc.name, err)
-		}
-		if got != tc.wantAncest {
-			t.Fatalf("%s: IsAncestor = %v, want %v", tc.name, got, tc.wantAncest)
-		}
+	if got := mustRange(t, fx, chk, c, a); len(got) != 0 {
+		t.Fatalf("Range(tip, root) = %v, want empty: the root is reachable from the tip", got)
 	}
-
-	base, found, err := chk.MergeBase(fx.ctx, a, c)
-	if err != nil {
-		t.Fatalf("MergeBase: %v", err)
-	}
-	if !found || base != a {
-		t.Fatalf("MergeBase(root, tip) = (%s, %v), want (%s, true)", base, found, a)
+	if got := mustRange(t, fx, chk, c, c); len(got) != 0 {
+		t.Fatalf("Range(tip, tip) = %v, want empty", got)
 	}
 }
 
-// TestSpecGitMergeBaseForkAndUnrelated: MergeBase finds the fork point of two branches
-// and reports no merge base for unrelated histories, without an error.
-func TestSpecGitMergeBaseForkAndUnrelated(t *testing.T) {
+// TestSpecGitRangeForkAndUnrelated: the range of a branch onto a sibling stops at their fork
+// point, and an unrelated history is listed down to its root, without an error.
+func TestSpecGitRangeForkAndUnrelated(t *testing.T) {
 	fx := newSpecFixture(t)
 	chk := Git(fx.repo)
 	root, left, right, _, lone := buildForkDAG(t, fx)
 
-	base, found, err := chk.MergeBase(fx.ctx, left, right)
-	if err != nil {
-		t.Fatalf("MergeBase(left, right): %v", err)
+	if got, want := mustRange(t, fx, chk, left, right), map[git.ObjectID][]git.ObjectID{right: {root}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Range(left, right) = %v, want %v", got, want)
 	}
-	if !found || base != root {
-		t.Fatalf("MergeBase(left, right) = (%s, %v), want (%s, true)", base, found, root)
-	}
-
-	_, found, err = chk.MergeBase(fx.ctx, left, lone)
-	if err != nil {
-		t.Fatalf("MergeBase(left, lone): unexpected error %v", err)
-	}
-	if found {
-		t.Fatalf("MergeBase(left, lone) found a base for unrelated histories")
-	}
-
-	anc, err := chk.IsAncestor(fx.ctx, root, lone)
-	if err != nil {
-		t.Fatalf("IsAncestor(root, lone): %v", err)
-	}
-	if anc {
-		t.Fatalf("IsAncestor(root, lone) = true for unrelated histories")
+	if got, want := mustRange(t, fx, chk, left, lone), map[git.ObjectID][]git.ObjectID{lone: nil}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Range(left, lone) = %v, want %v", got, want)
 	}
 }
 
@@ -281,28 +254,22 @@ func TestSpecNewEnabledFallsBackToGit(t *testing.T) {
 	}
 }
 
-// TestSpecMergeBaseOfAncestorIsAncestor: when one commit is an ancestor of the other,
-// MergeBase returns the ancestor (checked through the Graph checker too).
-func TestSpecMergeBaseOfAncestorIsAncestor(t *testing.T) {
+// TestSpecRangeOfDescendantWithMerge: the range from an ancestor to a merge lists both sides of
+// the merge with all their parents (checked through the Graph checker too).
+func TestSpecRangeOfDescendantWithMerge(t *testing.T) {
 	fx := newSpecFixture(t)
-	root, left, _, merged, _ := buildForkDAG(t, fx)
+	root, left, right, merged, _ := buildForkDAG(t, fx)
 
 	graph := fx.mustGraph(t)
 	for _, chk := range []Checker{Git(fx.repo), graph} {
-		base, found, err := chk.MergeBase(fx.ctx, root, merged)
-		if err != nil {
-			t.Fatalf("MergeBase(root, merged): %v", err)
-		}
-		if !found || base != root {
-			t.Fatalf("MergeBase(root, merged) = (%s, %v), want (%s, true)", base, found, root)
+		want := map[git.ObjectID][]git.ObjectID{merged: {left, right}, left: {root}, right: {root}}
+		if got := mustRange(t, fx, chk, root, merged); !reflect.DeepEqual(got, want) {
+			t.Fatalf("Range(root, merged) = %v, want %v", got, want)
 		}
 
-		base, found, err = chk.MergeBase(fx.ctx, left, merged)
-		if err != nil {
-			t.Fatalf("MergeBase(left, merged): %v", err)
-		}
-		if !found || base != left {
-			t.Fatalf("MergeBase(left, merged) = (%s, %v), want (%s, true)", base, found, left)
+		want = map[git.ObjectID][]git.ObjectID{merged: {left, right}, right: {root}}
+		if got := mustRange(t, fx, chk, left, merged); !reflect.DeepEqual(got, want) {
+			t.Fatalf("Range(left, merged) = %v, want %v", got, want)
 		}
 	}
 }

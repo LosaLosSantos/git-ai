@@ -15,6 +15,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/ancestry"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/stretchr/testify/require"
@@ -120,22 +121,62 @@ func buildHistories(f *fixture, rng *rand.Rand) (upstream, branch git.ObjectID) 
 	return upTip, brTip
 }
 
-// requireSameRebase rebases with the engine and with localrepo and requires the same outcome: the
-// same object ID, or the same error with the same code, message and conflict contents. It returns
-// the error of the localrepo rebase.
-func requireSameRebase(t *testing.T, f *fixture, engine *Engine, upstream, branch git.ObjectID, opts ...localrepo.RebaseOption) error {
+// landRebase rebases branch onto upstream the way landing does: the plan and the replay of the
+// engine. Like (*localrepo.Repo).Rebase it returns branch when upstream is
+// reachable from it and upstream when branch is reachable from upstream.
+func landRebase(ctx context.Context, repo *localrepo.Repo, engine *Engine, upstream, branch git.ObjectID, committer *git.Signature) (git.ObjectID, error) {
+	plan, err := Plan(ctx, ancestry.Git(repo), upstream, branch)
+	if err != nil {
+		return "", err
+	}
+
+	switch plan.Kind() {
+	case LandAlreadyLanded:
+		return upstream, nil
+	case LandFastForward:
+		return branch, nil
+	}
+
+	todo, err := plan.Replay()
+	if err != nil {
+		return "", err
+	}
+
+	return engine.Replay(ctx, upstream, todo, committer)
+}
+
+// rebaseOptions returns the options of (*localrepo.Repo).Rebase that landing uses: reapplied
+// cherry-picks, and the committer when it is set.
+func rebaseOptions(committer *git.Signature) []localrepo.RebaseOption {
+	opts := []localrepo.RebaseOption{localrepo.RebaseWithReappliedCherryPicks()}
+	if committer != nil {
+		opts = append(opts, localrepo.RebaseWithCommitter(*committer))
+	}
+	return opts
+}
+
+// hasMergesInRange reports whether git rev-list --merges upstream..branch lists a commit, which is
+// how landing found merge commits before the plan.
+func hasMergesInRange(t *testing.T, f *fixture, upstream, branch git.ObjectID) bool {
+	t.Helper()
+	return strings.TrimSpace(string(gittest.Exec(t, f.cfg, "-C", f.repoPath, "rev-list", "--merges", upstream.String()+".."+branch.String()))) != ""
+}
+
+// requireSameRebase rebases with landRebase and with localrepo and requires the same outcome: the
+// same object ID, or an error from both, with the same conflicting commit and conflict contents for
+// a conflict. It returns the error of the localrepo rebase.
+func requireSameRebase(t *testing.T, f *fixture, engine *Engine, upstream, branch git.ObjectID, committer *git.Signature) error {
 	t.Helper()
 
-	wantOID, wantErr := f.repo.Rebase(f.ctx, upstream.String(), branch.String(), opts...)
-	gotOID, gotErr := engine.Rebase(f.ctx, upstream, branch, opts...)
+	wantOID, wantErr := f.repo.Rebase(f.ctx, upstream.String(), branch.String(), rebaseOptions(committer)...)
+	gotOID, gotErr := landRebase(f.ctx, f.repo, engine, upstream, branch, committer)
 
 	require.Equal(t, wantOID, gotOID)
 	if wantErr == nil {
 		require.NoError(t, gotErr)
 		return nil
 	}
-
-	testhelper.RequireGrpcError(t, wantErr, gotErr)
+	require.Error(t, gotErr)
 
 	var wantConflict, gotConflict *localrepo.RebaseConflictError
 	if errors.As(wantErr, &wantConflict) {
@@ -147,11 +188,14 @@ func requireSameRebase(t *testing.T, f *fixture, engine *Engine, upstream, branc
 	return wantErr
 }
 
-func TestEngineRebaseMatchesLocalrepo(t *testing.T) {
+// TestEngineReplayMatchesLocalrepo rebases random histories the way landing does and with
+// localrepo. A range with merge commits is refused by the plan, as landing refused it before with
+// git rev-list --merges; every other range gives the commits of localrepo, or its conflict.
+func TestEngineReplayMatchesLocalrepo(t *testing.T) {
 	t.Parallel()
 
-	var conflicts, successes int
-	for seed := int64(1); seed <= 25; seed++ {
+	var conflicts, successes, merges int
+	for seed := int64(1); seed <= 40; seed++ {
 		f := newFixture(t)
 		rng := rand.New(rand.NewSource(seed))
 		upstream, branch := buildHistories(f, rng)
@@ -159,16 +203,20 @@ func TestEngineRebaseMatchesLocalrepo(t *testing.T) {
 		engine := New(f.repo)
 		t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-		var opts []localrepo.RebaseOption
+		var committer *git.Signature
 		if seed%2 == 1 {
-			opts = append(opts, localrepo.RebaseWithCommitter(testCommitter))
-		}
-		if seed%5 == 0 {
-			opts = append(opts, localrepo.RebaseWithReappliedCherryPicks())
+			committer = &testCommitter
 		}
 
 		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
-			err := requireSameRebase(t, f, engine, upstream, branch, opts...)
+			if hasMergesInRange(t, f, upstream, branch) {
+				merges++
+				_, err := landRebase(f.ctx, f.repo, engine, upstream, branch, committer)
+				require.ErrorIs(t, err, ErrMergesInRange)
+				return
+			}
+
+			err := requireSameRebase(t, f, engine, upstream, branch, committer)
 
 			var conflictErr *localrepo.RebaseConflictError
 			switch {
@@ -182,6 +230,7 @@ func TestEngineRebaseMatchesLocalrepo(t *testing.T) {
 
 	require.Positive(t, conflicts, "the seeds must cover conflicts")
 	require.Positive(t, successes, "the seeds must cover successful rebases")
+	require.Positive(t, merges, "the seeds must cover ranges with merge commits")
 }
 
 func TestEngineRebaseUnrelatedHistories(t *testing.T) {
@@ -194,8 +243,10 @@ func TestEngineRebaseUnrelatedHistories(t *testing.T) {
 	engine := New(f.repo)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	// Without a merge base the merge-base lookup fails the same way in both implementations.
-	require.Error(t, requireSameRebase(t, f, engine, upstream, branch, localrepo.RebaseWithCommitter(testCommitter)))
+	// Without a merge base localrepo fails in its merge-base lookup, and the plan refuses the range.
+	require.Error(t, requireSameRebase(t, f, engine, upstream, branch, &testCommitter))
+	_, err := landRebase(f.ctx, f.repo, engine, upstream, branch, &testCommitter)
+	require.ErrorIs(t, err, ErrUnrelated)
 }
 
 func TestEngineRebaseLongCommitMessage(t *testing.T) {
@@ -210,7 +261,7 @@ func TestEngineRebaseLongCommitMessage(t *testing.T) {
 	engine := New(f.repo)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch))
+	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch, nil))
 }
 
 // fakeBackends counts the helper processes started and the operations done through them. Merges
@@ -312,14 +363,14 @@ func TestEngineStartsHelpersLazily(t *testing.T) {
 	engine := newEngine(f.repo, fb.backends())
 
 	// A fast-forward, as the base is an ancestor of the branch, needs no helper process.
-	oid, err := engine.Rebase(f.ctx, base, branch)
+	oid, err := landRebase(f.ctx, f.repo, engine, base, branch, nil)
 	require.NoError(t, err)
 	require.Equal(t, branch, oid)
 	require.Zero(t, fb.streamStarts)
 	require.Zero(t, fb.writerStarts)
 
 	// A real rebase starts one helper of each kind, once.
-	oid, err = engine.Rebase(f.ctx, upstream, branch, localrepo.RebaseWithCommitter(testCommitter))
+	oid, err = landRebase(f.ctx, f.repo, engine, upstream, branch, &testCommitter)
 	require.NoError(t, err)
 	require.NotEmpty(t, oid)
 	require.Equal(t, 1, fb.streamStarts)
@@ -358,7 +409,7 @@ func TestEngineFallsBackToWriteCommitWhenUnsupported(t *testing.T) {
 	engine := newEngine(f.repo, fb.backends())
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch, localrepo.RebaseWithCommitter(testCommitter)))
+	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch, &testCommitter))
 	require.Equal(t, 3, fb.writes, "every commit is offered to the writer first")
 }
 
@@ -373,15 +424,15 @@ func TestEngineReportsHelperStartFailure(t *testing.T) {
 	engine := newEngine(f.repo, fb.backends())
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	_, err := engine.Rebase(f.ctx, upstream, branch)
+	_, err := landRebase(f.ctx, f.repo, engine, upstream, branch, nil)
 	require.ErrorIs(t, err, startErr)
 	require.Zero(t, fb.writes)
 }
 
 func BenchmarkRebaseEngine(b *testing.B) {
 	benchmarkRebase(b, func(f *fixture, upstream, branch git.ObjectID) {
-		// The fake backends count the helper processes the engine starts. The git commands run
-		// for the merge-base, the todo list and the object reads are not counted.
+		// The fake backends count the helper processes the engine starts. The git command that lists
+		// the range and the object reads are not counted.
 		fb := &fakeBackends{repo: f.repo}
 		engine := newEngine(f.repo, fb.backends())
 		defer func() { require.NoError(b, engine.Close()) }()
@@ -389,7 +440,7 @@ func BenchmarkRebaseEngine(b *testing.B) {
 		var iterations int
 		for b.Loop() {
 			iterations++
-			if _, err := engine.Rebase(f.ctx, upstream, branch, localrepo.RebaseWithCommitter(testCommitter)); err != nil {
+			if _, err := landRebase(f.ctx, f.repo, engine, upstream, branch, &testCommitter); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -401,7 +452,7 @@ func BenchmarkRebaseEngine(b *testing.B) {
 func BenchmarkLocalrepoRebase(b *testing.B) {
 	benchmarkRebase(b, func(f *fixture, upstream, branch git.ObjectID) {
 		for b.Loop() {
-			if _, err := f.repo.Rebase(f.ctx, upstream.String(), branch.String(), localrepo.RebaseWithCommitter(testCommitter)); err != nil {
+			if _, err := f.repo.Rebase(f.ctx, upstream.String(), branch.String(), rebaseOptions(&testCommitter)...); err != nil {
 				b.Fatal(err)
 			}
 		}

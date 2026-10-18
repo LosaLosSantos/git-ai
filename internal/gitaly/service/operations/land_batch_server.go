@@ -6,16 +6,12 @@ import (
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
-	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/git/mvcc"
-	"github.com/feder-cr/git-ai/internal/git/quarantine"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook/updateref"
-	"github.com/feder-cr/git-ai/internal/graft/ancestry"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
-	"github.com/feder-cr/git-ai/internal/graft/rebase"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -138,43 +134,11 @@ func (s *Server) executeLandBatch(ctx context.Context, _ landlane.Key, reqs []*l
 	executor := landBatchExecutor{
 		maxRebuilds: landBatchMaxRebuilds,
 		newStepper: func(ctx context.Context) (landBatchStepper, func(), error) {
-			defer observeLandBatchPhase(landBatchPhaseQuarantine, time.Now())
-
-			quarantineDir, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, repository)
+			stepper, cleanup, err := s.newLandBatchStepper(ctx, repository)
 			if err != nil {
 				return nil, nil, err
 			}
-
-			objectHash, err := quarantineRepo.ObjectHash(ctx)
-			if err != nil {
-				cleanup()
-				return nil, nil, structerr.NewInternal("detecting object hash: %w", err)
-			}
-
-			checker, releaseChecker, err := s.landAncestry(ctx, quarantineRepo)
-			if err != nil {
-				cleanup()
-				return nil, nil, err
-			}
-
-			// One rebase engine serves the whole attempt, and the attempt ends with it.
-			rebaser := newBatchRebaser(quarantineRepo)
-
-			return &serverLandBatchStepper{
-					server:        s,
-					repository:    repository,
-					quarantineDir: quarantineDir,
-					repo:          quarantineRepo,
-					objectHash:    objectHash,
-					rebaser:       rebaser,
-					ancestry:      checker,
-				}, func() {
-					releaseChecker()
-					if err := rebaser.Close(); err != nil {
-						s.logger.WithError(err).Error("graft: closing the rebaser of a land batch")
-					}
-					cleanup()
-				}, nil
+			return stepper, cleanup, nil
 		},
 		fallback: func(req *landBatchRequest) (*gitalypb.UserLandResponse, error) {
 			return s.landWithRetries(req.ctx, req.in, req.committer)
@@ -210,6 +174,17 @@ func (s *Server) executeLandBatch(ctx context.Context, _ landlane.Key, reqs []*l
 	}
 
 	return results, nil
+}
+
+// newLandBatchStepper starts a batch attempt on repository. Its phases are observed in
+// graft_land_batch_phase_seconds. The returned function ends the attempt.
+func (s *Server) newLandBatchStepper(ctx context.Context, repository *gitalypb.Repository) (*serverLandBatchStepper, func(), error) {
+	attempt, cleanup, err := s.newLandingAttempt(ctx, repository, landPublishPack, observeLandBatchPhase)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &serverLandBatchStepper{landingAttempt: attempt}, cleanup, nil
 }
 
 // landBatchResult builds the result of a request of a batch.
@@ -248,51 +223,17 @@ func landBatchGiveUp(req *landBatchRequest, cause error, attempts int) error {
 	return landKeptMovingError(req.in, conflict, attempts)
 }
 
-// batchRebaser rebases the commits of a batch attempt. It has the semantics of localrepo.Rebase, and
-// is rebase.Engine.
-type batchRebaser interface {
-	Rebase(ctx context.Context, upstream, branch git.ObjectID, opts ...localrepo.RebaseOption) (git.ObjectID, error)
-	Close() error
-}
-
-// newBatchRebaser starts the rebaser of a batch attempt on the quarantine of the attempt. It is a
-// variable so that tests can observe the rebases.
-var newBatchRebaser = func(repo *localrepo.Repo) batchRebaser {
-	return rebase.New(repo)
-}
-
-// serverLandBatchStepper implements landBatchStepper on the quarantine of one batch attempt.
+// serverLandBatchStepper implements landBatchStepper on one batch attempt: the landing attempt that
+// every land uses (see landingAttempt), plus the in-process admission of each request and the
+// combined update of the batch.
 type serverLandBatchStepper struct {
-	server        *Server
-	repository    *gitalypb.Repository
-	quarantineDir *quarantine.Dir
-	repo          *localrepo.Repo
-	objectHash    git.ObjectHash
-	// rebaser rebases the members of the attempt. It serves the whole attempt.
-	rebaser batchRebaser
-	// ancestry answers the ancestry questions of the attempt, with the graph index when it is enabled.
-	ancestry ancestry.Checker
+	*landingAttempt
 }
 
-// Tip returns the tip of the reference. A missing reference yields an empty ID.
-func (st *serverLandBatchStepper) Tip(ctx context.Context, reference git.ReferenceName) (git.ObjectID, error) {
-	defer observeLandBatchPhase(landBatchPhaseTip, time.Now())
-
-	tip, err := st.repo.ResolveRevision(ctx, reference.Revision())
-	if err != nil {
-		if errors.Is(err, git.ErrReferenceNotFound) {
-			return "", nil
-		}
-
-		return "", structerr.NewInternal("resolving branch: %w", err)
-	}
-
-	return tip, nil
-}
-
-// Land lands the request onto tip. It mirrors the decision of landAttempt for a single request. The
-// standalone policy is evaluated for the actor on the new tip the request would create, before the
-// request changes the running tip.
+// Land lands the request onto tip with the decision that every land makes (landingAttempt.decide).
+// The standalone policy is then evaluated for the actor on the new tip the request would create,
+// before the request changes the running tip: the combined update runs as graft-batch, so the hooks
+// do not judge the request.
 //
 // The git work runs in the context of the batch, which a submitter does not cancel: the request is
 // part of the batch from the moment it lands. The identity is the one of the request, not the one of
@@ -300,126 +241,26 @@ func (st *serverLandBatchStepper) Tip(ctx context.Context, reference git.Referen
 func (st *serverLandBatchStepper) Land(ctx context.Context, tip git.ObjectID, req *landBatchRequest) (landStep, error) {
 	defer observeLandBatchPhase(landBatchPhaseLandMember, time.Now())
 
-	ctx = requestIdentityContext(ctx, req)
-	in := req.in
-	reference := req.reference()
-
-	commitID, err := st.objectHash.FromHex(in.GetCommitId())
+	step, err := st.decide(ctx, tip, req)
 	if err != nil {
-		return landStep{tipIndependent: true}, structerr.NewInvalidArgument("cannot parse commit ID: %w", err).
-			WithMetadata("commit_id", in.GetCommitId())
+		return step, err
 	}
 
-	commitID, err = st.repo.ResolveRevision(ctx, git.Revision(commitID.String()+"^{commit}"))
-	if err != nil {
-		return landStep{tipIndependent: true}, structerr.NewInvalidArgument("cannot resolve commit ID: %w", err).
-			WithMetadata("commit_id", in.GetCommitId())
+	// A request that changes the running tip is admitted for the update it makes. A created branch
+	// is updated from the zero OID.
+	if step.alreadyLanded || (!step.created && step.tip == tip) {
+		return step, nil
 	}
 
-	if tip == "" {
-		if !in.GetCreateBranch() {
-			return landStep{}, structerr.NewNotFound("branch %q does not exist", string(in.GetBranch()))
-		}
-
-		if err := st.admit(req, reference, st.objectHash.ZeroOID, commitID); err != nil {
-			return landStep{}, err
-		}
-
-		return landStep{commit: commitID, tip: commitID, created: true}, nil
+	oldTip := tip
+	if step.created {
+		oldTip = st.objectHash.ZeroOID
 	}
-
-	landed, err := st.ancestry.IsAncestor(ctx, commitID, tip)
-	if err != nil {
-		return landStep{}, structerr.NewInternal("checking whether commit is already landed: %w", err)
-	}
-	if landed {
-		return landStep{commit: commitID, tip: tip, alreadyLanded: true}, nil
-	}
-
-	fastForward, err := st.ancestry.IsAncestor(ctx, tip, commitID)
-	if err != nil {
-		return landStep{}, structerr.NewInternal("checking for ancestry: %w", err)
-	}
-	if fastForward {
-		if err := st.admit(req, reference, tip, commitID); err != nil {
-			return landStep{}, err
-		}
-
-		return landStep{commit: commitID, tip: commitID}, nil
-	}
-
-	newTip, err := st.computeTip(ctx, in, tip, commitID, req.committer)
-	var resolution *landResolution
-	if err != nil {
-		if !in.GetResolveConflicts() || !isLandMergeConflict(err) {
-			return landStep{}, err
-		}
-
-		res, resolveErr := st.server.resolveLandConflicts(ctx, in, st.repo, tip, commitID, req.committer)
-		if resolveErr != nil {
-			st.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
-				Info("graft: conflict resolution of land failed")
-			return landStep{}, err
-		}
-
-		resolution = &res
-		newTip = res.commit
-	}
-
-	// The rebase dropped the change because the tip already holds all of it. The request reports
-	// a landing that changed nothing, as landAttempt does.
-	if resolution == nil && newTip == tip {
-		return landStep{commit: commitID, tip: tip}, nil
-	}
-
-	if err := st.admit(req, reference, tip, newTip); err != nil {
+	if err := st.admit(req, req.reference(), oldTip, step.tip); err != nil {
 		return landStep{}, err
 	}
 
-	return landStep{commit: commitID, tip: newTip, rewritten: true, resolution: resolution}, nil
-}
-
-// computeTip computes the new tip of the attempt for a commit that is neither reachable from the tip
-// nor a fast-forward of it. It is computeLandedTip, except that the rebase strategy rebases with the
-// rebaser of the attempt and checks the common ancestor with the ancestry checker of the attempt.
-// The rebase has the semantics and the errors of the rebase of computeLandedTip.
-//
-// The single-land path keeps its own computeLandedTip (land.go is not changed by the batch executor), so
-// the rebase branch below mirrors it.
-func (st *serverLandBatchStepper) computeTip(ctx context.Context, in *gitalypb.UserLandRequest, tip, commitID git.ObjectID, committer git.Signature) (git.ObjectID, error) {
-	if in.GetStrategy() != gitalypb.UserLandRequest_STRATEGY_REBASE_UNSPECIFIED {
-		return st.server.computeLandedTip(ctx, in, st.repo, tip, commitID, committer)
-	}
-
-	if err := rejectMergeCommitsInRange(ctx, st.repo, tip, commitID); err != nil {
-		return "", err
-	}
-
-	// Rebasing needs a merge base. Unrelated histories can only be landed with STRATEGY_MERGE.
-	_, related, err := st.ancestry.MergeBase(ctx, tip, commitID)
-	if err != nil {
-		return "", structerr.NewInternal("checking for a common ancestor: %w", err)
-	}
-	if !related {
-		return "", structerr.NewInvalidArgument("commit shares no history with branch %q: use STRATEGY_MERGE to land unrelated history", string(in.GetBranch()))
-	}
-
-	// Reapplied cherry-picks as in computeLandedTip: see the comment there.
-	rebasedCommitID, err := st.rebaser.Rebase(ctx, tip, commitID,
-		localrepo.RebaseWithCommitter(committer),
-		localrepo.RebaseWithReappliedCherryPicks(),
-	)
-	if err != nil {
-		// The conflict error is passed as the cause itself, see computeLandedTip.
-		var conflictErr *localrepo.RebaseConflictError
-		if errors.As(err, &conflictErr) {
-			return "", landMergeConflictError(tip, commitID, conflictingFileNames(conflictErr.ConflictError), conflictErr)
-		}
-
-		return "", structerr.NewInternal("rebasing commit: %w", err)
-	}
-
-	return rebasedCommitID, nil
+	return step, nil
 }
 
 // admit evaluates the standalone access policy for the actor of req on the update of reference from
@@ -450,6 +291,9 @@ func (st *serverLandBatchStepper) admit(req *landBatchRequest, reference git.Ref
 // Update publishes the batch with one compare-and-swap. The hooks run once for the combined update,
 // as the synthetic graft-batch user, and the changelog records the members of the batch.
 func (st *serverLandBatchStepper) Update(ctx context.Context, reference git.ReferenceName, members []changelog.Member, rewritten bool, old, newTip git.ObjectID) (landUpdateKind, error) {
+	if err := st.publish(ctx); err != nil {
+		return landUpdateFailed, err
+	}
 	defer observeLandBatchPhase(landBatchPhaseUpdate, time.Now())
 
 	oldOID := old
@@ -474,6 +318,9 @@ func (st *serverLandBatchStepper) Update(ctx context.Context, reference git.Refe
 // original commit of the member maps to the commit it landed as. The compare-and-swap and its outcomes
 // are those of Update.
 func (st *serverLandBatchStepper) UpdateSolo(ctx context.Context, req *landBatchRequest, member changelog.Member, reference git.ReferenceName, rewritten bool, old, newTip git.ObjectID) (landUpdateKind, error) {
+	if err := st.publish(ctx); err != nil {
+		return landUpdateFailed, err
+	}
 	defer observeLandBatchPhase(landBatchPhaseUpdate, time.Now())
 
 	oldOID := old

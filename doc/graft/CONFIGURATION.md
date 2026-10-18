@@ -157,7 +157,7 @@ the same values as the upstream, so that a cache tier returns the same stream.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `graph_ancestry` | bool | `false` | Answer ancestry and merge-base questions of `UserLand` (single and batched lands) from the stored `graph` index (see [DERIVED.md](DERIVED.md)) instead of running `git`. Both paths return the same answers. If the index cannot be built, or the repository has shallow commits, grafts or replace refs, the server falls back to `git` and logs it. With `[graft.derived] disabled = true` the index is computed in memory for each landing attempt and nothing is written under `graft/derived/`. |
+| `graph_ancestry` | bool | `false` | Answer the history questions of `UserLand` from the stored `graph` index (see [DERIVED.md](DERIVED.md)) instead of running `git`, for every land, batched or not: the listing of the commits that a request adds to the branch, and the ancestry and merge-base checks that make that listing exact when committer dates are skewed (see [LAND-BATCHING.md](LAND-BATCHING.md#how-a-request-is-decided-and-rebased)). The index lists the exact commits in one walk; both ways return the same answers. If the index cannot be built, or the repository has shallow commits, grafts or replace refs, the server falls back to `git` and logs it. With `[graft.derived] disabled = true` the index is computed in memory for each landing attempt and nothing is written under `graft/derived/`. |
 
 ### `[graft.land.batch]`
 

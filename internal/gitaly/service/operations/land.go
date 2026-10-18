@@ -1,7 +1,6 @@
 package operations
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,9 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
-	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/git/mvcc"
 	"github.com/feder-cr/git-ai/internal/git/quarantine"
@@ -171,257 +168,51 @@ func (s *Server) landAncestry(ctx context.Context, quarantineRepo *localrepo.Rep
 // landAttempt performs a single compare-and-swap attempt of UserLand. It returns a landConflict
 // if the branch was moved by a concurrent writer, in which case the caller retries.
 func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
-	quarantineDir, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, in.GetRepository())
+	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), landPublishLoose, ignoreLandPhase)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
 
-	checker, releaseChecker, err := s.landAncestry(ctx, quarantineRepo)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseChecker()
-
-	objectHash, err := quarantineRepo.ObjectHash(ctx)
-	if err != nil {
-		return nil, structerr.NewInternal("detecting object hash: %w", err)
-	}
-
-	commitID, err := objectHash.FromHex(in.GetCommitId())
-	if err != nil {
-		return nil, structerr.NewInvalidArgument("cannot parse commit ID: %w", err).
-			WithMetadata("commit_id", in.GetCommitId())
-	}
-
-	// The ID may refer to a tag object or another non-commit object that peels to a commit. A
-	// branch can only point to a commit, so the peeled commit is the one that lands.
-	commitID, err = quarantineRepo.ResolveRevision(ctx, git.Revision(commitID.String()+"^{commit}"))
-	if err != nil {
-		return nil, structerr.NewInvalidArgument("cannot resolve commit ID: %w", err).
-			WithMetadata("commit_id", in.GetCommitId())
-	}
-
 	reference := git.NewReferenceNameFromBranchName(string(in.GetBranch()))
-
-	tip, err := quarantineRepo.ResolveRevision(ctx, reference.Revision())
+	tip, err := attempt.Tip(ctx, reference)
 	if err != nil {
-		if !errors.Is(err, git.ErrReferenceNotFound) {
-			return nil, structerr.NewInternal("resolving branch: %w", err)
-		}
-
-		if !in.GetCreateBranch() {
-			return nil, structerr.NewNotFound("branch %q does not exist", string(in.GetBranch()))
-		}
-
-		// The branch does not exist yet and may be created at the commit. The
-		// compare-and-swap expects the zero OID, so a concurrent creation is detected.
-		if err := s.updateLandedReference(ctx, in, quarantineDir, quarantineRepo, reference, objectHash.ZeroOID, commitID, false); err != nil {
-			return nil, err
-		}
-
-		return landResponse(objectHash.ZeroOID, commitID, false, false, true), nil
-	}
-
-	// The commit is already reachable from the tip, so there is nothing to do. This also covers
-	// commit_id being equal to the tip.
-	landed, err := checker.IsAncestor(ctx, commitID, tip)
-	if err != nil {
-		return nil, structerr.NewInternal("checking whether commit is already landed: %w", err)
-	}
-	if landed {
-		return landResponse(tip, tip, false, true, false), nil
-	}
-
-	newTip := commitID
-	rewritten := false
-	var resolution *landResolution
-
-	fastForward, err := checker.IsAncestor(ctx, tip, commitID)
-	if err != nil {
-		return nil, structerr.NewInternal("checking for ancestry: %w", err)
-	}
-
-	if !fastForward {
-		newTip, err = s.computeLandedTip(ctx, in, quarantineRepo, tip, commitID, committer)
-		if err != nil {
-			if !in.GetResolveConflicts() || !isLandMergeConflict(err) {
-				return nil, err
-			}
-
-			// The conflict is resolved into a merge commit. When that fails, the client gets
-			// the merge conflict it would have got without resolution.
-			res, resolveErr := s.resolveLandConflicts(ctx, in, quarantineRepo, tip, commitID, committer)
-			if resolveErr != nil {
-				s.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
-					Info("graft: conflict resolution of land failed")
-				return nil, err
-			}
-
-			resolution = &res
-			newTip = res.commit
-		}
-		rewritten = true
-
-		// Rebasing drops the commits that become empty on top of the tip, so every commit
-		// of the change was dropped when the tip already holds all of its changes, for
-		// example because they were applied upstream as cherry-picks. commit_id itself is
-		// not reachable from the tip, so the change is not reported as already landed: the
-		// response reports a landing that left the branch unchanged.
-		if resolution == nil && newTip == tip {
-			return landResponse(tip, tip, false, false, false), nil
-		}
-	}
-
-	if err := s.updateLandedReference(ctx, in, quarantineDir, quarantineRepo, reference, tip, newTip, rewritten); err != nil {
 		return nil, err
 	}
 
-	resp := landResponse(tip, newTip, rewritten, false, false)
-	if resolution != nil {
-		resp.ResolvedPaths = resolution.resolvedPaths
-		resp.Resolver = resolution.resolver
+	// The request is decided as a member of a batch is (landingAttempt.decide). The policy is not
+	// evaluated here: the update runs with the identity of the request, so the hooks judge it.
+	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in)}
+	step, err := attempt.decide(ctx, tip, req)
+	if err != nil {
+		return nil, err
+	}
+
+	oldTip := tip
+	switch {
+	case step.alreadyLanded:
+		return landResponse(tip, tip, false, true, false), nil
+	case step.created:
+		oldTip = attempt.objectHash.ZeroOID
+	case step.tip == tip:
+		// The change became empty on top of the tip: the landing leaves the branch unchanged.
+		return landResponse(tip, tip, false, false, false), nil
+	}
+
+	if err := attempt.publish(ctx); err != nil {
+		return nil, err
+	}
+
+	if err := s.updateLandedReference(ctx, in, attempt.quarantineDir, attempt.repo, reference, oldTip, step.tip, step.rewritten); err != nil {
+		return nil, err
+	}
+
+	resp := landResponse(oldTip, step.tip, step.rewritten, false, step.created)
+	if step.resolution != nil {
+		resp.ResolvedPaths = step.resolution.resolvedPaths
+		resp.Resolver = step.resolution.resolver
 	}
 	return resp, nil
-}
-
-// computeLandedTip computes the new branch tip for a commit that is neither reachable from the
-// tip nor a fast-forward of it. It rebases or merges the change onto the tip, depending on the
-// strategy. FF_ONLY fails with a NotAncestor error.
-func (s *Server) computeLandedTip(
-	ctx context.Context,
-	in *gitalypb.UserLandRequest,
-	quarantineRepo *localrepo.Repo,
-	tip, commitID git.ObjectID,
-	committer git.Signature,
-) (git.ObjectID, error) {
-	switch in.GetStrategy() {
-	case gitalypb.UserLandRequest_STRATEGY_FF_ONLY:
-		return "", structerr.NewFailedPrecondition("branch %q cannot be fast-forwarded to commit", string(in.GetBranch())).
-			WithDetail(&gitalypb.UserLandError{
-				Error: &gitalypb.UserLandError_NotAncestor{
-					NotAncestor: &gitalypb.NotAncestorError{
-						ParentRevision: []byte(tip.String()),
-						ChildRevision:  []byte(commitID.String()),
-					},
-				},
-			})
-
-	case gitalypb.UserLandRequest_STRATEGY_MERGE:
-		mergeMessage := string(in.GetMergeMessage())
-		if mergeMessage == "" {
-			mergeMessage = fmt.Sprintf("Merge commit '%s' into %s", commitID, string(in.GetBranch()))
-		}
-
-		mergeCommitID, err := s.merge(ctx, quarantineRepo,
-			committer,
-			committer,
-			mergeMessage,
-			tip.String(),
-			commitID.String(),
-			false,
-			false,
-		)
-		if err != nil {
-			var conflictErr *localrepo.MergeTreeConflictError
-			if errors.As(err, &conflictErr) {
-				return "", landMergeConflictError(tip, commitID, conflictingFileNames(conflictErr), conflictErr)
-			}
-
-			return "", structerr.NewInternal("merging commit: %w", err)
-		}
-
-		return git.ObjectID(mergeCommitID), nil
-
-	case gitalypb.UserLandRequest_STRATEGY_REBASE_UNSPECIFIED:
-		if err := rejectMergeCommitsInRange(ctx, quarantineRepo, tip, commitID); err != nil {
-			return "", err
-		}
-
-		// Rebasing needs a merge base. Unrelated histories can only be landed with STRATEGY_MERGE.
-		related, err := hasMergeBase(ctx, quarantineRepo, tip, commitID)
-		if err != nil {
-			return "", structerr.NewInternal("checking for a common ancestor: %w", err)
-		}
-		if !related {
-			return "", structerr.NewInvalidArgument("commit shares no history with branch %q: use STRATEGY_MERGE to land unrelated history", string(in.GetBranch()))
-		}
-
-		// Commits that are patch-equivalent to a commit of the tip's history are reapplied
-		// instead of being dropped. The tip may have reverted such a commit since, and
-		// dropping it would lose its changes while the landing succeeds. A reapplied commit
-		// whose changes the tip still holds becomes empty and is dropped by the rebase. One
-		// whose changes the tip modified further conflicts, which is reported rather than
-		// guessed at.
-		rebasedCommitID, err := quarantineRepo.Rebase(
-			ctx,
-			tip.String(),
-			commitID.String(),
-			localrepo.RebaseWithCommitter(committer),
-			localrepo.RebaseWithReappliedCherryPicks(),
-		)
-		if err != nil {
-			// The conflict error is passed as the cause itself, not the structerr-wrapped
-			// error from Rebase, because structerr takes the code of the innermost error.
-			var conflictErr *localrepo.RebaseConflictError
-			if errors.As(err, &conflictErr) {
-				return "", landMergeConflictError(tip, commitID, conflictingFileNames(conflictErr.ConflictError), conflictErr)
-			}
-
-			return "", structerr.NewInternal("rebasing commit: %w", err)
-		}
-
-		return rebasedCommitID, nil
-
-	default:
-		return "", structerr.NewInvalidArgument("unknown strategy: %d", in.GetStrategy())
-	}
-}
-
-// rejectMergeCommitsInRange fails when the commits reachable from commit but not from tip contain
-// a merge commit. Rebasing drops merge commits, so such a change can only be landed with
-// STRATEGY_MERGE.
-func rejectMergeCommitsInRange(ctx context.Context, repo *localrepo.Repo, tip, commitID git.ObjectID) error {
-	var stdout, stderr bytes.Buffer
-	if err := repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name:  "rev-list",
-			Flags: []gitcmd.Option{gitcmd.Flag{Name: "--merges"}},
-			Args:  []string{fmt.Sprintf("%s..%s", tip, commitID)},
-		},
-		gitcmd.WithStdout(&stdout),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		return structerr.NewInternal("listing merge commits: %w", err).WithMetadata("stderr", stderr.String())
-	}
-
-	if strings.TrimSpace(stdout.String()) != "" {
-		return structerr.NewInvalidArgument("commit range contains merge commits, which cannot be rebased: use STRATEGY_MERGE")
-	}
-
-	return nil
-}
-
-// hasMergeBase reports whether a and b have a common ancestor. Unrelated histories have no merge
-// base, which git merge-base reports with exit status 1.
-func hasMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID) (bool, error) {
-	var stdout, stderr bytes.Buffer
-	if err := repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name: "merge-base",
-			Args: []string{a.String(), b.String()},
-		},
-		gitcmd.WithStdout(&stdout),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		if status, ok := command.ExitStatus(err); ok && status == 1 {
-			return false, nil
-		}
-
-		return false, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
-	}
-
-	return true, nil
 }
 
 // updateLandedReference performs the compare-and-swap of the branch. Hook rejections are returned

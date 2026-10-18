@@ -1,8 +1,10 @@
 # Land batching
 
-Status: implemented in phase 3 (standalone mode only) and extended in phase 4a
+Status: implemented in phase 3 (standalone mode only), extended in phase 4a
 (batch latency: a streaming rebase engine, early completion, adaptive batch
-sizes and a batch of one as an ordinary land). This page describes the code in
+sizes and a batch of one as an ordinary land) and in phase 4b (one range query
+per request and the objects of a batch made durable once, as one pack; see
+[PLAN8.md](PLAN8.md)). This page describes the code in
 `internal/gitaly/service/operations/land_batch*.go`, `internal/graft/landlane`,
 `internal/graft/rebase` and `internal/graft/ancestry`. The designs are in
 [PLAN3.md](PLAN3.md), section A, and [PLAN4.md](PLAN4.md).
@@ -83,27 +85,82 @@ One batch attempt:
 A batch that changes nothing publishes nothing. Its requests report their own
 outcomes.
 
-### Rebase engine
+### How a request is decided and rebased
 
-Since phase 4a, every batch attempt uses one `rebase.Engine`
-(`internal/graft/rebase`). It rebases with the same rules, errors and
-conflict contents as the repository's `Rebase`, but it keeps one
-`git merge-tree --stdin` process and one `git hash-object --stdin-paths`
-process running for the whole attempt, instead of starting several git
-processes per member. The engine is created when the attempt starts and closed
-when it ends. If the commit writer cannot write a commit (it returns
-`ErrCommitWriterUnsupported`, for example when signing is configured), that
-commit is written with the ordinary commit writer of the repository. The results
-are the same either way.
+Since phase 4b ([PLAN8.md](PLAN8.md)), each request of an attempt costs one
+short git process, one more when it diverges from the tip, and at most four in
+all when committer dates are skewed:
 
-Ancestry questions of the batch (already landed, fast-forward, merge base) go
-through the `ancestry.Checker` of the attempt. With `[graft.land] graph_ancestry
-= true` they use the stored `graph` index; with `false` they use `git`. The
-single-land path reads the same switch for its ancestry questions. Both return
-the same answers. The graph checker refuses repositories with shallow commits,
-grafts or replace refs, because git walks their history differently; for those
-it logs a warning and uses `git`. The single-land path still rebases with the
-repository's `Rebase`, not with the engine.
+1. The commit ID is peeled to a commit by an object info process of the
+   attempt's quarantine (`git cat-file --batch-check`), taken from the catfile
+   cache for each peel, so a process that dies fails the request that met it
+   and at most the next one.
+2. One listing of the commits that the change adds to the running tip
+   (`ancestry.Checker.List`, `git rev-list --parents commit ^tip`) decides the
+   landing (`rebase.Plan`): an empty list means the change is already landed;
+   the tip being a parent of a listed commit means a fast-forward; both facts
+   hold even when committer dates are skewed. Otherwise the change diverges, or,
+   under skew, may still turn out to be already landed (see below). A skewed
+   history can make `git rev-list` list commits that the tip
+   already has (its walk stops early when the commits it still has to visit are
+   older than those it listed), never fewer. So for a diverging change one
+   `git merge-base --independent tip <bottoms>` tells whether the listing is
+   exact: it drops exactly the bottoms of the listing (listed commits none of
+   whose parents is listed) that the tip reaches, and the listing has extra
+   commits exactly when one of them is dropped. Without skew that is the only
+   extra process. With skew (counted by `graft_revrange_skewed_listings_total`;
+   the commits removed from listings of the repository rebase todo are counted
+   by `graft_revrange_skew_extra_commits_total`)
+   `git merge-base --all` decides: the change is already landed when its only
+   merge base is the commit itself; otherwise one listing below the merge
+   bases either is a chain of commits with one parent each down to the only
+   merge base, which is then the exact range, or the range has a merge commit.
+   A land therefore costs at most four git processes, whatever the size of the
+   history. For the rebase strategy, a merge commit in the range refuses the
+   change (`InvalidArgument`, use `STRATEGY_MERGE`), a range that ends at a root
+   commit means unrelated history (`InvalidArgument`), and otherwise its
+   commits, oldest first, are the commits to replay.
+3. The commits are replayed by the `rebase.Engine` of the attempt, which keeps
+   one `git merge-tree --stdin` process and one `git hash-object --stdin-paths`
+   process running for the whole attempt. The replay has the rules, errors and
+   conflict contents of the repository's `Rebase` with reapplied cherry-picks.
+   If the commit writer cannot write a commit (`ErrCommitWriterUnsupported`, for
+   example when signing is configured), that commit is written with the
+   ordinary commit writer of the repository.
+
+With `[graft.land] graph_ancestry = true` the listing walks the stored `graph`
+index in process instead of running `git rev-list`; both return the same
+commits. The graph checker refuses repositories with shallow commits, grafts or
+replace refs, because git walks their history differently; for those it logs a
+warning and uses `git`. A land that is not batched is decided, rebased and
+published the same way, by the same code (`landingAttempt`): it only differs in
+its update, which runs with the request's own identity and hooks.
+
+### Durability of the objects of a batch
+
+The merge-tree and hash-object processes of an attempt write their objects into
+the quarantine of the attempt without fsync. Before the compare-and-swap, the
+attempt packs every loose object of its quarantine into one pack with
+`git pack-objects`, which writes and fsyncs the pack and its index, and removes
+the loose files and their fan-out directories. The quarantine migration of the
+update then moves the pack files into the repository, fsyncing them again,
+before the reference changes. So every object that the new tip reaches is on
+disk before the branch points to it, with a fixed number of fsyncs per batch
+instead of about three per object. A batch that only fast-forwards writes no
+object and packs nothing.
+
+If packing fails, the update of the attempt fails: the requests that changed the
+running tip fail with the error, as for any failed update (see *Outcomes of the
+CAS*), and the branch does not move. Each published batch adds one pack to the
+repository, like a push; housekeeping repacks them as it repacks the packs of
+pushes.
+
+A land that is not batched writes the few objects of its change with the server's
+fsync configuration and publishes them as loose objects, without a pack: a pack
+would cost a process and as many fsyncs for so few objects, and under contention
+every attempt that loses the compare-and-swap would leave a pack in the repository.
+In both cases every object file of the quarantine is durable before the quarantine
+migration moves it.
 
 ### Hooks and identity of the combined update
 
@@ -335,11 +392,17 @@ negative; zero means the default.
 The batch executor (`internal/gitaly/service/operations`) defines:
 
 - `graft_land_batch_phase_seconds{phase}` (histogram): time per phase of a batch
-  attempt. The phases are `quarantine` (opening the quarantine), `tip` (reading
-  the branch tip), `land_member` (one observation per request the stepper lands,
-  in every attempt, denied, conflicting and already-landed requests included),
-  `update` (the CAS and its hooks) and `total` (one observation per execution of
-  the batch, which covers all of its attempts, rebuilds and fallbacks).
+  attempt. The phases are `quarantine` (opening the quarantine and the processes
+  of the attempt), `tip` (reading the branch tip), `land_member` (one
+  observation per request the stepper lands, in every attempt, denied,
+  conflicting and already-landed requests included), `plan` and `replay` (parts
+  of `land_member`: the range listing and decision of a request, and the replay
+  of a rebased request), `pack` (packing the objects of an attempt before its
+  update), `update` (the CAS and its hooks) and `total` (one observation per
+  execution of the batch, which covers all of its attempts, rebuilds and
+  fallbacks).
+- `graft_land_batch_packed_objects_total` (counter): objects that attempts
+  packed before their update.
 - `graft_land_batch_members_total{outcome}` (counter): requests by outcome, with
   the outcomes `landed`, `already_landed`, `conflict`, `denied` and `error`.
 
@@ -355,6 +418,30 @@ pre-receive hook would use for that request alone. A denied request never enters
 the running tip, so it cannot delay or block the other requests of its batch.
 
 ## Measured results
+
+### Phase 4b
+
+The runs of `examples/graft/demo/acceptance-phase4.sh` on the phase 4b trees
+(three benchmark windows; full tables, phases and the machine in
+[BENCH.md](BENCH.md#measured-phase-4b-results)) **meet the phase 4a acceptance**,
+the stretch goal included: one attempt per landed change, only planned conflicts
+fail, and p99 with batching on is below off at every size. The final tree
+(`9bf4742`, window 3):
+
+| p99 landed (ms), run 1 / run 2 | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| batching on | 819 / 748 | 1880 / 9171 | 4640 / 5390 |
+| batching off | 4707 / 4813 | 8267 / 17868 | 14641 / 26692 |
+| lands/min, batching on | 1366 / 1476 | 1690 / 620 | 1459 / 1678 |
+
+The stretch goal (p99 on at 100 agents at most half of off) passed by 37% and 60%
+(in window 1 by 3.7% and 51%). The runs vary a lot, and the benchmark saturates the
+machine; the 50 agents of window 3, run 2, are an outlier on both sides.
+A batched request now costs about 8 ms (one range listing and a replay without
+fsync per object, see *How a request is decided and rebased*), and most of a batch
+is its publish: the pack of its objects and the update.
+
+### Phase 4a
 
 The phase 4a acceptance run of record (`examples/graft/demo/acceptance-phase4.sh`,
 20, 50 and 100 agents of 5 changes, conflict rate 0.2, seed 1; full tables, the
@@ -381,9 +468,9 @@ The phase breakdown shows where a batch spends its time: landing the members
 another) takes 56 to 72% of it, and the reference update with its hooks
 (`update`) 27 to 42%. The lane is busy for almost the whole run, so with many
 agents most of the latency is time spent queued behind earlier batches. Turning
-adaptive sizing off does not change that. Phase 4b (pipelined batches) must let
-a batch land its members while the batch before it publishes, and must cut or
-parallelize the per-member cost.
+adaptive sizing off does not change that. The profile of phase 4b found where the
+per-member time went (fsyncs of loose objects and nine short git processes per
+member) and removed it; see [PLAN8.md](PLAN8.md).
 
 ## Limits
 

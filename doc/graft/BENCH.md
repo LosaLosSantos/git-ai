@@ -207,8 +207,9 @@ Each server exposes its metrics on its own `prometheus_listen_addr` (set by
 `bench-batch.sh`). After each run the script scrapes `/metrics` and appends a
 "time per phase" table to the results. For each phase of a batch attempt
 (`graft_land_batch_phase_seconds{phase}`: `quarantine`, `tip`, `land_member`,
-`update`, `total`) it shows the sum and the mean, and the mean `land_member`
-time per batch. The metric names are in [LAND-BATCHING](LAND-BATCHING.md#metrics).
+`plan`, `replay`, `pack`, `update`, `total`) it shows the sum and the mean, and
+the mean `land_member` time per batch. `plan` and `replay` are parts of
+`land_member`; `pack` precedes `update`. The metric names are in [LAND-BATCHING](LAND-BATCHING.md#metrics).
 
 ### Phase 4a acceptance run
 
@@ -375,6 +376,123 @@ Reading it:
 - Compared with phase 3 (table above), p99 with batching on dropped at 20 agents
   (9868 to 2789 ms) and 50 agents (15317 to 12658 ms), and rose slightly at 100
   agents (21808 to 23253 ms), on a noisy machine.
+
+#### Measured phase 4b results
+
+Phase 4b ([PLAN8.md](PLAN8.md)) fixed the two causes of the latency that the
+profile of the phase 4a tree found: about 12 fsyncs per batched request (each new
+object fsynced when written and again by the quarantine migration) and nine short
+git processes per request where one listing of the change's commits answers every
+question. It also removed a second git process that the command factory started
+for most git commands (`gitcmd` attr.tree detection), which speeds up every
+command of the server, so the "off" column below is measured on that corrected
+base too.
+
+Runs of record: two runs of `acceptance-phase4.sh` in one benchmark window, on
+the tree of commit `1899a0d`, with the defaults (`AGENT_COUNTS="20 50 100"`,
+`CHANGES=5`, `RATE=0.2`, `SEED=1`, `window = "10ms"`, `max_size = 50`,
+`target_latency = "500ms"`, `graph_ancestry = false`). Same machine as above
+(Intel Core Ultra 7 255H, 16 logical CPUs, WSL2, ext4 on a virtual disk, an
+fsync of a small file takes about 6 ms), with no other workload: the load average
+was 4.2 when the first run started and rose to 38 and 48 during the runs, which is
+the benchmark itself (both servers and up to 100 agents).
+
+Both runs pass every criterion, the stretch goal included:
+
+| criterion | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| attempts/landed (on), run 1 / run 2 | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 / 1.00 |
+| failed = planned conflicts (on) | 22 / 22 | 50 / 50 | 108 / 108 |
+| p99 on vs off (ms), run 1 | 1347 vs 7437 | 2525 vs 12030 | 4854 vs 10077 |
+| p99 on vs off (ms), run 2 | 1193 vs 6741 | 4839 vs 12746 | 2897 vs 11905 |
+| stretch: p99 on-100 <= 0.5 x off-100 | | | 4854 <= 5038 (run 1), 2897 <= 5952 (run 2) |
+
+The stretch goal passed by 3.7% in run 1 and by 51% in run 2.
+
+| metric (batching on), run 1 / run 2 | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| lands/min | 1020 / 1070 | 1230 / 944 | 1616 / 2325 |
+| lands/min, phase 4a run of record | 412 | 251 | 258 |
+| p50 landed (ms) | 911 / 739 | 1700 / 1980 | 2653 / 1824 |
+| batch size mean | 8.2 / 8.3 | 13.4 / 8.9 | 13.9 / 18.5 |
+| duration | 4.6 s / 4.4 s | 9.8 s / 12.7 s | 14.6 s / 10.1 s |
+
+With batching off the runs took 17 to 41 s and landed 61 to 116 changes, as before:
+the off column still loses most lands to the 20-attempt limit at 50 and 100 agents.
+
+Time per phase, mean per observation, run 1 / run 2:
+
+| phase | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| land_member (per request) | 8.5 / 7.6 ms | 7.4 / 8.5 ms | 7.5 / 8.1 ms |
+| plan (per request) | 3.3 / 3.1 ms | 3.1 / 3.3 ms | 3.1 / 3.6 ms |
+| replay (per rebased request) | 4.8 / 4.2 ms | 3.9 / 4.8 ms | 4.1 / 4.2 ms |
+| pack (per batch) | 55 / 47 ms | 75 / 69 ms | 53 / 45 ms |
+| update (per batch) | 126 / 136 ms | 212 / 210 ms | 175 / 135 ms |
+| total (per batch) | 238 / 233 ms | 351 / 335 ms | 321 / 324 ms |
+
+Reading it:
+
+- A batched request costs about 8 ms instead of 80 to 137 ms in phase 4a: one
+  `git rev-list` for the decision and a replay through the long-lived merge-tree
+  and hash-object processes, without fsync per object.
+- The lane is still busy for most of a run, but each batch now spends most of its
+  time publishing: packing the objects of the batch and the update (the
+  compare-and-swap, the hooks and the changeset log). At 100 agents the publish
+  is about 70% of a batch. The update took 135 to 212 ms here, against 20 to 30 ms
+  (without the quarantine migration) in a profile at lower load; why it grew under
+  load is being profiled.
+- The variance between runs is large: p99 at 50 agents was 2525 ms in run 1 and
+  4839 ms in run 2, p99 at 100 agents 4854 and 2897 ms. The benchmark saturates
+  the machine (load average 38 to 48 during the runs), so single runs are not
+  precise; compare runs of one window, and rerun before comparing across trees.
+- The stretch goal passed with a margin of only 3.7% in run 1.
+- The off column moved too. At 100 agents its p99 (10077 and 11905 ms) is lower
+  than in the phase 4a run of record (13368 ms); at 50 agents it is higher (12030
+  and 12746 ms against 9939 ms). One known change applies to it: every git command
+  of the server now starts one process instead of two for most commands. Why the
+  off p99 at 50 agents rose is not explained; its p99 covers only the 97 changes
+  that landed, out of 250.
+
+##### Final tree (window 3)
+
+After window 1 the unbatched land was moved onto the same landing attempt as a
+batch (PLAN8 WP86). A second window (tree `59d8fda`) passed every criterion but
+showed a regression of the "off" column at 100 agents (p99 33.9 and 34.8 s, 60
+lands/min): every unbatched attempt published its objects as a pack, and under
+the contention of 100 agents about 98% of the ~6600 attempts lose the
+compare-and-swap and each left a pack in the repository (120 packs at the end of
+the run against 4 in window 1, `pack-objects` 1484 s and `update-ref` 840 s of
+real time against 1 s and 56 s). Unbatched lands now publish their few objects
+loose (PLAN8 section 13a). The runs of record of the final tree, commit
+`9bf4742`, are window 3 (same workload and defaults as above; load average 10.7
+at the start, 53 and 57 at the end of the runs):
+
+| criterion | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| attempts/landed (on), run 1 / run 2 | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 / 1.00 |
+| failed = planned conflicts (on) | 22 / 22 | 50 / 50 | 108 / 108 |
+| p99 on vs off (ms), run 1 | 819 vs 4707 | 1880 vs 8267 | 4640 vs 14641 |
+| p99 on vs off (ms), run 2 | 748 vs 4813 | 9171 vs 17868 | 5390 vs 26692 |
+| stretch: p99 on-100 <= 0.5 x off-100 | | | 4640 <= 7321 (run 1), 5390 <= 13346 (run 2) |
+
+| metric, run 1 / run 2 | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| lands/min, batching on | 1366 / 1476 | 1690 / 620 | 1459 / 1678 |
+| lands/min, batching off | 332 / 336 | 230 / 151 | 158 / 114 |
+| p50 landed on (ms) | 599 / 639 | 1326 / 1794 | 2927 / 2537 |
+| member (land_member, mean) | 10.8 / 11.1 ms | 14.9 / 21.1 ms | 14.2 / 13.1 ms |
+| pack per batch (mean) | 39 / 34 ms | 51 / 210 ms | 62 / 50 ms |
+| update per batch (mean) | 65 / 52 ms | 89 / 155 ms | 114 / 107 ms |
+
+All criteria pass in both runs, the stretch goal included (by 37% and 60%). The 50
+agents of run 2 are an outlier on both sides (pack 210 ms and update 155 ms per
+batch, p99 on 9171 ms, lands/min 620): the load average was above 40 during that
+part of the run. The off column at 100 agents recovered from window 2 (p99 14641 and
+26692 ms, 158 and 114 lands/min; window 1: 10077 and 11905 ms, about 170 lands/min)
+and its repository ended with 3 packs and 232 loose objects, but it still varies a
+lot between runs and was slower than in window 1 in run 2, for a reason not
+established.
 
 ## Reading the numbers
 

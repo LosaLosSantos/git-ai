@@ -140,6 +140,21 @@ Git hooks use private.
   does this. The quickstart creates a bare repository on disk and seeds it
   with a push.
 - `graft clone` needs the branch to exist. An empty repository cannot be cloned.
+- Durability of written objects assumes a local journaling filesystem, ext4 (in
+  any `data=` mode) or xfs, not NFS. The objects of a write are made durable by
+  their writer, and the migration of the write's quarantine into the repository
+  makes the new names durable with one fsync per directory: that relies on a
+  hard link being one journaled operation and on the fsync of a directory making
+  every earlier change of the journal durable. On other filesystems an object
+  written just before a crash may be missing although the write succeeded.
+- Custom hooks get the server's `core.fsync` configuration, so the objects that
+  their git commands write into a quarantine are durable. When a custom hook
+  runs with a quarantine of the server's own write RPCs (land, commit, merge and
+  the other operations), the migration of that quarantine also fsyncs its files,
+  because a hook may write objects without git; that costs about one fsync per
+  file of the write. Pushes over SSH or HTTP are different: git's receive-pack
+  migrates its own quarantine, so objects that a custom hook writes there
+  without git are only as durable as the hook makes them.
 
 ### Landing (`UserLand`)
 
@@ -262,7 +277,39 @@ commitment.
 6. Multi-node cache tiers with explicit invalidation for mutable keys.
 7. Signed changesets and a verifiable export of the log.
 
+## Phase 4b limitations
+
+1. The phase 4a acceptance is met by two runs on one machine and one workload
+   (seed 1, conflict rate 0.2; see [BENCH](BENCH.md#measured-phase-4b-results)).
+   The runs vary a lot, the benchmark saturates the machine, and the stretch goal
+   passed by only 3.7% in one of the two runs.
+2. Batches still run one at a time per lane, and each batch spends most of its time
+   publishing (packing its objects and the update with its hooks and the
+   changeset log). Pipelined batches, which would overlap the publish of one batch
+   with the work of the next, are not built: a profile showed that the inherent part
+   of the publish (about 65-70 ms) is smaller than the member work of a batch, and
+   that its growth under load comes from two causes outside the lane, which are
+   planned next: the quarantine migration fsyncs again every file that is already
+   durable, and every reference update of a repository waits for the changeset-log
+   order of the updates before it (shared with `UserCommitFiles`). See PLAN8,
+   section 9.
+3. Each published batch adds one small pack to the repository, as a push does.
+   Housekeeping repacks them like the packs of pushes, so busy branches make
+   repacks more frequent. A batch attempt that loses its compare-and-swap (to
+   another node or an external writer) also leaves its pack in the repository,
+   unreferenced, until housekeeping prunes it: at most one per lost batch attempt.
+   Unbatched lands publish loose objects and leave no pack.
+4. The objects of a batch are written without fsync and made durable by the pack
+   written before the update. An operator who sets `core.fsync` in the `[git]`
+   configuration overrides this for the helper processes too (the configuration
+   of the administrator is applied last), which keeps the old per-object fsyncs.
+5. An unbatched land decides and rebases like a batch attempt (one range listing and
+   the rebase engine) and publishes its objects loose, but it is still bounded by its
+   own compare-and-swap retries under contention (`max_attempts`).
+
 ## Phase 4a limitations
+
+(Items 1 and 2 are resolved by phase 4b, see above. The text describes phase 4a.)
 
 1. Batches still run one at a time per lane. Pipelined batches (phase 4b) are not
    implemented, so a lane's throughput is bounded by its batch duration. The

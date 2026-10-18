@@ -54,6 +54,8 @@ type MergeTreeStream struct {
 	inputs mergeTreeStreamInputs
 	// starts counts the processes the stream started.
 	starts int
+	// gitOpts are the options of every process of the stream, from its HelperOptions.
+	gitOpts []gitcmd.CmdOpt
 
 	cmd    *command.Command
 	reader *bufio.Reader
@@ -74,7 +76,7 @@ type mergeTreeStreamInputs struct {
 
 // NewMergeTreeStream starts a `git merge-tree --stdin` process for the repository.
 // The process lives until Close is called or ctx is done.
-func (repo *Repo) NewMergeTreeStream(ctx context.Context) (*MergeTreeStream, error) {
+func (repo *Repo) NewMergeTreeStream(ctx context.Context, opts ...HelperOption) (*MergeTreeStream, error) {
 	objectHash, err := repo.ObjectHash(ctx)
 	if err != nil {
 		return nil, structerr.NewInternal("getting object hash %w", err)
@@ -90,6 +92,7 @@ func (repo *Repo) NewMergeTreeStream(ctx context.Context) (*MergeTreeStream, err
 		repoPath:   repoPath,
 		objectHash: objectHash,
 		ctx:        ctx,
+		gitOpts:    resolveHelperOptions(opts),
 	}
 
 	// The inputs are read before the process starts: a change after this point is either
@@ -153,9 +156,11 @@ func (s *MergeTreeStream) start(inputs mergeTreeStreamInputs) error {
 				gitcmd.Flag{Name: "--allow-unrelated-histories"},
 			},
 		},
-		gitcmd.WithSetupStdin(),
-		gitcmd.WithSetupStdout(),
-		gitcmd.WithStderr(stderr),
+		append([]gitcmd.CmdOpt{
+			gitcmd.WithSetupStdin(),
+			gitcmd.WithSetupStdout(),
+			gitcmd.WithStderr(stderr),
+		}, s.gitOpts...)...,
 	)
 	if err != nil {
 		cancel()
@@ -352,4 +357,37 @@ func (s *MergeTreeStream) readField() (string, error) {
 	}
 
 	return field[:len(field)-1], nil
+}
+
+// HelperOption configures the long-lived git processes of a MergeTreeStream or a CommitWriter.
+type HelperOption func(*helperConfig)
+
+type helperConfig struct {
+	gitOpts []gitcmd.CmdOpt
+}
+
+// WithoutObjectFsync starts the helper processes with core.fsync=none. A MergeTreeStream and a
+// CommitWriter write nothing but objects, so the option only drops the fsync of the objects they
+// write. The caller must make those objects durable itself, before a quarantine that holds them is
+// migrated: every object file in a quarantine must be durable at migration time, and the migration
+// is not relied on to fsync them. The batch attempts of UserLand pack every loose object of their
+// quarantine into one fsynced pack before the update (see doc/graft/PLAN8.md, section 3.2).
+//
+// The value replaces the core.fsync of the server for the helper. It cannot be derived from it: git
+// does not subtract a component from a value set earlier (a later "-loose-object" replaces the
+// whole value), and the helpers write no reference, index or derived metadata that the other
+// components would cover.
+func WithoutObjectFsync() HelperOption {
+	return func(cfg *helperConfig) {
+		cfg.gitOpts = append(cfg.gitOpts, gitcmd.WithConfig(gitcmd.ConfigPair{Key: "core.fsync", Value: "none"}))
+	}
+}
+
+// resolveHelperOptions returns the command options of the helper processes configured by opts.
+func resolveHelperOptions(opts []HelperOption) []gitcmd.CmdOpt {
+	var cfg helperConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg.gitOpts
 }

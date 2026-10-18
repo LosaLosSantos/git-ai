@@ -369,7 +369,7 @@ func TestMigrate(t *testing.T) {
 			target := filepath.Join(dir, "target")
 			tc.target.create(t, target)
 
-			require.NoError(t, migrate(ctx, source, target))
+			require.NoError(t, migrate(ctx, source, target, false))
 			require.Equal(t, tc.expected, listEntries(t, target))
 			require.NoDirExists(t, source)
 		})

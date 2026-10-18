@@ -1,24 +1,26 @@
-// Package ancestry answers the ancestry questions of a landing: whether a commit is reachable from
-// another one, and what their merge base is. Git answers them by running git merge-base, and the
-// graph checker answers them from the stored graph index (see internal/graft/derived/graph). Both
-// answer the same questions with the same results, so a landing gives the same outcome with either.
+// Package ancestry answers the history questions of a landing (revrange.Walker): which commits a
+// change adds to a branch, whether a commit is reachable from another and the merge bases of two
+// commits. The git checker runs git for each question, and the graph checker answers from the
+// stored graph index (see internal/graft/derived/graph). The listing of the git checker may hold
+// commits outside of the range when committer dates are skewed; revrange.Exact, which
+// rebase.Plan uses, makes it exact. The listing of the graph checker is exact. A landing gives the
+// same outcome with either.
 package ancestry
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/catfile"
-	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/graft/derived"
 	"github.com/feder-cr/git-ai/internal/graft/derived/graph"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -31,22 +33,19 @@ const (
 	graphKindVersion = graph.KindVersion
 )
 
-// Checker answers the ancestry questions of one landing attempt. A Checker is used by one
-// goroutine at a time.
-type Checker interface {
-	// IsAncestor reports whether ancestor is reachable from descendant, including when both are
-	// the same commit.
-	IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error)
-	// MergeBase returns the merge base of a and b. When several best common ancestors exist, it
-	// returns the one with the smallest object ID, so that Git and the graph checker agree. The
-	// boolean is false when a and b have no common ancestor.
-	MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error)
-}
+// Checker answers the history questions of one landing attempt. A Checker is used by one goroutine
+// at a time. Its List is a listing that only revrange.Exact or revrange.Refine (through
+// rebase.Plan) make exact: no caller may take it for the exact range.
+type Checker = revrange.Walker
+
+// RangeCommit is a commit of a range with all of its parents in order, as git rev-list --parents
+// prints it.
+type RangeCommit = revrange.Commit
 
 // Git returns a Checker that runs git for each question. It is the behaviour without the graph
 // index.
 func Git(repo *localrepo.Repo) Checker {
-	return gitChecker{repo: repo}
+	return revrange.Git(repo)
 }
 
 // Graph returns a Checker that answers from the graph index of repo. The index reads the parents
@@ -69,8 +68,9 @@ func Graph(ctx context.Context, repo *localrepo.Repo, reader catfile.ObjectConte
 		return nil, err
 	}
 
-	index := graph.NewIndex(graph.NewCatfileSource(reader), store.Kind(graphKindName, graphKindVersion))
-	return graphChecker{index: index}, nil
+	source := graph.NewCatfileSource(reader)
+	index := graph.NewIndex(source, store.Kind(graphKindName, graphKindVersion))
+	return graphChecker{index: index, source: source}, nil
 }
 
 // New returns the Graph checker when enabled, and the Git checker otherwise. When the graph
@@ -130,63 +130,162 @@ func requireAbsent(path string) error {
 	}
 }
 
-// gitChecker answers the questions with git.
-type gitChecker struct {
-	repo *localrepo.Repo
-}
-
-func (c gitChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return c.repo.IsAncestor(ctx, ancestor.Revision(), descendant.Revision())
-}
-
-func (c gitChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error) {
-	var stdout, stderr bytes.Buffer
-	if err := c.repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name:  "merge-base",
-			Flags: []gitcmd.Option{gitcmd.Flag{Name: "--all"}},
-			Args:  []string{a.String(), b.String()},
-		},
-		gitcmd.WithStdout(&stdout),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		// git merge-base exits with status 1 when there is no common ancestor.
-		if status, ok := command.ExitStatus(err); ok && status == 1 {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
-	}
-
-	var best string
-	for _, line := range strings.Fields(stdout.String()) {
-		if best == "" || line < best {
-			best = line
-		}
-	}
-	if best == "" {
-		return "", false, nil
-	}
-
-	return git.ObjectID(best), true, nil
-}
-
-// graphChecker answers the questions with the graph index.
+// graphChecker answers with the graph index.
 type graphChecker struct {
 	index *graph.Index
+	// source reads the parents of the commits of a range.
+	source graph.Source
 }
 
-func (c graphChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return c.index.IsAncestor(ctx, ancestor, descendant)
+// The flags of the walk of List.
+const (
+	// fromHead marks the commits reachable from head.
+	fromHead uint8 = 1 << iota
+	// fromExcluded marks the commits reachable from a commit of exclude.
+	fromExcluded
+)
+
+// List returns exactly the commits reachable from head and from none of exclude. It walks down from
+// all of them at once in the order of their generation numbers, highest first. Every descendant of
+// a commit has a higher generation, so when the walk takes a commit, all of its descendants that the
+// walk reaches were taken already and its flags are final: it is in the range when head reaches it
+// and no excluded commit does. The walk ends when no commit that only head reaches is left to take,
+// as the ancestors of the others are not in the range.
+func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git.ObjectID) ([]RangeCommit, error) {
+	w := graphWalk{
+		checker: c,
+		flags:   map[git.ObjectID]uint8{},
+		taken:   map[git.ObjectID]bool{},
+	}
+
+	if err := w.add(ctx, head, fromHead); err != nil {
+		return nil, err
+	}
+	for _, id := range exclude {
+		if err := w.add(ctx, id, fromExcluded); err != nil {
+			return nil, err
+		}
+	}
+
+	var commits []RangeCommit
+	for w.headOnly > 0 {
+		next := heap.Pop(&w.queue).(generationItem)
+		flags := w.flags[next.id]
+		if flags == fromHead {
+			w.headOnly--
+		}
+		w.taken[next.id] = true
+
+		parents, err := c.source.Parents(ctx, next.id)
+		if err != nil {
+			return nil, err
+		}
+
+		// A commit that an excluded commit reaches passes only that on: its ancestors are not in
+		// the range, whether head reaches them or not.
+		propagate := fromExcluded
+		if flags == fromHead {
+			commits = append(commits, RangeCommit{ID: next.id, Parents: parents})
+			propagate = fromHead
+		}
+
+		for _, parent := range parents {
+			if err := w.add(ctx, parent, propagate); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return commits, nil
 }
 
-func (c graphChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error) {
-	base, err := c.index.MergeBase(ctx, a, b)
+// ReachedBottoms answers from the graph index, one bottom at a time, in this process.
+func (c graphChecker) ReachedBottoms(ctx context.Context, base git.ObjectID, bottoms []git.ObjectID) (map[git.ObjectID]bool, error) {
+	return c.Reachable(ctx, base, bottoms)
+}
+
+// Reachable answers from the graph index, one commit at a time, in this process.
+func (c graphChecker) Reachable(ctx context.Context, base git.ObjectID, commits []git.ObjectID) (map[git.ObjectID]bool, error) {
+	reached := map[git.ObjectID]bool{}
+	for _, id := range commits {
+		ok, err := c.index.IsAncestor(ctx, id, base)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			reached[id] = true
+		}
+	}
+	return reached, nil
+}
+
+// MergeBases answers from the graph index.
+func (c graphChecker) MergeBases(ctx context.Context, a, b git.ObjectID) ([]git.ObjectID, error) {
+	return c.index.MergeBases(ctx, a, b)
+}
+
+// graphWalk is the state of one List of the graph checker.
+type graphWalk struct {
+	checker graphChecker
+	// flags holds the flags of every commit the walk reached.
+	flags map[git.ObjectID]uint8
+	// queue holds the commits that the walk reached and did not take yet.
+	queue generationQueue
+	// taken holds the commits that the walk took from queue.
+	taken map[git.ObjectID]bool
+	// headOnly counts the commits of queue whose flags are fromHead alone.
+	headOnly int
+}
+
+// add gives id the flags, and queues it when the walk did not reach it before.
+func (w *graphWalk) add(ctx context.Context, id git.ObjectID, flags uint8) error {
+	old, reached := w.flags[id]
+	if reached {
+		if w.taken[id] {
+			// A commit is taken after all of its descendants, so a commit that was taken gets no
+			// new flags from a descendant afterwards, unless the generation numbers are wrong.
+			if old|flags != old {
+				return fmt.Errorf("graph walk reached commit %s with new flags after taking it: the generation numbers do not order the history", id)
+			}
+			return nil
+		}
+
+		if old == fromHead && old|flags != fromHead {
+			w.headOnly--
+		}
+		w.flags[id] = old | flags
+		return nil
+	}
+
+	generation, err := w.checker.index.Generation(ctx, id)
 	if err != nil {
-		return "", false, err
-	}
-	if base == "" {
-		return "", false, nil
+		return err
 	}
 
-	return base, true, nil
+	w.flags[id] = flags
+	if flags == fromHead {
+		w.headOnly++
+	}
+	heap.Push(&w.queue, generationItem{id: id, generation: generation})
+	return nil
+}
+
+// generationItem is a commit of the queue of a graph walk.
+type generationItem struct {
+	id         git.ObjectID
+	generation uint32
+}
+
+// generationQueue is a heap of commits, highest generation first.
+type generationQueue []generationItem
+
+func (q generationQueue) Len() int           { return len(q) }
+func (q generationQueue) Less(i, j int) bool { return q[i].generation > q[j].generation }
+func (q generationQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q *generationQueue) Push(x any)        { *q = append(*q, x.(generationItem)) }
+func (q *generationQueue) Pop() any {
+	old := *q
+	item := old[len(old)-1]
+	*q = old[:len(old)-1]
+	return item
 }

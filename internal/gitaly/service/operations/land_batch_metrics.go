@@ -19,6 +19,13 @@ const (
 	// landBatchPhaseLandMember is the landing of one request onto the running tip. It is observed
 	// once per request of an attempt.
 	landBatchPhaseLandMember = "land_member"
+	// landBatchPhasePlan is the decision of how one request lands, from one listing of the commits it
+	// adds to the running tip. It is observed once per request that reaches it.
+	landBatchPhasePlan = "plan"
+	// landBatchPhaseReplay is the replay of the commits of one rebased request.
+	landBatchPhaseReplay = "replay"
+	// landBatchPhasePack is the packing of the objects of an attempt before its compare-and-swap.
+	landBatchPhasePack = "pack"
 	// landBatchPhaseUpdate is the compare-and-swap that publishes a batch, with the hooks.
 	landBatchPhaseUpdate = "update"
 	// landBatchPhaseTotal is the whole execution of a batch, from its start to its outcomes.
@@ -44,9 +51,15 @@ var (
 	landBatchPhaseSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "graft_land_batch_phase_seconds",
 		Help: "Time spent in each phase of a land batch: quarantine, tip, land_member (one observation per " +
-			"request of a batch attempt), update (the compare-and-swap with the hooks) and total.",
+			"request of a batch attempt), plan and replay (parts of land_member), pack (the objects of an " +
+			"attempt before its update), update (the compare-and-swap with the hooks) and total.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"phase"})
+
+	landBatchPackedObjectsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "graft_land_batch_packed_objects_total",
+		Help: "Objects that batch attempts packed before their update.",
+	})
 
 	landBatchMembersTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "graft_land_batch_members_total",
