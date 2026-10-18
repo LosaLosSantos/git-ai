@@ -152,7 +152,12 @@ const (
 // and no excluded commit does. The walk ends when no commit that only head reaches is left to take,
 // as the ancestors of the others are not in the range.
 func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git.ObjectID) ([]RangeCommit, error) {
-	w := graphWalk{checker: c, flags: map[git.ObjectID]uint8{}}
+	w := graphWalk{
+		checker: c,
+		flags:   map[git.ObjectID]uint8{},
+		queued:  map[git.ObjectID]bool{},
+		taken:   map[git.ObjectID]bool{},
+	}
 
 	if err := w.add(ctx, head, fromHead); err != nil {
 		return nil, err
@@ -170,6 +175,8 @@ func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git
 		if flags == fromHead {
 			w.headOnly--
 		}
+		delete(w.queued, next.id)
+		w.taken[next.id] = true
 
 		parents, err := c.source.Parents(ctx, next.id)
 		if err != nil {
@@ -194,9 +201,24 @@ func (c graphChecker) List(ctx context.Context, head git.ObjectID, exclude []git
 	return commits, nil
 }
 
-// IsAncestor answers from the graph index.
-func (c graphChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return c.index.IsAncestor(ctx, ancestor, descendant)
+// ReachedBottoms answers from the graph index, one bottom at a time, in this process.
+func (c graphChecker) ReachedBottoms(ctx context.Context, base git.ObjectID, bottoms []git.ObjectID) (map[git.ObjectID]bool, error) {
+	return c.Reachable(ctx, base, bottoms)
+}
+
+// Reachable answers from the graph index, one commit at a time, in this process.
+func (c graphChecker) Reachable(ctx context.Context, base git.ObjectID, commits []git.ObjectID) (map[git.ObjectID]bool, error) {
+	reached := map[git.ObjectID]bool{}
+	for _, id := range commits {
+		ok, err := c.index.IsAncestor(ctx, id, base)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			reached[id] = true
+		}
+	}
+	return reached, nil
 }
 
 // MergeBases answers from the graph index.
@@ -213,6 +235,8 @@ type graphWalk struct {
 	queue generationQueue
 	// queued holds the commits of queue.
 	queued map[git.ObjectID]bool
+	// taken holds the commits that the walk took from queue.
+	taken map[git.ObjectID]bool
 	// headOnly counts the commits of queue whose flags are fromHead alone.
 	headOnly int
 }
@@ -221,11 +245,11 @@ type graphWalk struct {
 func (w *graphWalk) add(ctx context.Context, id git.ObjectID, flags uint8) error {
 	old, reached := w.flags[id]
 	if reached {
-		if !w.queued[id] {
+		if w.taken[id] {
 			// A commit is taken after all of its descendants, so a commit that was taken gets no
-			// flags from a descendant afterwards.
+			// new flags from a descendant afterwards, unless the generation numbers are wrong.
 			if old|flags != old {
-				return fmt.Errorf("graph walk reached commit %s again after taking it", id)
+				return fmt.Errorf("graph walk reached commit %s with new flags after taking it: the generation numbers do not order the history", id)
 			}
 			return nil
 		}
@@ -242,9 +266,6 @@ func (w *graphWalk) add(ctx context.Context, id git.ObjectID, flags uint8) error
 		return err
 	}
 
-	if w.queued == nil {
-		w.queued = map[git.ObjectID]bool{}
-	}
 	w.flags[id] = flags
 	w.queued[id] = true
 	if flags == fromHead {

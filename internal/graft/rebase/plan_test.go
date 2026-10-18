@@ -399,29 +399,58 @@ func TestPlanMatchesTheExactHistory(t *testing.T) {
 	}
 }
 
-// overListingChecker answers from a history held in memory. Its List adds to the exact range
-// every commit that an excluded commit reaches and head reaches too, the most that git rev-list can
-// list under committer-date skew.
+// overListingChecker answers from a history held in memory. Its List lists every commit that head
+// reaches without going through an excluded commit, the commits that the excluded commits reach
+// included: the most that git rev-list can list under committer-date skew, since git marks the
+// excluded commits as excluded from the start and its walk from head stops at them.
 type overListingChecker struct {
 	parents [][]int
 	ids     []git.ObjectID
 	index   map[git.ObjectID]int
 }
 
-func (c overListingChecker) List(_ context.Context, head git.ObjectID, _ []git.ObjectID) ([]ancestry.RangeCommit, error) {
+func (c overListingChecker) List(_ context.Context, head git.ObjectID, exclude []git.ObjectID) ([]ancestry.RangeCommit, error) {
+	excluded := map[int]bool{}
+	for _, id := range exclude {
+		excluded[c.index[id]] = true
+	}
+	if excluded[c.index[head]] {
+		return nil, nil
+	}
+
+	seen := map[int]bool{c.index[head]: true}
+	stack := []int{c.index[head]}
 	var commits []ancestry.RangeCommit
-	for x := range ancestorsOf(c.parents, c.index[head]) {
+	for len(stack) > 0 {
+		x := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
 		var parents []git.ObjectID
 		for _, p := range c.parents[x] {
 			parents = append(parents, c.ids[p])
+			if !seen[p] && !excluded[p] {
+				seen[p] = true
+				stack = append(stack, p)
+			}
 		}
 		commits = append(commits, ancestry.RangeCommit{ID: c.ids[x], Parents: parents})
 	}
 	return commits, nil
 }
 
-func (c overListingChecker) IsAncestor(_ context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return ancestorsOf(c.parents, c.index[descendant])[c.index[ancestor]], nil
+func (c overListingChecker) ReachedBottoms(ctx context.Context, base git.ObjectID, bottoms []git.ObjectID) (map[git.ObjectID]bool, error) {
+	return c.Reachable(ctx, base, bottoms)
+}
+
+func (c overListingChecker) Reachable(_ context.Context, base git.ObjectID, commits []git.ObjectID) (map[git.ObjectID]bool, error) {
+	ancestors := ancestorsOf(c.parents, c.index[base])
+	reached := map[git.ObjectID]bool{}
+	for _, id := range commits {
+		if ancestors[c.index[id]] {
+			reached[id] = true
+		}
+	}
+	return reached, nil
 }
 
 func (c overListingChecker) MergeBases(_ context.Context, a, b git.ObjectID) ([]git.ObjectID, error) {

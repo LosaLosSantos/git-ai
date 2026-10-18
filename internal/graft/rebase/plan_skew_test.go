@@ -17,7 +17,12 @@ import (
 // countingChecker counts the questions that a plan asks, each a git process for the git checker.
 type countingChecker struct {
 	ancestry.Checker
-	lists, isAncestors, mergeBases int
+	lists, reachedBottoms, reachables, mergeBases int
+}
+
+// processes is the number of git processes that the questions cost with the git checker.
+func (c *countingChecker) processes() int {
+	return c.lists + c.reachedBottoms + c.reachables + c.mergeBases
 }
 
 func (c *countingChecker) List(ctx context.Context, head git.ObjectID, exclude []git.ObjectID) ([]ancestry.RangeCommit, error) {
@@ -25,9 +30,14 @@ func (c *countingChecker) List(ctx context.Context, head git.ObjectID, exclude [
 	return c.Checker.List(ctx, head, exclude)
 }
 
-func (c *countingChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	c.isAncestors++
-	return c.Checker.IsAncestor(ctx, ancestor, descendant)
+func (c *countingChecker) ReachedBottoms(ctx context.Context, base git.ObjectID, bottoms []git.ObjectID) (map[git.ObjectID]bool, error) {
+	c.reachedBottoms++
+	return c.Checker.ReachedBottoms(ctx, base, bottoms)
+}
+
+func (c *countingChecker) Reachable(ctx context.Context, base git.ObjectID, commits []git.ObjectID) (map[git.ObjectID]bool, error) {
+	c.reachables++
+	return c.Checker.Reachable(ctx, base, commits)
 }
 
 func (c *countingChecker) MergeBases(ctx context.Context, a, b git.ObjectID) ([]git.ObjectID, error) {
@@ -96,9 +106,8 @@ func TestPlanOfTheReviewChain(t *testing.T) {
 
 // TestPlanOnALongSkewedHistory measures what a skewed listing costs on a long history: a main line
 // of 2000 commits, the commit A of a change on it, and a tip of ten commits on A dated a year
-// before the main line. git rev-list tip..A then lists A and the whole main line. The plan asks
-// one listing, one check of its only bottom, the merge bases and one listing below them, and
-// nothing that grows with the history.
+// before the main line. git rev-list tip..A then lists A and the whole main line. The plan asks a
+// fixed number of questions, whatever the length of the history.
 func TestPlanOnALongSkewedHistory(t *testing.T) {
 	t.Parallel()
 
@@ -127,12 +136,15 @@ func TestPlanOnALongSkewedHistory(t *testing.T) {
 	require.Greater(t, len(listed), mainLine, "git rev-list must list the main line for this test to measure anything")
 
 	for _, tc := range []struct {
-		desc     string
-		commit   git.ObjectID
-		wantKind LandKind
+		desc          string
+		commit        git.ObjectID
+		wantKind      LandKind
+		wantProcesses int
 	}{
-		{desc: "already landed", commit: change, wantKind: LandAlreadyLanded},
-		{desc: "diverged", commit: onA, wantKind: LandDiverged},
+		// The listing, the bottoms, the merge bases (only commit: already landed).
+		{desc: "already landed", commit: change, wantKind: LandAlreadyLanded, wantProcesses: 3},
+		// The same and the listing below the merge base, which is the chain of the change.
+		{desc: "diverged", commit: onA, wantKind: LandDiverged, wantProcesses: 4},
 	} {
 		checker := &countingChecker{Checker: ancestry.Git(f.repo)}
 		start := time.Now()
@@ -140,11 +152,67 @@ func TestPlanOnALongSkewedHistory(t *testing.T) {
 		elapsed := time.Since(start)
 		require.NoError(t, err)
 		require.Equal(t, tc.wantKind, plan.Kind(), tc.desc)
-
-		require.Equal(t, 2, checker.lists, tc.desc)
-		require.Equal(t, 1, checker.mergeBases, tc.desc)
-		require.LessOrEqual(t, checker.isAncestors, 2, tc.desc)
-		t.Logf("%s: %d listed by git rev-list, %d listings, %d ancestry checks, %d merge-base, %v",
-			tc.desc, len(listed), checker.lists, checker.isAncestors, checker.mergeBases, elapsed)
+		require.Equal(t, tc.wantProcesses, checker.processes(), tc.desc)
+		require.Zero(t, checker.reachables, "%s: a land never walks the history of the tip", tc.desc)
+		t.Logf("%s: %d listed by git rev-list, %d processes, %v", tc.desc, len(listed), checker.processes(), elapsed)
 	}
+}
+
+// TestPlanOfAMergeOfTheTipIntoTheChange is the shape that the review of the skew fix reported: a
+// main line of 3000 commits, ten commits on it dated a year before the main line, then M and the
+// tip T. A change F forks from main line commit 2500, and H merges M into it. The merge base of T
+// and H is M, but the path H -> F -> m2500 reaches the shared history without running through M,
+// so the listing below M still holds m0..m2500. Removing them one check at a time took 2503
+// checks and 43 s. The plan asks a fixed number of questions instead: the range has a merge
+// commit, which a rebase refuses.
+func TestPlanOfAMergeOfTheTipIntoTheChange(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	const n, k = 3000, 2500
+	base := int64(1767225600)
+	var parents []int
+	var dates []int64
+	for i := 0; i < n; i++ {
+		parents = append(parents, i-1)
+		dates = append(dates, base+int64(i)*60)
+	}
+	for j := 0; j < 10; j++ {
+		parents = append(parents, len(parents)-1)
+		dates = append(dates, 1735689600+int64(j))
+	}
+	now := base + int64(n)*60 + 1000
+	m := len(parents)
+	parents = append(parents, m-1)
+	dates = append(dates, now)
+	tipIndex := len(parents)
+	parents = append(parents, m)
+	dates = append(dates, now+60)
+	fIndex := len(parents)
+	parents = append(parents, k)
+	dates = append(dates, now+120)
+	ids := writeChain(t, f, parents, dates)
+
+	// H merges M into F.
+	h := git.ObjectID(strings.TrimSpace(string(gittest.ExecOpts(t, f.cfg, gittest.ExecConfig{
+		Env: []string{"GIT_COMMITTER_DATE=" + fmt.Sprintf("%d +0000", now+180), "GIT_AUTHOR_DATE=" + fmt.Sprintf("%d +0000", now+180)},
+	}, "-C", f.repoPath, "commit-tree", ids[fIndex].String()+"^{tree}", "-p", ids[fIndex].String(), "-p", ids[m].String(), "-m", "merge main"))))
+	tip := ids[tipIndex]
+
+	relisted := strings.Fields(string(gittest.Exec(t, f.cfg, "-C", f.repoPath, "rev-list", h.String(), "^"+ids[m].String())))
+	require.Greater(t, len(relisted), k, "the listing below the merge base must hold the main line for this test to measure anything")
+
+	checker := &countingChecker{Checker: ancestry.Git(f.repo)}
+	start := time.Now()
+	plan, err := Plan(f.ctx, checker, tip, h)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.Equal(t, LandDiverged, plan.Kind())
+	_, err = plan.Replay()
+	require.ErrorIs(t, err, ErrMergesInRange)
+
+	require.LessOrEqual(t, checker.processes(), 4)
+	require.Zero(t, checker.reachables)
+	require.Less(t, elapsed, 10*time.Second)
+	t.Logf("%d listed below the merge base by git rev-list; %d processes, %v", len(relisted), checker.processes(), elapsed)
 }

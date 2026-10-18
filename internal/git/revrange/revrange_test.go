@@ -19,9 +19,7 @@ type modelWalker struct {
 	// extra is the probability that List adds a commit that an excluded commit reaches.
 	extra float64
 
-	lists, isAncestors, mergeBases int
-	// checksAfterMergeBases counts the IsAncestor calls made after the first MergeBases call.
-	checksAfterMergeBases int
+	lists, reachedBottoms, reachables, mergeBases int
 	// lastExtra is the number of extra commits of the last List.
 	lastExtra int
 }
@@ -64,12 +62,25 @@ func (m *modelWalker) List(_ context.Context, head git.ObjectID, exclude []git.O
 	return commits, nil
 }
 
-func (m *modelWalker) IsAncestor(_ context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	m.isAncestors++
-	if m.mergeBases > 0 {
-		m.checksAfterMergeBases++
+func (m *modelWalker) ReachedBottoms(_ context.Context, base git.ObjectID, bottoms []git.ObjectID) (map[git.ObjectID]bool, error) {
+	m.reachedBottoms++
+	return m.reachable(base, bottoms), nil
+}
+
+func (m *modelWalker) Reachable(_ context.Context, base git.ObjectID, commits []git.ObjectID) (map[git.ObjectID]bool, error) {
+	m.reachables++
+	return m.reachable(base, commits), nil
+}
+
+func (m *modelWalker) reachable(base git.ObjectID, commits []git.ObjectID) map[git.ObjectID]bool {
+	ancestors := m.ancestors(base)
+	reached := map[git.ObjectID]bool{}
+	for _, id := range commits {
+		if ancestors[id] {
+			reached[id] = true
+		}
 	}
-	return m.ancestors(descendant)[ancestor], nil
+	return reached
 }
 
 func (m *modelWalker) MergeBases(_ context.Context, a, b git.ObjectID) ([]git.ObjectID, error) {
@@ -140,27 +151,10 @@ func rangeOf(commits []Commit) map[git.ObjectID][]git.ObjectID {
 	return set
 }
 
-func bottomsOf(set map[git.ObjectID][]git.ObjectID) int {
-	bottoms := 0
-	for _, parents := range set {
-		bottom := true
-		for _, p := range parents {
-			if _, ok := set[p]; ok {
-				bottom = false
-			}
-		}
-		if bottom {
-			bottoms++
-		}
-	}
-	return bottoms
-}
-
 // TestExactOnRandomHistories checks Exact against the exact range on random histories, with
 // listings that hold no extra commit, some, and every commit that the base reaches. It also checks
-// the costs that the package documents: without extra commits one check per bottom of the listing
-// and nothing else; with them, at most one check per extra commit of the second listing and per
-// bottom of the range.
+// the costs that the package documents, which do not depend on the size of the history: without
+// extra commits one listing and one question for all its bottoms; with them, one question more.
 func TestExactOnRandomHistories(t *testing.T) {
 	t.Parallel()
 
@@ -190,19 +184,20 @@ func TestExactOnRandomHistories(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, want, rangeOf(got), "range %s..%s", base, head)
 
-					if m.mergeBases == 0 {
-						// The listing was exact: one check per bottom at most, one listing.
-						require.Equal(t, 1, m.lists)
-						require.Equal(t, bottomsOf(want), m.isAncestors)
+					require.Equal(t, 1, m.lists)
+					require.Zero(t, m.mergeBases)
+					if len(want) == 0 && m.lastExtra == 0 {
+						require.Zero(t, m.reachedBottoms+m.reachables, "an empty listing needs no question")
+						continue
+					}
+					require.Equal(t, 1, m.reachedBottoms)
+					if m.lastExtra == 0 {
+						require.Zero(t, m.reachables, "an exact listing needs no walk")
 						continue
 					}
 
 					skewed++
-					require.Equal(t, 2, m.lists)
-					require.Equal(t, 1, m.mergeBases)
-					require.LessOrEqual(t, m.checksAfterMergeBases, m.lastExtra+bottomsOf(want),
-						"range %s..%s: %d checks for %d extra commits and %d bottoms", base, head,
-						m.checksAfterMergeBases, m.lastExtra, bottomsOf(want))
+					require.Equal(t, 1, m.reachables)
 				}
 
 				if extra == 0 {
@@ -220,10 +215,10 @@ func TestRefineOfAnEmptyListing(t *testing.T) {
 	t.Parallel()
 
 	m := &modelWalker{rnd: rand.New(rand.NewSource(1))}
-	got, err := Refine(context.Background(), m, "a", "b", nil)
+	got, err := Refine(context.Background(), m, "a", nil)
 	require.NoError(t, err)
 	require.Empty(t, got)
-	require.Zero(t, m.isAncestors+m.lists+m.mergeBases)
+	require.Zero(t, m.reachedBottoms+m.reachables+m.lists+m.mergeBases)
 }
 
 // TestRefineRejectsListingsThatAreNotHistories reports a listing that lists a commit twice.
@@ -231,7 +226,7 @@ func TestRefineRejectsListingsThatAreNotHistories(t *testing.T) {
 	t.Parallel()
 
 	m := &modelWalker{rnd: rand.New(rand.NewSource(1))}
-	_, err := Refine(context.Background(), m, "a", "b", []Commit{{ID: "b"}, {ID: "b"}})
+	_, err := Refine(context.Background(), m, "a", []Commit{{ID: "b"}, {ID: "b"}})
 	require.ErrorContains(t, err, "listed twice")
 }
 
