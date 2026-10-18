@@ -182,6 +182,9 @@ var (
 	ErrRepositoryExists = errors.New("storage core: repository already exists")
 	// ErrBlobNotFound is returned by BlobStore.Get for a missing key.
 	ErrBlobNotFound = errors.New("storage core: blob not found")
+	// ErrBlobExists is returned by BlobStore.Put for a key that exists already:
+	// objects are never overwritten nor shared between writers.
+	ErrBlobExists = errors.New("storage core: blob already exists")
 	// ErrBlobCorrupt is returned by the reader of BlobStore.Get when the content
 	// does not hash to its key.
 	ErrBlobCorrupt = errors.New("storage core: blob content does not match its key")

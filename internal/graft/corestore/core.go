@@ -10,12 +10,20 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 )
 
-// BlobStore is the object storage of the storage core. Keys are
-// content-addressed (see PackKey), so objects are immutable: Put never
-// overwrites. Implementations: blobstore (any gocloud bucket URL).
+// BlobStore is the object storage of the storage core. Objects are immutable
+// and every pack object belongs to exactly one database row: each upload uses a
+// new owned key (NewPackKey), and Put never overwrites nor shares an object
+// (doc/graft/PLAN7.md, PACK OWNERSHIP RULE). Implementations: blobstore (any
+// gocloud bucket URL).
 type BlobStore interface {
-	// Put stores the content under key if the key does not exist yet. An
-	// existing key is success: its content is the same by construction.
+	// Put stores the content under key, which must not exist: an existing key is
+	// ErrBlobExists and the stored object is left unchanged. Of concurrent Puts
+	// of one key exactly one succeeds. For a pack key (see ParsePackKey) the
+	// content must hash to the key's SHA-256, else ErrBlobCorrupt. A Put whose
+	// context ends before it commits stores nothing. After any error the caller
+	// must not reference the key: an object a failed Put may have left (its
+	// commit succeeded but making it durable failed) is an orphan that garbage
+	// collection reclaims, never an object another writer relies on.
 	Put(ctx context.Context, key string, r io.Reader) error
 	// Get returns the content, or ErrBlobNotFound. For a pack key (see
 	// ParsePackKey) the reader returns ErrBlobCorrupt instead of io.EOF when
@@ -23,8 +31,23 @@ type BlobStore interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	// Exists reports whether the key exists.
 	Exists(ctx context.Context, key string) (bool, error)
+	// List calls fn for every object whose key starts with prefix, in no
+	// defined order. Directories are not objects. An error returned by fn stops
+	// the iteration and is returned as it is.
+	List(ctx context.Context, prefix string, fn func(BlobInfo) error) error
+	// Delete removes the object. A key that does not exist is success, so a
+	// collection that is run again never fails on an object it deleted before.
+	Delete(ctx context.Context, key string) error
 	// Close releases the bucket.
 	Close() error
+}
+
+// BlobInfo describes a stored object. It has no modification time on purpose:
+// garbage collection never decides on bucket clocks (doc/graft/PLAN7.md, CLOCK
+// RULE).
+type BlobInfo struct {
+	Key  string
+	Size int64
 }
 
 // Watermark is how far the local cache of a repository is: every changeset

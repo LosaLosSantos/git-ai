@@ -104,7 +104,9 @@ func TestPutFailedFileSyncLeavesNoObject(t *testing.T) {
 
 func TestPutWithoutFileSyncHookSucceeds(t *testing.T) {
 	// The fsync steps run for real on a file bucket: the write is observable
-	// afterwards and a repeated Put is still a no-op.
+	// afterwards. A second Put of the key is refused and leaves the object as it
+	// is (PLAN7, PACK OWNERSHIP RULE 2: Put is strictly create-only; before phase 7
+	// a repeated Put was a successful no-op).
 	dir := t.TempDir()
 	s := openFileStoreForTest(t, dir, nil)
 	ctx := testhelper.Context(t)
@@ -112,11 +114,11 @@ func TestPutWithoutFileSyncHookSucceeds(t *testing.T) {
 	content := []byte("durable content")
 	key := corestore.NewPackKey(2, sha256.Sum256(content))
 	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
-	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
+	require.ErrorIs(t, s.Put(ctx, key, bytes.NewReader(content)), corestore.ErrBlobExists)
 
-	exists, err := s.Exists(ctx, key)
+	data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(key)))
 	require.NoError(t, err)
-	require.True(t, exists)
+	require.Equal(t, content, data)
 }
 
 func TestPutMemBucketWithoutFileSync(t *testing.T) {

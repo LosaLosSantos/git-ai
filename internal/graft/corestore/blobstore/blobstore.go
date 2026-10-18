@@ -1,18 +1,24 @@
 // Package blobstore implements corestore.BlobStore on a gocloud bucket. Owned
 // by WP52 (doc/graft/PLAN6.md).
 //
-// Conditional writes. Put writes with blob.WriterOptions{IfNotExist: true}.
-// This was probed experimentally with gocloud.dev v0.46.0: the memblob and
-// fileblob drivers support IfNotExist, and an existing key is reported by
-// Close as gcerrors.FailedPrecondition. (The gocloud documentation names
-// gcerrors.PreconditionFailed, which these drivers do not return.) Put treats
-// FailedPrecondition as success, and it checks Exists first, so an existing
-// key never reads the content. No plain-write fallback is implemented for a
-// driver that reports gcerrors.Unimplemented: no registered driver does so
-// (checked against gocloud.dev v0.46.0: s3blob, gcsblob, azureblob, memblob and
-// fileblob all implement IfNotExist), and by the time Close reports it the
-// reader is consumed, so a fallback would need a second copy of the content.
-// Such an error is returned instead.
+// Create-only writes. Every upload uses a new owned key (corestore.NewPackKey),
+// so an object is never shared between two writers, and Put never succeeds on a
+// key that exists: it returns corestore.ErrBlobExists and leaves the stored
+// object as it is (doc/graft/PLAN7.md, PACK OWNERSHIP RULE). Put writes with
+// blob.WriterOptions{IfNotExist: true}; the drivers report an existing key from
+// the writer's Close as gcerrors.FailedPrecondition (the gocloud documentation
+// names gcerrors.PreconditionFailed, which they do not return). Every registered
+// driver implements IfNotExist (checked against gocloud.dev v0.46.0: s3blob,
+// gcsblob, azureblob, memblob and fileblob), so no plain-write fallback exists.
+//
+// Exactly one of concurrent Puts of a key wins. memblob checks and inserts
+// under its bucket-wide mutex. fileblob does not: its Close stats the key and
+// then renames the temporary file onto it, under a mutex created per writer, so
+// on its own two writers of one key would both succeed and the second rename
+// would overwrite the first, in one process or across processes sharing the
+// bucket. Put therefore holds an exclusive flock on the key's directory around
+// the writer's Close (lockDir); file buckets need a local filesystem with flock.
+// S3, GCS and Azure use conditional requests that the server decides.
 //
 // Atomic objects. gocloud writers commit the object on Close and discard it
 // when the writer's context is cancelled before Close (probed: a cancelled
@@ -22,10 +28,15 @@
 // Durability of file buckets. The fileblob driver renames its temporary file
 // into place on Close without any fsync. A changeset row in the database
 // (synchronous=FULL) can therefore outlive a pack whose data never reached the
-// disk, and because Put skips existing keys, such a pack would never be
-// repaired. For file buckets Put fsyncs the content before Close, and fsyncs
-// the directories that hold the new entry (up to the bucket root) after Close.
-// The mem and remote drivers commit their objects durably themselves.
+// disk. For file buckets Put fsyncs the content before Close, and fsyncs the
+// directories that hold the new entry (up to the bucket root) after Close. The
+// mem and remote drivers commit their objects durably themselves.
+//
+// Listing. List reports objects only. fileblob also reports a writer's
+// temporary file (<key>.<nanos>.tmp, in the key's directory because file
+// buckets are opened with NoTempDir) while the write is in flight, and one that
+// a crashed writer left behind. Callers that act on a listing (the garbage
+// collector) must treat keys they did not write accordingly.
 //
 // Integrity. Pack keys (corestore.ParsePackKey) are verified: Put hashes the
 // content while writing and refuses content that does not match its key, and
@@ -47,6 +58,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"gocloud.dev/blob"
@@ -152,14 +164,6 @@ func withS3DefaultChecksumCalculation(parsed *url.URL) string {
 
 // Put implements corestore.BlobStore.
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
-	exists, err := s.bucket.Exists(ctx, key)
-	if err != nil {
-		return fmt.Errorf("blobstore: check %q: %w", key, err)
-	}
-	if exists {
-		return nil
-	}
-
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -214,14 +218,27 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 		}
 	}
 
+	// fileblob's Close stats the key and renames the temporary file onto it: a
+	// create-only commit only while no other writer of a key in the directory does
+	// the same, so it runs under the directory's lock (see the package doc). A
+	// lock that cannot be taken aborts the write before Close publishes anything.
+	unlock := func() {}
+	if file != nil {
+		if unlock, err = lockDir(filepath.Dir(file.Name())); err != nil {
+			return abort(err)
+		}
+	}
 	closeErr := w.Close()
-	if closeErr != nil && gcerrors.Code(closeErr) != gcerrors.FailedPrecondition {
+	unlock()
+	if gcerrors.Code(closeErr) == gcerrors.FailedPrecondition {
+		// The writer's Close discarded its content: the stored object is untouched.
+		return fmt.Errorf("blobstore: put %q: %w", key, corestore.ErrBlobExists)
+	}
+	if closeErr != nil {
 		return fmt.Errorf("blobstore: close writer %q: %w", key, closeErr)
 	}
 
-	// The rename (or, with FailedPrecondition, the key that another writer
-	// created first, whose content is the same) is durable only once its
-	// directory is synced.
+	// The rename is durable only once its directory is synced.
 	if file != nil {
 		if err := s.syncDirs(filepath.Dir(file.Name())); err != nil {
 			return fmt.Errorf("blobstore: sync directories of %q: %w", key, err)
@@ -304,6 +321,54 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 		return false, fmt.Errorf("blobstore: exists %q: %w", key, err)
 	}
 	return exists, nil
+}
+
+// lockDir takes an exclusive flock on the directory dir and returns the
+// function that releases it. The lock lives on the open descriptor: closing it
+// releases the lock, and so does the death of the process.
+func lockDir(dir string) (unlock func(), _ error) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("blobstore: open directory to lock: %w", err)
+	}
+	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX); err != nil {
+		_ = d.Close()
+		return nil, fmt.Errorf("blobstore: lock directory: %w", err)
+	}
+	return func() {
+		// close(2) releases the descriptor, and with it the lock, even when it
+		// reports an error, and a read-only directory descriptor has no pending
+		// writes whose loss an error could signal: there is nothing to handle.
+		_ = d.Close()
+	}, nil
+}
+
+// List implements corestore.BlobStore.
+func (s *Store) List(ctx context.Context, prefix string, fn func(corestore.BlobInfo) error) error {
+	it := s.bucket.List(&blob.ListOptions{Prefix: prefix})
+	for {
+		obj, err := it.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("blobstore: list %q: %w", prefix, err)
+		}
+		if obj.IsDir {
+			continue
+		}
+		if err := fn(corestore.BlobInfo{Key: obj.Key, Size: obj.Size}); err != nil {
+			return err
+		}
+	}
+}
+
+// Delete implements corestore.BlobStore.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if err := s.bucket.Delete(ctx, key); err != nil && gcerrors.Code(err) != gcerrors.NotFound {
+		return fmt.Errorf("blobstore: delete %q: %w", key, err)
+	}
+	return nil
 }
 
 // Close implements corestore.BlobStore.
