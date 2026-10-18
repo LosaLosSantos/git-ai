@@ -282,7 +282,10 @@ GITALY_INSTALLED_EXECUTABLES = $(filter-out ${GITALY_PACKED_EXECUTABLES}, ${GITA
 # TEST_OPTIONS: any additional options
 # TEST_PACKAGES: packages which shall be tested
 # TEST_LOG_DIR: specify the output log dir. By default, all logs will be discarded
+# Some tests build helper binaries with `go build`. The test PATH puts a guarding
+# git wrapper first, which Go's VCS stamping would call, so stamping is off.
 run_go_tests = PATH='${SOURCE_DIR}/internal/testhelper/testdata/home/bin:${PATH}' \
+    GOFLAGS='-buildvcs=false ${GOFLAGS}' \
     TEST_TMP_DIR='${TEST_TMP_DIR}' \
     TEST_LOG_DIR='${TEST_LOG_DIR}' \
     ${GOTESTSUM} --format ${TEST_FORMAT} --junitfile '${TEST_JUNIT_REPORT}' --jsonfile '${TEST_JSON_REPORT}' ${GOTESTSUM_OPTIONS} -- -ldflags '${GO_LDFLAGS}' -tags '${SERVER_BUILD_TAGS}' ${TEST_OPTIONS} ${TEST_PACKAGES}
