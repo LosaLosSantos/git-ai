@@ -416,6 +416,123 @@ between a review write and a checkpoint commit.
   change, with tests), `internal/graft/corestore/dbreview/**` (carries `S` to the
   store), `sqlstore` (the conditioned review writes and the R2 check).
 
+### REVIEW ROOTS amendment: review roots are references (proposed after WP74, PM decision pending)
+
+**Finding (WP74).** Gitaly housekeeping on a node keeps only what local
+references reach. After its expiry it can drop the commit of an open review
+whose branch was deleted. Checkpoint builds on that node then refuse with
+`FailedPrecondition` until the review closes. Re-hydrating would loop:
+housekeeping would prune the object again. The cause is the same as for R1/R2:
+an open review is a root that neither the local repository nor the reference
+graph of the storage core knows about. Every mechanism that decides liveness
+(local housekeeping, the voter's `--not --all`, the checkpoint closure, GC)
+respects references only.
+
+**Facts in the code (evidence).**
+1. Every reference write by a service goes through the voter:
+   `updateref.Updater` always runs with `gitcmd.WithRefTxHook`
+   (`internal/git/updateref/updateref.go:320`). The hook manager calls
+   Preparing/Prepared for every reference transaction (`voter.go` header). So a
+   ref the review service writes becomes a changeset with a database
+   compare-and-swap. Its pack holds every object not reachable from the local
+   references (`gitops.BuildPack`, `--not --all`), so a commit that only the
+   cache has is uploaded with it.
+2. The database records every reference name, while the Graft changelog records
+   only branches and tags (`sqlstore/changeset.go:202`, `IsChangelogRef`;
+   `changelog.ParseUpdates` names `refs/keep-around/*` as not recorded). A
+   keep-around write therefore adds a changeset but no changelog entry and no
+   `graft watch` event.
+3. `refs/keep-around/` is an internal hidden prefix (`git/reference.go:62`,
+   `InternalReferenceTypeHidden`). Gitaly adds it to `uploadpack.hideRefs` and
+   `receive.hideRefs` (`gitcmd/command_description.go:453-484`), so clients
+   never see it advertised and can neither push nor delete it.
+   `ListRefs` shows it only to a caller whose patterns include it, as in
+   upstream Gitaly. The graft CLI and the SDK list no references.
+4. Hydration, catch-up and verify treat every database reference alike, so
+   keep-around references reach every node through the normal path.
+
+**Option (a), recommended: review roots are references.** A review's head and
+base are protected by `refs/keep-around/<oid>` (target `<oid>`), written
+through the ordinary write path (voter, database CAS, changeset).
+* **Writes.** `CreateReview` writes the keep-around references of head and base
+  (one reference transaction, which creates the absent ones), then inserts the
+  review. `UpdateReview` writes the new head's reference, then updates the
+  review. Comments, verdicts and closes write no reference. The request path
+  never deletes one.
+* **Invariant, in the database (authoritative mode).** "Every open review's head
+  and base has its keep-around reference in `graft_refs`." Two checks, both
+  under the repository row lock (LOCK ORDER), keep it:
+  * `InsertReview` and `UpdateReview` with `requireRoots` (replacing `rootsAt`)
+    require the references to exist with that value, else
+    `ErrReviewRootsMissing`. The service then writes them again and retries, at
+    most 3 attempts, then Aborted. This happens only if a sweep deleted the
+    reference between the two steps.
+  * `CommitChangeset` refuses to delete a `refs/keep-around/<oid>` that an open
+    review uses (a reference conflict). This also protects them from
+    `DeleteRefs`/`WriteRef` callers.
+* **Deletion.** One path: a maintenance sweep (WP77) deletes keep-around
+  references that no open review uses. The changeset constraint makes it safe
+  against a concurrent creation. A leaked reference (crash between the steps,
+  closed review) only keeps objects alive until the next sweep.
+* **What this removes.**
+  * R2: `CheckpointInput.Roots`, `checkReviewRoots`,
+    `ErrCheckpointRootsChanged`.
+  * The checkpoint build's review step: `ListReviews`, the head `H`, and the
+    missing-review-commit path with its metric. The closure is "refs at N" and
+    EnsureFresh needs only `>= N`.
+  * R1's reachability check, its checkpoint-sequence condition (`rootsAt`,
+    `ErrReviewRootsStale`), and `gitops.IsReachable`'s only caller.
+  The roots rule becomes the general reference rule. A checkpoint can no
+  longer be blocked by a review: a review whose commits are already lost
+  simply has no reference.
+* **What it adds.**
+  * One reference transaction per review creation and per head move. Each
+    produces one changeset, plus a pack only when the commit was not yet in
+    the storage core.
+  * The two database checks.
+  * The sweep.
+  * A backfill in maintenance for reviews written before this amendment or
+    imported from files, which writes their references when the objects are
+    present (a review whose objects are missing is logged and counted, and
+    blocks nothing).
+* **UX.** `CreateReview` on a commit that only the serving node has works again:
+  the reference write uploads it. The STORAGE.md sentence added in WP74 ("push
+  it first") is replaced.
+* **Modes.** Off and shadow mode use the file review store. The service writes
+  the same references there too: the same local protection against
+  housekeeping, and in shadow mode the voter records them. The database
+  invariant exists only in authoritative mode, where the database decides.
+  This is one code path for all modes; in off mode it fixes the existing
+  "verdict commit pruned after a force push" limitation for review heads.
+* **Costs to measure (WP79).** The latency of a review creation (one extra
+  reference transaction, comparable to a one-reference land). The number of
+  changesets per review (1 per creation or head move, plus 1 per sweep batch).
+
+**Option (b), rejected: local-only hidden keep-alive references.** References
+present on each serving node but excluded from the database, from verify and
+from the voter.
+* It does not address liveness in the storage core. R1 and R2 stay, and so does
+  everything this amendment removes.
+* Every database-side reader of local references would need an exclusion: the
+  voter's hook input, `ImportRepository`'s `ReadRefs` (it records every local
+  reference), verify, the syncer's checks of local values, and the stale-cache
+  checks.
+* `--not --all` in the voter would count them as reachable. A later changeset's
+  pack could then omit objects that only such a local reference protects:
+  a new class of "present locally, not live in the storage core" objects.
+* A node that hydrates later, or that has not served the repository since a
+  review was created, has no such reference and does not learn about the
+  review until a request arrives. Its housekeeping can prune in between,
+  which is the same stall. A per-node rebuild of the references from the
+  database on every hydration and catch-up would be needed, and it stays
+  racy.
+
+**Recommendation: (a).** It removes R2 and the checkpoint's review step
+entirely, and replaces R1 by a reference-existence check. It uses only existing
+mechanisms (voter, CAS, hidden refs, sweep) and fixes the housekeeping finding
+on every node. Implementation would be a WP74b before WP76, replacing the
+WP74 R1/R2 code (doc and tests included).
+
 ### Data model (new migration, both dialects)
 
 Migration `20261018000000_graft_storage_gc`, appended to `sqliteMigrations` and
