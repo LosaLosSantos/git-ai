@@ -442,6 +442,17 @@ func TestAgentAllowlist_ConcurrentDecisions(t *testing.T) {
 // with OperationService.UserDeleteBranch, so the list is empty.
 var sdkCLIDriftAllowance = map[string]string{}
 
+// operatorOnlySources lists the SDK and CLI files whose calls are operator actions
+// rather than agent actions, with the gRPC service they may use outside the agent
+// allowlist. The storage core's administration (`graft storage import|state|verify`,
+// sdk/storage.go) runs with the server's shared token (doc/graft/STORAGE.md), so
+// agents are not meant to be allowed its RPCs. The scan checks these files
+// separately: every RPC they call must be agent-allowed or belong to the listed
+// service, and each file must still call that service (so an entry cannot go stale).
+var operatorOnlySources = map[string]string{
+	"sdk/storage.go": "gitaly.StorageCoreService",
+}
+
 // sourceMethodCall matches a Go method call such as `refs.DeleteRefs(ctx, ...)`
 // and captures the method name.
 var sourceMethodCall = regexp.MustCompile(`\.([A-Z][A-Za-z0-9]*)\(`)
@@ -459,7 +470,8 @@ func TestAgentAllowlist_SourceScanMatchesSDKAndCLI(t *testing.T) {
 	require.NoError(t, err)
 
 	// The test runs in internal/gitaly/server/auth, four levels below the root.
-	called := sourceMethodCalls(t, []string{"../../../../sdk", "../../../../cmd/graft"})
+	const root = "../../../.."
+	called, operatorCalls := sourceMethodCalls(t, root, []string{"sdk", "cmd/graft"})
 	require.NotEmpty(t, called)
 
 	methodsByName := map[string][]string{}
@@ -470,6 +482,21 @@ func TestAgentAllowlist_SourceScanMatchesSDKAndCLI(t *testing.T) {
 
 		name := fullMethod[strings.LastIndex(fullMethod, "/")+1:]
 		methodsByName[name] = append(methodsByName[name], fullMethod)
+	}
+
+	for file, service := range operatorOnlySources {
+		usesService := false
+		for name := range operatorCalls[file] {
+			for _, fullMethod := range methodsByName[name] {
+				if strings.HasPrefix(fullMethod, "/"+service+"/") {
+					usesService = true
+					continue
+				}
+				require.True(t, allowlist.mayCall(fullMethod),
+					"%s is an operator-only source for %s but also calls %s, which agents may not call", file, service, fullMethod)
+			}
+		}
+		require.True(t, usesService, "%s is in operatorOnlySources but no longer calls %s; remove the entry", file, service)
 	}
 
 	var denied []string
@@ -498,13 +525,15 @@ func TestAgentAllowlist_SourceScanMatchesSDKAndCLI(t *testing.T) {
 }
 
 // sourceMethodCalls returns the method names called in the non-test Go files
-// below dirs.
-func sourceMethodCalls(t *testing.T, dirs []string) map[string]struct{} {
+// below dirs (relative to root): those of the agent-facing files, and, per file,
+// those of the files in operatorOnlySources.
+func sourceMethodCalls(t *testing.T, root string, dirs []string) (map[string]struct{}, map[string]map[string]struct{}) {
 	t.Helper()
 
 	calls := map[string]struct{}{}
+	operatorCalls := map[string]map[string]struct{}{}
 	for _, dir := range dirs {
-		require.NoError(t, filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		require.NoError(t, filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -518,13 +547,24 @@ func sourceMethodCalls(t *testing.T, dirs []string) map[string]struct{} {
 				return err
 			}
 
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+
+			target := calls
+			if _, operator := operatorOnlySources[rel]; operator {
+				target = map[string]struct{}{}
+				operatorCalls[rel] = target
+			}
 			for _, match := range sourceMethodCall.FindAllStringSubmatch(string(content), -1) {
-				calls[match[1]] = struct{}{}
+				target[match[1]] = struct{}{}
 			}
 
 			return nil
 		}))
 	}
 
-	return calls
+	return calls, operatorCalls
 }
