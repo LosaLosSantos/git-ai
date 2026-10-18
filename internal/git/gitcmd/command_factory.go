@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -452,7 +453,10 @@ func (cf *ExecCommandFactory) newCommand(ctx context.Context, repo storage.Repos
 	//
 	// This can be removed once https://gitlab.com/gitlab-org/git/-/issues/316 is implemented and put in git upstream
 
-	attrTreeConfig := cf.AttrTreeConfig(ctx, repo, sc, opts...)
+	attrTreeConfig, err := cf.AttrTreeConfig(ctx, repo, sc, opts...)
+	if err != nil {
+		return nil, err
+	}
 	if attrTreeConfig != nil {
 		opts = append(opts, WithConfig(*attrTreeConfig))
 	}
@@ -769,13 +773,19 @@ func (cf *ExecCommandFactory) trace2Finalizer(manager *trace2.Manager) func(cont
 
 // AttrTreeConfig adds `attr.tree = HEAD` to the commands in the whiteList have,
 // others has `attr.tree = emptyTreeHash`.
-func (cf *ExecCommandFactory) AttrTreeConfig(ctx context.Context, repo storage.Repository, sc Command, opts ...CmdOpt) *ConfigPair {
+//
+// The empty tree depends on the object format of the repository, which is read from the
+// configuration file of its common git directory, as git reads it, without starting a git process.
+// An error means that the object format cannot be determined: the command fails with it, because
+// running it without attr.tree would make git read the attributes from HEAD, the slow path that
+// attr.tree exists to avoid.
+func (cf *ExecCommandFactory) AttrTreeConfig(ctx context.Context, repo storage.Repository, sc Command, opts ...CmdOpt) (*ConfigPair, error) {
 	repoPath := cf.findRepoPath(ctx, repo, sc, opts...)
 	if len(repoPath) == 0 {
 		// Add tree config only when repo exists, because some git command, e.g. diff
 		// can exec without a repo, If we add an attr.tree when a command is executing
 		// without a repo, it leads to error, e.g. attempting to get main_ref_store outside of repository.
-		return nil
+		return nil, nil
 	}
 
 	whiteList := map[string]struct{}{
@@ -787,48 +797,90 @@ func (cf *ExecCommandFactory) AttrTreeConfig(ctx context.Context, repo storage.R
 		"archive":      {},
 		"log":          {},
 		"format-patch": {},
-		// Below commands do not need attributes. They are here
-		// to avoid object hash resolving below as it causes
-		// performance degradation with transactions.
+		// Below commands read attributes only on request (cat-file --filters and --textconv),
+		// or not at all. They keep attr.tree = HEAD so that cat-file's filters see the
+		// attributes of HEAD.
 		"cat-file":   {},
 		"rev-parse":  {},
 		"update-ref": {},
 	}
 	if _, ok := whiteList[sc.Name]; ok {
-		return &ConfigPair{Key: "attr.tree", Value: "HEAD"}
+		return &ConfigPair{Key: "attr.tree", Value: "HEAD"}, nil
 	}
 
-	// Execute git -C <repo path> rev-parse --show-object-format before setting
-	// attr.tree to an empty tree. We need to decide the object format of the repo. SHA1 and SHA256
-	// have different empty tree object ID.
-	//
-	// Note that we're not using `newCommand()` or `DetectObjectHash()`, but instead hand-craft the command.
-	// This is required to avoid recursive git command spawning.
-	execEnv := cf.GetExecutionEnvironment(ctx)
-	var objectFormat bytes.Buffer
-	findFormatCmd, err := command.New(ctx, cf.logger, []string{
-		execEnv.BinaryPath,
-		"-C", repoPath,
-		"rev-parse", "--show-object-format",
-	},
-		command.WithEnvironment(execEnv.EnvironmentVariables),
-		command.WithStdout(&objectFormat),
-	)
+	objectHash, err := repositoryObjectHash(repoPath)
 	if err != nil {
-		return nil
-	}
-	if err := findFormatCmd.Wait(); err != nil {
-		return nil
+		return nil, fmt.Errorf("detecting the object format for attr.tree: %w", err)
 	}
 
-	switch strings.TrimSpace(objectFormat.String()) {
-	case git.ObjectHashSHA1.Format:
-		return &ConfigPair{Key: "attr.tree", Value: git.ObjectHashSHA1.EmptyTreeOID.String()}
-	case git.ObjectHashSHA256.Format:
-		return &ConfigPair{Key: "attr.tree", Value: git.ObjectHashSHA256.EmptyTreeOID.String()}
-	default:
-		return nil
+	return &ConfigPair{Key: "attr.tree", Value: objectHash.EmptyTreeOID.String()}, nil
+}
+
+// repositoryObjectHash returns the object hash of the repository that git -C path would use, where
+// path is a git directory (a bare repository) or the root of a worktree, as findRepoPath returns
+// them. Its object format is the extensions.objectFormat of the configuration file of the common
+// git directory. A repository without a configuration file uses SHA-1, as git does.
+func repositoryObjectHash(path string) (git.ObjectHash, error) {
+	commonDir, err := commonGitDir(path)
+	if err != nil {
+		return git.ObjectHash{}, err
 	}
+
+	objectHash, err := DetectObjectHash(context.Background(), commonDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return git.ObjectHashSHA1, nil
+	}
+
+	return objectHash, err
+}
+
+// commonGitDir returns the common git directory of the repository at path. path is the git
+// directory itself unless it holds a .git entry: a .git directory is the git directory of a main
+// worktree, and a .git file ("gitdir: <dir>") names the git directory of a linked worktree. A
+// linked worktree's git directory names its common directory in its commondir file. Relative paths
+// are relative to the directory holding the file, as git resolves them.
+func commonGitDir(path string) (string, error) {
+	gitDir := path
+
+	dotGit := filepath.Join(path, ".git")
+	info, err := os.Stat(dotGit)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return "", fmt.Errorf("stat .git: %w", err)
+	case info.IsDir():
+		gitDir = dotGit
+	default:
+		content, err := os.ReadFile(dotGit)
+		if err != nil {
+			return "", fmt.Errorf("reading .git file: %w", err)
+		}
+
+		target, ok := strings.CutPrefix(strings.TrimSpace(string(content)), "gitdir:")
+		if !ok {
+			return "", fmt.Errorf("invalid .git file %q", dotGit)
+		}
+
+		gitDir = strings.TrimSpace(target)
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(path, gitDir)
+		}
+	}
+
+	commonDir, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return gitDir, nil
+	case err != nil:
+		return "", fmt.Errorf("reading commondir: %w", err)
+	}
+
+	common := strings.TrimSpace(string(commonDir))
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(gitDir, common)
+	}
+
+	return common, nil
 }
 
 // findRepoPath find the repo to execute git rev-parse --show-object-format

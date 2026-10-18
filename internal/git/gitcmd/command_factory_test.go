@@ -376,7 +376,8 @@ func TestExecCommandFactory_addAttrTree(t *testing.T) {
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			cmd := gitcmd.Command{Name: tc.cmd}
-			actualAttrTreeConfig := cf.AttrTreeConfig(ctx, tc.repo, cmd)
+			actualAttrTreeConfig, err := cf.AttrTreeConfig(ctx, tc.repo, cmd)
+			require.NoError(t, err)
 			require.Equal(t, tc.expectedAttrTreeConfig, actualAttrTreeConfig)
 		})
 	}

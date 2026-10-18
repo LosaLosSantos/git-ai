@@ -310,10 +310,9 @@ func TestLandBatchStepperLandsWithOneProcessPerMember(t *testing.T) {
 	}
 
 	// A rebase onto the running tip, a request already landed, and a fast-forward of the starting
-	// tip each run one short git command: the range listing (git rev-list). The command factory
-	// starts a second process for it: for a command outside its attr.tree list it runs git
-	// rev-parse --show-object-format first (gitcmd AttrTreeConfig).
-	const rangeListingProcesses = 2
+	// tip each run one short git process: the range listing (git rev-list). The command factory
+	// reads the object format for attr.tree from the repository's files, without a process.
+	const rangeListingProcesses = 1
 
 	second, processes := landWithProcesses(first.tip, f.diverged2)
 	require.True(t, second.rewritten)
