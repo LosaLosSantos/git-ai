@@ -103,8 +103,11 @@ func TestInterceptor(t *testing.T) {
 				_, err := client.RefExists(ctx, req)
 				require.NoError(t, err)
 			},
+			// git commands no longer spawn `git rev-parse --show-object-format` to choose
+			// attr.tree (the object format is read from the repository config), so each
+			// command counts once.
 			expectedLogData: map[string]interface{}{
-				"command.count": 3,
+				"command.count": 2,
 			},
 		},
 		{
@@ -124,7 +127,7 @@ func TestInterceptor(t *testing.T) {
 				}
 			},
 			expectedLogData: map[string]interface{}{
-				"command.count": 2,
+				"command.count": 1,
 			},
 		},
 	}
