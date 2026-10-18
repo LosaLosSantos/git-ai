@@ -1,8 +1,11 @@
 # Graft p5w: the write path, root causes first (plan for approval)
 
 Status: approved by the PM with the decisions and amendments of section 14;
-WP91 to WP95 implemented, the acceptance measurement (section 11) waits for a
-benchmark window, WP96 (stage 2) is gated on it. Owner: p5w (Opus). Branch
+WP91 to WP95 implemented and measured in the window of 2026-10-19 (BENCH.md,
+"Measured PLAN9 results"): the mean of `UserCommitFiles` fell by 252 ms at 50
+agents and 152 ms at 100 and acceptance-phase4 passed twice, but two criteria of
+section 11 are not met (the p99 of one pair, and the committed phase at 22 to 27 ms
+against 20). WP96 (stage 2) is gated on the PM's decision. Owner: p5w (Opus). Branch
 `p5w-write-path` (from `6a94caf`, the final phase 4b tree, plus the
 committer-date skew fix `04c0776..b6058e5` and its performance fix `6aecff1`).
 

@@ -495,6 +495,57 @@ and its repository ended with 3 packs and 232 loose objects, but it still varies
 lot between runs and was slower than in window 1 in run 2, for a reason not
 established.
 
+#### Measured PLAN9 results
+
+PLAN9 ([PLAN9.md](PLAN9.md)) changed the write path that every reference update
+shares: the changeset log records the transactions that commit together with one
+fsync (group commit, in ticket order), and the quarantine migration fsyncs each
+directory once instead of every file. The window of 2026-10-19 measured
+`UserCommitFiles`, the RPC that pays for both, with the per-RPC latency of
+`graft-bench` (`rpcs`), against a baseline built from the same history without
+PLAN9 (`b6058e5` + `6aecff1`, the tree of v0.2.0's land code), runs interleaved
+base, p5w, base, p5w, each one server with batching on, `--mode land`, 50 then 100
+agents of 5 changes, conflict rate 0.2, seed 1, on the same machine (load 0.4 at the
+start, 12.7 at the end). The p5w tree is `64b29bb`.
+
+Server-side mean of `UserCommitFiles` (`grpc_server_handling_seconds`), and the
+client-side percentiles:
+
+| run | agents | mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | lands/min |
+|---|---:|---:|---:|---:|---:|---:|
+| base 1 | 50 | 594 | 466 | 1152 | 1259 | 1427 |
+| p5w 1 | 50 | 433 | 379 | 1440 | 1517 | 1342 |
+| base 2 | 50 | 775 | 589 | 1420 | 4268 | 833 |
+| p5w 2 | 50 | 430 | 349 | 882 | 927 | 1877 |
+| base 1 | 100 | 455 | 339 | 1273 | 1458 | 1499 |
+| p5w 1 | 100 | 367 | 295 | 1061 | 1089 | 1876 |
+| base 2 | 100 | 642 | 404 | 2116 | 2717 | 816 |
+| p5w 2 | 100 | 426 | 322 | 1098 | 1146 | 1481 |
+
+The committed phase of a transaction (`graft_changeset_ticket_wait_seconds`, from the
+committed hook to its entries being durable) averaged 22 to 27 ms, with 2.5 to 3.1
+transactions per group write and 13 to 18 ms per write; before PLAN9 the profile
+measured a ticket wait of 92 to 99 ms plus a 7 ms append.
+
+Against the acceptance of PLAN9 (section 11):
+
+| criterion | result |
+|---|---|
+| mean at least 150 ms lower at 50 agents | met: 684 -> 432 ms on average (-252); per pair -161 and -344 |
+| mean at least 100 ms lower at 100 agents | met on average: 548 -> 396 ms (-152); per pair -88 and -216 |
+| p99 not higher than the baseline | not met in every pair: p5w 1 at 50 agents 1517 ms against base 1 1259 ms; lower in the other three pairs |
+| committed phase at most 20 ms mean | not met: 22 to 27 ms |
+| `acceptance-phase4.sh` twice on the p5w tree | A1, A2, A3 and the stretch goal pass in both runs (p99 on-100 3397 and 2338 ms against 0.5 x off of 4527 and 3817 ms) |
+| lands/min not below phase 4b | 1377 / 1184 at 20 agents, 2628 / 2856 at 50, 2066 / 2785 at 100; above the phase 4b window 3 runs at 50 and 100 agents, below them at 20 agents in run 2 (1184 against 1366 and 1476) |
+
+The runs are short (250 and 500 calls per point, 8 to 30 s each) and noisy: base 2
+ran at half the throughput of base 1 (833 against 1427 lands/min at 50 agents) as
+the load rose, so the per-pair numbers vary more than the effect at 100 agents. The
+committed phase misses its target by a few milliseconds: a group write still costs
+one fsync of the log (13 to 18 ms under this load) after the transaction's own wait
+for the head of the queue. Outputs: `/home/feder/p5w-work/window` (scripts
+`window.sh`, `summary.py`, `means.py`).
+
 ## Reading the numbers
 
 - Compare `land` and `land-resolve` at the same `--conflict-rate`. The first
