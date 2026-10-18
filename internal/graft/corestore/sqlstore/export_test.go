@@ -21,6 +21,30 @@ func SetRetryHook(fn func(err error)) (restore func()) {
 	return func() { retryHook = nil }
 }
 
+// SetQueuedHook installs fn as the hook called each time a writer joins the
+// write queue of a Store, and returns the function that removes it.
+func SetQueuedHook(fn func(waiting int)) (restore func()) {
+	queuedHook = fn
+	return func() { queuedHook = nil }
+}
+
+// HoldWriteAdmission takes the write admission of the Store, as a writer
+// would, and returns the function that releases it. SQLite stores only.
+func (s *Store) HoldWriteAdmission(ctx context.Context) (release func(), _ error) {
+	if s.writers == nil {
+		return nil, errors.New("only a SQLite store has a write queue")
+	}
+	if err := s.writers.acquire(ctx); err != nil {
+		return nil, err
+	}
+	return s.writers.release, nil
+}
+
+// WaitingWriters returns the number of writers waiting for the write admission.
+func (s *Store) WaitingWriters() int {
+	return s.writers.waiting()
+}
+
 // IsDeadlock reports whether err is a Postgres deadlock (40P01).
 func IsDeadlock(err error) bool {
 	var pe *pgconn.PgError

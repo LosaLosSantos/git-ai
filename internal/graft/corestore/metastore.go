@@ -145,7 +145,8 @@ type MetaStore interface {
 	ImportHistory(ctx context.Context, repoID int64, entries []changelog.Entry, reviews []*gitalypb.Review) (importedEntries, importedReviews int, err error)
 
 	// InsertReview allocates the next review ID of the repository, calls build
-	// with it and stores the returned review (version 1), atomically.
+	// with it and stores the returned review (version 1), atomically. build runs
+	// inside the write transaction and must not call the MetaStore.
 	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error)) (*gitalypb.Review, error)
 	// GetReview returns the review and its version, ErrReviewNotFound if unknown.
 	GetReview(ctx context.Context, repoID int64, id string) (*gitalypb.Review, int64, error)

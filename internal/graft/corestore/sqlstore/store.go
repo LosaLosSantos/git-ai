@@ -68,6 +68,9 @@ type Store struct {
 	// of db take. On Postgres it is db.
 	readDB  *sql.DB
 	dialect Dialect
+	// writers queues the write transactions on SQLite (nil on Postgres, whose
+	// row locks queue their waiters themselves); see writeQueue.
+	writers *writeQueue
 }
 
 var _ corestore.MetaStore = (*Store)(nil)
@@ -169,7 +172,11 @@ func open(ctx context.Context, dsn string, migrations int) (*Store, error) {
 		}
 	}
 
-	return &Store{db: db, readDB: readDB, dialect: dialect}, nil
+	s := &Store{db: db, readDB: readDB, dialect: dialect}
+	if dialect == SQLite {
+		s.writers = &writeQueue{}
+	}
+	return s, nil
 }
 
 // ping checks the connection to the database. On SQLite, the first
@@ -383,6 +390,22 @@ func (s *Store) runTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn f
 	}
 	defer func() { _ = conn.Close() }()
 	defer restoreBusyTimeout(conn)
+
+	// A write transaction waits for its turn among the writers of this Store
+	// before it asks SQLite for the write lock (writeQueue). The admission covers
+	// one attempt: it is taken right before BEGIN IMMEDIATE and released when the
+	// attempt has committed or rolled back, so a writer never holds it while
+	// retryTx sleeps before the next attempt, and the writers behind it are never
+	// kept waiting for a lock nobody uses. No transaction function starts another
+	// write transaction, and the admission is always taken before the SQLite
+	// lock, so the two can never wait for each other. Read transactions run on
+	// readDB and need no admission.
+	if db == s.db && s.writers != nil {
+		if err := s.writers.acquire(ctx); err != nil {
+			return fmt.Errorf("wait for the write admission: %w", err)
+		}
+		defer s.writers.release()
+	}
 
 	tx, err := beginSQLite(ctx, conn, opts)
 	if err != nil {
