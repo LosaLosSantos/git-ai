@@ -1,8 +1,10 @@
 # Graft p5w: the write path, root causes first (plan for approval)
 
-Status: proposed, waiting for the PM's approval; nothing below is implemented.
-Owner: p5w (Opus). Branch `p5w-write-path` (from `6a94caf`, the final phase 4b
-tree, plus the committer-date skew fix `04c0776..b6058e5`).
+Status: approved by the PM with the decisions and amendments of section 14;
+WP91 to WP95 implemented, the acceptance measurement (section 11) waits for a
+benchmark window, WP96 (stage 2) is gated on it. Owner: p5w (Opus). Branch
+`p5w-write-path` (from `6a94caf`, the final phase 4b tree, plus the
+committer-date skew fix `04c0776..b6058e5` and its performance fix `6aecff1`).
 
 Phase 4b is in [PLAN8.md](PLAN8.md). Its profile left two costs outside the land
 lane, shared with every other write: the quarantine migration fsyncs again files

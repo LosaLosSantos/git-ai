@@ -152,6 +152,13 @@ Git hooks use private.
   runs with a quarantine, the migration of that quarantine also fsyncs its files,
   because a hook may write objects without git; that costs about one fsync per
   file of the write.
+- The objects of an update that fails after the quarantine migration remain in
+  the repository unreferenced until housekeeping prunes them. They have passed
+  the pre-receive hook. Until pruned, they can be read by object ID by anyone
+  with read access to the repository. This happens when a land loses its
+  compare-and-swap (a batch attempt leaves one pack, an unbatched land loose
+  objects), when the expected old revision of a write is stale, and after a
+  crash between the migration and the reference update.
 
 ### Landing (`UserLand`)
 
