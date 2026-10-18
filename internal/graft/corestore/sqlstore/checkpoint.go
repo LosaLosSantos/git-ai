@@ -137,6 +137,22 @@ func validateCheckpoint(repoID int64, in corestore.CheckpointInput) error {
 	return nil
 }
 
+// checkRootsAt refuses a review write whose commits were checked against the
+// reference snapshot at rootsAt when a newer checkpoint was recorded since
+// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R1): that checkpoint may not include
+// them. The caller holds the repository row, which CreateCheckpoint takes
+// first too, so the two are serialized.
+func (s *Store) checkRootsAt(ctx context.Context, tx *sql.Tx, repoID int64, rootsAt uint64) error {
+	newest, ok, err := s.newestCheckpoint(ctx, tx, repoID)
+	if err != nil {
+		return err
+	}
+	if ok && newest.Seq > rootsAt {
+		return fmt.Errorf("checkpoint at changeset %d, review commits checked at %d: %w", newest.Seq, rootsAt, corestore.ErrReviewRootsStale)
+	}
+	return nil
+}
+
 // checkReviewRoots refuses the checkpoint when an open review has a head or
 // base commit that is not one of the roots the checkpoint's pack includes: the
 // review was created, or moved its head, during the build (doc/graft/PLAN7.md,

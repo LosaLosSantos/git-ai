@@ -147,7 +147,14 @@ type MetaStore interface {
 	// InsertReview allocates the next review ID of the repository, calls build
 	// with it and stores the returned review (version 1), atomically. build runs
 	// inside the write transaction and must not call the MetaStore.
-	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error)) (*gitalypb.Review, error)
+	//
+	// rootsAt is the sequence of the reference snapshot the review's head and
+	// base commits were checked against (doc/graft/PLAN7.md, REVIEW ROOTS RULE
+	// R1). When it is not 0 the transaction, under the repository row lock,
+	// requires the newest checkpoint's sequence to be at most rootsAt, else
+	// ErrReviewRootsStale and nothing is written. Writes that do not check
+	// commits (imports) pass 0.
+	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), rootsAt uint64) (*gitalypb.Review, error)
 	// GetReview returns the review and its version, ErrReviewNotFound if unknown.
 	GetReview(ctx context.Context, repoID int64, id string) (*gitalypb.Review, int64, error)
 	// ListReviews returns the reviews of the repository newest first
@@ -158,7 +165,14 @@ type MetaStore interface {
 	ListReviews(ctx context.Context, repoID int64, targetBranch string, includeClosed bool, limit int) ([]*gitalypb.Review, error)
 	// UpdateReview stores r if the review is still at version, which becomes
 	// version+1. It returns ErrReviewVersionConflict otherwise.
-	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review) error
+	//
+	// rootsAt is as for InsertReview: an update that moves the review's head
+	// passes the sequence of the snapshot the new head was checked against, and
+	// the transaction then takes the repository row lock first and requires the
+	// newest checkpoint's sequence to be at most rootsAt, else
+	// ErrReviewRootsStale. Updates that move no commit (comments, verdicts,
+	// closes) pass 0 and do not lock the repository row (LOCK ORDER).
+	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, rootsAt uint64) error
 
 	// CreateCheckpoint records a checkpoint and its reference snapshot in one
 	// transaction, with the database time as its creation time. Its first

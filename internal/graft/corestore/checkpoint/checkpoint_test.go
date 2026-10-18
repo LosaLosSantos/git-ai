@@ -223,7 +223,7 @@ func (e *env) review(t *testing.T, id int64, head, base git.ObjectID, state gita
 			BaseCommitId: base.String(),
 			State:        state,
 		}, nil
-	})
+	}, 0)
 	require.NoError(t, err)
 	return r
 }
@@ -504,7 +504,7 @@ func TestCreateRefusesMissingReviewCommits(t *testing.T) {
 		stored, version, err := e.core.Meta.GetReview(e.ctx, repo.ID, r.GetId())
 		require.NoError(t, err)
 		stored.State = gitalypb.Review_STATE_CLOSED
-		require.NoError(t, e.core.Meta.UpdateReview(e.ctx, repo.ID, r.GetId(), version, stored))
+		require.NoError(t, e.core.Meta.UpdateReview(e.ctx, repo.ID, r.GetId(), version, stored, 0))
 		_, created, err := e.cp.Create(e.ctx, e.pbRepo())
 		require.NoError(t, err)
 		require.True(t, created)

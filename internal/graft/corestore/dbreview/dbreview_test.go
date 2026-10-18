@@ -207,6 +207,8 @@ type conflictingMeta struct {
 	corestore.MetaStore
 	gets, updates int
 	updateErr     error
+	// rootsAt are the rootsAt arguments of the writes, in order.
+	rootsAt []uint64
 }
 
 func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.Review, int64, error) {
@@ -214,9 +216,42 @@ func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.R
 	return &gitalypb.Review{Id: "1", TargetBranch: []byte("main")}, int64(m.gets), nil
 }
 
-func (m *conflictingMeta) UpdateReview(context.Context, int64, string, int64, *gitalypb.Review) error {
+func (m *conflictingMeta) UpdateReview(_ context.Context, _ int64, _ string, _ int64, _ *gitalypb.Review, rootsAt uint64) error {
 	m.updates++
+	m.rootsAt = append(m.rootsAt, rootsAt)
 	return m.updateErr
+}
+
+func (m *conflictingMeta) InsertReview(_ context.Context, _ int64, build func(string) (*gitalypb.Review, error), rootsAt uint64) (*gitalypb.Review, error) {
+	m.rootsAt = append(m.rootsAt, rootsAt)
+	return build("1")
+}
+
+// TestRootsAtReachesTheDatabase: the snapshot sequence of WithRootsAt is the
+// rootsAt of every write; New's store moves no commit (0). A stale snapshot is
+// returned at once, never retried with the same snapshot.
+func TestRootsAtReachesTheDatabase(t *testing.T) {
+	ctx := testhelper.Context(t)
+	meta := &conflictingMeta{}
+	plain := dbreview.New(ctx, meta, 1)
+
+	_, err := plain.Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = plain.Update("1", func(*gitalypb.Review) error { return nil })
+	require.NoError(t, err)
+
+	at := plain.(*dbreview.Store).WithRootsAt(7)
+	_, err = at.Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = at.Update("1", func(*gitalypb.Review) error { return nil })
+	require.NoError(t, err)
+	require.Equal(t, []uint64{0, 0, 7, 7}, meta.rootsAt)
+
+	meta.updateErr = corestore.ErrReviewRootsStale
+	meta.updates = 0
+	_, err = at.Update("1", func(*gitalypb.Review) error { return nil })
+	require.ErrorIs(t, err, corestore.ErrReviewRootsStale)
+	require.Equal(t, 1, meta.updates)
 }
 
 func TestUpdateGivesUpAfterTenConflicts(t *testing.T) {

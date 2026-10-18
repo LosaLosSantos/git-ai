@@ -454,7 +454,7 @@ func TestRegisterWithHistory(t *testing.T) {
 		inserted, err := s.InsertReview(ctx, repo.ID, func(id string) (*gitalypb.Review, error) {
 			require.Equal(t, "4", id)
 			return newReview("new", "main", gitalypb.Review_STATE_OPEN_UNSPECIFIED), nil
-		})
+		}, 0)
 		require.NoError(t, err)
 		require.Equal(t, "4", inserted.GetId())
 
@@ -491,7 +491,7 @@ func TestDeleteCascadesAndReRegisterGetsNewID(t *testing.T) {
 		require.NoError(t, err)
 		_, err = s.InsertReview(ctx, first.ID, func(id string) (*gitalypb.Review, error) {
 			return newReview("doomed", "main", gitalypb.Review_STATE_OPEN_UNSPECIFIED), nil
-		})
+		}, 0)
 		require.NoError(t, err)
 
 		deleted, err := s.DeleteRepository(ctx, key)

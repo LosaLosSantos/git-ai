@@ -232,6 +232,11 @@ var (
 	// include: the review was created or moved during the build
 	// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
 	ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
+	// ErrReviewRootsStale is returned by MetaStore.InsertReview and UpdateReview
+	// when a checkpoint newer than the snapshot the review's commits were checked
+	// at was recorded in between: the caller checks the commits again against a
+	// new snapshot (doc/graft/PLAN7.md, REVIEW ROOTS RULE R1).
+	ErrReviewRootsStale = errors.New("storage core: a checkpoint was recorded after the review's commits were checked")
 	// ErrPackDeadline is returned when a pack upload, or the commit of the row
 	// that references it, would end after the write deadline: garbage collection
 	// may then already treat the pack as an orphan (doc/graft/PLAN7.md, PACK

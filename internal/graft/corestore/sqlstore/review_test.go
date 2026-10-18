@@ -19,7 +19,7 @@ func insertReview(t *testing.T, ctx context.Context, s *sqlstore.Store, repoID i
 
 	inserted, err := s.InsertReview(ctx, repoID, func(id string) (*gitalypb.Review, error) {
 		return r, nil
-	})
+	}, 0)
 	require.NoError(t, err)
 	return inserted
 }
@@ -49,17 +49,17 @@ func TestReviewsCRUD(t *testing.T) {
 
 		// Updates succeed on the current version only.
 		updated := newReview("two, edited", "release", gitalypb.Review_STATE_OPEN_UNSPECIFIED)
-		require.NoError(t, s.UpdateReview(ctx, repo.ID, "2", 1, updated))
+		require.NoError(t, s.UpdateReview(ctx, repo.ID, "2", 1, updated, 0))
 		_, version, err = s.GetReview(ctx, repo.ID, "2")
 		require.NoError(t, err)
 		require.Equal(t, int64(2), version)
 
-		err = s.UpdateReview(ctx, repo.ID, "2", 1, updated)
+		err = s.UpdateReview(ctx, repo.ID, "2", 1, updated, 0)
 		require.ErrorIs(t, err, corestore.ErrReviewVersionConflict)
 
-		err = s.UpdateReview(ctx, repo.ID, "99", 1, updated)
+		err = s.UpdateReview(ctx, repo.ID, "99", 1, updated, 0)
 		require.ErrorIs(t, err, corestore.ErrReviewNotFound)
-		err = s.UpdateReview(ctx, repo.ID, "abc", 1, updated)
+		err = s.UpdateReview(ctx, repo.ID, "abc", 1, updated, 0)
 		require.ErrorIs(t, err, corestore.ErrReviewNotFound)
 
 		// Listing is newest first, filtered by target and by state.
@@ -113,7 +113,7 @@ func TestReviewsConcurrentUpdatesLoseNothing(t *testing.T) {
 
 						next := fmt.Sprintf("%d", i)
 						current.Title = []byte(next)
-						err = store.UpdateReview(ctx, repo.ID, "1", version, current)
+						err = store.UpdateReview(ctx, repo.ID, "1", version, current, 0)
 						if errors.Is(err, corestore.ErrReviewVersionConflict) {
 							continue
 						}
