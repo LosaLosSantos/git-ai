@@ -136,18 +136,8 @@ func (n node) ffBranch(t *testing.T, repo *gitalypb.Repository, name string, oid
 	require.NoError(t, err)
 }
 
-// publish puts commit on a branch of its own, so that the storage core holds
-// it: a review's commits must be reachable from its references (REVIEW ROOTS
-// R1, doc/graft/PLAN7.md).
-func (n node) publish(t *testing.T, s seed, commit git.ObjectID) {
-	t.Helper()
-	n.createBranch(t, s.repo, "review/"+commit.String(), commit)
-}
-
-// createReview publishes head and opens a review of it against main.
 func (n node) createReview(t *testing.T, s seed, head git.ObjectID) *gitalypb.Review {
 	t.Helper()
-	n.publish(t, s, head)
 	resp, err := gitalypb.NewReviewServiceClient(n.conn).CreateReview(n.ctx, &gitalypb.CreateReviewRequest{
 		Repository:   s.repo,
 		TargetBranch: []byte("main"),
@@ -659,7 +649,6 @@ func proofCases() map[string]func(t *testing.T, n node, s seed) {
 			child := n.commit(t, s, s.base, "change", gittest.TreeEntry{Path: "a", Mode: "100644", Content: "change\n"})
 			next := n.commit(t, s, child, "change 2", gittest.TreeEntry{Path: "a", Mode: "100644", Content: "change 2\n"})
 			review := n.createReview(t, s, child)
-			n.publish(t, s, next)
 			_, err := gitalypb.NewReviewServiceClient(n.conn).UpdateReview(n.ctx, &gitalypb.UpdateReviewRequest{
 				Repository:   s.repo,
 				Id:           review.GetId(),

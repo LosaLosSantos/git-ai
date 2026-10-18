@@ -207,8 +207,8 @@ type conflictingMeta struct {
 	corestore.MetaStore
 	gets, updates int
 	updateErr     error
-	// rootsAt are the rootsAt arguments of the writes, in order.
-	rootsAt []uint64
+	// requireRoots are the requireRoots arguments of the writes, in order.
+	requireRoots []bool
 }
 
 func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.Review, int64, error) {
@@ -216,21 +216,22 @@ func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.R
 	return &gitalypb.Review{Id: "1", TargetBranch: []byte("main")}, int64(m.gets), nil
 }
 
-func (m *conflictingMeta) UpdateReview(_ context.Context, _ int64, _ string, _ int64, _ *gitalypb.Review, rootsAt uint64) error {
+func (m *conflictingMeta) UpdateReview(_ context.Context, _ int64, _ string, _ int64, _ *gitalypb.Review, requireRoots bool) error {
 	m.updates++
-	m.rootsAt = append(m.rootsAt, rootsAt)
+	m.requireRoots = append(m.requireRoots, requireRoots)
 	return m.updateErr
 }
 
-func (m *conflictingMeta) InsertReview(_ context.Context, _ int64, build func(string) (*gitalypb.Review, error), rootsAt uint64) (*gitalypb.Review, error) {
-	m.rootsAt = append(m.rootsAt, rootsAt)
+func (m *conflictingMeta) InsertReview(_ context.Context, _ int64, build func(string) (*gitalypb.Review, error), requireRoots bool) (*gitalypb.Review, error) {
+	m.requireRoots = append(m.requireRoots, requireRoots)
 	return build("1")
 }
 
-// TestRootsAtReachesTheDatabase: the snapshot sequence of WithRootsAt is the
-// rootsAt of every write; New's store moves no commit (0). A stale snapshot is
-// returned at once, never retried with the same snapshot.
-func TestRootsAtReachesTheDatabase(t *testing.T) {
+// TestRequiredRootsReachTheDatabase: the writes of WithRequiredRoots require
+// the review's roots, those of New's store do not. A missing root is returned
+// at once: retrying the same write without writing the reference again could
+// not succeed.
+func TestRequiredRootsReachTheDatabase(t *testing.T) {
 	ctx := testhelper.Context(t)
 	meta := &conflictingMeta{}
 	plain := dbreview.New(ctx, meta, 1)
@@ -240,17 +241,17 @@ func TestRootsAtReachesTheDatabase(t *testing.T) {
 	_, err = plain.Update("1", func(*gitalypb.Review) error { return nil })
 	require.NoError(t, err)
 
-	at := plain.(*dbreview.Store).WithRootsAt(7)
-	_, err = at.Create(&gitalypb.Review{})
+	required := plain.(*dbreview.Store).WithRequiredRoots()
+	_, err = required.Create(&gitalypb.Review{})
 	require.NoError(t, err)
-	_, err = at.Update("1", func(*gitalypb.Review) error { return nil })
+	_, err = required.Update("1", func(*gitalypb.Review) error { return nil })
 	require.NoError(t, err)
-	require.Equal(t, []uint64{0, 0, 7, 7}, meta.rootsAt)
+	require.Equal(t, []bool{false, false, true, true}, meta.requireRoots)
 
-	meta.updateErr = corestore.ErrReviewRootsStale
+	meta.updateErr = corestore.ErrReviewRootsMissing
 	meta.updates = 0
-	_, err = at.Update("1", func(*gitalypb.Review) error { return nil })
-	require.ErrorIs(t, err, corestore.ErrReviewRootsStale)
+	_, err = required.Update("1", func(*gitalypb.Review) error { return nil })
+	require.ErrorIs(t, err, corestore.ErrReviewRootsMissing)
 	require.Equal(t, 1, meta.updates)
 }
 

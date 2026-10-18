@@ -153,9 +153,9 @@ type Changeset struct {
 }
 
 // Checkpoint is a consolidated state of a repository at a changeset sequence:
-// one pack with every object reachable from the references at Seq and from the
-// roots of the reviews open when it was built, plus the reference snapshot at
-// Seq (MetaStore.CheckpointRefs). Hydration starts from the newest checkpoint
+// one pack with every object reachable from the references at Seq (among them
+// the keep-around references of the open reviews), plus the reference snapshot
+// at Seq (MetaStore.CheckpointRefs). Hydration starts from the newest checkpoint
 // and replays only the changesets after it (doc/graft/PLAN7.md).
 type Checkpoint struct {
 	RepoID    int64
@@ -227,16 +227,15 @@ var (
 	// ErrCheckpointNotFound is returned for a checkpoint sequence the
 	// repository has no checkpoint at.
 	ErrCheckpointNotFound = errors.New("storage core: checkpoint not found")
-	// ErrCheckpointRootsChanged is returned by MetaStore.CreateCheckpoint when an
-	// open review has a head or base commit that the checkpoint's pack does not
-	// include: the review was created or moved during the build
-	// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
-	ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
-	// ErrReviewRootsStale is returned by MetaStore.InsertReview and UpdateReview
-	// when a checkpoint newer than the snapshot the review's commits were checked
-	// at was recorded in between: the caller checks the commits again against a
-	// new snapshot (doc/graft/PLAN7.md, REVIEW ROOTS RULE R1).
-	ErrReviewRootsStale = errors.New("storage core: a checkpoint was recorded after the review's commits were checked")
+	// ErrReviewRootsMissing is returned by MetaStore.InsertReview and
+	// UpdateReview, when they require the review's roots, for a head or base
+	// commit that has no keep-around reference (KeepAroundRef): the caller writes
+	// the reference again and retries (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	ErrReviewRootsMissing = errors.New("storage core: a commit of the review has no keep-around reference")
+	// ErrReviewRootInUse is returned by MetaStore.CommitChangeset for a changeset
+	// that deletes or moves the keep-around reference of a commit that an open
+	// review uses; nothing is written (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	ErrReviewRootInUse = errors.New("storage core: the keep-around reference is the root of an open review")
 	// ErrPackDeadline is returned when a pack upload, or the commit of the row
 	// that references it, would end after the write deadline: garbage collection
 	// may then already treat the pack as an orphan (doc/graft/PLAN7.md, PACK
@@ -327,6 +326,16 @@ func parsePackKey(key string) (repoID int64, sum [32]byte, owned, ok bool) {
 	}
 	return id, sum, owned, true
 }
+
+// KeepAroundPrefix is the prefix of the references that keep the commits of
+// open reviews alive: Gitaly hides it from clients (it is neither advertised
+// nor writable over the git protocols), housekeeping and garbage collection
+// respect it like every reference (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+const KeepAroundPrefix = "refs/keep-around/"
+
+// KeepAroundRef returns the keep-around reference of a commit; its target is
+// the commit itself.
+func KeepAroundRef(oid string) string { return KeepAroundPrefix + oid }
 
 // IsChangelogRef reports whether updates of the reference are recorded in the
 // Graft changelog: branches and tags, as changelog.ParseUpdates does.

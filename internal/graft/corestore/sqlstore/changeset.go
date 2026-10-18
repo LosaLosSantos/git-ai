@@ -110,6 +110,11 @@ func (s *Store) commitChangeset(ctx context.Context, tx *sql.Tx, repo *repoState
 	if len(conflicts) > 0 && !in.Force {
 		return corestore.CommitResult{}, &corestore.ErrRefConflict{Conflicts: conflicts}
 	}
+	if !in.Force {
+		if err := s.refuseReleasedRoots(ctx, tx, repo.id, effective); err != nil {
+			return corestore.CommitResult{}, err
+		}
+	}
 
 	if len(effective) == 0 {
 		return corestore.CommitResult{NoOp: true, Conflicts: conflicts}, nil

@@ -34,6 +34,11 @@ const (
 type server struct {
 	gitalypb.UnimplementedReviewServiceServer
 	deps *service.Dependencies
+
+	// rootsProtected, when set by a test, is called after the keep-around
+	// references of a review write were written and before the review is
+	// recorded. Nil in production.
+	rootsProtected func(ctx context.Context, repo *localrepo.Repo, st store.ReviewStore)
 }
 
 // NewServer creates a new instance of the ReviewService server.

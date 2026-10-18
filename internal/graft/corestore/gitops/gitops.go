@@ -121,8 +121,7 @@ func BuildPack(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID, t
 // `git rev-list --objects --stdin`, piped into `git pack-objects --stdout` and
 // written to a new file in tmpDir while hashing. Zero tips are ignored; without
 // any tip the result is an empty Pack and no file. A tip that is not in the
-// repository is an error: callers check the tips with MissingObjects first, so
-// that a missing object is reported precisely and never yields a partial pack.
+// repository is an error, never a partial pack.
 func BuildPackFrom(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID, tmpDir string) (Pack, error) {
 	stdin, positive, err := tipsInput(ctx, repo, tips)
 	if err != nil {
@@ -218,54 +217,6 @@ func MissingObjects(ctx context.Context, repo *localrepo.Repo, oids []git.Object
 		}
 	}
 	return missing, nil
-}
-
-// IsReachable reports whether commit is reachable from at least one of tips
-// (the object IDs that the references of a repository point to): `git
-// rev-list --stdin` from commit with every tip negated prints nothing exactly
-// when every commit it would walk is reachable from a tip, which holds exactly
-// when commit is. commit must be in the repository; zero tips are ignored, and
-// no tip at all reaches nothing.
-func IsReachable(ctx context.Context, repo *localrepo.Repo, commit git.ObjectID, tips []git.ObjectID) (bool, error) {
-	hash, err := repo.ObjectHash(ctx)
-	if err != nil {
-		return false, fmt.Errorf("object hash: %w", err)
-	}
-	if err := hash.ValidateHex(commit.String()); err != nil {
-		return false, fmt.Errorf("commit: %w", err)
-	}
-
-	var stdin bytes.Buffer
-	stdin.WriteString(commit.String())
-	stdin.WriteByte('\n')
-	for _, tip := range tips {
-		if hash.IsZeroOID(tip) {
-			continue
-		}
-		if err := hash.ValidateHex(tip.String()); err != nil {
-			return false, fmt.Errorf("tip: %w", err)
-		}
-		stdin.WriteString("^" + tip.String())
-		stdin.WriteByte('\n')
-	}
-
-	var stdout, stderr bytes.Buffer
-	if err := repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name: "rev-list",
-			Flags: []gitcmd.Option{
-				gitcmd.Flag{Name: "--stdin"},
-				gitcmd.Flag{Name: "--max-count=1"},
-			},
-		},
-		gitcmd.WithStdin(&stdin),
-		gitcmd.WithStdout(&stdout),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		return false, structerr.New("rev-list: %w", err).WithMetadata("stderr", stderr.String())
-	}
-
-	return stdout.Len() == 0, nil
 }
 
 // BuildFullPack writes a pack of every object reachable from any reference

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,7 +26,6 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
 	"github.com/feder-cr/git-ai/internal/log"
-	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -211,23 +209,6 @@ func (e *env) setRef(t *testing.T, id int64, src source, name string, old, new g
 	}, tips...).Seq
 }
 
-// review records a review of head on base, open unless state says otherwise.
-func (e *env) review(t *testing.T, id int64, head, base git.ObjectID, state gitalypb.Review_State) *gitalypb.Review {
-	t.Helper()
-
-	r, err := e.core.Meta.InsertReview(e.ctx, id, func(reviewID string) (*gitalypb.Review, error) {
-		return &gitalypb.Review{
-			Id:           reviewID,
-			TargetBranch: []byte("main"),
-			HeadCommitId: head.String(),
-			BaseCommitId: base.String(),
-			State:        state,
-		}, nil
-	}, 0)
-	require.NoError(t, err)
-	return r
-}
-
 func (e *env) head(t *testing.T) uint64 {
 	t.Helper()
 
@@ -318,21 +299,6 @@ func hasObject(t *testing.T, cfg config.Cfg, path string, oid git.ObjectID) bool
 	return gittest.NewCommand(t, cfg, "-C", path, "cat-file", "-e", oid.String()).Run() == nil
 }
 
-func missingCount(t *testing.T, c *checkpoint.Checkpointer) float64 {
-	t.Helper()
-
-	reg := prometheus.NewPedanticRegistry()
-	require.NoError(t, reg.Register(c))
-	families, err := reg.Gather()
-	require.NoError(t, err)
-	for _, family := range families {
-		if family.GetName() == "graft_storage_checkpoint_review_objects_missing_total" {
-			return family.GetMetric()[0].GetCounter().GetValue()
-		}
-	}
-	return 0
-}
-
 func TestCreate(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
 		e := newEnv(t, envOptions{dialect: dialect})
@@ -387,31 +353,30 @@ func TestCreate(t *testing.T) {
 	})
 }
 
-func TestCreateKeepsOpenReviewCommits(t *testing.T) {
+// TestCreateKeepsKeepAroundCommits: the commits of open reviews are kept by
+// their keep-around references (REVIEW ROOTS RULE), which the checkpoint
+// closure covers like every reference; a commit whose reference was swept is
+// not kept.
+func TestCreateKeepsKeepAroundCommits(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
 		e := newEnv(t, envOptions{dialect: dialect})
 		src := e.newSource(t)
 		c1 := e.commit(t, src, "c1")
 		repo := e.register(t, src, c1)
 
-		open := e.commit(t, src, "open review", c1)
-		e.setRef(t, repo.ID, src, "refs/heads/open", "", open)
-		e.review(t, repo.ID, open, c1, gitalypb.Review_STATE_OPEN_UNSPECIFIED)
-		closed := e.commit(t, src, "closed review", c1)
-		e.setRef(t, repo.ID, src, "refs/heads/closed", "", closed)
-		e.review(t, repo.ID, closed, c1, gitalypb.Review_STATE_CLOSED)
-
-		// Neither commit is reachable from a reference any more.
-		e.setRef(t, repo.ID, src, "refs/heads/open", open, "")
-		e.setRef(t, repo.ID, src, "refs/heads/closed", closed, "")
+		kept := e.commit(t, src, "open review", c1)
+		e.setRef(t, repo.ID, src, corestore.KeepAroundRef(kept.String()), "", kept)
+		swept := e.commit(t, src, "closed review", c1)
+		e.setRef(t, repo.ID, src, corestore.KeepAroundRef(swept.String()), "", swept)
+		e.setRef(t, repo.ID, src, corestore.KeepAroundRef(swept.String()), swept, "")
 
 		cp, created, err := e.cp.Create(e.ctx, e.pbRepo())
 		require.NoError(t, err)
 		require.True(t, created)
 
 		path := e.restore(t, cp)
-		require.True(t, hasObject(t, e.cfg, path, open), "an open review's commit is a root of the checkpoint")
-		require.False(t, hasObject(t, e.cfg, path, closed), "a closed review's commit is not (documented limit)")
+		require.True(t, hasObject(t, e.cfg, path, kept))
+		require.False(t, hasObject(t, e.cfg, path, swept))
 	})
 }
 
@@ -443,115 +408,11 @@ func TestCreateOnALaggingCopy(t *testing.T) {
 	})
 }
 
-// TestCreateIncludesAReviewWrittenAfterTheSnapshot is the third review's case:
-// a review written after the reference snapshot N, at S > N, on a commit that
-// only the changesets after N bring and that no reference reaches any more. The
-// building node is below S; the build catches it up to the head and packs the
-// commit.
-func TestCreateIncludesAReviewWrittenAfterTheSnapshot(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
-		a := newEnv(t, envOptions{dialect: dialect})
-		b := a.secondNode(t, dialect)
-		src := a.newSource(t)
-		c1 := a.commit(t, src, "c1")
-		repo := a.register(t, src, c1)
-		require.NoError(t, b.sy.EnsureFresh(b.ctx, b.pbRepo()))
-
-		feature := a.commit(t, src, "feature", c1)
-		checkpoint.SetFaultHook(b.cp, func(point string) error {
-			if point == checkpoint.PointAfterSnapshot {
-				a.setRef(t, repo.ID, src, "refs/heads/feature", "", feature)
-				a.review(t, repo.ID, feature, c1, gitalypb.Review_STATE_OPEN_UNSPECIFIED)
-				a.setRef(t, repo.ID, src, "refs/heads/feature", feature, "")
-			}
-			return nil
-		})
-
-		cp, created, err := b.cp.Create(b.ctx, b.pbRepo())
-		require.NoError(t, err)
-		require.True(t, created)
-		require.Equal(t, uint64(1), cp.Seq, "the snapshot was read before the review")
-		require.Equal(t, corestore.Watermark{RepoID: repo.ID, Seq: 3}, b.watermark(t))
-
-		path := b.restore(t, cp)
-		require.True(t, hasObject(t, b.cfg, path, feature))
-	})
-}
-
-func TestCreateRefusesMissingReviewCommits(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
-		e := newEnv(t, envOptions{dialect: dialect})
-		src := e.newSource(t)
-		c1 := e.commit(t, src, "c1")
-		repo := e.register(t, src, c1)
-
-		// A review written without the R1 check, on a commit the storage core
-		// never received.
-		pruned := e.commit(t, src, "never pushed", c1)
-		r := e.review(t, repo.ID, pruned, c1, gitalypb.Review_STATE_OPEN_UNSPECIFIED)
-		before := e.packKeys(t, repo.ID)
-
-		_, _, err := e.cp.Create(e.ctx, e.pbRepo())
-		require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-		require.Equal(t, []string{r.GetId()}, structerr.ExtractMetadata(err)["review_id"])
-		require.Equal(t, float64(1), missingCount(t, e.cp))
-		require.Equal(t, before, e.packKeys(t, repo.ID), "nothing is uploaded")
-		_, ok, err := e.core.Meta.NewestCheckpoint(e.ctx, repo.ID)
-		require.NoError(t, err)
-		require.False(t, ok)
-
-		// Closing the review resolves it.
-		stored, version, err := e.core.Meta.GetReview(e.ctx, repo.ID, r.GetId())
-		require.NoError(t, err)
-		stored.State = gitalypb.Review_STATE_CLOSED
-		require.NoError(t, e.core.Meta.UpdateReview(e.ctx, repo.ID, r.GetId(), version, stored, 0))
-		_, created, err := e.cp.Create(e.ctx, e.pbRepo())
-		require.NoError(t, err)
-		require.True(t, created)
-	})
-}
-
-// TestCreateRefusesReviewsChangedDuringTheBuild is REVIEW ROOTS R2.
-func TestCreateRefusesReviewsChangedDuringTheBuild(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
-		e := newEnv(t, envOptions{dialect: dialect})
-		src := e.newSource(t)
-		c1 := e.commit(t, src, "c1")
-		repo := e.register(t, src, c1)
-		c2 := e.commit(t, src, "c2", c1)
-		e.setRef(t, repo.ID, src, "refs/heads/main", c1, c2)
-		before := e.packKeys(t, repo.ID)
-
-		checkpoint.SetFaultHook(e.cp, func(point string) error {
-			if point == checkpoint.PointAfterUpload {
-				e.review(t, repo.ID, c2, c1, gitalypb.Review_STATE_OPEN_UNSPECIFIED)
-			}
-			return nil
-		})
-		_, _, err := e.cp.Create(e.ctx, e.pbRepo())
-		require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-		require.ErrorIs(t, err, corestore.ErrCheckpointRootsChanged)
-
-		_, ok, err := e.core.Meta.NewestCheckpoint(e.ctx, repo.ID)
-		require.NoError(t, err)
-		require.False(t, ok)
-		orphans := newKeys(before, e.packKeys(t, repo.ID))
-		require.Len(t, orphans, 1, "the uploaded pack is left for garbage collection")
-		require.False(t, e.referenced(t, repo.ID, orphans[0]))
-
-		// The next build includes the review.
-		checkpoint.SetFaultHook(e.cp, nil)
-		_, created, err := e.cp.Create(e.ctx, e.pbRepo())
-		require.NoError(t, err)
-		require.True(t, created)
-	})
-}
-
 func TestCreateCrashPoints(t *testing.T) {
 	errCrash := errors.New("crash")
 
 	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
-		for _, point := range []string{checkpoint.PointAfterSnapshot, checkpoint.PointAfterUpload, checkpoint.PointAfterCommit} {
+		for _, point := range []string{checkpoint.PointAfterUpload, checkpoint.PointAfterCommit} {
 			t.Run(point, func(t *testing.T) {
 				e := newEnv(t, envOptions{dialect: dialect})
 				src := e.newSource(t)
@@ -572,9 +433,6 @@ func TestCreateCrashPoints(t *testing.T) {
 				require.NoError(t, err)
 
 				switch point {
-				case checkpoint.PointAfterSnapshot:
-					require.Empty(t, uploaded)
-					require.False(t, recorded)
 				case checkpoint.PointAfterUpload:
 					require.Len(t, uploaded, 1)
 					require.False(t, e.referenced(t, repo.ID, uploaded[0]), "an orphan")

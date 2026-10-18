@@ -37,10 +37,9 @@ type Store struct {
 	ctx    context.Context
 	meta   corestore.MetaStore
 	repoID int64
-	// rootsAt is the sequence of the reference snapshot that the commits written
-	// by Create and Update were checked against, 0 when they move no commit
-	// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R1).
-	rootsAt uint64
+	// requireRoots makes Create and Update require the keep-around references of
+	// the review's commits (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	requireRoots bool
 }
 
 var _ store.ReviewStore = (*Store)(nil)
@@ -51,21 +50,14 @@ func New(ctx context.Context, meta corestore.MetaStore, repoID int64) store.Revi
 	return &Store{ctx: ctx, meta: meta, repoID: repoID}
 }
 
-// Refs returns the references of the repository in the storage core and the
-// sequence of that snapshot, which the commits of a review are checked
-// against.
-func (s *Store) Refs() (map[string]corestore.Target, uint64, error) {
-	return s.meta.Refs(s.ctx, s.repoID)
-}
-
-// WithRootsAt returns a store whose Create and Update write only while no
-// checkpoint newer than rootsAt exists, else they fail with
-// corestore.ErrReviewRootsStale and write nothing. rootsAt is the sequence
-// returned by the Refs call the review's new commits were checked against.
-func (s *Store) WithRootsAt(rootsAt uint64) store.ReviewStore {
-	at := *s
-	at.rootsAt = rootsAt
-	return &at
+// WithRequiredRoots returns a store whose Create and Update write a review only
+// when the keep-around references of its head and base commits exist in the
+// database, else they fail with corestore.ErrReviewRootsMissing and write
+// nothing. It is the store of the writes that may record new commits.
+func (s *Store) WithRequiredRoots() store.ReviewStore {
+	required := *s
+	required.requireRoots = true
+	return &required
 }
 
 // Create stores a new review. It assigns the id, created_at and updated_at.
@@ -80,7 +72,7 @@ func (s *Store) Create(r *gitalypb.Review) (*gitalypb.Review, error) {
 		review.Requirements = nil
 		review.Approved = false
 		return review, nil
-	}, s.rootsAt)
+	}, s.requireRoots)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -132,7 +124,7 @@ func (s *Store) Update(id string, fn func(*gitalypb.Review) error) (*gitalypb.Re
 		stored.Requirements = nil
 		stored.Approved = false
 
-		err = s.meta.UpdateReview(s.ctx, s.repoID, id, version, stored, s.rootsAt)
+		err = s.meta.UpdateReview(s.ctx, s.repoID, id, version, stored, s.requireRoots)
 		if err == nil {
 			return proto.Clone(r).(*gitalypb.Review), nil
 		}

@@ -80,9 +80,6 @@ type CheckpointInput struct {
 	// pack, PackBytes its size.
 	PackKey   string
 	PackBytes int64
-	// Roots are the head and base commits of the open reviews that the pack
-	// includes (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
-	Roots []string
 }
 
 var (
@@ -116,7 +113,11 @@ type MetaStore interface {
 	// records the changeset, the reference changes and the changelog entries
 	// in one transaction (see the CAS table of doc/graft/PLAN6.md). It returns
 	// *ErrRefConflict, writing nothing, when an expectation fails and Force is
-	// not set, and ErrRepositoryNotFound for an unknown repository.
+	// not set, and ErrRepositoryNotFound for an unknown repository. Unless Force
+	// is set, a changeset that deletes or moves the keep-around reference of a
+	// commit that an open review uses as its head or base is refused with
+	// ErrReviewRootInUse (doc/graft/PLAN7.md, REVIEW ROOTS RULE); shadow mode,
+	// whose changesets are forced, does not enforce it.
 	CommitChangeset(ctx context.Context, in ChangesetInput) (CommitResult, error)
 	// ListChangesets returns the changesets with after < seq <= upTo in
 	// ascending order, with their updates.
@@ -148,13 +149,13 @@ type MetaStore interface {
 	// with it and stores the returned review (version 1), atomically. build runs
 	// inside the write transaction and must not call the MetaStore.
 	//
-	// rootsAt is the sequence of the reference snapshot the review's head and
-	// base commits were checked against (doc/graft/PLAN7.md, REVIEW ROOTS RULE
-	// R1). When it is not 0 the transaction, under the repository row lock,
-	// requires the newest checkpoint's sequence to be at most rootsAt, else
-	// ErrReviewRootsStale and nothing is written. Writes that do not check
-	// commits (imports) pass 0.
-	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), rootsAt uint64) (*gitalypb.Review, error)
+	// With requireRoots the transaction locks the repository row first and
+	// requires the keep-around reference (KeepAroundRef) of the review's head and
+	// base commits to exist with that value, else ErrReviewRootsMissing and
+	// nothing is written (doc/graft/PLAN7.md, REVIEW ROOTS RULE). Together with
+	// CommitChangeset's refusal to delete such a reference, every open review
+	// written so has its commits referenced.
+	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), requireRoots bool) (*gitalypb.Review, error)
 	// GetReview returns the review and its version, ErrReviewNotFound if unknown.
 	GetReview(ctx context.Context, repoID int64, id string) (*gitalypb.Review, int64, error)
 	// ListReviews returns the reviews of the repository newest first
@@ -166,13 +167,11 @@ type MetaStore interface {
 	// UpdateReview stores r if the review is still at version, which becomes
 	// version+1. It returns ErrReviewVersionConflict otherwise.
 	//
-	// rootsAt is as for InsertReview: an update that moves the review's head
-	// passes the sequence of the snapshot the new head was checked against, and
-	// the transaction then takes the repository row lock first and requires the
-	// newest checkpoint's sequence to be at most rootsAt, else
-	// ErrReviewRootsStale. Updates that move no commit (comments, verdicts,
-	// closes) pass 0 and do not lock the repository row (LOCK ORDER).
-	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, rootsAt uint64) error
+	// requireRoots is as for InsertReview, for the head and base of r: an update
+	// that may move the head requires them. Updates that move no commit
+	// (comments, verdicts, closes) do not, and do not lock the repository row
+	// (LOCK ORDER).
+	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, requireRoots bool) error
 
 	// CreateCheckpoint records a checkpoint and its reference snapshot in one
 	// transaction, with the database time as its creation time. Its first
@@ -181,9 +180,7 @@ type MetaStore interface {
 	// an owned pack key of the repository and a valid snapshot, else an error and
 	// nothing is written. A checkpoint at Seq that exists already is returned
 	// unchanged with created false (its pack is kept; the caller's becomes an
-	// orphan). It requires every open review's head and base commit to be in
-	// Roots, else ErrCheckpointRootsChanged and nothing is written.
-	// ErrRepositoryNotFound for an unknown repository.
+	// orphan). ErrRepositoryNotFound for an unknown repository.
 	CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
 	// NewestCheckpoint returns the checkpoint with the greatest sequence; ok is
 	// false when the repository has none.

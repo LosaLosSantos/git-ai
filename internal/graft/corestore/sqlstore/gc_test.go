@@ -207,7 +207,6 @@ func TestCheckpointLifecycle(t *testing.T) {
 			"no references":         {Seq: 3, PackKey: ownedKey(repo.ID, "x")},
 			"absent target":         {Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": ""}, PackKey: ownedKey(repo.ID, "x")},
 			"empty name":            {Seq: 3, Refs: map[string]corestore.Target{"": oid(1)}, PackKey: ownedKey(repo.ID, "x")},
-			"empty root":            {Seq: 3, Refs: refs, PackKey: ownedKey(repo.ID, "x"), Roots: []string{""}},
 		} {
 			_, _, err := s.CreateCheckpoint(ctx, repo.ID, bad)
 			require.Error(t, err, name)
@@ -240,98 +239,6 @@ func TestCheckpointLifecycle(t *testing.T) {
 			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID+1000, "unknown"),
 		})
 		require.ErrorIs(t, err, corestore.ErrRepositoryNotFound)
-	})
-}
-
-func TestCheckpointRequiresOpenReviewRoots(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, ctx context.Context, s *sqlstore.Store) {
-		repo, _ := headRepo(t, ctx, s, "roots", 1)
-
-		head, base := string(oid(10)), string(oid(11))
-		insert := func(r *gitalypb.Review) {
-			_, err := s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) { return r, nil }, 0)
-			require.NoError(t, err)
-		}
-		insert(&gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: head, BaseCommitId: base})
-		insert(&gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(oid(12)), State: gitalypb.Review_STATE_CLOSED})
-		insert(&gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(oid(13)), State: gitalypb.Review_STATE_LANDED})
-
-		input := func(roots ...string) corestore.CheckpointInput {
-			return corestore.CheckpointInput{
-				Seq: 1, Refs: map[string]corestore.Target{"refs/heads/main": oid(1)}, PackKey: ownedKey(repo.ID, "roots"), Roots: roots,
-			}
-		}
-
-		for _, roots := range [][]string{nil, {head}, {base}} {
-			_, _, err := s.CreateCheckpoint(ctx, repo.ID, input(roots...))
-			require.ErrorIs(t, err, corestore.ErrCheckpointRootsChanged, "roots %v", roots)
-
-			_, ok, err := s.NewestCheckpoint(ctx, repo.ID)
-			require.NoError(t, err)
-			require.False(t, ok, "nothing recorded with roots %v", roots)
-		}
-
-		// Closed and landed reviews are not roots.
-		_, created, err := s.CreateCheckpoint(ctx, repo.ID, input(head, base))
-		require.NoError(t, err)
-		require.True(t, created)
-	})
-}
-
-// TestReviewWritesRequireFreshRoots is REVIEW ROOTS R1 in the store: a review
-// write whose commits were checked at a snapshot older than the newest
-// checkpoint is refused and writes nothing; rootsAt 0 is unconditioned.
-func TestReviewWritesRequireFreshRoots(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, ctx context.Context, s *sqlstore.Store) {
-		repo, _ := headRepo(t, ctx, s, "fresh-roots", 3)
-		build := func(head string) func(string) (*gitalypb.Review, error) {
-			return func(string) (*gitalypb.Review, error) {
-				return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: head}, nil
-			}
-		}
-
-		// Without a checkpoint any snapshot is fresh.
-		_, err := s.InsertReview(ctx, repo.ID, build(string(oid(10))), 1)
-		require.NoError(t, err)
-
-		_, _, err = s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-			Seq: 2, Refs: map[string]corestore.Target{"refs/heads/main": oid(2)}, PackKey: ownedKey(repo.ID, "fresh-roots"),
-			Roots: []string{string(oid(10))},
-		})
-		require.NoError(t, err)
-
-		_, err = s.InsertReview(ctx, repo.ID, build(string(oid(11))), 1)
-		require.ErrorIs(t, err, corestore.ErrReviewRootsStale)
-		reviews, err := s.ListReviews(ctx, repo.ID, "", true, 0)
-		require.NoError(t, err)
-		require.Len(t, reviews, 1, "the refused creation wrote nothing")
-
-		for _, rootsAt := range []uint64{2, 3, 0} {
-			_, err = s.InsertReview(ctx, repo.ID, build(string(oid(12))), rootsAt)
-			require.NoError(t, err, "rootsAt %d", rootsAt)
-		}
-
-		r, version, err := s.GetReview(ctx, repo.ID, "1")
-		require.NoError(t, err)
-		r.HeadCommitId = string(oid(13))
-		require.ErrorIs(t, s.UpdateReview(ctx, repo.ID, "1", version, r, 1), corestore.ErrReviewRootsStale)
-		unchanged, unchangedVersion, err := s.GetReview(ctx, repo.ID, "1")
-		require.NoError(t, err)
-		require.Equal(t, version, unchangedVersion, "the refused update wrote nothing")
-		require.Equal(t, string(oid(10)), unchanged.GetHeadCommitId())
-
-		require.NoError(t, s.UpdateReview(ctx, repo.ID, "1", version, r, 2))
-		r.Title = []byte("a comment moves no commit")
-		require.NoError(t, s.UpdateReview(ctx, repo.ID, "1", version+1, r, 0))
-
-		// A head move of a removed repository finds no repository row.
-		gone, _ := headRepo(t, ctx, s, "fresh-roots-gone", 1)
-		_, err = s.InsertReview(ctx, gone.ID, build(string(oid(14))), 1)
-		require.NoError(t, err)
-		removed, err := s.DeleteRepository(ctx, gone.Key)
-		require.NoError(t, err)
-		require.True(t, removed)
-		require.ErrorIs(t, s.UpdateReview(ctx, gone.ID, "1", 1, r, 1), corestore.ErrRepositoryNotFound)
 	})
 }
 
@@ -599,7 +506,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 
 		_, err := a.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 			return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(oid(500))}, nil
-		}, 0)
+		}, false)
 		require.NoError(t, err)
 
 		const (
@@ -612,34 +519,57 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 		var (
 			mu               sync.Mutex
 			createdSeqs      []uint64
-			rootsRefused     int
-			rootsStale       int
+			rootsMissing     int
+			swept, inUse     int
+			committed        atomic.Int32
 			unexpected       []error
 			recordUnexpected = func(err error) { mu.Lock(); unexpected = append(unexpected, err); mu.Unlock() }
 			nodes            = []*sqlstore.Store{a, b}
 			g                errgroup.Group
 		)
 
-		// writeRoots runs a review write that moves commits as the review service
-		// does (REVIEW ROOTS R1): with the sequence of a fresh snapshot, again
-		// after ErrReviewRootsStale. Its own bound is generous: the test counts
-		// the conflicts instead of failing on the service's third one.
-		writeRoots := func(s *sqlstore.Store, write func(rootsAt uint64) error) error {
+		// protect writes the keep-around reference of the commit, as the review
+		// service does through the voter; a reference that exists is a conflict
+		// and left as it is.
+		protect := func(s *sqlstore.Store, root string) error {
+			_, err := commit(ctx, s, repo.ID, create(corestore.KeepAroundRef(root), corestore.Target(root)))
+			var conflict *corestore.ErrRefConflict
+			switch {
+			case err == nil:
+				committed.Add(1)
+				return nil
+			case errors.As(err, &conflict):
+				return nil
+			default:
+				return err
+			}
+		}
+
+		// writeRoots runs a review write that records commit as the review
+		// service does (REVIEW ROOTS RULE): its reference first, then the write
+		// that requires it, again after ErrReviewRootsMissing (the sweeper below
+		// deleted the reference in between). Its own bound is generous: the test
+		// counts the retries instead of failing on the service's third attempt.
+		writeRoots := func(s *sqlstore.Store, root string, write func() error) error {
 			for range 20 {
-				_, rootsAt, err := s.Refs(ctx, repo.ID)
-				if err != nil {
+				if err := protect(s, root); err != nil {
 					return err
 				}
-				err = write(rootsAt)
-				if !errors.Is(err, corestore.ErrReviewRootsStale) {
+				err := write()
+				if !errors.Is(err, corestore.ErrReviewRootsMissing) {
 					return err
 				}
 				mu.Lock()
-				rootsStale++
+				rootsMissing++
 				mu.Unlock()
 			}
-			return errors.New("the review write kept conflicting with checkpoints")
+			return errors.New("the review write kept losing its keep-around reference")
 		}
+
+		// The review writers below; the sweeper runs until they are done, so that
+		// it races with every one of them.
+		var writers sync.WaitGroup
+		writersDone := make(chan struct{})
 
 		for n, s := range nodes {
 			g.Go(func() error {
@@ -647,17 +577,21 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 					ref := fmt.Sprintf("refs/heads/node-%d-%d", n, i)
 					if _, err := commitPack(ctx, s, repo.ID, create(ref, oid(1000+i)), ownedKey(repo.ID, ref)); err != nil {
 						recordUnexpected(fmt.Errorf("land %s: %w", ref, err))
+						continue
 					}
+					committed.Add(1)
 				}
 				return nil
 			})
+			writers.Add(1)
 			g.Go(func() error {
+				defer writers.Done()
 				for i := range reviewsPerNode {
 					head := string(oid(2000 + 100*n + i))
-					if err := writeRoots(s, func(rootsAt uint64) error {
+					if err := writeRoots(s, head, func() error {
 						_, err := s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 							return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: head}, nil
-						}, rootsAt)
+						}, true)
 						return err
 					}); err != nil {
 						recordUnexpected(fmt.Errorf("insert review: %w", err))
@@ -667,17 +601,59 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 			})
 		}
 
+		// The sweeper deletes every keep-around reference it finds; the database
+		// refuses those that an open review uses.
+		g.Go(func() error {
+			for {
+				select {
+				case <-writersDone:
+					return nil
+				default:
+				}
+
+				refs, _, err := b.Refs(ctx, repo.ID)
+				if err != nil {
+					recordUnexpected(err)
+					return nil
+				}
+				for name, target := range refs {
+					if !strings.HasPrefix(name, corestore.KeepAroundPrefix) {
+						continue
+					}
+					_, err := commit(ctx, b, repo.ID, update(name, target, ""))
+					var conflict *corestore.ErrRefConflict
+					switch {
+					case err == nil:
+						committed.Add(1)
+						mu.Lock()
+						swept++
+						mu.Unlock()
+					case errors.Is(err, corestore.ErrReviewRootInUse):
+						mu.Lock()
+						inUse++
+						mu.Unlock()
+					case errors.As(err, &conflict):
+					default:
+						recordUnexpected(fmt.Errorf("sweep %s: %w", name, err))
+					}
+				}
+			}
+		})
+
 		// Head moves of review 1: the repository row first, then the version
 		// compare-and-swap of the review row.
+		writers.Add(1)
 		g.Go(func() error {
+			defer writers.Done()
 			for done := 0; done < updates; {
-				err := writeRoots(a, func(rootsAt uint64) error {
+				head := string(oid(3000 + done))
+				err := writeRoots(a, head, func() error {
 					r, version, err := a.GetReview(ctx, repo.ID, "1")
 					if err != nil {
 						return err
 					}
-					r.HeadCommitId = string(oid(3000 + done))
-					return a.UpdateReview(ctx, repo.ID, "1", version, r, rootsAt)
+					r.HeadCommitId = head
+					return a.UpdateReview(ctx, repo.ID, "1", version, r, true)
 				})
 				switch {
 				case err == nil:
@@ -690,6 +666,10 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 			}
 			return nil
 		})
+		go func() {
+			writers.Wait()
+			close(writersDone)
+		}()
 
 		// Updates of one review that do not move its commits (a comment): a
 		// version compare-and-swap on the review row only.
@@ -701,7 +681,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 					return nil
 				}
 				r.Title = []byte(fmt.Sprintf("comment %d", done))
-				switch err := b.UpdateReview(ctx, repo.ID, "1", version, r, 0); {
+				switch err := b.UpdateReview(ctx, repo.ID, "1", version, r, false); {
 				case err == nil:
 					done++
 				case errors.Is(err, corestore.ErrReviewVersionConflict):
@@ -713,20 +693,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 			return nil
 		})
 
-		// Checkpoints at the head. Their roots include every head the review
-		// writers above will record (R2 requires a superset of the open
-		// reviews' commits), so that checkpoints commit while the R1 writes run
-		// instead of being refused by them; R2's refusal is tested
-		// deterministically in TestCheckpointRequiresOpenReviewRoots.
-		roots := []string{string(oid(500))}
-		for n := range nodes {
-			for i := range reviewsPerNode {
-				roots = append(roots, string(oid(2000+100*n+i)))
-			}
-		}
-		for done := range updates {
-			roots = append(roots, string(oid(3000+done)))
-		}
+		// Checkpoints at the head.
 		g.Go(func() error {
 			for range checkpoints {
 				refs, head, err := a.Refs(ctx, repo.ID)
@@ -736,7 +703,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 				}
 
 				cp, created, err := a.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-					Seq: head, Refs: refs, PackKey: ownedKey(repo.ID, fmt.Sprint("checkpoint ", head)), Roots: roots,
+					Seq: head, Refs: refs, PackKey: ownedKey(repo.ID, fmt.Sprint("checkpoint ", head)),
 				})
 				switch {
 				case err == nil && created:
@@ -744,10 +711,6 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 					createdSeqs = append(createdSeqs, cp.Seq)
 					mu.Unlock()
 				case err == nil:
-				case errors.Is(err, corestore.ErrCheckpointRootsChanged):
-					mu.Lock()
-					rootsRefused++
-					mu.Unlock()
 				default:
 					recordUnexpected(fmt.Errorf("checkpoint at %d: %w", head, err))
 				}
@@ -772,10 +735,11 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 		require.Empty(t, unexpected)
 		require.Zero(t, deadlocks.Load(), "a transaction deadlocked")
 
-		// Dense changesets: the first one plus every land.
+		// Dense changesets: the first one plus every land, keep-around write and
+		// sweep that committed.
 		final, err := a.GetRepository(ctx, testKey("lock-order"))
 		require.NoError(t, err)
-		require.Equal(t, uint64(1+2*landsPerNode), final.HeadSeq)
+		require.Equal(t, uint64(1+committed.Load()), final.HeadSeq)
 		changesets, err := a.ListChangesets(ctx, repo.ID, 0, final.HeadSeq)
 		require.NoError(t, err)
 		require.Len(t, changesets, int(final.HeadSeq))
@@ -798,11 +762,21 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 			recorded = append(recorded, cp.Seq)
 		}
 		require.Equal(t, createdSeqs, recorded)
-		require.Zero(t, rootsRefused, "the roots include every review commit")
-		t.Logf("checkpoints created %d; review writes refused after a newer checkpoint %d", len(createdSeqs), rootsStale)
+		t.Logf("checkpoints created %d; keep-around references swept %d, kept for an open review %d; review writes retried after a sweep %d",
+			len(createdSeqs), swept, inUse, rootsMissing)
 
 		r, _, err := a.GetReview(ctx, repo.ID, "1")
 		require.NoError(t, err)
 		require.Equal(t, string(oid(3000+updates-1)), r.GetHeadCommitId(), "every head move applied")
+
+		// The REVIEW ROOTS invariant: every open review written with its roots
+		// required has the keep-around reference of its head. Review 1 was
+		// inserted without, but every head move required its new head.
+		refs, _, err := a.Refs(ctx, repo.ID)
+		require.NoError(t, err)
+		for _, review := range reviews {
+			head := review.GetHeadCommitId()
+			require.Equal(t, corestore.Target(head), refs[corestore.KeepAroundRef(head)], "review %s", review.GetId())
+		}
 	})
 }

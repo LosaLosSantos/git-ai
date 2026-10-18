@@ -410,6 +410,11 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		}
 		return structerr.NewFailedPrecondition("storage core: repository is not imported into the storage core")
 	}
+	if errors.Is(err, corestore.ErrReviewRootInUse) {
+		// Only non-forced (authoritative) changesets are refused.
+		result = resultConflict
+		return structerr.NewFailedPrecondition("%w", err)
+	}
 	if err != nil {
 		return v.unavailable(err)
 	}

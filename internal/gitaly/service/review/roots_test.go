@@ -2,10 +2,11 @@ package review
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -13,205 +14,255 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
+	housekeepingcfg "github.com/feder-cr/git-ai/internal/git/housekeeping/config"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
-	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	"github.com/feder-cr/git-ai/internal/graft/review/store"
 	"github.com/feder-cr/git-ai/internal/testhelper"
-	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// staleStore is a rootsStore whose first stale writes are refused with
-// ErrReviewRootsStale, as when a checkpoint is recorded between the check and
-// each of those writes.
-type staleStore struct {
+// sweptStore is a store that requires the review roots, whose first swept
+// writes fail with ErrReviewRootsMissing, as when a sweep deletes the
+// keep-around references between their write and the review write.
+type sweptStore struct {
 	store.ReviewStore
-	stale int
-	// snapshots counts the Refs calls; snapshot n has sequence 10*n.
-	snapshots int
-	// rootsAt are the sequences the writes carried, in order.
-	rootsAt []uint64
+	swept, writes int
 }
 
-func (f *staleStore) Refs() (map[string]corestore.Target, uint64, error) {
-	f.snapshots++
-	return map[string]corestore.Target{}, uint64(10 * f.snapshots), nil
-}
+func (f *sweptStore) WithRequiredRoots() store.ReviewStore { return &sweptWriter{f: f} }
 
-func (f *staleStore) WithRootsAt(rootsAt uint64) store.ReviewStore {
-	return &staleWriter{f: f, rootsAt: rootsAt}
-}
-
-type staleWriter struct {
+type sweptWriter struct {
 	store.ReviewStore
-	f       *staleStore
-	rootsAt uint64
+	f *sweptStore
 }
 
-func (w *staleWriter) Create(r *gitalypb.Review) (*gitalypb.Review, error) {
-	w.f.rootsAt = append(w.f.rootsAt, w.rootsAt)
-	if len(w.f.rootsAt) <= w.f.stale {
-		return nil, fmt.Errorf("insert review: %w", corestore.ErrReviewRootsStale)
+func (w *sweptWriter) Create(r *gitalypb.Review) (*gitalypb.Review, error) {
+	w.f.writes++
+	if w.f.writes <= w.f.swept {
+		return nil, fmt.Errorf("insert review: %w", corestore.ErrReviewRootsMissing)
 	}
 	return r, nil
 }
 
-func TestWriteRootsTakesANewSnapshotAfterAConflict(t *testing.T) {
+func TestWriteRootsRetriesAfterASweep(t *testing.T) {
 	ctx := testhelper.Context(t)
 	s := newServer(&service.Dependencies{})
 
 	for _, tc := range []struct {
-		desc    string
-		stale   int
-		rootsAt []uint64
-		code    codes.Code
+		swept  int
+		writes int
+		code   codes.Code
 	}{
-		{desc: "no conflict", stale: 0, rootsAt: []uint64{10}, code: codes.OK},
-		{desc: "exactly one conflict", stale: 1, rootsAt: []uint64{10, 20}, code: codes.OK},
-		{desc: "two conflicts", stale: 2, rootsAt: []uint64{10, 20, 30}, code: codes.OK},
-		{desc: "attempts exhausted", stale: 3, rootsAt: []uint64{10, 20, 30}, code: codes.Aborted},
+		{swept: 0, writes: 1, code: codes.OK},
+		{swept: 1, writes: 2, code: codes.OK},
+		{swept: 2, writes: 3, code: codes.OK},
+		{swept: 3, writes: 3, code: codes.Aborted},
 	} {
-		t.Run(tc.desc, func(t *testing.T) {
-			st := &staleStore{stale: tc.stale}
-			checks := 0
-			err := s.writeRoots(ctx, nil, nil, st, func(st store.ReviewStore, _ rootsCheck) error {
-				checks++
+		t.Run(fmt.Sprintf("swept %d", tc.swept), func(t *testing.T) {
+			st := &sweptStore{swept: tc.swept}
+			err := s.writeRoots(ctx, nil, st, func(st store.ReviewStore, _ rootsProtect) error {
 				_, err := st.Create(&gitalypb.Review{})
 				return err
 			})
 			require.Equal(t, tc.code, status.Code(err), "%v", err)
-			require.Equal(t, tc.rootsAt, st.rootsAt, "every attempt writes with its own snapshot")
-			require.Equal(t, len(tc.rootsAt), st.snapshots)
-			require.Equal(t, len(tc.rootsAt), checks, "every attempt checks again")
+			require.Equal(t, tc.writes, st.writes, "every attempt writes again")
 		})
 	}
 
-	t.Run("other errors end the write", func(t *testing.T) {
-		st := &staleStore{}
-		broken := errors.New("database is down")
-		err := s.writeRoots(ctx, nil, nil, st, func(store.ReviewStore, rootsCheck) error { return broken })
-		require.ErrorIs(t, err, broken)
-		require.Equal(t, 1, st.snapshots)
-	})
-
-	// The files store holds no storage core roots: nothing is checked.
-	t.Run("files store", func(t *testing.T) {
-		files := store.Open(t.TempDir())
-		err := s.writeRoots(ctx, nil, nil, files, func(st store.ReviewStore, check rootsCheck) error {
-			require.Same(t, files, st)
-			return check(git.ObjectID("not even an object ID"))
-		})
-		require.NoError(t, err)
-	})
+	// The files store does not require the roots in a database.
+	files := store.Open(t.TempDir())
+	require.NoError(t, s.writeRoots(ctx, nil, files, func(st store.ReviewStore, _ rootsProtect) error {
+		require.Same(t, files, st)
+		return nil
+	}))
 }
 
-// countingFreshener counts EnsureFresh calls.
-type countingFreshener struct {
-	corestore.NopFreshener
-	calls int
-}
+// housekeep runs the object housekeeping of Gitaly on the repository with an
+// expiry of now: a full repack that drops unreachable objects into an expired
+// cruft pack, then a prune of the unreachable loose objects. Production
+// housekeeping does the same with a grace period of two weeks.
+func housekeep(t *testing.T, cfg config.Cfg, repo *gitalypb.Repository) {
+	t.Helper()
 
-func (f *countingFreshener) EnsureFresh(context.Context, storage.Repository) error {
-	f.calls++
-	return nil
-}
-
-func TestRootsCheckReachability(t *testing.T) {
 	ctx := testhelper.Context(t)
-	cfg := testcfg.Build(t)
-	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
-	repo := localrepo.NewTestRepo(t, cfg, repoProto)
-
-	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"))
-	head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base))
-	unreachable := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("unreachable"), gittest.WithParents(base))
-	unrelated := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("unrelated"))
-
-	snapshot := func(fresh corestore.Freshener, refs map[string]corestore.Target) *rootsSnapshot {
-		return &rootsSnapshot{ctx: ctx, fresh: fresh, repoProto: repoProto, repo: repo, refs: refs}
-	}
-	refs := map[string]corestore.Target{
-		"HEAD":            corestore.SymbolicTarget("refs/heads/main"),
-		"refs/heads/main": corestore.Target(head),
-	}
-
-	fresh := &countingFreshener{}
-	s := snapshot(fresh, refs)
-	require.NoError(t, s.check(head, base))
-	for _, commit := range []git.ObjectID{unreachable, unrelated} {
-		err := s.check(head, commit)
-		require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-		require.ErrorContains(t, err, commit.String())
-	}
-	require.Zero(t, fresh.calls, "every tip is local: no catch-up")
-
-	// No reference reaches anything.
-	err := snapshot(fresh, map[string]corestore.Target{"HEAD": corestore.SymbolicTarget("refs/heads/main")}).check(base)
-	require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-
-	// A tip the local repository does not have yet (committed on another node
-	// after the gate caught it up): the repository is caught up before the
-	// check. The counting Freshener does not bring the object, so the check
-	// then fails as Internal: a Freshener that returns nil must have brought
-	// every object of the snapshot.
-	absent := git.ObjectID(strings.Repeat("a", gittest.DefaultObjectHash.EncodedLen()))
-	err = snapshot(fresh, map[string]corestore.Target{"refs/heads/other": corestore.Target(absent)}).check(base)
-	require.Equal(t, 1, fresh.calls)
-	require.Equal(t, codes.Internal, status.Code(err), "%v", err)
+	local := localrepo.NewTestRepo(t, cfg, repo)
+	now := time.Now()
+	require.NoError(t, housekeeping.RepackObjects(ctx, local, housekeepingcfg.RepackObjectsConfig{
+		Strategy:          housekeepingcfg.RepackObjectsStrategyFullWithCruft,
+		CruftExpireBefore: now,
+	}))
+	require.NoError(t, housekeeping.PruneObjects(ctx, local, housekeeping.PruneObjectsConfig{ExpireBefore: now}))
 }
 
-// TestAuthoritativeReviewCommitsMustBeReachable is REVIEW ROOTS R1 end to end:
-// a review cannot be created on, or moved to, a commit that the references in
-// the storage core do not reach, even when the local repository has it.
-func TestAuthoritativeReviewCommitsMustBeReachable(t *testing.T) {
+func hasObject(t *testing.T, cfg config.Cfg, repoPath string, oid git.ObjectID) bool {
+	t.Helper()
+	return gittest.NewCommand(t, cfg, "-C", repoPath, "cat-file", "-e", oid.String()).Run() == nil
+}
+
+// keepArounds returns the keep-around references of the repository in the
+// database.
+func keepArounds(t *testing.T, ctx context.Context, core *corestore.Core, repoID int64) map[string]corestore.Target {
+	t.Helper()
+
+	refs, _, err := core.Meta.Refs(ctx, repoID)
+	require.NoError(t, err)
+	kept := map[string]corestore.Target{}
+	for name, target := range refs {
+		if strings.HasPrefix(name, corestore.KeepAroundPrefix) {
+			kept[name] = target
+		}
+	}
+	return kept
+}
+
+func keepAroundOf(commits ...git.ObjectID) map[string]corestore.Target {
+	kept := map[string]corestore.Target{}
+	for _, c := range commits {
+		kept[corestore.KeepAroundRef(c.String())] = corestore.Target(c)
+	}
+	return kept
+}
+
+// TestAuthoritativeReviewRootsAreReferences: in authoritative mode a review
+// write records keep-around references of its commits in the storage core,
+// also for a commit that only the serving node had, and a close deletes those
+// that no other open review uses (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+func TestAuthoritativeReviewRootsAreReferences(t *testing.T) {
 	ctx, cfg, core, client := setupAuthoritative(t)
 
 	repo, repoPath := createLocalRepository(t, ctx, cfg)
 	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
-	head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base), gittest.WithBranch("feature"))
 	tracked := importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{})
 
 	// The first request lets the gate replace the imported copy by a cache built
-	// from the storage core; a commit written into that cache afterwards is only
-	// in the local repository, never recorded in the storage core.
+	// from the storage core; commits written into that cache afterwards are only
+	// on this node.
 	require.Empty(t, listStoredReviews(t, ctx, client, repo, true))
-	local := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("local only"), gittest.WithParents(base))
-	_, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{
-		Repository:   repo,
-		TargetBranch: []byte("main"),
-		HeadCommitId: local.String(),
-	})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-	reviews, err := core.Meta.ListReviews(ctx, tracked.ID, "", true, 0)
-	require.NoError(t, err)
-	require.Empty(t, reviews)
+	head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base))
+	next := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("next"), gittest.WithParents(head))
 
-	created, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{
-		Repository:   repo,
-		TargetBranch: []byte("main"),
-		HeadCommitId: head.String(),
-	})
+	first, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
 	require.NoError(t, err)
-	id := created.GetReview().GetId()
+	require.Equal(t, keepAroundOf(head, base), keepArounds(t, ctx, core, tracked.ID))
+	second, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
+	require.NoError(t, err)
 
-	_, err = client.UpdateReview(ctx, &gitalypb.UpdateReviewRequest{
-		Repository:   repo,
-		Id:           id,
-		HeadCommitId: local.String(),
-	})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
-	stored, _, err := core.Meta.GetReview(ctx, tracked.ID, id)
+	// A head move references the new head; the old one is still the second
+	// review's.
+	_, err = client.UpdateReview(ctx, &gitalypb.UpdateReviewRequest{Repository: repo, Id: first.GetReview().GetId(), HeadCommitId: next.String()})
 	require.NoError(t, err)
-	require.Equal(t, head.String(), stored.GetHeadCommitId(), "the head did not move")
+	require.Equal(t, keepAroundOf(head, next, base), keepArounds(t, ctx, core, tracked.ID))
 
-	// An update that keeps the head moves no commit and is not checked.
-	_, err = client.UpdateReview(ctx, &gitalypb.UpdateReviewRequest{
-		Repository:   repo,
-		Id:           id,
-		HeadCommitId: head.String(),
-	})
+	// Closing the first review releases only what no open review uses.
+	_, err = client.CloseReview(ctx, &gitalypb.CloseReviewRequest{Repository: repo, Id: first.GetReview().GetId()})
 	require.NoError(t, err)
+	require.Equal(t, keepAroundOf(head, base), keepArounds(t, ctx, core, tracked.ID))
+	_, err = client.CloseReview(ctx, &gitalypb.CloseReviewRequest{Repository: repo, Id: second.GetReview().GetId(), Landed: true})
+	require.NoError(t, err)
+	require.Empty(t, keepArounds(t, ctx, core, tracked.ID))
+}
+
+// TestAuthoritativeReviewWriteSurvivesASweep: a maintenance sweep that deletes
+// the keep-around references between their write and the review write makes
+// the write fail in the database (ErrReviewRootsMissing), and the service
+// writes them again; after maxRootsAttempts such sweeps the request is
+// Aborted and nothing is recorded.
+func TestAuthoritativeReviewWriteSurvivesASweep(t *testing.T) {
+	for _, tc := range []struct {
+		desc   string
+		sweeps int
+		code   codes.Code
+	}{
+		{desc: "one sweep", sweeps: 1, code: codes.OK},
+		{desc: "every attempt swept", sweeps: maxRootsAttempts, code: codes.Aborted},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			var (
+				mu       sync.Mutex
+				protects int
+				deleted  int
+				sweepErr error
+			)
+			ctx, cfg, core, client := setupWithStorageCore(t, corestore.ModeAuthoritative, func(s *server) {
+				s.rootsProtected = func(ctx context.Context, repo *localrepo.Repo, st store.ReviewStore) {
+					mu.Lock()
+					defer mu.Unlock()
+					protects++
+					if protects > tc.sweeps {
+						return
+					}
+					report, err := reviewroots.Sweep(ctx, repo, st, nil)
+					deleted += report.Deleted
+					if err != nil && sweepErr == nil {
+						sweepErr = err
+					}
+				}
+			})
+
+			repo, repoPath := createLocalRepository(t, ctx, cfg)
+			base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
+			head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base), gittest.WithBranch("feature"))
+			tracked := importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{})
+
+			_, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
+			require.Equal(t, tc.code, status.Code(err), "%v", err)
+
+			mu.Lock()
+			defer mu.Unlock()
+			require.NoError(t, sweepErr)
+			require.Equal(t, 2*tc.sweeps, deleted, "every sweep deleted the head's and the base's reference")
+
+			reviews, err := core.Meta.ListReviews(ctx, tracked.ID, "", true, 0)
+			require.NoError(t, err)
+			if tc.code == codes.OK {
+				require.Equal(t, tc.sweeps+1, protects)
+				require.Len(t, reviews, 1)
+				require.Equal(t, keepAroundOf(head, base), keepArounds(t, ctx, core, tracked.ID))
+			} else {
+				require.Equal(t, maxRootsAttempts, protects)
+				require.Empty(t, reviews, "nothing is recorded")
+			}
+		})
+	}
+}
+
+// TestReviewRootsOutsideAuthoritativeMode: with the storage core off or in
+// shadow mode the reviews are files, and the service still writes the
+// keep-around references: housekeeping keeps an open review's commit after its
+// branch is deleted. In shadow mode the voter records the references in the
+// database, which does not require them (the files are the source of truth).
+func TestReviewRootsOutsideAuthoritativeMode(t *testing.T) {
+	t.Run("off", func(t *testing.T) {
+		h := setupHarness(t)
+		base, head := h.fixture(codeV2)
+		gittest.WriteRef(t, h.cfg, h.repoPath, "refs/heads/feature", head)
+		h.create(head)
+		gittest.Exec(t, h.cfg, "-C", h.repoPath, "update-ref", "-d", "refs/heads/feature")
+
+		housekeep(t, h.cfg, h.repo)
+		require.True(t, hasObject(t, h.cfg, h.repoPath, head))
+		require.True(t, hasObject(t, h.cfg, h.repoPath, base))
+	})
+
+	t.Run("shadow", func(t *testing.T) {
+		ctx, cfg, core, client := setupWithStorageCore(t, corestore.ModeShadow)
+		repo, repoPath := createLocalRepository(t, ctx, cfg)
+		base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
+		head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base), gittest.WithBranch("feature"))
+		tracked := importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{})
+
+		_, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
+		require.NoError(t, err)
+		require.Equal(t, keepAroundOf(head, base), keepArounds(t, ctx, core, tracked.ID), "the voter records the references")
+		gittest.Exec(t, cfg, "-C", repoPath, "update-ref", "-d", "refs/heads/feature")
+
+		housekeep(t, cfg, repo)
+		require.True(t, hasObject(t, cfg, repoPath, head))
+	})
 }

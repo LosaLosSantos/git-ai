@@ -41,7 +41,7 @@ func unmarshalReview(body string) (*gitalypb.Review, error) {
 }
 
 // InsertReview implements corestore.MetaStore.
-func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), rootsAt uint64) (*gitalypb.Review, error) {
+func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), requireRoots bool) (*gitalypb.Review, error) {
 	var stored *gitalypb.Review
 
 	err := s.withTx(ctx, nil, func(tx *sql.Tx) error {
@@ -51,11 +51,6 @@ func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id st
 		repo, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true)
 		if err != nil {
 			return err
-		}
-		if rootsAt != 0 {
-			if err := s.checkRootsAt(ctx, tx, repoID, rootsAt); err != nil {
-				return err
-			}
 		}
 
 		id := repo.nextReviewID
@@ -68,6 +63,11 @@ func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id st
 		}
 
 		r := prepareReview(built, fmt.Sprintf("%d", id))
+		if requireRoots {
+			if err := s.requireReviewRoots(ctx, tx, repoID, r); err != nil {
+				return err
+			}
+		}
 		body, err := marshalReview(r)
 		if err != nil {
 			return err
@@ -170,21 +170,22 @@ func (s *Store) ListReviews(ctx context.Context, repoID int64, targetBranch stri
 }
 
 // UpdateReview implements corestore.MetaStore.
-func (s *Store) UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, rootsAt uint64) error {
+func (s *Store) UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, requireRoots bool) error {
 	reviewID, ok := parseReviewID(id)
 	if !ok {
 		return corestore.ErrReviewNotFound
 	}
 
 	return s.withTx(ctx, nil, func(tx *sql.Tx) error {
-		// An update that moves the review's head serializes with checkpoint
-		// commits: LOCK ORDER, the repository row first. The others touch only
-		// the review row and never lock the repository row.
-		if rootsAt != 0 {
+		// An update that may move the review's head serializes with the
+		// changesets that could delete its keep-around references: LOCK ORDER,
+		// the repository row first. The others touch only the review row and
+		// never lock the repository row.
+		if requireRoots {
 			if _, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true); err != nil {
 				return err
 			}
-			if err := s.checkRootsAt(ctx, tx, repoID, rootsAt); err != nil {
+			if err := s.requireReviewRoots(ctx, tx, repoID, r); err != nil {
 				return err
 			}
 		}

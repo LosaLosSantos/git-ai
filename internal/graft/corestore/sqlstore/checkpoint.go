@@ -25,9 +25,8 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 	err := s.withTx(ctx, nil, func(tx *sql.Tx) error {
 		cp, created = corestore.Checkpoint{}, false
 
-		// LOCK ORDER (doc/graft/PLAN7.md): the repository row first. It serializes
-		// the checkpoint with changesets and with the review writes that move a
-		// review's commits, which the roots check below relies on.
+		// LOCK ORDER (doc/graft/PLAN7.md): the repository row first, which
+		// serializes the checkpoint with changesets.
 		repo, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true)
 		if err != nil {
 			return err
@@ -51,10 +50,6 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 		}
 		if ok && newest.Seq > in.Seq {
 			return fmt.Errorf("storage core: checkpoint at changeset %d is older than the newest checkpoint at %d of repository %d", in.Seq, newest.Seq, repoID)
-		}
-
-		if err := s.checkReviewRoots(ctx, tx, repoID, in.Roots); err != nil {
-			return err
 		}
 
 		now, err := s.wallTime(ctx, tx)
@@ -128,69 +123,7 @@ func validateCheckpoint(repoID int64, in corestore.CheckpointInput) error {
 		}
 	}
 
-	for _, root := range in.Roots {
-		if root == "" || !storableText(root) {
-			return fmt.Errorf("storage core: invalid checkpoint root %q", root)
-		}
-	}
-
 	return nil
-}
-
-// checkRootsAt refuses a review write whose commits were checked against the
-// reference snapshot at rootsAt when a newer checkpoint was recorded since
-// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R1): that checkpoint may not include
-// them. The caller holds the repository row, which CreateCheckpoint takes
-// first too, so the two are serialized.
-func (s *Store) checkRootsAt(ctx context.Context, tx *sql.Tx, repoID int64, rootsAt uint64) error {
-	newest, ok, err := s.newestCheckpoint(ctx, tx, repoID)
-	if err != nil {
-		return err
-	}
-	if ok && newest.Seq > rootsAt {
-		return fmt.Errorf("checkpoint at changeset %d, review commits checked at %d: %w", newest.Seq, rootsAt, corestore.ErrReviewRootsStale)
-	}
-	return nil
-}
-
-// checkReviewRoots refuses the checkpoint when an open review has a head or
-// base commit that is not one of the roots the checkpoint's pack includes: the
-// review was created, or moved its head, during the build (doc/graft/PLAN7.md,
-// REVIEW ROOTS RULE R2). The caller holds the repository row, which every
-// review write that moves a review's commits takes first, so the reviews read
-// here are the ones the checkpoint commits with.
-func (s *Store) checkReviewRoots(ctx context.Context, tx *sql.Tx, repoID int64, roots []string) error {
-	included := make(map[string]struct{}, len(roots))
-	for _, root := range roots {
-		included[root] = struct{}{}
-	}
-
-	rows, err := tx.QueryContext(ctx, s.bind("SELECT body FROM graft_reviews WHERE repo_id = ? AND closed = ?"), repoID, false)
-	if err != nil {
-		return fmt.Errorf("read open reviews: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var body string
-		if err := rows.Scan(&body); err != nil {
-			return fmt.Errorf("scan review: %w", err)
-		}
-		review, err := unmarshalReview(body)
-		if err != nil {
-			return err
-		}
-		for _, commit := range []string{review.GetHeadCommitId(), review.GetBaseCommitId()} {
-			if commit == "" {
-				continue
-			}
-			if _, ok := included[commit]; !ok {
-				return fmt.Errorf("review %s commit %s: %w", review.GetId(), commit, corestore.ErrCheckpointRootsChanged)
-			}
-		}
-	}
-
-	return rows.Err()
 }
 
 // checkpointColumns are the columns read by scanCheckpoint, in order.

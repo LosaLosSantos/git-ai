@@ -81,8 +81,8 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 	}
 
 	var stored *gitalypb.Review
-	err = s.writeRoots(ctx, req.GetRepository(), repo, st, func(st store.ReviewStore, check rootsCheck) error {
-		if err := check(head, base); err != nil {
+	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
+		if err := protect(head, base); err != nil {
 			return err
 		}
 
@@ -200,10 +200,10 @@ func (s *server) UpdateReview(ctx context.Context, req *gitalypb.UpdateReviewReq
 	}
 
 	var updated *gitalypb.Review
-	err = s.writeRoots(ctx, req.GetRepository(), repo, st, func(st store.ReviewStore, check rootsCheck) error {
+	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
 		var err error
 		updated, err = st.Update(req.GetId(), func(r *gitalypb.Review) error {
-			return moveHead(ctx, repo, req, r, head, check)
+			return moveHead(ctx, repo, req, r, head, protect)
 		})
 		return err
 	})
@@ -214,10 +214,11 @@ func (s *server) UpdateReview(ctx context.Context, req *gitalypb.UpdateReviewReq
 	return &gitalypb.UpdateReviewResponse{Review: s.withRequirements(updated)}, nil
 }
 
-// moveHead moves the review r to head, for UpdateReview. check verifies the
-// new head as a root of the storage core (REVIEW ROOTS R1); a head that does
-// not move is not checked.
-func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateReviewRequest, r *gitalypb.Review, head git.ObjectID, check rootsCheck) error {
+// moveHead moves the review r to head, for UpdateReview. protect writes the
+// keep-around references of the head and base the review is stored with (the
+// REVIEW ROOTS RULE), also when the head does not move: the review store of
+// authoritative mode requires them for every review it writes here.
+func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateReviewRequest, r *gitalypb.Review, head git.ObjectID, protect rootsProtect) error {
 	if err := checkAuthor(ctx, r, "update"); err != nil {
 		return err
 	}
@@ -227,14 +228,12 @@ func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateRev
 	if expected := req.GetExpectedHeadCommitId(); expected != "" && expected != r.GetHeadCommitId() {
 		return structerr.NewFailedPrecondition("review head is %s, expected %s", r.GetHeadCommitId(), expected)
 	}
-	if head.String() == r.GetHeadCommitId() {
-		return nil
-	}
-	if err := check(head); err != nil {
-		return err
-	}
 
 	base := git.ObjectID(r.GetBaseCommitId())
+	if head.String() == r.GetHeadCommitId() {
+		return protect(reviewCommits(head, base)...)
+	}
+
 	descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
 	if err != nil {
 		if !errors.As(err, new(localrepo.InvalidCommitError)) {
@@ -269,9 +268,22 @@ func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateRev
 		v.Current = survives
 	}
 
+	if err := protect(reviewCommits(head, base)...); err != nil {
+		return err
+	}
+
 	r.Files = files
 	r.HeadCommitId = head.String()
 	return nil
+}
+
+// reviewCommits returns the head and base of a review, leaving out an unset
+// base (reviews imported from the files of an older version may have none).
+func reviewCommits(head, base git.ObjectID) []git.ObjectID {
+	if base == "" {
+		return []git.ObjectID{head}
+	}
+	return []git.ObjectID{head, base}
 }
 
 // onlyCommentOrDocs reports whether every file changed between from and to is
@@ -432,7 +444,7 @@ func (s *server) CloseReview(ctx context.Context, req *gitalypb.CloseReviewReque
 		return nil, structerr.NewInvalidArgument("review id is required")
 	}
 
-	_, st, err := s.openRepo(ctx, req.GetRepository())
+	repo, st, err := s.openRepo(ctx, req.GetRepository())
 	if err != nil {
 		return nil, err
 	}
@@ -454,6 +466,9 @@ func (s *server) CloseReview(ctx context.Context, req *gitalypb.CloseReviewReque
 	if err != nil {
 		return nil, toStatus(err)
 	}
+
+	// A closed review is not a root any more (REVIEW ROOTS RULE).
+	s.releaseRoots(ctx, repo, st, reviewCommits(git.ObjectID(updated.GetHeadCommitId()), git.ObjectID(updated.GetBaseCommitId())))
 
 	return &gitalypb.CloseReviewResponse{Review: s.withRequirements(updated)}, nil
 }
