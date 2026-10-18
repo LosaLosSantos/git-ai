@@ -287,11 +287,18 @@ between a review write and a checkpoint commit.
   of the review is not reachable from the references of the repository in the
   storage core"). The database write of the review then carries `S`: in its
   transaction, under the repository row lock, it requires that the newest
-  checkpoint's sequence is `<= S`, else it returns `ErrReviewRootsStale` and the
-  service runs the check again with a new snapshot (a compare-and-swap checked
-  under the lock, bounded by the request context; it fails only when a
-  checkpoint was committed during the check). Comments, verdicts and closes do
-  not move roots and are not checked.
+  checkpoint's sequence is `<= S`, else it returns `ErrReviewRootsStale`. This is
+  an **optimistic compare-and-swap protocol**, not a retry that hides a race: the
+  condition is decided under the lock, and a conflict means only that a checkpoint
+  was committed between the check and the write. The service then takes a new
+  snapshot and checks again, **at most 3 attempts in all** (checkpoints are minutes
+  apart at the least, so a second conflict is already exceptional); when the
+  attempts are exhausted it returns `Aborted` ("the commits of the review could not
+  be checked against a stable snapshot: checkpoints were recorded concurrently";
+  Gitaly's Aborted interceptor shows clients its generic "try again" message and
+  keeps this one in the `error_details` metadata). Tested: success after exactly
+  one conflict, and exhaustion. Comments, verdicts and closes do not move roots and
+  are not checked.
 * **R2 — checkpoint commit.** The build records the root set it included (the
   open reviews' head and base commits, read after `Refs`). `CreateCheckpoint`, in
   its transaction under the repository row lock, requires every open review's head
@@ -307,8 +314,25 @@ between a review write and a checkpoint commit.
   pack `> N` (an object present locally but unreachable is packed again by the
   voter, whose `rev-list --not --all` excludes only reachable objects), which stays
   live until a later checkpoint whose R2 includes R.
+* **LOCK ORDER (PM check 3).** Every transaction that must serialize with a
+  changeset, a root-moving review write or a checkpoint commit takes the
+  repository row (`SELECT ... FOR UPDATE` on Postgres; SQLite's immediate
+  transaction holds the database write lock from `BEGIN`) **as its first
+  statement**, before it reads or writes any child table: `CommitChangeset`,
+  `RegisterRepository`, `ImportHistory`, `InsertReview`, `UpdateReview` with
+  `rootsAt != 0`, `CreateCheckpoint` and the lease methods. Transactions that touch
+  only child rows without changing their `repo_id` (`UpdateReview` with `rootsAt ==
+  0`, `ReportApplied`, the orphan observations, `DeleteCheckpoint`) never lock the
+  repository row and never upgrade a lock, so they cannot form a cycle with the
+  first group. Insert-only child transactions take Postgres's implicit `KEY SHARE`
+  on the parent and nothing after it. Tested with `-race` on Postgres and SQLite:
+  concurrent lands, review creations and head moves, comments, and checkpoint
+  commits on one repository, with no deadlock or serialization error surfacing
+  (the retry of `withTx` is counted and must stay at zero for deadlocks), and every
+  invariant checked at the end.
 * **Reviews created before phase 7** may already reference a pruned commit (not
-  possible after R1). A checkpoint build whose open-review root is missing from the
+  possible after R1); so may reviews that `ImportHistory` brings in from the
+  shadow-mode files. A checkpoint build whose open-review root is missing from the
   building node's repository fails with `FailedPrecondition` naming the review IDs
   (metadata `review_id`), counts
   `graft_storage_checkpoint_review_objects_missing_total`, and records nothing; GC
@@ -666,27 +690,39 @@ Binding order:
 1. Require authoritative mode (else `FailedPrecondition`, SHADOW SCOPE) and a
    reftable local repository. Read `(refs, N) = Meta.Refs(repoID)` (one snapshot).
    If `NewestCheckpoint` is at `N`: return it, `created = false`.
-2. **Change D:** `EnsureFresh(repo)`. EnsureFresh catches up to a head read after
-   the call arrived, which is `>= N`; then read the local watermark and require
-   `wm.RepoID == repoID && wm.Seq >= N` (else `Internal`: the Freshener contract is
+2. **Roots before freshness (PM check 1).** Read the open reviews
+   (`ListReviews(repoID, "", false, 0)`): their `head_commit_id` and
+   `base_commit_id` (each validated as an object ID of the repository's hash;
+   empty values skipped) are the build's root set (`Roots`). Then read the record
+   again: its head `H` (`>= N`) is at least the snapshot sequence `S` of every review
+   read, because each of them was written after its own check at `S` and before
+   this read. A review's roots can come from changesets in `(N, S]`, so the
+   reference snapshot `N` alone does not tell which objects the builder needs.
+3. **Change D:** `EnsureFresh(repo)`. EnsureFresh catches up to a head read after
+   the call arrived, which is `>= H`; then read the local watermark and require
+   `wm.RepoID == repoID && wm.Seq >= H` (else `Internal`: the Freshener contract is
    broken, never retried around). The local repository now holds every object of
-   the changesets `<= N`, hence every object reachable from `refs`.
-3. Tips = the object-ID targets of `refs` (symbolic and absent skipped) plus the
-   `head_commit_id` and `base_commit_id` of every open review
-   (`ListReviews(repoID, "", false, 0)`, each value validated as an object ID of
-   the repository's hash; empty values skipped); the review commits are the
-   build's root set (`Roots`). `MissingObjects` on the review tips: any missing →
-   `FailedPrecondition` naming the reviews (REVIEW ROOTS RULE, reviews created
-   before phase 7), metric, nothing uploaded. A missing reference tip is impossible
-   after step 2 and is `Internal`.
-4. `pack = BuildPackFrom(local, tips, tmpDir)`. No object tips → return
+   the changesets `<= H`, hence every object reachable from `refs` and every root
+   of a review checked at `S <= H`.
+4. **All objects present, or a precise error, never a partial pack.**
+   `MissingObjects` over the reference tips and the roots, before any pack is built:
+   a missing reference tip is impossible after step 3 and is `Internal` naming the
+   object; a missing review root can only belong to a review written without R1
+   (created before phase 7, or brought in by `ImportHistory` from the shadow-mode
+   files) and is `FailedPrecondition` naming the review IDs, with the metric;
+   nothing is uploaded.
+5. `pack = BuildPackFrom(local, tips ∪ roots, tmpDir)`. No object tips → return
    `created = false` (nothing to consolidate; hydration of such a repository is
    already trivial).
-5. Re-read the record (`t_r`), upload under `NewPackKey(repoID, pack.SHA256)` with
-   deadline `t_r + W`. `//! after_upload`.
-6. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes, Roots})`
-   under the upload's `CommitContext`. `ErrCheckpointRootsChanged` → the build fails
-   (its pack is an orphan). `//! after_commit`.
+6. Re-read the record (`t_r`), `Core.UploadPack`. `//! after_upload`.
+7. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes, Roots})`
+   under the upload's `CommitContext`. `ErrCheckpointRootsChanged` (a review moved
+   its head after step 2) → the build fails with `FailedPrecondition` (its pack is
+   an orphan). `//! after_commit`.
+
+The roots of a review written after step 2 are not in `Roots`: either R2 refuses the
+checkpoint (the review committed before step 7) or R1 makes the review's snapshot
+`>= N` (it committed after step 7), so its roots are live without this checkpoint.
 
 A crash after 5 leaves the pack as an orphan (reclaimed by the orphan protocol); a
 re-run starts over from the head at that time. The build holds no reference lock
@@ -1082,7 +1118,12 @@ sweep of removed repositories and takes no `-repo`.
     and re-checked; R2 refuses a checkpoint whose build missed a review moved during
     the build;
   * a sync round slower than `sync_timeout` and a dry hydration slower than `W` are
-    cancelled.
+    cancelled;
+  * (third review) a checkpoint build on a node whose watermark is below the
+    snapshot `S` of an open review created at `S > N` includes that review's roots
+    (EnsureFresh to `H`); a root missing locally is a precise error and no pack is
+    uploaded; R1 succeeds after exactly one `ErrReviewRootsStale` and returns
+    `Aborted` after 3; the LOCK ORDER `-race` test on Postgres and SQLite.
 * **measurement** (WP79, in the benchmark window the PM schedules): bucket size and
   fresh-node hydration time before and after a checkpoint and GC on a repository
   with many changesets; the preparing/prepared histograms before and after WP73.
