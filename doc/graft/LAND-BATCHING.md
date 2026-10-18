@@ -392,6 +392,28 @@ the running tip, so it cannot delay or block the other requests of its batch.
 
 ## Measured results
 
+### Phase 4b
+
+Two runs of `examples/graft/demo/acceptance-phase4.sh` on the phase 4b tree (one
+benchmark window; full tables, phases and the machine in
+[BENCH.md](BENCH.md#measured-phase-4b-results)) **meet the phase 4a acceptance**,
+the stretch goal included: one attempt per landed change, only planned conflicts
+fail, and p99 with batching on is below off at every size.
+
+| p99 landed (ms), run 1 / run 2 | 20 agents | 50 agents | 100 agents |
+|---|---|---|---|
+| batching on | 1347 / 1193 | 2525 / 4839 | 4854 / 2897 |
+| batching off | 7437 / 6741 | 12030 / 12746 | 10077 / 11905 |
+| lands/min, batching on | 1020 / 1070 | 1230 / 944 | 1616 / 2325 |
+
+The stretch goal (p99 on at 100 agents at most half of off) passed by 3.7% in run 1
+and by 51% in run 2; the runs vary a lot, and the benchmark saturates the machine.
+A batched request now costs about 8 ms (one range listing and a replay without
+fsync per object, see *How a request is decided and rebased*), and most of a batch
+is its publish: the pack of its objects and the update.
+
+### Phase 4a
+
 The phase 4a acceptance run of record (`examples/graft/demo/acceptance-phase4.sh`,
 20, 50 and 100 agents of 5 changes, conflict rate 0.2, seed 1; full tables, the
 other runs and the machine in [BENCH.md](BENCH.md#measured-phase-4a-results))
@@ -417,9 +439,9 @@ The phase breakdown shows where a batch spends its time: landing the members
 another) takes 56 to 72% of it, and the reference update with its hooks
 (`update`) 27 to 42%. The lane is busy for almost the whole run, so with many
 agents most of the latency is time spent queued behind earlier batches. Turning
-adaptive sizing off does not change that. Phase 4b (pipelined batches) must let
-a batch land its members while the batch before it publishes, and must cut or
-parallelize the per-member cost.
+adaptive sizing off does not change that. The profile of phase 4b found where the
+per-member time went (fsyncs of loose objects and nine short git processes per
+member) and removed it; see [PLAN8.md](PLAN8.md).
 
 ## Limits
 

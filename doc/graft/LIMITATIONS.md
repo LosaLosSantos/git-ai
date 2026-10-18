@@ -262,7 +262,32 @@ commitment.
 6. Multi-node cache tiers with explicit invalidation for mutable keys.
 7. Signed changesets and a verifiable export of the log.
 
+## Phase 4b limitations
+
+1. The phase 4a acceptance is met by two runs on one machine and one workload
+   (seed 1, conflict rate 0.2; see [BENCH](BENCH.md#measured-phase-4b-results)).
+   The runs vary a lot, the benchmark saturates the machine, and the stretch goal
+   passed by only 3.7% in one of the two runs.
+2. Batches still run one at a time per lane. Each batch now spends most of its time
+   publishing (packing its objects and the update with its hooks and the
+   changeset log). Why the update takes much longer under load than at low load is
+   not yet known; overlapping the publish of one batch with the work of the next
+   (pipelined batches) is not implemented and is only planned if that cost turns
+   out to be inherent to a batch.
+3. Each published batch adds one small pack to the repository, as a push does.
+   Housekeeping repacks them like the packs of pushes, so busy branches make
+   repacks more frequent.
+4. The objects of a batch are written without fsync and made durable by the pack
+   written before the update. An operator who sets `core.fsync` in the `[git]`
+   configuration overrides this for the helper processes too (the configuration
+   of the administrator is applied last), which keeps the old per-object fsyncs.
+5. Until phase 4b's single-land work (WP86 of PLAN8) lands, an unbatched land still
+   decides with several history walks and rebases with `localrepo.Rebase`, without
+   the pack of a batch.
+
 ## Phase 4a limitations
+
+(Item 1 is resolved by phase 4b, see above. The text describes phase 4a.)
 
 1. Batches still run one at a time per lane. Pipelined batches (phase 4b) are not
    implemented, so a lane's throughput is bounded by its batch duration. The
