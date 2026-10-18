@@ -214,7 +214,7 @@ phase_rows() {
     { v[$1, $2, $3] = $4 + 0 }
     END {
       batches = v["post", "count", "total"] - v["pre", "count", "total"]
-      n = split("quarantine tip land_member update total", phases, " ")
+      n = split("quarantine tip land_member plan replay pack update total", phases, " ")
       for (i = 1; i <= n; i++) {
         p = phases[i]
         count = v["post", "count", p] - v["pre", "count", p]

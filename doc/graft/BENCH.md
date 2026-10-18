@@ -207,8 +207,9 @@ Each server exposes its metrics on its own `prometheus_listen_addr` (set by
 `bench-batch.sh`). After each run the script scrapes `/metrics` and appends a
 "time per phase" table to the results. For each phase of a batch attempt
 (`graft_land_batch_phase_seconds{phase}`: `quarantine`, `tip`, `land_member`,
-`update`, `total`) it shows the sum and the mean, and the mean `land_member`
-time per batch. The metric names are in [LAND-BATCHING](LAND-BATCHING.md#metrics).
+`plan`, `replay`, `pack`, `update`, `total`) it shows the sum and the mean, and
+the mean `land_member` time per batch. `plan` and `replay` are parts of
+`land_member`; `pack` precedes `update`. The metric names are in [LAND-BATCHING](LAND-BATCHING.md#metrics).
 
 ### Phase 4a acceptance run
 

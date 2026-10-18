@@ -1,8 +1,10 @@
 # Land batching
 
-Status: implemented in phase 3 (standalone mode only) and extended in phase 4a
+Status: implemented in phase 3 (standalone mode only), extended in phase 4a
 (batch latency: a streaming rebase engine, early completion, adaptive batch
-sizes and a batch of one as an ordinary land). This page describes the code in
+sizes and a batch of one as an ordinary land) and in phase 4b (one range query
+per request and the objects of a batch made durable once, as one pack; see
+[PLAN8.md](PLAN8.md)). This page describes the code in
 `internal/gitaly/service/operations/land_batch*.go`, `internal/graft/landlane`,
 `internal/graft/rebase` and `internal/graft/ancestry`. The designs are in
 [PLAN3.md](PLAN3.md), section A, and [PLAN4.md](PLAN4.md).
@@ -83,27 +85,55 @@ One batch attempt:
 A batch that changes nothing publishes nothing. Its requests report their own
 outcomes.
 
-### Rebase engine
+### How a request is decided and rebased
 
-Since phase 4a, every batch attempt uses one `rebase.Engine`
-(`internal/graft/rebase`). It rebases with the same rules, errors and
-conflict contents as the repository's `Rebase`, but it keeps one
-`git merge-tree --stdin` process and one `git hash-object --stdin-paths`
-process running for the whole attempt, instead of starting several git
-processes per member. The engine is created when the attempt starts and closed
-when it ends. If the commit writer cannot write a commit (it returns
-`ErrCommitWriterUnsupported`, for example when signing is configured), that
-commit is written with the ordinary commit writer of the repository. The results
-are the same either way.
+Since phase 4b ([PLAN8.md](PLAN8.md)), each request of an attempt costs one
+short git process:
 
-Ancestry questions of the batch (already landed, fast-forward, merge base) go
-through the `ancestry.Checker` of the attempt. With `[graft.land] graph_ancestry
-= true` they use the stored `graph` index; with `false` they use `git`. The
-single-land path reads the same switch for its ancestry questions. Both return
-the same answers. The graph checker refuses repositories with shallow commits,
-grafts or replace refs, because git walks their history differently; for those
-it logs a warning and uses `git`. The single-land path still rebases with the
-repository's `Rebase`, not with the engine.
+1. The commit ID is peeled to a commit by the object info process of the
+   attempt (`git cat-file --batch-check`, started once per attempt).
+2. One listing of the commits that the change adds to the running tip
+   (`ancestry.Checker.Range`, `git rev-list --parents tip..commit`) answers
+   every question of the landing (`rebase.PlanLanding`): the change is already
+   landed when the list is empty; it fast-forwards the tip when the tip is a
+   parent of a listed commit; otherwise it diverges. For the rebase strategy, a
+   listed merge commit refuses the change (`InvalidArgument`, use
+   `STRATEGY_MERGE`), a list that ends at a root commit means unrelated history
+   (`InvalidArgument`), and otherwise the listed commits, oldest first, are the
+   commits to replay.
+3. The commits are replayed by the `rebase.Engine` of the attempt, which keeps
+   one `git merge-tree --stdin` process and one `git hash-object --stdin-paths`
+   process running for the whole attempt. The replay has the rules, errors and
+   conflict contents of the repository's `Rebase` with reapplied cherry-picks.
+   If the commit writer cannot write a commit (`ErrCommitWriterUnsupported`, for
+   example when signing is configured), that commit is written with the
+   ordinary commit writer of the repository.
+
+With `[graft.land] graph_ancestry = true` the listing walks the stored `graph`
+index in process instead of running `git rev-list`; both return the same
+commits. The graph checker refuses repositories with shallow commits, grafts or
+replace refs, because git walks their history differently; for those it logs a
+warning and uses `git`. The single-land path answers its ancestry questions with
+the same switch, and still rebases with the repository's `Rebase`.
+
+### Durability of the objects of a batch
+
+The merge-tree and hash-object processes of an attempt write their objects into
+the quarantine of the attempt without fsync. Before the compare-and-swap, the
+attempt packs every loose object of its quarantine into one pack with
+`git pack-objects`, which writes and fsyncs the pack and its index, and removes
+the loose files and their fan-out directories. The quarantine migration of the
+update then moves the pack files into the repository, fsyncing them again,
+before the reference changes. So every object that the new tip reaches is on
+disk before the branch points to it, with a fixed number of fsyncs per batch
+instead of about three per object. A batch that only fast-forwards writes no
+object and packs nothing.
+
+If packing fails, the update of the attempt fails: the requests that changed the
+running tip fail with the error, as for any failed update (see *Outcomes of the
+CAS*), and the branch does not move. Each published batch adds one pack to the
+repository, like a push; housekeeping repacks them as it repacks the packs of
+pushes.
 
 ### Hooks and identity of the combined update
 
@@ -335,11 +365,17 @@ negative; zero means the default.
 The batch executor (`internal/gitaly/service/operations`) defines:
 
 - `graft_land_batch_phase_seconds{phase}` (histogram): time per phase of a batch
-  attempt. The phases are `quarantine` (opening the quarantine), `tip` (reading
-  the branch tip), `land_member` (one observation per request the stepper lands,
-  in every attempt, denied, conflicting and already-landed requests included),
-  `update` (the CAS and its hooks) and `total` (one observation per execution of
-  the batch, which covers all of its attempts, rebuilds and fallbacks).
+  attempt. The phases are `quarantine` (opening the quarantine and the processes
+  of the attempt), `tip` (reading the branch tip), `land_member` (one
+  observation per request the stepper lands, in every attempt, denied,
+  conflicting and already-landed requests included), `plan` and `replay` (parts
+  of `land_member`: the range listing and decision of a request, and the replay
+  of a rebased request), `pack` (packing the objects of an attempt before its
+  update), `update` (the CAS and its hooks) and `total` (one observation per
+  execution of the batch, which covers all of its attempts, rebuilds and
+  fallbacks).
+- `graft_land_batch_packed_objects_total` (counter): objects that attempts
+  packed before their update.
 - `graft_land_batch_members_total{outcome}` (counter): requests by outcome, with
   the outcomes `landed`, `already_landed`, `conflict`, `denied` and `error`.
 
