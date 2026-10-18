@@ -243,6 +243,69 @@ WP76 audits the syncer's paths (the single-flight retry rounds, `fetch`,
 tests that a round slower than the bound is cancelled. Verify's dry hydration runs
 under a deadline of `W` from its start, tested the same way.
 
+### SHADOW BUDGET requirement (WP73b, binding; charter case B)
+
+Found in WP73b: `TestStorageShadowModeBenchmarkHasNoDivergence` failed under
+machine load with `select repository: context deadline exceeded`. Traced (pool
+waits 0, SQLite lock waits under 50 ms; the failure reproduced byte for byte
+with a 150 ms budget): Preparing's git work used up the shadow budget, and
+Prepared failed at its first context-aware call, which was the `SELECT` of
+`GetRepository`. The design behaved as specified; the test asserted more than
+the design guarantees.
+
+* **Old (implicit) requirement, asserted by the test:** in shadow mode every
+  reference transaction is recorded in the database, under any load.
+* **Requirement (RULE 4, stated):** shadow mode never fails or noticeably delays
+  a git write: the storage-core work of one reference transaction, the Preparing
+  and Prepared phases together, runs under `shadow_timeout`. A transaction whose
+  work exceeds it is **not recorded**: the failure is counted in
+  `graft_storage_shadow_errors_total` and logged at error level, and the git write
+  proceeds. The database misses that write until the next write of the same
+  reference, which is recorded as a forced changeset (counted in
+  `graft_storage_shadow_divergences_total` and logged); meanwhile `graft storage
+  verify` reports the reference as diverging. Recording every write is
+  guaranteed only while the shadow work of every transaction fits the budget.
+* **Operator rule:** switch to authoritative mode only with
+  `graft_storage_shadow_errors_total`, `graft_storage_shadow_divergences_total`
+  and `graft_storage_untracked_writes_total` at zero and `graft storage verify
+  --connectivity` consistent on every repository.
+* **Tests:** the mirroring test runs with a non-binding budget, because it tests
+  the correctness of the mirroring and whether a load fits 5 s depends on the
+  machine; `TestStorageShadowModeBudgetOverrun` tests the budget path
+  deterministically, for an overrun in Preparing and one in Prepared (git write
+  succeeds, error logged, nothing recorded, verify reports the divergence, the next
+  write is forced and logged), and the voter's unit tests check the counter.
+
+### SQLite write admission (WP73b, binding)
+
+Found in WP73b: `TestCommitsOnOneReferenceAreDense/sqlite` (32 writers on one
+reference) failed under load with `database is locked`. Traced on two cores: the
+write lock is busy all the time (summed holds at least the wall time; mean hold
+9 ms), but SQLite's busy handler keeps no queue, so the lock goes to whichever
+waiter retries first: mean wait 0.16 s, longest 3.05 s where a fair queue bounds
+it near 0.3 s, and under heavier load the tail crossed the 10 s busy timeout.
+Postgres queues its row-lock waiters and is not affected.
+
+* Every SQLite `Store` admits its write transactions one at a time, first come
+  first served (`sqlstore.writeQueue`), before `BEGIN IMMEDIATE`; the admission is
+  handed directly to the next waiter, so no newcomer overtakes it, and a writer
+  whose context ends leaves the queue at once.
+* **One admission covers one attempt** of `withTx`: it is taken right before
+  `BEGIN IMMEDIATE` and released when that attempt committed or rolled back. A
+  writer never holds it while `retryTx` sleeps before its next attempt, so the
+  writers behind it never wait for a lock nobody uses. No transaction function
+  starts another write transaction, and the admission is always taken before
+  SQLite's lock, so the two cannot wait for each other (LOCK ORDER).
+* Read transactions (the query-only pool) and plain reads need no admission.
+* **Limit:** the fairness is per process. Several processes on one SQLite file
+  (several nodes on one host) still meet in SQLite's busy handler; a multi-node
+  deployment uses Postgres, SQLite is for one node or for tests (STORAGE.md).
+* **Tests:** writers are admitted in arrival order; a writer whose context ends
+  leaves the queue and writes nothing; the hand-over never loses the admission when
+  it races a cancellation; the dense test and the LOCK ORDER `-race` test; and the
+  dense test's wait distribution before and after, measured with the WP73b tracing
+  under the same pinning.
+
 ### Liveness is per key (change G)
 
 Liveness is decided per key from the rows that reference it: a key is live when

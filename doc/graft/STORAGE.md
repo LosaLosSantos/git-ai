@@ -118,6 +118,21 @@ that landed while the repository's import was not complete) shows up as a
 divergence until a later write records the reference as a forced changeset;
 its objects are uploaded with the pack of the next write that builds on them.
 
+Shadow mode never fails or noticeably delays a git write: the storage-core work
+of one reference transaction (building and uploading its pack, then recording
+it in the database) runs under `shadow_timeout`. A transaction whose work takes
+longer is **not recorded**: the failure is counted in
+`graft_storage_shadow_errors_total` and logged at error level, and the git write
+proceeds. The database misses that write until the next write of the same
+reference, which is recorded as a forced changeset (counted in
+`graft_storage_shadow_divergences_total`); until then `graft storage verify`
+reports the reference as diverging. Recording every write is therefore
+guaranteed only while the shadow work of every transaction fits the budget; on a
+heavily loaded machine some writes may not fit. Switch to authoritative mode only
+when those counters and `graft_storage_untracked_writes_total` are at zero and
+`graft storage verify --connectivity` is consistent on every repository (see
+[Switching](#switching-from-shadow-to-authoritative)).
+
 Authoritative mode serves reftable repositories only. Repositories created
 through `CreateRepository` are created with the reftable backend, and the syncer
 treats a local copy that is not reftable as a stale cache and hydrates a
@@ -170,9 +185,9 @@ environment variables and `.pgpass`, and buckets use the standard environment
 of their cloud SDK (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_*`).
 
 All nodes of a deployment use the same `database` and `bucket` and different
-`node_id` values. SQLite works for one node, or for several nodes on one host
-(the tests run several servers on one SQLite file); a deployment with nodes on
-several hosts needs Postgres and a shared bucket. The database schema is
+`node_id` values. SQLite is for one node (the tests also run several servers
+on one SQLite file, at the cost described in [Limits](#limits)); a deployment
+with more than one node needs Postgres and a shared bucket. The database schema is
 created and migrated at startup.
 
 Startup fails when the mode is unknown, authoritative mode is set without
@@ -523,6 +538,12 @@ show:
   the lock is taken), and git waits up to 10 s for it, so concurrent writes
   queue instead of failing; a write that waits longer than 10 s still fails with
   "reference is already locked". See [Benchmark](#benchmark).
+- **SQLite serves one node.** SQLite has a single write lock. The writes of
+  one gitaly process take it in the order they arrive, but several processes on
+  one SQLite file (several nodes on one host) meet in SQLite's own lock wait,
+  which keeps no queue: under steady contention an unlucky write can wait past
+  the 10 s busy timeout and fail. A deployment with more than one node uses
+  Postgres; SQLite is for one node, or for tests.
 - **Some mutators are refused in authoritative mode**, see
   [RPCs in authoritative mode](#rpcs-in-authoritative-mode).
 - **Switching back from authoritative mode** has no export of the changelog
