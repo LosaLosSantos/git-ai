@@ -140,6 +140,9 @@ type Options struct {
 	// short.
 	GCGrace  time.Duration
 	GCMargin time.Duration
+	// ShadowTimeout is the shadow budget of a transaction; zero means the
+	// production default (5s).
+	ShadowTimeout time.Duration
 }
 
 // Open opens a storage core for the test and closes it when the test ends.
@@ -167,6 +170,9 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 	if opts.GCMargin == 0 {
 		opts.GCMargin = 5 * time.Minute
 	}
+	if opts.ShadowTimeout == 0 {
+		opts.ShadowTimeout = 5 * time.Second
+	}
 
 	ctx := context.Background()
 
@@ -182,7 +188,7 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 		Meta:          meta,
 		Blobs:         blobs,
 		SyncTimeout:   10 * time.Second,
-		ShadowTimeout: 5 * time.Second,
+		ShadowTimeout: opts.ShadowTimeout,
 		GCGrace:       opts.GCGrace,
 		GCMargin:      opts.GCMargin,
 	}
