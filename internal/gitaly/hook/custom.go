@@ -12,6 +12,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/cgroups"
 	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/quarantine"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/helper/env"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -81,6 +82,17 @@ func (m *GitLabHookManager) newCustomHooksExecutor(ctx context.Context, repo *gi
 			stdinBytes, err = io.ReadAll(stdin)
 			if err != nil {
 				return err
+			}
+		}
+
+		// A custom hook is code that Gitaly does not control. When it runs with a quarantine as its
+		// object directory, it may write objects there that are not durable, which the migration
+		// of the quarantine then makes durable itself (see quarantine.Dir). Custom hooks run in the
+		// Gitaly process: gitaly-hooks forwards them through the HookService, and updateref calls
+		// the hook manager directly, so the quarantine is one of this process.
+		if len(hookFiles) > 0 {
+			if objectDir := environmentValue(env, "GIT_OBJECT_DIRECTORY"); objectDir != "" {
+				quarantine.MarkUntrustedWriter(objectDir)
 			}
 		}
 
@@ -212,6 +224,11 @@ func (m *GitLabHookManager) customHooksEnv(ctx context.Context, payload gitcmd.H
 	// case we're running with bundled Git such that Git can locate its binaries.
 	customEnvs = append(customEnvs, gitExecEnv.EnvironmentVariables...)
 
+	// The git commands of a custom hook write objects as durably as the server's own: a
+	// quarantine relies on its files being durable before it is migrated (see quarantine.Dir).
+	// The environment carries no other GIT_CONFIG_* variable (command.AllowedEnvironment).
+	customEnvs = append(customEnvs, gitcmd.ConfigPairsToGitEnvironment(m.fsyncConfiguration())...)
+
 	return append(customEnvs,
 		"GIT_DIR="+repoPath,
 		"GL_REPOSITORY="+payload.Repo.GetGlRepository(),
@@ -220,6 +237,38 @@ func (m *GitLabHookManager) customHooksEnv(ctx context.Context, payload gitcmd.H
 		"GL_USERNAME="+payload.UserDetails.Username,
 		"GL_PROTOCOL="+payload.UserDetails.Protocol,
 	), nil
+}
+
+// fsyncConfiguration returns the fsync configuration of the server's git commands: the defaults
+// of the command factory (gitcmd, GlobalConfiguration), overridden by the administrator's [git]
+// configuration, which the command factory applies after them.
+func (m *GitLabHookManager) fsyncConfiguration() []gitcmd.ConfigPair {
+	pairs := []gitcmd.ConfigPair{
+		{Key: "core.fsync", Value: "objects,derived-metadata,reference"},
+		{Key: "core.fsyncMethod", Value: "fsync"},
+	}
+
+	for _, configured := range m.cfg.Git.Config {
+		for i := range pairs {
+			if strings.EqualFold(configured.Key, pairs[i].Key) {
+				pairs[i].Value = configured.Value
+			}
+		}
+	}
+
+	return pairs
+}
+
+// environmentValue returns the value of the variable name in the environment variables envs, the
+// last one if it is set several times.
+func environmentValue(envs []string, name string) string {
+	value := ""
+	for _, variable := range envs {
+		if strings.HasPrefix(variable, name+"=") {
+			value = strings.TrimPrefix(variable, name+"=")
+		}
+	}
+	return value
 }
 
 // pushOptionsEnv turns a slice of git push option values into a GIT_PUSH_OPTION_COUNT and individual

@@ -4,20 +4,31 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage/mode"
 	"github.com/feder-cr/git-ai/internal/log"
-	"github.com/feder-cr/git-ai/internal/safe"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/internal/tempdir"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/proto"
 )
+
+// untrustedMigrationsTotal counts the migrations that fsynced the files of their quarantine
+// because a writer that Gitaly does not control ran with it.
+var untrustedMigrationsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "graft_quarantine_untrusted_migrations_total",
+	Help: "Quarantine migrations that fsynced the files of the quarantine because a custom hook ran with it.",
+})
 
 // Dir is a quarantine directory for Git objects. Instead of writing new commits into the main
 // repository, they're instead written into a temporary quarantine directory. This staging area can
@@ -25,11 +36,35 @@ import (
 // when the context gets cancelled. If the quarantine environment is discarded without being staged,
 // then none of the objects which have been created in the quarantine directory will end up in the
 // main repository.
+//
+// Durability contract: every file in a quarantine is durable when Migrate starts, its data and its
+// inode. The Gitaly writers make it so: they are git processes that the command factory starts with
+// core.fsync covering objects, or helpers that write without fsync and pack their objects into one
+// fsynced pack before the update (see localrepo.WithoutObjectFsync). Migrate then only makes the
+// new names durable, with one fsync per directory. A writer that Gitaly does not control, a custom
+// hook, is reported with MarkUntrustedWriter, and Migrate then fsyncs the files of that quarantine
+// itself.
 type Dir struct {
 	repo            *gitalypb.Repository
 	quarantinedRepo *gitalypb.Repository
 	dir             tempdir.Dir
 	locator         storage.Locator
+	// untrustedWriter is set when a writer that Gitaly does not control may have written into
+	// the quarantine, see MarkUntrustedWriter.
+	untrustedWriter atomic.Bool
+}
+
+// quarantines holds the quarantines of this process by the absolute path of their object
+// directory, so that MarkUntrustedWriter finds the quarantine that a hook was given.
+var quarantines sync.Map
+
+// MarkUntrustedWriter records that a writer that Gitaly does not control, such as a custom hook, ran
+// with objectDir as its object directory. When objectDir is a quarantine of this process, its
+// files are not trusted to be durable, and its migration fsyncs them first.
+func MarkUntrustedWriter(objectDir string) {
+	if d, ok := quarantines.Load(filepath.Clean(objectDir)); ok {
+		d.(*Dir).untrustedWriter.Store(true)
+	}
 }
 
 // New creates a new quarantine directory and returns the directory and a cleanup function.
@@ -52,12 +87,20 @@ func New(ctx context.Context, repo *gitalypb.Repository, logger log.Logger, loca
 		return nil, nil, err
 	}
 
-	return &Dir{
+	d := &Dir{
 		repo:            repo,
 		quarantinedRepo: quarantinedRepo,
 		locator:         locator,
 		dir:             quarantineDir,
-	}, cleanup, nil
+	}
+
+	key := filepath.Clean(quarantineDir.Path())
+	quarantines.Store(key, d)
+
+	return d, func() {
+		quarantines.CompareAndDelete(key, d)
+		cleanup()
+	}, nil
 }
 
 // Apply applies the quarantine on the repository. This is done by setting the quarantineDirectory
@@ -109,59 +152,129 @@ func (d *Dir) Migrate(ctx context.Context) error {
 		objectDir = "objects"
 	}
 
-	return migrate(ctx, d.dir.Path(), filepath.Join(repoPath, objectDir))
+	return migrate(ctx, d.dir.Path(), filepath.Join(repoPath, objectDir), d.untrustedWriter.Load())
 }
 
-func migrate(ctx context.Context, sourcePath, targetPath string) error {
+// migrate moves the objects of the quarantine at sourcePath into the object directory at
+// targetPath, in two passes.
+//
+// The first pass links every file into the target directories, in the order of sortEntries, so
+// that a pack's index appears after its data. An empty fan-out directory of the target may be
+// removed at any time: git's housekeeping (prune-packed, repack -d, prune) removes empty fan-out
+// directories, and git's own writers create their temporary file inside the fan-out directory,
+// which pins it. A quarantine is a separate directory, so a target directory that migrate created
+// or found can vanish before its first link. A link that fails because its target directory is
+// gone creates the directory again and links again; once the link succeeds the directory is not
+// empty and stays. Each round needs another removal between the creation and the link, so the loop
+// ends; it also ends with the context.
+//
+// The second pass, unless a transaction manager owns durability (storage.NeedsSync), fsyncs each
+// target directory that received a link, once, through a descriptor opened in the first pass, and
+// the object directory itself. The files are not fsynced: they are durable before the migration
+// (see Dir), unless untrustedWriter is set, in which case they are fsynced in parallel before the
+// first pass.
+//
+// Filesystem assumption (local ext4 in any data mode, or xfs; not NFS): a new hard link is
+// durable once its directory is fsynced; a link is one journaled operation that changes the
+// directory entry and the link count together; the journal commits its transactions in order, and
+// the fsync of a directory forces it up to the directory's last change. So after the second pass
+// every link is durable, and a crash before leaves a prefix of the links in their order.
+func migrate(ctx context.Context, sourcePath, targetPath string, untrustedWriter bool) error {
+	sync := storage.NeedsSync(ctx)
+
+	if sync && untrustedWriter {
+		untrustedMigrationsTotal.Inc()
+		if err := syncFilesInParallel(ctx, sourcePath); err != nil {
+			return fmt.Errorf("syncing the files of an untrusted writer: %w", err)
+		}
+	}
+
+	m := migration{ctx: ctx, dirs: map[string]*os.File{}}
+	defer m.closeDirs()
+
+	if err := m.openDir(targetPath); err != nil {
+		return err
+	}
+	if err := m.link(sourcePath, targetPath); err != nil {
+		return err
+	}
+
+	if !sync {
+		return nil
+	}
+
+	// The object directory last: it holds the entries of the fan-out directories that the first
+	// pass created.
+	for i := len(m.order) - 1; i >= 0; i-- {
+		if err := syncDirFile(m.dirs[m.order[i]]); err != nil {
+			return fmt.Errorf("sync directory %q: %w", m.order[i], err)
+		}
+	}
+
+	return nil
+}
+
+// migration is the state of the first pass of migrate.
+type migration struct {
+	ctx context.Context
+	// dirs holds a descriptor of each target directory, by path.
+	dirs map[string]*os.File
+	// order holds the target directories in the order they were opened, parents first.
+	order []string
+}
+
+// openDir creates the target directory dir if it does not exist and opens a descriptor of it,
+// replacing the descriptor of a directory of the same path that was removed.
+func (m *migration) openDir(dir string) error {
+	if err := os.Mkdir(dir, mode.Directory); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("creating target directory %q: %w", dir, err)
+	}
+
+	f, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("opening target directory %q: %w", dir, err)
+	}
+
+	if old, ok := m.dirs[dir]; ok {
+		_ = old.Close()
+	} else {
+		m.order = append(m.order, dir)
+	}
+	m.dirs[dir] = f
+
+	return nil
+}
+
+func (m *migration) closeDirs() {
+	for _, f := range m.dirs {
+		_ = f.Close()
+	}
+}
+
+// link links the files of sourcePath into targetPath, recursively, and removes sourcePath.
+func (m *migration) link(sourcePath, targetPath string) error {
 	entries, err := os.ReadDir(sourcePath)
 	if err != nil {
 		return fmt.Errorf("reading directory: %w", err)
 	}
 	sortEntries(entries)
 
-	syncer := safe.NewSyncer()
 	for _, entry := range entries {
-		if entry.Name() == "." {
-			continue
-		}
-
 		nestedTargetPath := filepath.Join(targetPath, entry.Name())
 		nestedSourcePath := filepath.Join(sourcePath, entry.Name())
 
 		if entry.IsDir() {
-			if err := os.Mkdir(nestedTargetPath, mode.Directory); err != nil {
-				if !errors.Is(err, os.ErrExist) {
-					return fmt.Errorf("creating target directory %q: %w", nestedTargetPath, err)
-				}
+			if err := m.openDir(nestedTargetPath); err != nil {
+				return err
 			}
-
-			if err := migrate(ctx, nestedSourcePath, nestedTargetPath); err != nil {
+			if err := m.link(nestedSourcePath, nestedTargetPath); err != nil {
 				return fmt.Errorf("migrating directory %q: %w", nestedSourcePath, err)
 			}
-
-			if storage.NeedsSync(ctx) {
-				if err := syncer.Sync(ctx, nestedTargetPath); err != nil {
-					return fmt.Errorf("sync directory: %w", err)
-				}
-			}
-
 			continue
 		}
 
-		if err := finalizeObjectFile(nestedSourcePath, nestedTargetPath); err != nil {
+		if err := m.linkFile(nestedSourcePath, nestedTargetPath); err != nil {
 			return fmt.Errorf("migrating object file %q: %w", nestedSourcePath, err)
-		}
-
-		if storage.NeedsSync(ctx) {
-			if err := syncer.Sync(ctx, nestedTargetPath); err != nil {
-				return fmt.Errorf("sync object: %w", err)
-			}
-		}
-	}
-
-	if storage.NeedsSync(ctx) {
-		if err := syncer.Sync(ctx, targetPath); err != nil {
-			return fmt.Errorf("sync object directory: %w", err)
 		}
 	}
 
@@ -170,6 +283,105 @@ func migrate(ctx context.Context, sourcePath, targetPath string) error {
 	}
 
 	return nil
+}
+
+// linkFile links the file at sourcePath to targetPath, creating the target directory again when
+// it was removed (see migrate).
+func (m *migration) linkFile(sourcePath, targetPath string) error {
+	for {
+		beforeLink(targetPath)
+
+		err := finalizeObjectFile(sourcePath, targetPath)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+
+		if _, statErr := os.Lstat(sourcePath); statErr != nil {
+			return fmt.Errorf("%w (source: %w)", err, statErr)
+		}
+		if ctxErr := m.ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%w (%w)", err, ctxErr)
+		}
+
+		// The source exists, so the target directory is gone.
+		if err := m.openDir(filepath.Dir(targetPath)); err != nil {
+			return err
+		}
+	}
+}
+
+// beforeLink runs before each link of the first pass of migrate. Tests replace it to remove a
+// target directory at that point, as housekeeping may.
+var beforeLink = func(targetPath string) {}
+
+// syncDirFile fsyncs the descriptor of a target directory. Tests replace it to count the fsyncs.
+var syncDirFile = func(f *os.File) error {
+	return f.Sync()
+}
+
+// syncFile fsyncs the file at path. Tests replace it to count the fsyncs.
+var syncFile = func(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return f.Sync()
+}
+
+// maxParallelSyncs bounds the fsyncs that syncFilesInParallel runs at once.
+const maxParallelSyncs = 16
+
+// syncFilesInParallel fsyncs every file under dir. Concurrent fsyncs of the files of one
+// filesystem share journal commits, which one fsync after another does not.
+func syncFilesInParallel(ctx context.Context, dir string) error {
+	var files []string
+	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	slots := make(chan struct{}, maxParallelSyncs)
+	for _, path := range files {
+		if err := ctx.Err(); err != nil {
+			wg.Wait()
+			return err
+		}
+
+		slots <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+
+			if err := syncFile(path); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("sync %q: %w", path, err)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	return firstErr
 }
 
 // finalizeObjectFile will move the object file (either a packfile, its metadata or or a loose

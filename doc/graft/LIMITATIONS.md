@@ -140,6 +140,18 @@ Git hooks use private.
   does this. The quickstart creates a bare repository on disk and seeds it
   with a push.
 - `graft clone` needs the branch to exist. An empty repository cannot be cloned.
+- Durability of written objects assumes a local journaling filesystem, ext4 (in
+  any `data=` mode) or xfs, not NFS. The objects of a write are made durable by
+  their writer, and the migration of the write's quarantine into the repository
+  makes the new names durable with one fsync per directory: that relies on a
+  hard link being one journaled operation and on the fsync of a directory making
+  every earlier change of the journal durable. On other filesystems an object
+  written just before a crash may be missing although the write succeeded.
+- Custom hooks get the server's `core.fsync` configuration, so the objects that
+  their git commands write into a quarantine are durable. When a custom hook
+  runs with a quarantine, the migration of that quarantine also fsyncs its files,
+  because a hook may write objects without git; that costs about one fsync per
+  file of the write.
 
 ### Landing (`UserLand`)
 

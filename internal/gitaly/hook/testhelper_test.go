@@ -50,6 +50,16 @@ func getExpectedEnv(tb testing.TB, ctx context.Context, locator storage.Locator,
 
 	expectedEnv["PATH"] = fmt.Sprintf("%s:%s", filepath.Dir(execEnv.BinaryPath), os.Getenv("PATH"))
 
+	// Custom hooks get the fsync configuration of the server's git commands (see customHooksEnv
+	// and TestCustomHooksGetTheFsyncConfiguration).
+	for _, variable := range gitcmd.ConfigPairsToGitEnvironment([]gitcmd.ConfigPair{
+		{Key: "core.fsync", Value: "objects,derived-metadata,reference"},
+		{Key: "core.fsyncMethod", Value: "fsync"},
+	}) {
+		kv := strings.SplitN(variable, "=", 2)
+		expectedEnv[kv[0]] = kv[1]
+	}
+
 	result := make([]string, 0, len(expectedEnv))
 	for key, value := range expectedEnv {
 		result = append(result, fmt.Sprintf("%s=%s", key, value))
