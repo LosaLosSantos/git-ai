@@ -1,12 +1,15 @@
 # Graft phase 7: pack garbage collection and checkpoint compaction (binding plan)
 
-Status: binding contract for WP71–WP79 (storage core milestone 3). It extends
-the phase-6 foundation (`doc/graft/PLAN6.md`, which stays binding: the CAS
-semantics, the write path, the read path and catch-up, the REFTABLE, IMPORT,
-STALE CACHE and LOCK AND HISTORY rules, and RULES 1–15 all still apply). This
-plan adds tables, interface methods and packages; it never edits an applied
-migration and never changes a phase-6 exported signature except where a rule
-below says so.
+Status: binding contract for WP71–WP79 (storage core milestone 3). First
+version 85189d4; **amended 2026-10-18 after the PM review** (changes A–H, the
+answers to the open questions, and the "No patches: refactor the cause" section
+of PM.md). It extends the phase-6 foundation (`doc/graft/PLAN6.md`, which stays
+binding: the CAS semantics, the write path, the read path and catch-up, the
+REFTABLE, IMPORT, STALE CACHE and LOCK AND HISTORY rules, and RULES 1–15). This
+plan adds tables, interface methods and packages, and **refactors two phase-6
+contracts** (the pack key format and `BlobStore.Put`, see the PACK OWNERSHIP
+RULE), authorized by the PM provided every phase-6 storage test is green
+afterwards. It never edits a released migration.
 
 Owner workstream: **m3** (`internal/graft/corestore/**`,
 `internal/gitaly/service/storagecore/**`, the storage sub-commands of
@@ -15,543 +18,694 @@ Owner workstream: **m3** (`internal/graft/corestore/**`,
 
 ## Problem
 
-`doc/graft/STORAGE.md`, "Limits", states two gaps left after the first
-release:
+`doc/graft/STORAGE.md`, "Limits", states two gaps left after the first release:
 
-1. **Packs are never deleted.** Every reference transaction uploads a
-   content-addressed pack before it commits (`doc/graft/PLAN6.md`, write path).
-   Nothing ever removes one. Three kinds accumulate forever in
-   `repos/<repo_id>/packs/`:
-   * **orphans** of writes that uploaded a pack and then did not commit the
-     changeset (a transaction aborted after the Preparing phase, a node that
-     died before the database commit — `graft_storage_local_commit_failures_total`
-     and every aborted Preparing pack);
+1. **Packs are never deleted.** Every reference transaction uploads a pack
+   before it commits (PLAN6, write path), and nothing ever removes one:
+   * **orphans** of writes that uploaded a pack and then did not commit (an
+     aborted transaction after the Preparing phase, a node that died before the
+     database commit);
    * **superseded** changeset packs, whose objects a later consolidated state
      already contains;
-   * the packs of **removed repositories** (`RemoveRepository` deletes the
-     database rows through `ON DELETE CASCADE`, but the bucket keeps every pack
-     under the removed repository's prefix).
+   * the packs of **removed repositories** (`RemoveRepository` cascades the
+     database rows, the bucket keeps `repos/<repo_id>/`).
 2. **No checkpoint compaction.** Hydration (`syncer.hydrate`) and the dry
-   hydration of `graft storage verify --connectivity` replay **every** changeset
-   from sequence 1: they download and index every pack the repository ever had.
-   Catch-up of a node that fell behind does the same from its watermark. The
-   cost of a fresh node and of a connectivity check grows without bound with the
-   history of the repository.
+   hydration of `graft storage verify --connectivity` replay every changeset
+   from sequence 1. Their cost grows without bound with the history.
 
-The database is authoritative and `repo_id` is never reused, so both can be
-solved without ever risking the correctness of a read or a write: a consolidated
-**checkpoint** gives hydration a bounded starting point, and a crash-safe,
-idempotent **mark and sweep** reclaims the packs that no reader needs, with the
-database as the single source of truth over what is live.
+A third, latent problem was found in review and is the subject of the PACK
+OWNERSHIP RULE: **bucket objects are silently shared between writes.** Pack keys
+are content-addressed and `BlobStore.Put` returns success without writing when
+the key exists, so a write can commit a changeset whose pack is an object it did
+not write and whose liveness is decided by other rows. Any collector, however
+careful, can then delete an object that a write in flight relies on. Phase 6 never
+deletes, so the defect was harmless; phase 7 must remove its cause before it
+deletes anything.
 
 ## Goal and non-goals
 
-Deliver, for the storage core in authoritative mode (and, for the parts that
-make sense without a source of truth, in shadow mode — see the SHADOW SCOPE
-rule):
-
-* **Checkpoints.** Per repository, a checkpoint at sequence `N` = one
-  consolidated, content-addressed pack holding every object reachable from the
-  references as of `N`, plus the reference snapshot at `N`, recorded in the
-  database **atomically after the pack is uploaded**. Hydration and catch-up
-  start from the newest checkpoint `<= head` and replay only changesets `> N`.
-  Created by a background task on configurable thresholds and on demand
-  (`graft storage checkpoint` + RPC). Writes are never blocked while a
-  checkpoint is built.
-* **Pack GC.** Mark and sweep, idempotent, crash-safe after every step, the
-  database authoritative. Reclaims (a) orphan packs, (b) changeset packs covered
-  by a kept checkpoint, (c) packs of removed repositories, and the superseded
-  checkpoint packs themselves. `graft storage gc` (+ `--dry-run`) and the
-  background task.
+* **Pack ownership.** Every pack object in the bucket is written by, and belongs
+  to, exactly one database row (a changeset or a checkpoint). No write relies on
+  an object it did not upload.
+* **Checkpoints.** Per repository, a checkpoint at sequence `N` = one consolidated
+  pack holding every object reachable from the references at `N` and from the
+  head and base commits of the reviews open at the time of the build, plus the
+  reference snapshot at `N`, recorded atomically after the pack is uploaded.
+  Hydration starts from the newest checkpoint and replays only changesets `> N`.
+  Created on demand (`graft storage checkpoint` + RPC) and by the background task
+  when it is enabled. Writes are never blocked while a checkpoint is built.
+* **Pack GC.** Mark and sweep, database authoritative, idempotent, crash-safe
+  after every step. Reclaims orphans, changeset packs covered by a checkpoint old
+  enough that no reader can still need them, superseded checkpoint packs, and the
+  packs of removed repositories. `graft storage gc` (+ `--dry-run`), `graft
+  storage gc --removed`, and the background task.
 
 Out of scope (stated as limits or future work in STORAGE.md): per-directory
-permissions; S3/GCS/Azure testing (no server here — file/mem buckets only);
-renaming anything; **local-repository housekeeping** (no `git gc`/repack of a
-node's cache — the cache is rebuildable from a checkpoint, so an operator
-reclaims local disk by removing and re-hydrating a cache; we do not add local
-maintenance here); changelog-row / changeset-metadata compaction (we delete
-packs, never changeset or changelog rows, so `graft log` and the changelog
-cursors are untouched).
+permissions; S3/GCS/Azure testing (no server here, file and mem buckets only);
+renaming anything; local-repository housekeeping (no `git gc` of a node's cache;
+the cache can be rebuilt from a checkpoint); compaction of changeset, changelog or
+review rows (only packs are deleted).
 
 ## Design
 
 ### Overview
 
-The expensive, immutable state is the **packs** in the bucket. The cheap state
-is the **changeset metadata** (`graft_changesets`, `graft_changeset_refs`) and
-the **changelog** (`graft_changelog`). Phase 7 reclaims packs and never touches
-the metadata or the changelog: every changeset row stays, so the WAL, the
-changelog and their consumers' cursors are unaffected. A checkpoint supersedes
-the *packs* of the changesets up to its sequence, not their rows.
+The expensive, immutable state is the packs in the bucket. The cheap state is the
+changeset metadata (`graft_changesets`, `graft_changeset_refs`) and the changelog
+(`graft_changelog`). Phase 7 deletes packs and never touches those rows, so the
+WAL, the changelog and their consumers' cursors are unaffected. A checkpoint
+supersedes the *packs* of the changesets up to its sequence, not their rows.
 
 ```
-seq:   1    2    3   ...        N (checkpoint)   N+1  ...  head
-packs: p1   p2   p3  ...        [reclaimable once checkpoint N exists]
-                                 C_N (consolidated)  p_{N+1} ... p_head
-rows:  all changeset rows kept (WAL + changelog), forever
+seq:   1    2    3   ...   N (checkpoint)    N+1  ...  head
+packs: p1   p2   p3  ...   pN                p_{N+1} ... p_head
+                           C_N (consolidated pack of the checkpoint)
+rows:  every changeset row is kept (WAL + changelog)
 ```
 
-A **checkpoint at N** is: a consolidated pack `C_N` (objects reachable from the
-references at N) uploaded to the bucket, plus the reference snapshot at N, plus
-a row in `graft_checkpoints`, committed in one transaction after `C_N` is
-uploaded. Because `C_N` holds the full reachable closure at N, the individual
-packs `p1..pN` are then redundant for reconstructing any state `>= N`.
+`p1..pN` are reclaimed only once the checkpoint `N` is old enough that no
+hydration, catch-up or verification that could still read them is running (the
+GC BOUNDARY rule). Every pack has exactly one owner row (the PACK OWNERSHIP
+RULE), so "is this pack still needed" is a question about its owner row only.
 
-* **Hydration** uses the newest checkpoint `<= head`: it indexes `C_N`, sets the
-  references to the snapshot at N, then replays changesets `(N, head]` exactly
-  as the phase-6 hydration replays `(0, head]`.
-* **Catch-up** of a node whose watermark is `< N` cannot download the reclaimed
-  `p` packs, so it **re-hydrates** from the checkpoint. A node at `>= N` catches
-  up from its watermark as before (those packs are never reclaimed).
-* **GC** keeps every pack that a hydration or catch-up still needs: the kept
-  checkpoint packs and every changeset pack with sequence `> C` (the newest kept
-  checkpoint's sequence). It deletes the rest, orphans only after a grace
-  period.
+### PACK OWNERSHIP RULE (change A, binding)
+
+**Root cause.** The dedup race reported in review (a write's `Put` finds the key
+and skips; GC deletes the key; the write commits a changeset referencing a missing
+pack) is not a timing window to be narrowed. Its cause is structural: pack keys
+are content-addressed and shared, `Put`-exists makes a write depend on an object
+it did not write, and that object's liveness belongs to other rows (an older
+covered changeset, or a failed write's orphan). The phase-6 orphan grace was a
+time assumption, not an enforced invariant. Both are removed at their source.
+
+**Decision: per-row ownership** (direction 1 of the PM review). Rejected:
+database fencing of deletions with a doomed set (direction 2), see "Rejected
+alternatives".
+
+1. **Owned pack keys.** A pack key is
+   `repos/<repo_id>/packs/<sha256>-<nonce>.pack`, where `<sha256>` is the SHA-256
+   of the bytes (64 lowercase hex, still verified on every `Put` and `Get`, RULE
+   22) and `<nonce>` is 16 random bytes (`crypto/rand`, 32 lowercase hex) drawn
+   for that one upload. Every writer (the voter, `ImportRepository`, the
+   checkpoint builder) uploads under a key it just generated
+   (`corestore.NewPackKey(repoID, sum)`). There is no cross-row dedup: two writes
+   with byte-identical packs store two objects. Legacy keys
+   `repos/<repo_id>/packs/<sha256>.pack`, written by v0.1.0 and still referenced
+   by its rows, stay readable (`ParsePackKey` accepts both forms) and are never
+   written again.
+2. **`BlobStore.Put` is strictly create-only.** `Put` writes with
+   `blob.WriterOptions{IfNotExist: true}`; an existing key is the new error
+   `corestore.ErrBlobExists`, never success. The `Exists` pre-check is removed (one
+   bucket round trip less per write). A fresh nonce never collides in practice; if
+   it does, the writer fails rather than share an object. This is a phase-6
+   contract change: the blobstore tests "Put idempotent" and "concurrent Puts of
+   the same key" assert the old requirement and are rewritten to the new one
+   (exactly one concurrent `Put` of a key succeeds, the others return
+   `ErrBlobExists`, and the stored content is that of the winner).
+3. **Database fence for writers that are not upgraded.** A v0.1.0 binary cannot
+   start against a migrated database (sql-migrate v1.8.1 refuses an unknown
+   applied migration, and the store does not set `IgnoreUnknown`), but a node
+   already running v0.1.0 keeps writing with shared keys. Migration 2 therefore
+   installs a trigger on `graft_changesets` that rejects an insert whose
+   `pack_key` is not NULL and not an owned key
+   (`pack_key NOT LIKE 'repos/%/packs/%-%.pack'`). A write from an old binary that
+   carries a pack fails at its database commit (authoritative: git aborts it;
+   shadow: counted as a shadow error). Writes without a pack are unaffected.
+   Operational consequence, documented: upgrade every node together; until a node
+   runs the new binary, its pack-carrying writes fail.
+4. **In-flight writes have an enforced deadline.** Without sharing, the only
+   object a write relies on is its own upload, which is an unreferenced object
+   until the write commits. The writer and the collector are bound by one rule:
+   * **Writer.** Let `W = gc_grace − gc_margin`. The writer takes the time `t_r`
+     (monotonic clock) of the repository-record read (`GetRepository`) that
+     precedes its upload. It uploads the pack and commits the row that references
+     it under a context whose deadline is `t_r + W`. When the deadline passes, the
+     `Put` is cancelled (gocloud discards a cancelled writer, nothing is stored) or
+     the commit transaction is not started, and the write fails like any storage
+     failure (authoritative: `Unavailable`, git aborts; shadow: counted, the git
+     write proceeds). The voter's Prepared phase uses the pack of the Preparing
+     phase only when that pack's deadline has not passed; otherwise it builds and
+     uploads a new owned pack itself (the existing "Preparing did not prepare"
+     path), with a new `t_r` from its own record read. `ImportRepository` and the
+     checkpoint builder re-read the record immediately before their upload, so a
+     long pack build does not consume the deadline.
+   * **Collector.** An unreferenced pack is deleted only when the collector itself
+     **observed** it unreferenced at least `gc_grace` earlier, measured on the
+     database clock (`graft_gc_orphans.first_seen`, see the CLOCK RULE), and it is
+     still unreferenced in the same database snapshot whose time decides the age.
+     The bucket's modification time is never used.
+5. **Proof (no live pack is deleted).** Let `t_s` be the database time of the
+   snapshot in which the collector finds key `K` unreferenced with
+   `first_seen(K) <= t_s − gc_grace`. `first_seen(K)` was recorded after a listing
+   that returned `K`, so the upload of `K` completed before `first_seen(K)`, and
+   the writer's record read `t_r` was earlier still. The writer can commit only
+   before `t_r + W < first_seen(K) + gc_grace − gc_margin <= t_s − gc_margin`. A
+   commit before `t_s` is visible in the snapshot, so a committed row would
+   reference `K`. Since none does, no writer will ever commit `K`, and deleting it
+   is safe. The only clock assumption is that the drift of the clock **rates**
+   (the writer's monotonic clock against the database clock) over `gc_grace` is
+   smaller than `gc_margin`; absolute skew between machines does not enter.
+   `gc_margin` also absorbs the latency of a commit that is in flight when the
+   writer's deadline passes (a commit message sent just before the deadline may
+   still complete after it).
+6. **Covered and superseded packs need no time.** A covered changeset pack (its
+   owner row has `seq <= C_gc`) or the pack of a dropped checkpoint is owned by a
+   committed row, so no writer relies on it (new writers never reuse a key, rule
+   1), and its readers are excluded by the GC BOUNDARY rule. It is deleted in the
+   run that finds it.
+7. **Cost on the write path.** No database access is added. The `Put` loses its
+   `Exists` round trip; the nonce and the deadline are negligible; the trigger is
+   one `LIKE` per inserted changeset; byte-identical packs are stored twice (rare:
+   retried identical pushes). The preparing and prepared histograms and the bucket
+   bytes are measured before and after in the WP79 benchmark window.
+
+### CLOCK RULE (binding)
+
+Every time that decides a GC action is a **database time**: `graft_checkpoints.created_at`,
+`graft_gc_orphans.first_seen`, `graft_gc_removed.removed_at` and the lease times
+are written with the database clock (Postgres `now()` in the statement; SQLite
+`time.Now()` of the host, which every node shares because SQLite is single-host),
+and every "older than" comparison is made against the database time read in the
+same transaction (`now()` on Postgres; on SQLite `time.Now()` taken before the
+read transaction begins, so that every commit before it is visible). The writer's
+deadline is a duration on its own monotonic clock. The only assumption is the
+bounded rate drift of RULE 5 above, covered by `gc_margin`.
+
+### GC BOUNDARY rule (changes B and C, binding)
+
+Two boundaries are computed from the checkpoints, on the database clock:
+
+* **`C_gc`** = the sequence of the newest checkpoint created at least `gc_grace`
+  ago (0 when there is none). The collector reclaims changeset packs with
+  `seq <= C_gc` and the packs of checkpoints with `seq < C_gc`. It keeps every
+  changeset pack with `seq > C_gc` and every checkpoint with `seq >= C_gc`
+  (`checkpoint_retain` of the first version is removed: the lag makes it
+  unnecessary).
+* **`C_sync`** = the sequence of the newest checkpoint created at least
+  `gc_grace − sync_timeout − gc_margin` ago (0 when there is none). A sync round
+  (catch-up or hydration, bounded by `sync_timeout` through its context) decides
+  with `C_sync`: **re-hydrate when the watermark is below `C_sync`; otherwise
+  catch up** (change C: a node that is a few changesets behind when a checkpoint
+  is created catches up normally; the checkpoint does not count for it until it
+  is about `gc_grace − sync_timeout` old).
+
+Why no reader ever misses a pack. A checkpoint becomes `C_gc` only `gc_grace`
+after its creation. For a collector run during a sync round that starts at `t0`
+and ends before `t0 + sync_timeout` to reclaim a pack the round reads, the
+checkpoint that defines its `C_gc` must have been created before `t0 + sync_timeout
+− gc_grace`, so it was already `gc_grace − sync_timeout` old at `t0` (up to the
+rate drift covered by `gc_margin`), so its sequence is `<= C_sync`. A catch-up
+with watermark `>= C_sync` reads only packs `> C_sync`, a hydration reads the
+newest checkpoint (whose sequence is `>= C_sync >= C_gc`) and the packs after it.
+Configuration validation requires `gc_grace > sync_timeout + gc_margin`.
+
+Consequence: under the invariant a sync never meets a reclaimed pack, so a
+missing pack is corruption and stays an Internal error naming the pack (as in
+phase 6). The restart on a missing covered pack of the first review is not added:
+with these boundaries it would be unreachable code. (This refines B and C of the
+PM review; confirmed with the PM before WP76.)
+
+### Liveness is per key (change G)
+
+Liveness is decided per key from the rows that reference it: a key is live when
+**any** changeset with `seq > C_gc` or any checkpoint with `seq >= C_gc`
+references it. The snapshot therefore keeps, per key, the **maximum** referencing
+sequence. With owned keys every key has one row, but legacy v0.1.0 keys can be
+shared by several changesets, and the maximum makes them correct.
 
 ### What happens to unreachable objects (binding decision)
 
-The checkpoint pack is built with `git pack-objects` over the object-ID targets
-of the references at N, non-thin: it holds exactly the objects **reachable from
-the references at N**. Objects that were reachable at some earlier sequence but
-not at N — commits orphaned by a force-update, a deleted branch or tag, a
-rebased-away lineage — are **not** carried into the checkpoint pack, and once the
-changeset packs that introduced them are reclaimed they are gone from object
-storage.
+The checkpoint pack holds exactly the objects reachable from:
+* the object-ID targets of the references at `N`;
+* the `head_commit_id` and `base_commit_id` of every review that is **open** when
+  the checkpoint is built (answer 2 of the review).
 
-Justification. Hydration and catch-up only ever reconstruct the state at or
-after a checkpoint; no node ever needs a pre-checkpoint, now-unreachable object
-to reach `head`. `graft storage verify --connectivity` checks reachability from
-the **current** references, which the checkpoint pack plus the packs after it
-satisfy. The changeset log keeps its metadata (operation, actor, old/new object
-IDs), so the history questions the log answers keep working; only the git
-*objects* of superseded history below a checkpoint are pruned — exactly as
-`git gc` prunes unreachable objects in an ordinary repository. Stated as a limit
-in STORAGE.md. (Open question for the PM: whether the checkpoint pack should also
-retain objects reachable from the tips of **open reviews**; see "Open questions".)
+Objects reachable only from earlier states (commits orphaned by a force-update,
+deleted branches or tags, rebased-away lineages) and not from an open review are
+not carried into the checkpoint pack; once the changeset packs that introduced
+them are reclaimed, they are gone from object storage, as `git gc` prunes
+unreachable objects. Hydration and catch-up only reconstruct states at or after a
+checkpoint, verification checks reachability from the current references, and
+the changeset log keeps its metadata. **Documented limit:** the diff of a closed or
+merged review whose commits are reachable from no reference at a checkpoint may
+no longer be available.
+
+An open review whose head or base commit is not in the building node's local
+repository (it can only happen when the commit was pruned by an earlier
+checkpoint and the review was opened later on a node whose old cache still had
+it) is a review whose commits the storage core no longer holds. The build fails
+with `FailedPrecondition` naming the review IDs (metadata `review_id`), counts
+`graft_storage_checkpoint_review_objects_missing_total`, and records nothing; GC
+of the existing checkpoints is unaffected. The fix at the source belongs in the
+review service (refuse, in authoritative mode, a review whose commits are not in
+the storage core), which is not m3's file: raised with the PM.
 
 ### Data model (new migration, both dialects)
 
-A new migration `20261018000000_graft_storage_gc`, appended to
-`sqliteMigrations` and `postgresMigrations` in
-`internal/graft/corestore/sqlstore/migrations.go` (the phase-6 migration is
-never edited). A v0.1.0 database (migration 1 only) gets these tables created at
-`Open`; with zero checkpoints and zero tombstones every phase-7 path degrades to
-the phase-6 behaviour (hydration replays from 1; GC still reclaims orphans).
+Migration `20261018000000_graft_storage_gc`, appended to `sqliteMigrations` and
+`postgresMigrations` in `internal/graft/corestore/sqlstore/migrations.go`. A
+v0.1.0 database gets it at `Open`; with no checkpoints, observations or tombstones
+every phase-7 path degrades to phase-6 behaviour.
 
 ```sql
--- A checkpoint: a consolidated pack holding every object reachable from the
--- references at `seq`, plus (in graft_checkpoint_refs) the reference snapshot.
+-- A checkpoint: the consolidated pack and (graft_checkpoint_refs) the reference
+-- snapshot at seq.
 CREATE TABLE graft_checkpoints (
-    repo_id    <int>   NOT NULL REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
-    seq        <int>   NOT NULL,            -- the changeset sequence the checkpoint is at (1..head_seq)
-    pack_key   TEXT    NOT NULL,            -- repos/<repo_id>/packs/<sha256>.pack of the consolidated pack
-    pack_bytes <int>   NOT NULL DEFAULT 0,
-    created_at <ts>    NOT NULL,
+    repo_id    <int> NOT NULL REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
+    seq        <int> NOT NULL,           -- 1..head_seq
+    pack_key   TEXT  NOT NULL,           -- an owned key
+    pack_bytes <int> NOT NULL DEFAULT 0,
+    created_at <ts>  NOT NULL,           -- database clock
     PRIMARY KEY (repo_id, seq)
 );
 
--- The reference snapshot at a checkpoint: name -> target. Never holds an absent
--- value (only the references that exist at `seq`). `target` is a hex object ID
--- or "ref:<name>" for a symbolic reference, exactly like graft_refs.
+-- The reference snapshot at a checkpoint (no absent values). target is a hex
+-- object ID or "ref:<name>", as in graft_refs.
 CREATE TABLE graft_checkpoint_refs (
-    repo_id <int>  NOT NULL,
-    seq     <int>  NOT NULL,
-    ordinal <int>  NOT NULL,
-    name    BLOB   NOT NULL,                -- BYTEA on Postgres; may not be valid UTF-8
-    target  TEXT   NOT NULL,
+    repo_id <int> NOT NULL,
+    seq     <int> NOT NULL,
+    ordinal <int> NOT NULL,
+    name    BLOB  NOT NULL,              -- BYTEA on Postgres
+    target  TEXT  NOT NULL,
     PRIMARY KEY (repo_id, seq, ordinal),
     FOREIGN KEY (repo_id, seq) REFERENCES graft_checkpoints (repo_id, seq) ON DELETE CASCADE
 );
 
--- One maintenance lease per repository: the node building a checkpoint or
--- running GC for it. Acquired by compare-and-swap (expires_at in the past is
--- free). Observability + exclusivity only; never a correctness gate for reads
--- or writes.
-CREATE TABLE graft_gc_leases (
-    repo_id    <int>  NOT NULL PRIMARY KEY REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
-    holder     TEXT   NOT NULL,             -- node_id
-    acquired_at <ts>  NOT NULL,
-    expires_at  <ts>  NOT NULL
+-- The collector's observations of unreferenced packs (PACK OWNERSHIP RULE 4).
+-- Written only by the collector, never on the write path.
+CREATE TABLE graft_gc_orphans (
+    repo_id    <int> NOT NULL REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
+    pack_key   TEXT  NOT NULL,
+    first_seen <ts>  NOT NULL,           -- database clock
+    PRIMARY KEY (repo_id, pack_key)
 );
 
--- A tombstone for a removed repository, written in the same transaction as the
--- repository row's deletion. No foreign key: the repository row is gone. GC
--- deletes the bucket prefix repos/<repo_id>/ and then the tombstone.
+-- One maintenance lease per repository (exclusivity and efficiency; GC and
+-- checkpoint correctness do not depend on it, see change E).
+CREATE TABLE graft_gc_leases (
+    repo_id     <int> NOT NULL PRIMARY KEY REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
+    holder      TEXT  NOT NULL,          -- node_id
+    acquired_at <ts>  NOT NULL,          -- database clock
+    expires_at  <ts>  NOT NULL           -- database clock
+);
+
+-- A tombstone of a removed repository, written in the transaction that deletes
+-- the repository row. No foreign key: the row is gone.
 CREATE TABLE graft_gc_removed (
     repo_id       <int> NOT NULL PRIMARY KEY,
-    storage       TEXT  NOT NULL,           -- for logs/observability only
-    relative_path TEXT  NOT NULL,           -- "
-    removed_at    <ts>  NOT NULL
+    storage       TEXT  NOT NULL,        -- for logs
+    relative_path TEXT  NOT NULL,        -- for logs
+    removed_at    <ts>  NOT NULL         -- database clock
 );
 ```
 
-`<int>` = `INTEGER` on SQLite / `BIGINT` on Postgres; `<ts>` = RFC 3339 text in
-UTC on SQLite / `TIMESTAMPTZ` on Postgres; names are `BLOB`/`BYTEA`, as the
-phase-6 tables. `repo_id` of a checkpoint and of a tombstone is never reused, so
-a removed-and-recreated repository never shares a checkpoint or a tombstone with
-its predecessor.
+Plus the owned-key trigger (PACK OWNERSHIP RULE 3), both dialects:
 
-Go types (new, in `internal/graft/corestore/types.go`):
+```sql
+-- SQLite
+CREATE TRIGGER graft_changesets_owned_pack BEFORE INSERT ON graft_changesets
+WHEN NEW.pack_key IS NOT NULL AND NEW.pack_key NOT LIKE 'repos/%/packs/%-%.pack'
+BEGIN
+    SELECT RAISE(ABORT, 'storage core: the pack key is not an owned key; every node must run the same version');
+END;
+
+-- Postgres
+CREATE FUNCTION graft_changesets_owned_pack() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.pack_key IS NOT NULL AND NEW.pack_key NOT LIKE 'repos/%/packs/%-%.pack' THEN
+        RAISE EXCEPTION 'storage core: the pack key is not an owned key; every node must run the same version'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER graft_changesets_owned_pack BEFORE INSERT ON graft_changesets
+    FOR EACH ROW EXECUTE FUNCTION graft_changesets_owned_pack();
+```
+
+`<int>` = `INTEGER` on SQLite / `BIGINT` on Postgres; `<ts>` = RFC 3339 text in UTC
+on SQLite / `TIMESTAMPTZ` on Postgres. The `Down` steps drop the trigger (and the
+Postgres function) and the five tables. WP71 checks that sql-migrate executes the
+trigger bodies (they contain `;` inside `BEGIN ... END` and `$$ ... $$`) as single
+statements on both drivers, with a test.
+
+### Types and pack keys (`internal/graft/corestore/types.go`)
 
 ```go
-// Checkpoint is a consolidated state of a repository at a changeset sequence:
-// one pack with every object reachable from the references at Seq.
+// Checkpoint is a consolidated state of a repository at a changeset sequence.
 type Checkpoint struct {
     RepoID    int64
     Seq       uint64
     PackKey   string
     PackBytes int64
-    CreatedAt time.Time
+    CreatedAt time.Time // database clock
 }
 
-// RemovedRepository is a tombstone of a removed repository whose bucket packs
-// are still to be reclaimed.
+// RemovedRepository is a tombstone whose bucket prefix is still to be reclaimed.
 type RemovedRepository struct {
-    RepoID       int64
-    Key          RepoKey
-    RemovedAt    time.Time
+    RepoID    int64
+    Key       RepoKey
+    RemovedAt time.Time // database clock
 }
+
+// GCState is what the collector decides on, read in one database snapshot.
+type GCState struct {
+    Now         time.Time            // database time of the snapshot
+    Packs       map[string]uint64    // changeset pack key -> greatest referencing seq
+    Checkpoints []Checkpoint         // ascending by Seq
+    Orphans     map[string]time.Time // observed unreferenced key -> first_seen
+}
+
+var (
+    ErrBlobExists         = errors.New("storage core: blob already exists")
+    ErrCheckpointNotFound = errors.New("storage core: checkpoint not found")
+)
+
+// NewPackKey returns a new owned pack key for a pack of the repository with the
+// given SHA-256: "repos/<repo_id>/packs/<hex sha256>-<hex nonce>.pack", with a
+// random 16-byte nonce.
+func NewPackKey(repoID int64, sum [32]byte) string
+
+// ParsePackKey returns the repository ID and the SHA-256 of an owned key or of a
+// legacy key "repos/<repo_id>/packs/<hex sha256>.pack", and false for anything
+// else. Only canonical spellings are accepted (lowercase hex, no leading zeros).
+func ParsePackKey(key string) (repoID int64, sum [32]byte, ok bool)
+
+// IsOwnedPackKey reports whether key is an owned key (not a legacy one).
+func IsOwnedPackKey(key string) bool
 ```
 
-### BlobStore additions (RULE: GC needs listing and deletion)
+`PackKey(repoID, sum)` (the legacy constructor) is removed: no caller may produce a
+legacy key any more. Every call site (voter, `shadowpack.go`, import, tests) moves
+to `NewPackKey`.
 
-`corestore.BlobStore` (in `core.go`) gains two methods; `blobstore` implements
-them on the gocloud bucket, `coretest`/test doubles follow:
+### BlobStore changes (`core.go`, `blobstore`)
 
 ```go
-// BlobInfo describes a stored object for garbage collection.
+// BlobInfo describes a stored object.
 type BlobInfo struct {
-    Key     string
-    Size    int64
-    ModTime time.Time
+    Key  string
+    Size int64
 }
 
 type BlobStore interface {
-    // ... existing Put, Get, Exists, Close ...
+    // Put stores the content under key, which must not exist: an existing key is
+    // ErrBlobExists and nothing is written. A pack key's content must hash to its
+    // SHA-256 (ErrBlobCorrupt otherwise, nothing stored). A cancelled context
+    // stores nothing.
+    Put(ctx context.Context, key string, r io.Reader) error
+    // Get, Exists, Close: unchanged.
 
-    // List calls fn for every object whose key starts with prefix, in no
-    // defined order. It lists objects only, never directory markers. fn may
-    // return an error to stop the iteration (returned as-is).
+    // List calls fn for every object whose key starts with prefix, in no defined
+    // order, objects only (no directory entries). An error from fn stops the
+    // iteration and is returned.
     List(ctx context.Context, prefix string, fn func(BlobInfo) error) error
-    // Delete removes the object. A key that does not exist is success
-    // (idempotent), so a re-run of GC never fails on an already-deleted pack.
+    // Delete removes the object; a missing key is success.
     Delete(ctx context.Context, key string) error
 }
 ```
 
-Implementation (`blobstore`): `List` uses `bucket.List(&blob.ListOptions{Prefix:
-prefix})` and the iterator's `*blob.ListObject` (`Key`, `Size`, `ModTime`,
-`IsDir`), skipping `IsDir` entries (we list without a delimiter, so there are
-none, but we guard). `Delete` uses `bucket.Delete`, mapping `gcerrors.NotFound`
-to success. `ModTime` is the object's last-modified time; for the fileblob
-driver it is the file mtime, for mem it is the write time (both used in tests);
-for S3/GCS/Azure it is the provider's object mtime (untested here, see limits).
-File buckets may leave empty directories behind after the last pack under them
-is deleted; this is harmless and documented (the keys, which are what matters,
-are gone).
+`List` uses `bucket.List(&blob.ListOptions{Prefix: prefix})` and skips `IsDir`
+entries; `Delete` maps `gcerrors.NotFound` to success. `BlobInfo` carries no
+modification time on purpose (the CLOCK RULE: GC never reads bucket times). A
+file bucket may keep empty directories after the last key under them is deleted;
+the keys, which are what matters, are gone (documented).
 
-### MetaStore additions
+### MetaStore additions (`metastore.go`, `sqlstore`)
 
-`corestore.MetaStore` (in `metastore.go`) gains the methods below; `sqlstore`
-implements them on both dialects, with the phase-6 patterns (`bind` for
-placeholders, `withTx`/`withReadTx` with the retry on busy/serialization,
-`timeArg`/`scanTime`, `bytesArg`/`targetArg`, name chunks of
-`maxNamesPerQuery`). `DeleteRepository` changes behaviour (writes a tombstone).
+Implemented on both dialects with the phase-6 patterns (`bind`, `withTx` /
+`withReadTx` with the busy/serialization retry, `timeArg`/`scanTime`,
+`bytesArg`/`targetArg`, name chunks of `maxNamesPerQuery`).
 
 ```go
-// CheckpointInput is the state recorded by CreateCheckpoint.
+// CheckpointInput is the state CreateCheckpoint records.
 type CheckpointInput struct {
-    Seq       uint64             // 1..head_seq, strictly greater than the newest checkpoint's Seq
-    Refs      map[string]Target  // the reference snapshot at Seq; no absent values; no empty map
-    PackKey   string             // the already-uploaded consolidated pack (never empty)
+    Seq       uint64            // 1..head_seq, greater than the newest checkpoint's Seq
+    Refs      map[string]Target // the reference snapshot at Seq: no absent value, not empty
+    PackKey   string            // an owned key, already uploaded
     PackBytes int64
 }
 
 type MetaStore interface {
-    // ... existing methods ...
+    // ... phase-6 methods ...
 
-    // CreateCheckpoint records a checkpoint and its reference snapshot in one
-    // transaction. It locks the repository row, verifies Seq <= head_seq and
-    // Seq > the newest existing checkpoint's Seq (else an error, nothing
-    // written), inserts graft_checkpoints and graft_checkpoint_refs, and
-    // returns the stored Checkpoint. A checkpoint at Seq that already exists is
-    // returned unchanged (idempotent; the lease makes a concurrent build at the
-    // same Seq a non-case, but a resumed build after a crash is safe).
-    // ErrRepositoryNotFound for an unknown repository.
-    CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (Checkpoint, error)
-    // NewestCheckpoint returns the checkpoint of the repository with the
-    // greatest Seq; ok is false when there is none.
+    // CreateCheckpoint records a checkpoint and its snapshot in one transaction
+    // with created_at = the database time. It locks the repository row and
+    // requires Seq <= head_seq, Seq > the newest checkpoint's Seq and an owned
+    // PackKey of the repository (else an error, nothing written). A checkpoint at
+    // Seq that exists already is returned unchanged with created=false (its pack
+    // is kept; the caller's pack becomes an orphan). ErrRepositoryNotFound for an
+    // unknown repository.
+    CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
+    // NewestCheckpoint returns the checkpoint with the greatest Seq; ok is false
+    // when there is none.
     NewestCheckpoint(ctx context.Context, repoID int64) (cp Checkpoint, ok bool, err error)
-    // ListCheckpoints returns every checkpoint of the repository, ascending by
-    // Seq.
-    ListCheckpoints(ctx context.Context, repoID int64) ([]Checkpoint, error)
-    // CheckpointRefs returns the reference snapshot at the checkpoint (name ->
-    // target). ErrCheckpointNotFound when there is no checkpoint at seq.
+    // SyncBoundary returns the Seq of the newest checkpoint created at least age
+    // ago on the database clock, 0 when there is none (the C_sync of the GC
+    // BOUNDARY rule).
+    SyncBoundary(ctx context.Context, repoID int64, age time.Duration) (uint64, error)
+    // CheckpointRefs returns the snapshot of the checkpoint at seq;
+    // ErrCheckpointNotFound when there is none.
     CheckpointRefs(ctx context.Context, repoID int64, seq uint64) (map[string]Target, error)
-    // DeleteCheckpoint removes the checkpoint row and its snapshot (cascade). It
-    // returns false when there was none. The caller deletes the pack afterwards
-    // (a crash in between leaves an orphan pack, reclaimed by the orphan sweep).
+    // DeleteCheckpoint removes the checkpoint row and its snapshot; false when
+    // there was none.
     DeleteCheckpoint(ctx context.Context, repoID int64, seq uint64) (bool, error)
 
-    // ChangesetPacks calls fn for every changeset of the repository with a
-    // non-empty pack key, ascending by sequence, reading only (seq, pack_key).
-    // It is the lean scan GC marks live packs with (ListChangesets would carry
-    // every reference change).
-    ChangesetPacks(ctx context.Context, repoID int64, fn func(seq uint64, packKey string) error) error
+    // GCSnapshot reads, in one read transaction, the database time, the changeset
+    // pack keys with their greatest referencing sequence, the checkpoints and the
+    // orphan observations of the repository. ErrRepositoryNotFound if unknown.
+    GCSnapshot(ctx context.Context, repoID int64) (GCState, error)
+    // RecordOrphans stores first_seen = the database time for every key that has
+    // no observation yet (existing observations are kept).
+    RecordOrphans(ctx context.Context, repoID int64, keys []string) error
+    // ForgetOrphans removes the observations of the keys (deleted, or referenced
+    // since they were observed).
+    ForgetOrphans(ctx context.Context, repoID int64, keys []string) error
 
-    // AcquireMaintenanceLease takes the repository's maintenance lease for
-    // holder until now+ttl, by compare-and-swap: it succeeds when there is no
-    // lease or the current one has expired. RenewMaintenanceLease extends it if
-    // holder still holds it; ReleaseMaintenanceLease frees it if holder holds
-    // it. All three are no bar to reads or writes; they only serialize GC and
-    // checkpoint builds across nodes.
+    // AcquireMaintenanceLease takes the lease for holder until the database time
+    // plus ttl, by compare-and-swap: it succeeds when there is no lease, the lease
+    // has expired, or holder holds it already. RenewMaintenanceLease extends it
+    // when holder still holds it (held=false otherwise). ReleaseMaintenanceLease
+    // frees it when holder holds it. They never bar a read or a write.
     AcquireMaintenanceLease(ctx context.Context, repoID int64, holder string, ttl time.Duration) (acquired bool, err error)
     RenewMaintenanceLease(ctx context.Context, repoID int64, holder string, ttl time.Duration) (held bool, err error)
     ReleaseMaintenanceLease(ctx context.Context, repoID int64, holder string) error
 
-    // ListRepositories returns every repository registered in the storage
-    // (its head sequence > 0), for the background maintenance task. keyPrefix
-    // empty lists all storages' repositories; otherwise only the given storage.
+    // ListRepositories returns every repository of the given storage whose import
+    // is complete (head_seq > 0), ascending by ID. An empty storage lists the
+    // repositories of every storage.
     ListRepositories(ctx context.Context, storage string) ([]Repository, error)
 
-    // ListRemovedRepositories returns the tombstones of removed repositories
-    // whose bucket packs are still to be reclaimed.
-    ListRemovedRepositories(ctx context.Context) ([]RemovedRepository, error)
-    // DeleteRemovedRepository removes a tombstone after its bucket prefix was
-    // cleared. Idempotent.
+    // ListRemovedRepositories returns the tombstones of the given storage (every
+    // storage when empty) whose removed_at is at least minAge ago on the database
+    // clock (change F).
+    ListRemovedRepositories(ctx context.Context, storage string, minAge time.Duration) ([]RemovedRepository, error)
+    // DeleteRemovedRepository removes a tombstone; idempotent.
     DeleteRemovedRepository(ctx context.Context, repoID int64) error
 }
 ```
 
-`ErrCheckpointNotFound` is a new sentinel in `types.go`.
+**DeleteRepository (changed).** In the transaction that deletes the repository row
+it reads the row's `repo_id` and inserts the `graft_gc_removed` tombstone with
+`removed_at` = the database time. The cascade removes changesets, references,
+changelog, reviews, checkpoints, observations and the lease; the tombstone stays.
+An unknown key writes nothing and returns false, as before. Signature unchanged.
 
-**DeleteRepository (changed, binding).** It now writes a `graft_gc_removed`
-tombstone `(repo_id, storage, relative_path, removed_at)` in the **same
-transaction** that deletes the repository row, reading the `repo_id` before the
-delete. The cascade removes the repository's changesets, references, changelog,
-reviews, checkpoints and lease; the tombstone survives (no FK) so that GC can
-reclaim the bucket prefix afterwards. A key the database does not know writes no
-tombstone and returns false, as before. The method keeps its signature
-`(bool, error)`; the gate's `removeRepository` is unchanged.
+### Core additions (`core.go`, `open/open.go`)
+
+`corestore.Core` gains `GCGrace` and `GCMargin time.Duration` (from the config,
+also in shadow mode: GC runs there too, so the writers' deadline applies) and the
+method `func (c *Core) WriteDeadline() time.Duration` = `GCGrace − GCMargin` (the
+`W` of the PACK OWNERSHIP RULE).
 
 ### gitops addition
 
-One new function in `internal/graft/corestore/gitops/gitops.go`, with a test;
-nothing else in gitops changes:
-
 ```go
 // BuildPackFrom writes a self-contained (non-thin) pack of every object
-// reachable from tips (the consolidated pack of a checkpoint). The tips are the
-// object-ID targets of the references at the checkpoint sequence; symbolic and
-// zero targets are ignored. It is BuildFullPack restricted to the given tips:
-// `git rev-list --objects --stdin <tips>` (no --not) piped into
-// `git pack-objects --stdout`, hashed into a file in tmpDir. An empty tip set
-// returns an empty Pack.
+// reachable from tips: `git rev-list --objects --stdin` (the tips on stdin, no
+// --not) piped into `git pack-objects --stdout`, hashed into a file in tmpDir.
+// Zero tips are ignored; no tips is an empty Pack. A tip that is not in the
+// repository is an error that IsMissingObject recognizes.
 func BuildPackFrom(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID, tmpDir string) (Pack, error)
+
+// MissingObjects returns the tips that are not in the repository (one
+// `cat-file --batch-check` run).
+func MissingObjects(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID) ([]git.ObjectID, error)
 ```
 
-### Checkpoint creation (new package `internal/graft/corestore/checkpoint`)
+### Writers (WP73, change A on the write path)
 
-`checkpoint.Checkpointer` builds and records a checkpoint for one repository. It
-is used by the background maintenance task and by the `CreateCheckpoint` RPC.
+* **Voter.** `preparePack` records `t_r` after its `GetRepository` and uploads with
+  `NewPackKey` under a context with deadline `t_r + W`; `preparedPack` keeps the
+  deadline. `prepare` (Prepared) uses the prepared pack only when the repository ID
+  matches **and** its deadline has not passed; otherwise it calls `buildAndUpload`
+  with a new `t_r` from the record it has just read. The `CommitChangeset` call runs
+  under the pack's deadline (the earlier of the request context and `t_r + W`). A
+  transaction without a pack has no deadline. Shadow mode: the same, inside the
+  shadow timeout (which is far shorter than `W`).
+* **ImportRepository.** After building the full pack it re-reads the record
+  (`GetRepository`, which also confirms the registration still exists), uploads
+  with `NewPackKey` and commits changeset 1 under `t_r + W`. A resumed import uploads
+  a new owned pack; the pack of the interrupted attempt is an orphan.
+* **Checkpoint builder.** See below; same rule.
+
+### Checkpoint creation (`internal/graft/corestore/checkpoint`)
 
 ```go
 func New(core *corestore.Core, logger log.Logger, locator storage.Locator,
     repoFactory localrepo.Factory, fresh corestore.Freshener) *Checkpointer
 
 // Create builds a checkpoint of repo at the current database head and records
-// it. It requires authoritative mode and a local copy that EnsureFresh can
-// bring to the head (the objects of the checkpoint come from the local cache).
-// Returns the created Checkpoint and whether one was created (false = a
-// checkpoint already exists at the head, nothing to do).
-func (c *Checkpointer) Create(ctx context.Context, repo storage.Repository) (corestore.Checkpoint, bool, error)
+// it. created is false when a checkpoint at the head exists already.
+func (c *Checkpointer) Create(ctx context.Context, repo storage.Repository) (cp corestore.Checkpoint, created bool, err error)
+
+// FaultHook is called at "after_upload" and "after_commit" (tests only).
+var FaultHook func(point string) error
 ```
 
-Binding order (crash-safe; `FaultHook`-style test points at each `//!` below):
+Binding order:
 
-1. Require `core.Authoritative()` (else `FailedPrecondition`). `EnsureFresh` the
-   local copy. Read `(refs, N) = core.Meta.Refs(repoID)` — the reference
-   snapshot and the head sequence in **one consistent database snapshot**. If a
-   checkpoint at `N` already exists (`NewestCheckpoint`), return it, `created =
-   false`.
-2. The tips are the object-ID targets of `refs` (skip symbolic and absent).
-   `pack = gitops.BuildPackFrom(ctx, local, tips, tmpDir)` from the **local**
-   repository (fresh to `>= N`, so it holds every object reachable from `refs`;
-   nothing prunes the local cache). An empty repository (no object tips) records
-   a checkpoint with no pack is **not** allowed — a checkpoint must have a pack;
-   a repository whose references are only symbolic/empty is a degenerate case
-   handled by recording the snapshot with an empty pack key is disallowed, so we
-   skip creating a checkpoint (return `created = false`) when there are no object
-   tips. (Hydration of such a repository from 1 is already trivial.)
-3. `//! before_upload` — upload `pack` under `corestore.PackKey(repoID,
-   pack.SHA256)` (`BlobStore.Put`, create-only).
-4. `//! after_upload` — `core.Meta.CreateCheckpoint(repoID, CheckpointInput{Seq:
-   N, Refs: refs, PackKey, PackBytes})`. The snapshot `refs` is exactly the
-   references read in step 1, so it is consistent with `N`.
-5. `//! after_commit` — return the checkpoint, `created = true`.
+1. Require authoritative mode (else `FailedPrecondition`, SHADOW SCOPE) and a
+   reftable local repository. Read `(refs, N) = Meta.Refs(repoID)` (one snapshot).
+   If `NewestCheckpoint` is at `N`: return it, `created = false`.
+2. **Change D:** `EnsureFresh(repo)`. EnsureFresh catches up to a head read after
+   the call arrived, which is `>= N`; then read the local watermark and require
+   `wm.RepoID == repoID && wm.Seq >= N` (else `Internal`: the Freshener contract is
+   broken, never retried around). The local repository now holds every object of
+   the changesets `<= N`, hence every object reachable from `refs`.
+3. Tips = the object-ID targets of `refs` (symbolic and absent skipped) plus the
+   `head_commit_id` and `base_commit_id` of every open review
+   (`ListReviews(repoID, "", false, 0)`, each value validated as an object ID of
+   the repository's hash; empty values skipped). `MissingObjects` on the review
+   tips: any missing → `FailedPrecondition` naming the reviews (see "unreachable
+   objects"), metric, nothing uploaded. A missing reference tip is impossible after
+   step 2 and is `Internal`.
+4. `pack = BuildPackFrom(local, tips, tmpDir)`. No object tips → return
+   `created = false` (nothing to consolidate; hydration of such a repository is
+   already trivial).
+5. Re-read the record (`t_r`), upload under `NewPackKey(repoID, pack.SHA256)` with
+   deadline `t_r + W`. `//! after_upload`.
+6. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes})` under the
+   same deadline. `//! after_commit`.
 
-A crash after step 3 and before step 4 leaves the consolidated pack as an orphan
-(no checkpoint row references it), reclaimed by the orphan sweep. A re-run
-rebuilds from the head at that time (possibly a larger `N`) and commits. The
-build never holds a reference lock and never blocks a write: it reads a database
-snapshot and the local objects, and records the checkpoint in its own
-transaction, while writes keep appending changesets `> N` (CKPT-2).
+A crash after 5 leaves the pack as an orphan (reclaimed by the orphan protocol); a
+re-run starts over from the head at that time. The build holds no reference lock
+and never blocks or fails a write (CKPT-2).
 
-### Pack GC (new package `internal/graft/corestore/gc`)
+**Change E (fencing).** `CreateCheckpoint` does **not** check the maintenance lease
+in its transaction, and checkpoint correctness does not rely on the orphan grace
+being a guess either: it relies on (a) per-sequence idempotency (a second build
+at the same `N` returns the existing checkpoint, its own owned pack becomes an
+orphan), (b) monotonic sequences (a checkpoint at a smaller `N` than the newest
+is refused), and (c) the enforced orphan protocol for the loser's pack. Two
+checkpoints at different sequences built by two nodes whose leases overlapped are
+both valid states. The lease only prevents wasted builds.
 
-`gc.Collector` runs the mark and sweep for one repository and the removed-
-repository cleanup. Used by the background task and by `CollectGarbage`.
+### Pack GC (`internal/graft/corestore/gc`)
 
 ```go
 func New(core *corestore.Core, logger log.Logger) *Collector
 
-// Report is what a collection did (or would do, for a dry run).
 type Report struct {
-    CheckpointSeq      uint64 // the newest kept checkpoint, 0 when none
-    PacksDeleted       int    // covered + orphan + dropped-checkpoint packs
-    BytesReclaimed     int64
+    Boundary           uint64 // C_gc
     CoveredDeleted     int
-    OrphansDeleted     int
-    OrphansKeptInGrace int
     CheckpointsDropped int
-    RemovedRepos       int    // removed-repository prefixes reclaimed
+    OrphansDeleted     int
+    OrphansObserved    int    // newly observed, kept for now
+    OrphansInGrace     int    // observed earlier, not old enough yet
+    PacksDeleted       int
+    BytesReclaimed     int64  // sizes from List
+    RemovedRepos       int
     DryRun             bool
 }
 
-// CollectRepository reclaims the dead packs of one repository: changeset packs
-// covered by the newest kept checkpoint, dropped-checkpoint packs, and orphans
-// older than the grace period. The caller holds the repository's maintenance
-// lease. grace is config gc_grace; retain is config checkpoint_retain.
-func (c *Collector) CollectRepository(ctx context.Context, repoID int64, grace time.Duration, retain int, dryRun bool) (Report, error)
+// CollectRepository reclaims the dead packs of one repository. The caller holds
+// the repository's maintenance lease (efficiency only).
+func (c *Collector) CollectRepository(ctx context.Context, repoID int64, dryRun bool) (Report, error)
 
-// CollectRemoved reclaims the bucket prefix of every removed-repository
-// tombstone and deletes the tombstone. No lease (the repository is gone,
-// repo_id never reused, no writer); idempotent.
-func (c *Collector) CollectRemoved(ctx context.Context, dryRun bool) (Report, error)
+// CollectRemoved reclaims the bucket prefixes of the tombstones of the storage
+// (every storage when empty) that are older than gc_grace, then deletes the
+// tombstones.
+func (c *Collector) CollectRemoved(ctx context.Context, storage string, dryRun bool) (Report, error)
+
+// FaultHook is called at "after_drop_row", "after_delete", "mid_sweep" and
+// "after_prefix" (tests only).
+var FaultHook func(point string) error
 ```
 
-`CollectRepository` (binding; the database is authoritative at every step, and
-no live pack is ever deleted):
+`CollectRepository` (binding):
 
-1. `checkpoints = ListCheckpoints(repoID)` ascending. Choose the **kept** set:
-   always the newest; also the most recent `retain` checkpoints; also any
-   checkpoint younger than `grace` (so an in-flight hydration started before a
-   newer checkpoint appeared is safe). `C` = the newest checkpoint's sequence (0
-   when there is none). The checkpoints **to drop** are the rest (older than the
-   newest, beyond `retain`, and older than `grace`).
-2. `packKeys = {}`; `ChangesetPacks(repoID, func(seq, key){ packKeys[key] = seq })`.
-   Build the live set:
-   * every kept checkpoint's `PackKey`;
-   * every `key` in `packKeys` with `seq > C`.
-   The covered set = every `key` in `packKeys` with `seq <= C`.
-3. Drop the superseded checkpoints: for each, `DeleteCheckpoint` (row) first,
-   then its pack becomes an orphan for step 4 (we do **not** delete the pack
-   before the row: a crash in between would leave a row pointing at a missing
-   pack, which a hydration might pick — the row goes first, the pack is an orphan
-   afterwards). In a dry run, nothing is deleted; the pack is counted as a
-   dropped-checkpoint pack.
-4. Sweep: `Blobs.List("repos/<repoID>/packs/", func(obj){ ... })`. For each
-   `obj.Key`:
-   * in the live set → keep;
-   * in the covered set (`packKeys[key] <= C`) → delete (covered by a kept
-     checkpoint);
-   * otherwise it is an **orphan** (no changeset row and no kept checkpoint
-     references it — a dead write's pack, or a just-dropped checkpoint's pack):
-     delete only when `now - obj.ModTime >= grace`, else count it in
-     `OrphansKeptInGrace` and keep it.
-   `dryRun` deletes nothing and only counts.
-5. Return the `Report`. Idempotent: the live/covered sets are recomputed from
-   the database each run, and `Blobs.Delete` of an already-deleted key is a
-   no-op, so a crashed sweep converges on the next run and a re-run is cheap.
+1. `st = GCSnapshot(repoID)`. `C_gc` = the greatest `Seq` among `st.Checkpoints`
+   with `CreatedAt <= st.Now − gc_grace` (0 when none).
+2. **Drop superseded checkpoints:** for each checkpoint with `Seq < C_gc`:
+   `DeleteCheckpoint` (row first), `//! after_drop_row`, then `Blobs.Delete` of its
+   pack (owned by that row only, and no reader uses a checkpoint below `C_gc`).
+   A crash in between leaves an unreferenced pack, reclaimed by the orphan protocol.
+3. **Live set** (per key, change G): kept checkpoint packs (`Seq >= C_gc`) and
+   every key of `st.Packs` whose greatest sequence is `> C_gc`. **Covered set:**
+   keys of `st.Packs` whose greatest sequence is `<= C_gc`, minus the live set.
+4. **Sweep** `Blobs.List("repos/<repoID>/packs/")`, for each key:
+   * live → keep;
+   * covered → `Blobs.Delete`;
+   * referenced by no row: if `st.Orphans[key] <= st.Now − gc_grace` →
+     `Blobs.Delete` and then forget the observation; if it has a younger
+     observation → keep (in grace); if it has none → collect it for
+     `RecordOrphans`.
+   `//! mid_sweep` after the first deletion. Finally `RecordOrphans(new)` and
+   `ForgetOrphans` for the observations whose key is now referenced or was not
+   listed.
+5. Dry run: steps 1 and 3, and the sweep only counts (no delete, no observation
+   written).
 
-`CollectRemoved`: `ListRemovedRepositories`; for each tombstone,
-`Blobs.List("repos/<repo_id>/", delete each key)`, then
-`DeleteRemovedRepository(repo_id)`. A crash after a partial prefix delete leaves
-the tombstone; the next run finishes (idempotent). No lease.
+Every decision comes from one snapshot and the PACK OWNERSHIP proof; `Delete` of a
+missing key is success; a crashed run converges on the next one. Two collectors
+racing on one repository (lease expired) both make only safe decisions: deletes
+are idempotent, observations are inserted with "do nothing on conflict".
 
-### Hydration from a checkpoint (syncer, binding change)
+### Removed repositories (change F)
 
-`internal/graft/corestore/syncer/syncer.go`, `hydrate`, now seeds from the
-newest usable checkpoint instead of always from sequence 1. The phase-6 WP55
-RULE (catch-up never moves a reference backwards; the watermark only claims
-sequences whose effects are local) and the install/stale-cache handling are
-unchanged.
+`CollectRemoved`: `ListRemovedRepositories(storage, gc_grace)`; for each tombstone,
+`Blobs.List("repos/<repo_id>/")` and delete every key, `//! after_prefix`, then
+`DeleteRemovedRepository`. A tombstone is swept only once `removed_at` is at least
+`gc_grace` old: a writer whose record read found the repository did so before
+`removed_at`, and its upload is bounded by `t_r + W`, so no upload can arrive in the
+prefix after the sweep (the PACK OWNERSHIP RULE makes this an enforced bound, not
+an assumption). A crash after a partial prefix deletion leaves the tombstone; the
+next run finishes it. No lease (the repository is gone and its ID is never reused).
 
-`hydrate(ctx, repo, r, hash, path)`:
+### Hydration from a checkpoint (syncer, WP76)
 
-1. Choose the seed: iterate `ListCheckpoints(r.ID)` from the greatest `Seq`
-   downward and pick the first whose `Seq <= r.HeadSeq` and whose pack
-   `Blobs.Exists`/can be fetched. Call it `cp` (seed sequence `S = cp.Seq`,
-   snapshot `snap = CheckpointRefs(r.ID, S)`). If there is none, `S = 0`, no
-   seed pack, no snapshot — the phase-6 replay from 1.
-2. `InitBare` the build repository. When seeded, index `cp.PackKey` into it
-   (downloaded and SHA-256-verified exactly like a changeset pack; the pack key
-   is validated to belong to `r.ID`), and validate every name/target of `snap`.
-3. `f = newFetched(S)`; `fetch(ctx, buildRepo, tmpDir, r.ID, hash, f,
-   r.HeadSeq)` — downloads and indexes the changeset packs `(S, head]` and folds
-   their reference changes, as today.
-4. Compute the final reference set as of head: start from `snap` (the references
-   at `S`), then apply `f`'s changes — a changed reference's final value
-   overwrites, an absent final value deletes it. `applyBuild(combined)`.
-5. `WriteWatermark(buildPath, {r.ID, f.head})`, then `install` as today.
+`hydrate` seeds from `NewestCheckpoint`:
 
-The number of changesets replayed is `head - S`, bounded by the checkpoint
-cadence, instead of `head`. If no checkpoint's pack can be fetched **and** the
-replay from 1 needs a pack that GC reclaimed, hydration fails with an Internal
-error naming the missing pack (a genuine inconsistency); the newest checkpoint's
-pack is always present by GC-3, so this is the corruption case only.
+1. Seed `S` = the newest checkpoint's `Seq` and its snapshot (`CheckpointRefs`),
+   or `S = 0` without one.
+2. `InitBare`; when seeded, download, verify (SHA-256 against the key, `repo_id`
+   of the key) and index the checkpoint pack, and validate every name and target of
+   the snapshot (RULE 22).
+3. `f = newFetched(S)`; `fetch(..., f, r.HeadSeq)` downloads and indexes the packs
+   `(S, head]` and folds their reference changes.
+4. Final references = the snapshot, overwritten by `f`'s final values (an absent
+   final value deletes); `applyBuild` once; watermark `{r.ID, f.head}`; `install`.
 
-### Catch-up below a checkpoint (syncer, binding change)
+A missing checkpoint pack or a missing pack `> S` is an Internal error naming the
+key (corruption, GC BOUNDARY rule).
 
-A node whose watermark `wm.Seq < C` (the newest checkpoint) cannot download the
-reclaimed packs `(wm.Seq, C]`, so it must re-hydrate from the checkpoint rather
-than catch up. In `sync()`, the condition that chooses hydration gains this
-case:
+### Catch-up and the sync boundary (syncer, WP76, change C)
 
-* read `cp, hasCp = NewestCheckpoint(r.ID)` once per round (cheap);
-* hydrate when `!ok || wm.RepoID != r.ID || !localCurrent || (hasCp && wm.Seq <
-  cp.Seq)`; otherwise catch up (then `wm.Seq >= cp.Seq`, and every pack `(wm.Seq,
-  head]` is live, so it exists).
+In `sync()`, each round reads `C_sync = SyncBoundary(r.ID, gc_grace − sync_timeout −
+gc_margin)` and hydrates when `!ok || wm.RepoID != r.ID || !localCurrent ||
+wm.Seq < C_sync`; otherwise it catches up as in phase 6 (the WP55 RULE unchanged).
+`checkReplaceable` still runs before any hydration.
 
-Re-hydration rebuilds the local copy from the checkpoint and replaces it through
-the existing `install` path (which moves the stale copy aside under the
-repository lock). This is correct because the commit point is the database: every
-committed write is in the database at a sequence `<= head`, so it is either in
-the checkpoint (`<= S`) or replayed from `(S, head]`. It discards the local
-objects of a far-behind cache (wasteful but rare — an actively-served node stays
-near the head and never falls below a checkpoint). `checkReplaceable` (the
-shadow-history guard, IMPORT RULE) still runs first and is unaffected
-(authoritative mode writes no file changelog or file reviews).
+### Verify after compaction (`verify_objects.go`, WP76)
 
-Belt-and-suspenders in `fetch`: if a changeset pack with `seq <= C` is
-`ErrBlobNotFound` during a catch-up (a lagging round races a concurrent GC that
-reclaimed a covered pack), return `errRestart` so `sync` re-evaluates and
-hydrates from the checkpoint. A missing pack with `seq > C` stays a hard
-Internal error (real corruption). `fetch` is given the newest checkpoint
-sequence for this test.
+`checkStoredObjects` indexes the newest checkpoint's pack and the changeset packs
+`(S, head]` (all packs `1..head` without a checkpoint), then runs the reachability
+check as today, and also checks the open reviews' head and base commits. It runs
+under a deadline of `W` from its start (a dry hydration that read checkpoint `S`
+must end before a checkpoint newer than `S` can become `C_gc`); a missing pack is
+reported as a connectivity failure starting with `storage core objects:`.
 
-### Verify after compaction (service/storagecore/verify_objects.go, binding change)
-
-`checkStoredObjects` (the dry hydration of `graft storage verify
---connectivity`) replays from the newest checkpoint instead of from 1, so it
-keeps passing after GC reclaimed the covered packs:
-
-* `cp, ok = NewestCheckpoint(record.ID)`. When `ok`, index `cp.PackKey` into the
-  empty verification repository, then index the changeset packs for `seq in (C,
-  head]`. When not, index all changeset packs `1..head` (as today).
-* Then `git rev-list --objects --quiet` from the object-ID targets of the
-  database references, as today.
-
-A checkpoint pack that is missing or corrupt, or a missing changeset pack `>
-C`, is reported as a connectivity failure beginning `storage core objects:`
-exactly as a missing changeset pack is today.
-
-### Background maintenance task (new, `internal/graft/corestore/maintenance`)
-
-`maintenance.Runner` runs the checkpoints and GC on a timer. Wired in
-`internal/cli/gitaly/serve.go` (my section only), started with the server and
-stopped on shutdown (as `bundleGenerationStrategy.Start(ctx)` / `stop()`), only
-when the storage core is authoritative and `maintenance = "auto"`.
+### Background maintenance (`internal/graft/corestore/maintenance`, WP77)
 
 ```go
 func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collector,
@@ -559,80 +713,66 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 func (r *Runner) Start(ctx context.Context) (stop func())
 ```
 
-Each tick (every `maintenance_interval`):
+**Off by default** (answer 3): it runs only with `maintenance = "auto"` and in
+authoritative mode; the CLI is always available. Each tick (`maintenance_interval`):
+`CollectRemoved` for this node's storages; then, for each repository of
+`ListRepositories` that this node has a current local copy of:
+`AcquireMaintenanceLease` (skip when held elsewhere), checkpoint when
+`head_seq − newest checkpoint seq >= checkpoint_changesets` or the pack bytes of
+the changesets after the newest checkpoint `>= checkpoint_pack_bytes`, then
+`CollectRepository`, renewing during a long build and releasing at the end. Wired in
+`serve.go` (the storage core block only), started with the server and stopped on
+shutdown.
 
-1. `CollectRemoved` (tombstones; any node, no lease).
-2. For each repository `ListRepositories` reports in this node's storages that
-   this node has a **local copy with a current watermark** (so it can build a
-   checkpoint from local objects):
-   * `AcquireMaintenanceLease(repoID, node_id, lease_ttl)`; skip the repository
-     when another node holds it.
-   * `EnsureFresh`.
-   * If `head_seq - newestCheckpointSeq >= checkpoint_changesets` **or** the pack
-     bytes of the changesets since the newest checkpoint `>= checkpoint_pack_bytes`
-     (summed from `ChangesetPacks` / `ListChangesets` pack bytes), `Checkpointer.Create`.
-   * `Collector.CollectRepository(repoID, gc_grace, checkpoint_retain, false)`.
-   * `RenewMaintenanceLease` around a long build; `ReleaseMaintenanceLease` at
-     the end (a crash lets the lease expire after `lease_ttl`).
-
-A node without a local copy of a repository never builds its checkpoint (it has
-no objects), but any node may run GC of it (GC needs only the database and the
-bucket). In practice the node that serves a repository maintains it.
-
-### Configuration (`internal/gitaly/config/config_graft_storage.go`, my section)
-
-New keys on `[graft.storage]` (`GraftStorage` struct), all optional:
+### Configuration (`config_graft_storage.go`, my section)
 
 ```toml
 [graft.storage]
-# ... existing mode, database, bucket, node_id, sync_timeout, shadow_timeout ...
-maintenance            = "auto"    # off | auto — background checkpoints + GC (authoritative only). Default auto.
-maintenance_interval   = "1h"      # how often the background task scans repositories (Go duration)
-checkpoint_changesets  = 1000      # create a checkpoint after this many changesets since the last one (0 = disabled)
-checkpoint_pack_bytes  = 268435456 # ...or after this many bytes of changeset packs since the last one (0 = disabled)
-checkpoint_retain      = 2         # number of most-recent checkpoints to keep (>= 1)
-gc_grace               = "1h"      # minimum age before an orphan or a dropped-checkpoint pack is deleted (Go duration)
-lease_ttl              = "10m"     # maintenance lease duration, renewed during a build
+# ... mode, database, bucket, node_id, sync_timeout, shadow_timeout ...
+maintenance           = "off"      # off | auto: background checkpoints and GC (authoritative only). Default off.
+maintenance_interval  = "1h"       # how often the background task runs
+checkpoint_changesets = 1000       # checkpoint after this many changesets since the newest one (0 = never)
+checkpoint_pack_bytes = 268435456  # ...or after this many pack bytes since the newest one (0 = never)
+gc_grace              = "1h"       # age before an unreferenced pack is deleted and a checkpoint becomes C_gc
+gc_margin             = "5m"       # safety margin of the writers' deadline (gc_grace - gc_margin) and the boundaries
+lease_ttl             = "10m"      # maintenance lease duration, renewed during a build
 ```
 
-Defaults (new `Default*` constants): `maintenance` = `"auto"`,
-`maintenance_interval` = 1h, `checkpoint_changesets` = 1000,
-`checkpoint_pack_bytes` = 256 MiB, `checkpoint_retain` = 2, `gc_grace` = 1h,
-`lease_ttl` = 10m. Validation (extend `GraftStorage.validate`): `maintenance in
-{"", "off", "auto"}`; durations positive; `checkpoint_retain >= 1`;
-thresholds `>= 0`; it is not an error to set them in shadow/off mode (they are
-ignored, documented). `gc_grace` must comfortably exceed the Preparing→commit
-window (bounded by `shadow_timeout` / the 10 s reftable lock wait +
-`sync_timeout`); the default 1h does. Accessor helpers mirror
-`SyncTimeoutOrDefault`.
+Defaults are `Default*` constants with the values above. Validation (extends
+`GraftStorage.validate`): `maintenance in {"", "off", "auto"}`; durations positive;
+thresholds `>= 0`; `gc_margin < gc_grace`; **`gc_grace > sync_timeout + gc_margin`**
+(GC BOUNDARY rule). `checkpoint_retain` of the first version does not exist.
 
 ### RPCs (`proto/storage_core.proto`)
 
-`StorageCoreService` is in the gate's `Passthrough`, so these RPCs are **not**
-intercepted (no `AuthoritativeMutators` entry needed); they handle freshness
-themselves.
+`StorageCoreService` is in the gate's `Passthrough`, so these RPCs are not
+intercepted and need no `AuthoritativeMutators` entry.
 
 ```proto
 // CreateCheckpoint builds a consolidated checkpoint of the repository at the
-// current head and records it, so that hydration and catch-up start from it.
-// Requires authoritative mode.
+// current head and records it. Authoritative mode only.
 rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse) {
   option (op_type) = { op: MUTATOR };
 }
-// CollectGarbage reclaims the storage core packs the repository no longer needs
-// (orphans past the grace period, and packs covered by a kept checkpoint) and,
-// as a cheap global step, the packs of removed repositories. dry_run reports
-// what it would delete without deleting anything.
+// CollectGarbage reclaims the packs this repository no longer needs: orphans
+// observed at least gc_grace ago, packs covered by a checkpoint at least gc_grace
+// old, and superseded checkpoints. It does not touch other repositories.
 rpc CollectGarbage(CollectGarbageRequest) returns (CollectGarbageResponse) {
   option (op_type) = { op: MUTATOR };
+}
+// CollectRemovedRepositories reclaims the packs of the repositories of a storage
+// that were removed at least gc_grace ago.
+rpc CollectRemovedRepositories(CollectRemovedRepositoriesRequest) returns (CollectRemovedRepositoriesResponse) {
+  option (op_type) = { op: MUTATOR scope_level: STORAGE };
 }
 
 message CreateCheckpointRequest  { Repository repository = 1 [(target_repository)=true]; }
 message CreateCheckpointResponse {
-  uint64 checkpoint_sequence = 1; // the sequence the checkpoint is at
-  bool   created             = 2; // false when a checkpoint already existed at the head
+  uint64 checkpoint_sequence = 1;
+  bool   created             = 2; // false: a checkpoint at the head existed already
   int64  pack_bytes          = 3;
-  uint32 references          = 4; // references in the snapshot
+  uint32 references          = 4;
+  uint32 review_commits      = 5; // open-review head/base commits included
 }
 
 message CollectGarbageRequest {
@@ -640,342 +780,310 @@ message CollectGarbageRequest {
   bool       dry_run    = 2;
 }
 message CollectGarbageResponse {
-  uint64 checkpoint_sequence   = 1; // newest kept checkpoint, 0 when none
-  uint32 packs_deleted         = 2;
-  int64  bytes_reclaimed       = 3;
-  uint32 covered_deleted       = 4;
-  uint32 orphans_deleted       = 5;
-  uint32 orphans_kept_in_grace = 6;
-  uint32 checkpoints_dropped   = 7;
-  uint32 removed_repositories  = 8;
-  bool   dry_run               = 9;
+  uint64 boundary            = 1; // C_gc
+  uint32 covered_deleted     = 2;
+  uint32 checkpoints_dropped = 3;
+  uint32 orphans_deleted     = 4;
+  uint32 orphans_observed    = 5;
+  uint32 orphans_in_grace    = 6;
+  uint32 packs_deleted       = 7;
+  int64  bytes_reclaimed     = 8;
+  bool   dry_run             = 9;
+}
+
+message CollectRemovedRepositoriesRequest {
+  string storage_name = 1 [(storage)=true];
+  bool   dry_run      = 2;
+}
+message CollectRemovedRepositoriesResponse {
+  uint32 repositories    = 1;
+  uint32 packs_deleted   = 2;
+  int64  bytes_reclaimed = 3;
+  bool   dry_run         = 4;
 }
 ```
 
-Handlers (`internal/gitaly/service/storagecore/checkpoint.go`, `gc.go`):
-`CreateCheckpoint` → off/shadow → `FailedPrecondition`; MVCC/non-reftable →
-`FailedPrecondition`; otherwise `Checkpointer.Create`. `CollectGarbage` → off →
-`FailedPrecondition`; resolves the repository, `AcquireMaintenanceLease`
-(contending → `Aborted`/`FailedPrecondition` "another maintenance operation is
-in progress"), `CollectRepository` + `CollectRemoved`, release the lease. In
-shadow mode `CollectGarbage` runs the orphan + removed-repo sweeps only (no
-checkpoints exist, so there is no covered set) — see SHADOW SCOPE.
+Handlers (`service/storagecore/{checkpoint,gc}.go`): off → `FailedPrecondition`;
+`CreateCheckpoint` in shadow → `FailedPrecondition`; `CollectGarbage` acquires the
+lease (held elsewhere → `FailedPrecondition` "another maintenance operation of
+this repository is in progress"), collects, releases. WP78 checks the exact
+`op_type` options the repository's proto lint accepts for a storage-scoped mutator
+and follows the existing storage-scoped RPCs.
 
 ### SDK and CLI
 
-SDK (`sdk/storage_gc.go`, mirroring `sdk/storage.go`): `func (r *Repo)
-StorageCheckpoint(ctx) (*StorageCheckpoint, error)` and `func (r *Repo)
-StorageGC(ctx, dryRun bool) (*StorageGC, error)` with plain result structs.
+SDK (`sdk/storage_gc.go`): `func (r *Repo) StorageCheckpoint(ctx)
+(*StorageCheckpoint, error)`, `func (r *Repo) StorageGC(ctx, dryRun bool)
+(*StorageGC, error)`, and `func (c *Client) StorageGCRemoved(ctx, storage string,
+dryRun bool) (*StorageGCRemoved, error)`.
 
-CLI (`cmd/graft/storage.go`, extending the dispatcher and the usage strings):
+CLI (`cmd/graft/storage.go`):
 
 ```
 graft storage checkpoint [-repo R] [--json]
-graft storage gc         [-repo R] [--dry-run] [--json]
+graft storage gc [-repo R] [--dry-run] [--json]
+graft storage gc --removed [-storage S] [--dry-run] [--json]
 ```
 
-Human output: `checkpoint` → `checkpoint at changeset N: K references, pack B
-bytes` (or `already checkpointed at changeset N` when `created=false`); `gc` →
-one line per category and a total, with `(dry run)` when `--dry-run`.
+`gc -repo R` touches only that repository (answer 1); `--removed` is the storage-wide
+sweep of removed repositories and takes no `-repo`.
 
 ## Rejected alternatives
 
-* **Store the reference snapshot by folding changeset metadata at hydration
-  time** instead of a `graft_checkpoint_refs` table. Rejected: folding is
-  `O(N)` metadata rows per hydration, and a self-contained snapshot makes the
-  checkpoint directly verifiable. The snapshot is `O(refs)` rows written once.
-* **Delete changeset and changelog rows below a checkpoint** (full WAL
-  compaction). Rejected: the changelog is the ordered log clients follow and its
-  cursors must stay valid (`ListChangesets`/`WatchChangesets`); the rows are
-  cheap; and keeping them lets catch-up fold reference history above a checkpoint
-  without a special case. We compact packs, not rows.
-* **A pending-record table for in-flight uploads** instead of a grace period on
-  orphans. Rejected for v1: it adds a database write to every write path (RULE
-  4: shadow must not slow a write), while the Preparing→commit window is tightly
-  bounded and a generous `gc_grace` covers it at zero write-path cost. Kept as a
-  fallback if a bucket's mtime proves unreliable (noted as a risk).
-* **Additive catch-up from a checkpoint** (index the checkpoint pack into the
-  existing cache of a node below the checkpoint, then replay) instead of a full
-  re-hydration. Rejected for v1: it entangles the checkpoint seed with the WP55
-  "never revert a local write" compare-and-swap logic; re-hydration is provably
-  correct and the case is rare. Noted as a possible later optimization.
-* **Carry unreachable objects into the checkpoint pack** (pack `--all` of the
-  building node's local cache, not just the refs-at-N closure). Rejected: it
-  would defeat compaction (the cache accumulates every object ever seen) and no
-  reader needs those objects to reach head. See "unreachable objects" above.
-* **No lease; rely on GC idempotency for concurrency.** Rejected: idempotent GC
-  is safe to race, but a GC on one node must not run while a checkpoint build on
-  another uploads a not-yet-committed checkpoint pack (it would look like an
-  orphan). One maintenance lease per repository makes checkpoint build and GC
-  mutually exclusive and is the invariant the assignment requires. (Orphan grace
-  still protects the checkpoint pack as defence in depth.)
-* **Full-bucket scan to find removed repositories** (list `repos/<id>/` prefixes
-  and match against `graft_repositories`). Rejected: `O(all objects)` and racy
-  against concurrent creation. A tombstone written in the delete transaction is
-  crash-safe and bounded.
+* **Database fencing of deletions** (a `graft_gc_doomed` set serialized with
+  `CommitChangeset`, direction 2 of the PM review). It keeps objects shared between
+  rows and adds a lookup to every commit under the reftable lock. It is not complete
+  by itself: after the collector deletes the blob and removes the intent, a writer
+  whose `Put` skipped the key before the deletion can commit with neither the intent
+  nor the blob present, so the writer needs an additional protocol (re-upload after
+  the intent clears, and keep re-checking) whose correctness depends on the order of
+  bucket operations outside the transaction. The in-flight orphans of each write still
+  need a time rule on top. Ownership removes the sharing instead, needs no write-path
+  database access, and makes the in-flight bound an enforced deadline.
+* **Bucket modification times for orphans** (the first version). An object's mtime
+  is set by the bucket provider's clock, with no bound on skew against the
+  collector, untested for S3/GCS/Azure here, and under the old `Put` an existing
+  object's mtime is not refreshed. Replaced by the collector's own observations on
+  the database clock.
+* **A pending record per in-flight upload.** Rigorous, but one more database write
+  per transaction on the write path (RULE 4), and it still needs an expiry for
+  records of dead writers, i.e. the same deadline. The deadline alone suffices.
+* **Restart a sync when a covered pack is missing** (B of the first review).
+  Under the GC BOUNDARY rule a sync never meets a reclaimed pack, so this path would
+  be unreachable; a missing pack is corruption and is reported as such.
+* **`checkpoint_retain`.** The lagging boundary already keeps every checkpoint a
+  reader can use; a count adds nothing.
+* **Fold the reference snapshot from changeset metadata at hydration time**: `O(N)`
+  rows per hydration; the snapshot table is `O(refs)` rows written once.
+* **Delete changeset and changelog rows below a checkpoint**: the changelog cursors
+  must stay valid and the rows are cheap.
+* **Additive catch-up from a checkpoint** (index the checkpoint pack into a
+  far-behind cache): entangles the seed with the WP55 compare-and-swap logic;
+  re-hydration is correct and the case is rare (the node lagged by about
+  `gc_grace − sync_timeout`).
+* **Carry unreachable objects into the checkpoint pack**: defeats compaction.
+* **Full-bucket scan to find removed repositories**: `O(objects)` and racy; the
+  tombstone is crash-safe and bounded.
 
 ## Invariants (binding; each has a test)
 
-* **I1 (preserved).** Every object reachable from the current references of a
-  repository is in some pack the storage core keeps: the newest checkpoint's
-  pack holds the closure at its sequence, and every changeset pack after it is
-  kept, so the closure at head is covered.
-* **GC-1.** GC never deletes a pack referenced by a changeset with sequence `>`
-  the newest kept checkpoint (they are in the live set).
-* **GC-2.** GC never deletes a pack a write in progress may still commit: an
-  orphan is deleted only when older than `gc_grace`, which exceeds the
-  Preparing→commit window.
-* **GC-3.** GC never deletes a pack a node hydrating from a kept checkpoint
-  reads: the newest checkpoint is always kept, and an older one is dropped only
-  when a newer exists and it is older than `gc_grace` (> `sync_timeout`, the
-  hydration budget).
-* **GC-4.** At most one checkpoint build or GC per repository across nodes at a
-  time (the `graft_gc_leases` compare-and-swap).
-* **GC-5.** A node whose watermark is below the newest checkpoint still reaches
-  head: it re-hydrates from the checkpoint; a covered pack missing mid-catch-up
-  restarts the sync into hydration.
-* **CKPT-1.** A checkpoint at `N` holds every object reachable from the
-  references at `N`; hydrating from it and replaying `(N, head]` yields exactly
-  the state at head (references and connectivity).
-* **CKPT-2.** Building a checkpoint never blocks a write and never fails one: it
-  reads a database snapshot and local objects outside any reference lock and
-  records the checkpoint in its own transaction.
-* **COMPAT-1.** A v0.1.0 database (migration 1 only) works unchanged after
-  migration 2: with no checkpoints hydration replays from 1, and GC still
-  reclaims orphans and removed-repository packs.
+* **OWN-1.** Every pack object is written by exactly one writer and referenced by at
+  most one row (legacy keys excepted); `Put` never succeeds on an existing key.
+* **OWN-2.** A writer commits a row referencing its pack only before `t_r + W`; no
+  writer of a not-upgraded binary can commit a pack-carrying changeset (trigger).
+* **I1 (preserved).** Every object reachable from the current references, and the
+  head and base commits of the open reviews at the last checkpoint, is in a kept
+  pack.
+* **GC-1.** The collector never deletes a pack referenced by a changeset with
+  `seq > C_gc` or a checkpoint with `seq >= C_gc`.
+* **GC-2.** The collector never deletes a pack a write in progress may still commit
+  (PACK OWNERSHIP proof).
+* **GC-3.** No sync round and no verification ever needs a pack the collector
+  deletes during it (GC BOUNDARY rule).
+* **GC-4.** At most one checkpoint build or collection per repository at a time
+  under normal operation (the lease); correctness does not depend on it.
+* **GC-5.** A node whose watermark is below `C_sync` re-hydrates from the newest
+  checkpoint; a node at or above it catches up without re-hydrating.
+* **CKPT-1.** Hydrating from a checkpoint at `N` and replaying `(N, head]` yields
+  exactly the state at head.
+* **CKPT-2.** Building a checkpoint never blocks or fails a write.
+* **REM-1.** A removed repository's prefix is swept only when its tombstone is at
+  least `gc_grace` old, and no upload can arrive in it afterwards.
+* **COMPAT-1.** A v0.1.0 database works after migration 2: no checkpoints means
+  replay from 1; legacy keys stay readable and collectable.
 * **CRASH/IDEMPOTENT.** Every GC and checkpoint step is crash-safe and a re-run
-  converges; the database is authoritative over what is live; a `Delete` of a
-  missing key is a no-op.
-* **HISTORY (preserved).** No changeset, changelog or review row is deleted by
-  compaction; `graft log`, `WatchChangesets`, reviews and the connectivity
-  check keep working after GC and compaction.
+  converges; the database decides liveness.
+* **HISTORY.** No changeset, changelog or review row is deleted by compaction.
 
-## Crash and race cases (each tested with an injected fault)
+## Crash and race cases (each tested)
 
-1. Checkpoint crash after the pack upload, before the row commit → orphan
-   checkpoint pack; reclaimed by the orphan sweep; a re-run rebuilds and commits.
-2. Checkpoint crash after the row commit → the checkpoint exists; nothing to do.
-3. GC crash mid-sweep → some dead packs remain; the next run reclaims them; no
-   live pack was deleted.
-4. GC crash after `DeleteCheckpoint` (row), before the pack delete → the pack is
-   an orphan; reclaimed by the orphan sweep.
-5. Removed-repository crash after a partial prefix delete, before the tombstone
-   delete → the tombstone remains; the next run finishes (idempotent).
-6. A write uploads its pack (Preparing) while GC sweeps → the pack is younger
-   than `gc_grace`, so it is kept; after the commit it is a live changeset pack.
-7. A checkpoint build on node A while GC runs on node B → prevented by the single
-   maintenance lease; the orphan grace also protects the in-flight checkpoint
-   pack.
-8. A node catching up from `wm < C` while GC reclaims `(wm, C]` → the sync detects
-   `wm < C` and hydrates from the checkpoint; a covered pack missing mid-fetch
-   restarts the sync.
-9. A node hydrating from the newest checkpoint while GC runs → GC keeps the
-   newest checkpoint pack and every pack `> C`, so the hydration is unaffected.
-10. `RemoveRepository` with a concurrent hydration leaving a stale local copy →
-    the STALE CACHE RULE moves the local copy aside; the tombstone drives the
-    bucket cleanup; `repo_id` is never reused, so a recreated repository is
-    independent.
-11. Two nodes race `AcquireMaintenanceLease` → exactly one wins; the other skips.
-12. A checkpoint build node crashes holding the lease → the lease expires after
-    `lease_ttl`; GC and future builds resume.
+1. Two writes with byte-identical packs (the dedup race of the review): each uploads
+   its own key; the collector deletes the first's covered key; the second write's
+   changeset and pack are intact (test with a fault hook between the second write's
+   upload and its commit, the collector deleting in between, SQLite and Postgres).
+2. A write whose upload is older than its deadline at Prepared time: it rebuilds and
+   re-uploads a new owned pack; one whose commit cannot start before the deadline
+   fails like a storage failure (test with a shortened `gc_grace`).
+3. An unreferenced pack observed, then committed by its writer before its deadline:
+   the next run forgets the observation and keeps the pack.
+4. A not-upgraded writer inserts a legacy key: the trigger rejects it (test inserts a
+   changeset with a legacy key through `CommitChangeset` bypassing `NewPackKey`).
+5. Checkpoint crash after the upload, before the row: the pack is an orphan; a re-run
+   commits a new checkpoint.
+6. Collector crash after `DeleteCheckpoint`, before the pack deletion; mid-sweep;
+   after a partial prefix deletion of a removed repository: the next run converges.
+7. A node one changeset behind when a checkpoint is created catches up and does not
+   re-hydrate (change C).
+8. A node whose watermark is below `C_sync` re-hydrates and reaches head.
+9. Hydration while the collector runs; GC concurrent with continuous lands; a
+   checkpoint build concurrent with lands (all `-race`).
+10. A checkpoint build on a copy that lags behind the head (change D): EnsureFresh
+    brings it to `>= N` and the checkpoint is complete.
+11. A write in flight on a repository being removed: its pack lands before the sweep
+    (bound `t_r + W`), the sweep at `removed_at + gc_grace` deletes it.
+12. Two nodes race for the lease: one wins; a holder that crashes lets the lease
+    expire after `lease_ttl`.
+13. An open review whose commits are missing locally: the checkpoint fails with
+    `FailedPrecondition` naming the review; GC still runs.
 
-## Test plan (multilevel; SQLite and Postgres everywhere a store is involved)
+## Test plan (multilevel; SQLite and Postgres wherever a store is involved)
 
-* **sqlstore unit** (`sqlstore_test`, both dialects via `coretest.Dialects()`):
-  `CreateCheckpoint` (monotonic sequence, `Seq <= head_seq`, idempotent at the
-  same sequence, snapshot round-trip including non-UTF-8 names and symbolic
-  targets); `NewestCheckpoint`/`ListCheckpoints`/`CheckpointRefs`/`DeleteCheckpoint`
-  (cascade of the snapshot); `ChangesetPacks` (only non-empty keys, ascending);
-  lease acquire/renew/release with a CAS race between two `Store`s and expiry;
-  `DeleteRepository` writes a tombstone and cascades, re-registration gets a new
-  `repo_id` and a fresh tombstone space; `ListRemovedRepositories`/
-  `DeleteRemovedRepository`; `ListRepositories`.
-* **blobstore unit** (`blobstore_test`, file + mem): `List` under a prefix with
-  correct `ModTime`/`Size`, directory markers skipped; `Delete` idempotent on a
-  missing key; `List`/`Delete` leave other keys untouched; S3 variant behind
-  `GRAFT_TEST_S3_URL` only.
-* **gitops unit** (`gitops_test`, SHA-1 and SHA-256): `BuildPackFrom` yields a
-  self-contained pack whose index into an empty repository makes the tips'
-  history connectivity-complete (`git fsck`); an empty tip set is an empty pack.
-* **checkpoint unit** (`checkpoint_test`, `coretest` + `gittest`): build a
-  checkpoint from a source repository, hydrate a fresh repository from the
-  checkpoint and replay, assert references and `git fsck` connectivity equal the
-  source at head; an object unreachable before the checkpoint is absent after
-  compaction (the documented behaviour); `created=false` when a checkpoint
-  already exists at head.
-* **gc unit** (`gc_test`, `coretest` + `gittest`, both dialects): an orphan is
-  kept within grace and reclaimed after it; covered packs (`<= C`) are deleted,
-  packs `> C` and the kept checkpoint pack survive; a dropped old checkpoint's
-  pack is reclaimed; a removed-repository prefix is cleared and its tombstone
-  removed; `--dry-run` deletes nothing and reports the same counts; a re-run is
-  a no-op.
-* **-race** (`syncer_test`/`gc_test`/e2e): GC concurrent with continuous lands
-  (every land keeps committing, no live pack is deleted, no CAS or connectivity
-  break); GC concurrent with a hydration (the hydration completes); a checkpoint
-  build concurrent with lands (writes are not blocked and the checkpoint is
-  correct); re-hydration of a node forced below the checkpoint.
-* **crash injection** (`checkpoint.FaultHook`, `gc.FaultHook`, and the real-binary
-  `CrashEnv` for e2e): each fault point of §"Crash and race cases" 1–5 and 12,
-  each followed by a re-run that converges and a `VerifyRepository
-  --connectivity` that passes.
+* **sqlstore unit** (both dialects): every new method; `CreateCheckpoint`
+  monotonicity, idempotency (`created=false`), owned-key and `seq <= head`
+  checks, snapshot round trip with non-UTF-8 names and symbolic targets;
+  `GCSnapshot` maxima per key with legacy shared keys; `RecordOrphans` keeps an
+  existing `first_seen`; lease CAS between two `Store`s and expiry on the database
+  clock; `DeleteRepository` tombstone and cascade; `ListRemovedRepositories` age
+  filter; `SyncBoundary`; the trigger rejects a legacy key and accepts an owned one
+  and NULL; migration 2 on a migration-1 database (fixture) and the trigger bodies
+  executed as single statements.
+* **blobstore unit** (file and mem): `Put` on an existing key is `ErrBlobExists` and
+  leaves the content unchanged; concurrent `Put`s of one key: exactly one wins;
+  `List` by prefix, sizes, no directory entries; `Delete` idempotent.
+* **types unit**: `NewPackKey`/`ParsePackKey`/`IsOwnedPackKey` round trips, legacy
+  parsing, non-canonical spellings refused, nonce uniqueness.
+* **gitops unit** (SHA-1 and SHA-256): `BuildPackFrom` is self-contained (`fsck` after
+  indexing into an empty repository); `MissingObjects`.
+* **voter/import unit**: owned keys on every upload; the deadline (prepared pack
+  expired → rebuilt; commit past the deadline → refused); the phase-6 voter, import,
+  syncer, gate and storagecore suites stay green.
+* **checkpoint unit**: hydration from a checkpoint equals the source at head
+  (references, `fsck`); open-review commits survive the deletion of their branch;
+  closed-review commits do not (documented limit); lagging copy (change D); missing
+  review objects → `FailedPrecondition`; `created=false`.
+* **gc unit**: every branch of the sweep; covered vs live per key; dropped
+  checkpoints; observations (new, in grace, expired, referenced since); removed
+  repositories younger and older than `gc_grace`; dry run deletes and writes
+  nothing; re-run is a no-op.
+* **-race**: crash/race cases 1, 9 and 12.
+* **crash injection**: every `FaultHook` point of the checkpoint and gc packages,
+  and the voter's `after_upload`, each followed by a re-run that converges and a
+  `VerifyRepository --connectivity` that passes.
 * **e2e** (`internal/graft/e2e/storage_gc_test.go`, two and three real gitaly
-  processes sharing one database and one bucket, SQLite and Postgres): node A
-  writes many changesets; `graft storage checkpoint`; `graft storage gc`; a fresh
-  node B hydrates from the checkpoint (asserted: it downloads the checkpoint pack
-  and only the changeset packs after it, via `graft_storage_sync_*` and the
-  bucket), serves, and `VerifyRepository --connectivity` is consistent; a node
-  that fell below the checkpoint re-hydrates; a repository removed on one node
-  has its packs reclaimed; the changelog and reviews are intact after GC.
-* **migration**: open a database created with migration 1 only (fixture), assert
-  migration 2 applies, and that hydration, catch-up, checkpoint, GC and verify
-  all work with zero checkpoints and zero tombstones.
-* **measurement** (ask the PM for a benchmark window — the machine is shared):
-  bucket size and fresh-node hydration time before and after a checkpoint + GC,
-  on a repository with many changesets. Numbers go into STORAGE.md only from a
-  real run.
+  processes, one database and one bucket, SQLite and Postgres): writes on A,
+  `graft storage checkpoint`, `graft storage gc` with a shortened `gc_grace`, a fresh
+  node B hydrates from the checkpoint (asserted from the downloaded keys and the
+  `graft_storage_sync_*` metrics), serves, verify is consistent; a node below
+  `C_sync` re-hydrates; `graft storage gc --removed` reclaims a removed repository;
+  changelog and reviews intact.
+* **measurement** (WP79, in the benchmark window the PM schedules): bucket size and
+  fresh-node hydration time before and after a checkpoint and GC on a repository
+  with many changesets; the preparing/prepared histograms before and after WP73.
 
 ## Acceptance criteria
 
-* After `checkpoint_changesets` writes, a checkpoint plus GC leaves the bucket
-  holding the newest checkpoint pack and the packs after it, not the whole
-  history (measured bucket size drops; orphans and removed-repository packs are
-  gone).
-* A fresh node's hydration time is a function of `head - newestCheckpointSeq`,
-  not of `head` (measured; constant as history grows past a checkpoint).
-* `graft storage verify --connectivity` reports `consistent` after GC and
-  compaction; `graft log`, `WatchChangesets` and reviews are unchanged.
+* After a checkpoint and GC the bucket holds the kept checkpoint packs and the packs
+  after `C_gc`, not the whole history; orphans and removed-repository packs are gone
+  (measured).
+* Fresh-node hydration time depends on `head − newest checkpoint`, not on `head`
+  (measured).
+* `graft storage verify --connectivity` is consistent after GC and compaction;
+  `graft log`, `WatchChangesets` and reviews are unchanged.
 * A v0.1.0 database migrates and every storage path works.
-* All phase-6 storage tests stay green; the new unit, `-race`, crash and e2e
-  tests pass on SQLite and Postgres.
-* No live pack is ever deleted (GC-1..GC-5), proven by the `-race` and crash
-  tests.
+* Every phase-6 storage test is green (the blobstore `Put` tests rewritten to the
+  new contract, stated in the report); the new tests pass on SQLite and Postgres.
+* No live pack is ever deleted (OWN-1, OWN-2, GC-1..GC-3), proven by the race and
+  crash tests.
 
 ## SHADOW SCOPE rule (binding)
 
-Checkpoints and background maintenance are **authoritative-mode only**: a
-checkpoint's purpose is to seed hydration, which does not happen in shadow or
-off mode, and its reference snapshot is the database's view, which is not
-authoritative in shadow mode. `CreateCheckpoint` and the background `Runner`
-therefore refuse / do nothing outside authoritative mode. **GC** of orphans and
-of removed-repository packs is useful in shadow mode too (shadow uploads a pack
-per recorded write, and a dead shadow write leaves an orphan), so `CollectGarbage`
-and `CollectRemoved` run in shadow mode as well, doing the orphan and
-removed-repository sweeps only (there are no checkpoints, hence no covered set).
-Off mode opens no bucket: every entry point returns `FailedPrecondition`.
+Checkpoints and the background task are authoritative-mode only: a checkpoint seeds
+hydration, which does not happen in shadow mode, and its snapshot is the database's
+view, which is not authoritative there. `CollectGarbage` and
+`CollectRemovedRepositories` also run in shadow mode (orphans and removed
+repositories only; no checkpoints means no covered set). The pack ownership rule,
+the trigger and the writers' deadline apply in both modes. Off mode opens no bucket:
+every entry point returns `FailedPrecondition`.
 
-## Work split: what Opus writes, what Haiku drafts
+## Work packages and split
 
-Per the engineering charter, Opus (the main chat) writes everything that deletes
-data, is concurrent, is a compare-and-swap, or is crash recovery; Haiku drafts
-scoped support from an exact spec, actively monitored, output checked by Opus.
+| WP | content | depends on |
+|---|---|---|
+| WP71 | migration 2 (tables, trigger), every new `sqlstore` method, `DeleteRepository` tombstone | — |
+| WP72 | `BlobStore` `List`/`Delete`, strict `Put`, owned pack keys in `types.go` | — |
+| WP73 | writers: owned keys and the deadline in the voter, `shadowpack.go`, import; `Core` fields | WP71, WP72 |
+| WP74 | `gitops.BuildPackFrom`/`MissingObjects`, `checkpoint` package | WP71–WP73 |
+| WP75 | `gc` package | WP71–WP73 |
+| WP76 | syncer (seed, `C_sync`), `verify_objects.go` | WP71, WP74 |
+| WP77 | config, `maintenance` package, `serve.go` wiring | WP74–WP76 |
+| WP78 | proto, handlers, SDK, CLI | WP74, WP75 |
+| WP79 | e2e, STORAGE.md and CONFIGURATION.md, benchmark | all |
 
-**Opus writes:**
-
-* the migration (`sqlstore/migrations.go`) and all new `sqlstore` methods
-  (checkpoint transaction, lease CAS, tombstone, the changed `DeleteRepository`,
-  `ChangesetPacks`, `ListRepositories`, `ListRemovedRepositories`);
-* the `BlobStore` `List`/`Delete` interface and the `blobstore` implementation;
-* `checkpoint.Checkpointer` (upload-then-commit, crash points);
-* `gc.Collector` (the mark and sweep that deletes packs, and removed-repository
-  cleanup);
-* the syncer changes (hydration from a checkpoint, the below-checkpoint
-  re-hydration decision, the covered-pack-missing restart);
-* the `maintenance.Runner` (the lease-guarded concurrent background task);
-* the `verify_objects.go` change;
-* `gitops.BuildPackFrom`;
-* the config validation, the proto, the service handlers, and the `serve.go`
-  wiring;
-* the integration, `-race` and crash tests, and the e2e test.
-
-**Haiku drafts (exact spec, Opus verifies):**
-
-* the spec tests `zz_*_spec_test.go` for every WP (read only this file and the
-  foundation signatures), under `<workspace>/spec-tests7/<WP>/...`;
-* the CLI subcommand plumbing in `cmd/graft/storage.go` (flag binding, dispatch,
-  human/JSON output) mirroring the existing `import|state|verify`;
-* the SDK result structs and methods mirroring `sdk/storage.go`;
-* first drafts of the STORAGE.md and CONFIGURATION.md prose and tables (Opus
-  edits for correctness and fills the measured numbers);
-* table-driven unit-test scaffolding for the pure `sqlstore` methods from the
-  exact specs above (Opus owns the concurrency and deletion tests).
+**Opus writes** everything that deletes data, is concurrent, is a compare-and-swap
+or is crash recovery: WP71–WP77 entirely, the handlers of WP78, and the race, crash
+and e2e tests. **Haiku drafts** from an exact spec, monitored and checked by Opus:
+the `zz_*_spec_test.go` spec tests of each WP (from this file and the signatures
+only, in `/home/feder/m3-work/spec-tests7/<WP>/...`), the CLI and SDK plumbing of
+WP78, table-driven scaffolding for the pure `sqlstore` methods, and first drafts of
+the STORAGE.md and CONFIGURATION.md prose (Opus fixes and fills the measured
+numbers). Work files live in `/home/feder/m3-work/`, never in `/tmp` (PM.md).
 
 ## Risks
 
-* **Bucket mtime reliability.** The orphan grace uses `BlobInfo.ModTime`. File
-  and mem buckets are exact; S3/GCS/Azure are untested here. A provider with a
-  coarse or wrong mtime could, in principle, reclaim a fresh orphan. Mitigation:
-  a generous default grace (1h ≫ the write window); the pending-record
-  alternative is kept in reserve. Documented as an S3-untested limit.
-* **`pack-objects` non-determinism.** Two nodes could build byte-different
-  checkpoint packs for the same `N`; the maintenance lease makes concurrent
-  builds a non-case, and a resumed build after a crash simply uploads a fresh
-  content-addressed pack.
-* **Re-hydration discards a far-behind cache's local objects** (correct but
-  wasteful); rare, because an actively-served node stays near head.
-* **Unreachable-object pruning** can make a *closed/abandoned* review's diff
-  unavailable if its commits are reachable from no reference at the checkpoint;
-  usually reviews target live branches. Open question below.
-* **Unbounded local-cache growth** (no local `git gc`) is out of scope; an
-  operator reclaims local disk by removing and re-hydrating a cache. Noted in
-  STORAGE.md.
-* **Lease held by a crashed node** blocks maintenance of that repository until
-  `lease_ttl` expires (bounded; default 10m).
-* **Large-bucket listing** for removed-repository cleanup is `O(objects under
-  the prefix)`; per-repository GC is bounded by one repository's prefix.
+* **Mixed-version clusters.** Old running nodes fail their pack-carrying writes as
+  soon as migration 2 is applied (intended, the trigger); operators must upgrade every
+  node together. Documented in STORAGE.md.
+* **Lost dedup.** Byte-identical packs are stored once per write; measured.
+* **Writer deadline.** A write slower than `gc_grace − gc_margin` (55 min by default)
+  fails; an import of a very large repository must fit in it after its pack build
+  (the deadline starts after the build).
+* **Unreachable-object pruning** loses the diff of closed reviews whose commits are
+  unreachable at a checkpoint (documented limit).
+* **Missing open-review objects** block checkpoints of the repository until the
+  review is closed; the root fix is in the review service (open question).
+* **Re-hydration** discards a far-behind cache's objects (rare).
+* **Lease held by a crashed node** delays maintenance by at most `lease_ttl`.
+* **S3/GCS/Azure untested**; the design reads no bucket times, so the clock risk of
+  the first version is gone, but `List` and conditional `Put` are exercised on file
+  and mem buckets only.
+
+## Resolved questions (PM review of 85189d4)
+
+1. `graft storage gc -repo R` touches only that repository; removed repositories are
+   swept by `graft storage gc --removed` and by the background task.
+2. The checkpoint closure includes the head and base commits of open reviews.
+3. `maintenance` defaults to `off` in this release.
+4. The benchmark window is requested at WP79.
 
 ## Open questions for the PM
 
-1. **`graft storage gc` scope.** This plan makes `CollectGarbage` repository-
-   scoped (matching `import`/`verify`'s `-repo`) and folds the removed-repository
-   tombstone sweep into every call as a cheap global step. Would you prefer a
-   separate storage-scoped `graft storage gc --all` that iterates every
-   repository in a storage plus the tombstones? (The background task already
-   covers everything; this is only about the operator CLI shape.)
-2. **Open-review objects.** Should the checkpoint pack also retain objects
-   reachable from the tips of **open** reviews, so a review's diff survives
-   compaction even when its branch was deleted? It adds a `graft_reviews` read
-   and extra tips to the pack build. Default in this plan: no (documented limit).
-3. **Default `maintenance = "auto"`.** The background task runs by default in
-   authoritative mode. Do you want it `off` by default for the first milestone-3
-   release (operators opt in), with only the CLI available?
-4. **Benchmark window.** I need a quiet window on the shared machine to measure
-   bucket size and hydration time before/after for the STORAGE.md numbers (the
-   other workstream's tests skew it, as the LOCK AND HISTORY benchmark noted).
+1. **Refinement of B and C** (GC BOUNDARY rule): decide catch-up versus re-hydration
+   with `C_sync` and keep a missing pack an Internal error, instead of adding a
+   restart on a missing covered pack, which this boundary makes unreachable. Confirm
+   before WP76.
+2. **Open reviews whose commits the storage core no longer holds**: the plan fails
+   the checkpoint and names them. The source of the condition is the review service
+   accepting such a review in authoritative mode; should p4b/the PM own a change
+   there, or may m3 add that check?
 
 ## Foundation touchpoints and ownership
 
-New files (mine): `internal/graft/corestore/checkpoint/**`,
-`internal/graft/corestore/gc/**`, `internal/graft/corestore/maintenance/**`,
-`internal/gitaly/service/storagecore/{checkpoint,gc}.go`,
-`sdk/storage_gc.go`, `internal/graft/e2e/storage_gc_test.go`.
-Changed (mine): `sqlstore/**`, `corestore/{core,types,metastore}.go`,
-`blobstore/**`, `gitops/gitops.go`, `syncer/syncer.go`,
-`service/storagecore/verify_objects.go`, `cmd/graft/storage.go`,
-`proto/storage_core.proto` (+ generated code), `config_graft_storage.go`,
-`doc/graft/STORAGE.md`.
-Shared (my section only, listed in the report): `internal/cli/gitaly/serve.go`
-(the storage core block — wire the maintenance runner),
-`doc/graft/CONFIGURATION.md` (the `[graft.storage]` section).
-I do not touch the land path (`internal/graft/landlane/**`, `land*.go`): the
-checkpoint reads a database snapshot and the local objects, and GC touches only
-the bucket and the database, so phase 7 needs no land-path change. If
-implementation proves otherwise I stop and tell the PM.
+New (m3): `corestore/checkpoint/**`, `corestore/gc/**`, `corestore/maintenance/**`,
+`service/storagecore/{checkpoint,gc}.go`, `sdk/storage_gc.go`,
+`internal/graft/e2e/storage_gc_test.go`. Changed (m3): `sqlstore/**`,
+`corestore/{core,types,metastore}.go`, `blobstore/**`, `gitops/gitops.go`,
+`voter/**`, `syncer/syncer.go`, `open/open.go`, `service/storagecore/{import,verify_objects}.go`,
+`cmd/graft/storage.go`, `proto/storage_core.proto` (+ generated code),
+`config_graft_storage.go`, `doc/graft/STORAGE.md`. Shared, my section only:
+`internal/cli/gitaly/serve.go`, `doc/graft/CONFIGURATION.md`. No change to the land
+path: the voter is m3's; the land paths call it unchanged.
 
-## RULES (binding for every WP, in addition to PLAN6 RULES 1–15)
+## RULES (binding, in addition to PLAN6 RULES 1–15)
 
-16. **Packs only.** Compaction deletes packs, never changeset, changelog or
-    review rows. The changelog and its cursors are untouched.
-17. **Database authoritative over liveness.** GC computes the live set from the
-    database every run and never deletes a pack a committed changeset `> C` or a
-    kept checkpoint references.
-18. **Grace before orphan deletion.** An unreferenced pack is deleted only when
-    older than `gc_grace`.
-19. **One maintenance operation per repository across nodes** (the lease).
-20. **Checkpoints are authoritative-mode only**; GC of orphans and removed
-    repositories also runs in shadow mode (SHADOW SCOPE).
-21. **Crash-safe and idempotent**: upload before record; row before pack delete;
-    tombstone before prefix delete; a `Delete` of a missing key is success.
-22. **Untrusted data** (RULE 10 extended): a checkpoint pack and its snapshot
-    read from the database or the bucket are validated (pack SHA-256 against its
-    key and `repo_id`; names and targets with git's rules) before anything
-    touches a local repository.
+16. **Packs only.** Compaction deletes packs, never changeset, changelog or review rows.
+17. **Ownership.** Every upload uses a fresh owned key; `Put` never succeeds on an
+    existing key; no code produces a legacy key.
+18. **Enforced deadline.** A writer uploads and commits only before `t_r + W`.
+19. **Observed age on the database clock.** An unreferenced pack is deleted only after
+    the collector observed it unreferenced at least `gc_grace` earlier, decided in one
+    snapshot; bucket times are never read.
+20. **Lagging boundaries.** The collector uses `C_gc`; a sync decides with `C_sync`.
+21. **Checkpoints are authoritative-mode only**; GC of orphans and removed repositories
+    also runs in shadow mode.
+22. **Untrusted data** (RULE 10 extended): checkpoint packs, snapshots and review
+    commit IDs read from the database or the bucket are validated before they touch a
+    local repository.
+23. **Crash-safe order**: upload before record; row before pack deletion; prefix before
+    tombstone deletion; `Delete` of a missing key is success.
+24. **No fallback paths**: a pack the invariants say exists and does not is reported as
+    corruption, never routed around.
