@@ -80,15 +80,24 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 		return nil, structerr.NewInternal("%w", err)
 	}
 
-	stored, err := st.Create(&gitalypb.Review{
-		TargetBranch: []byte(branch),
-		BaseCommitId: base.String(),
-		HeadCommitId: head.String(),
-		Author:       identity.Actor(ctx, anonymousActor),
-		Title:        req.GetTitle(),
-		Description:  req.GetDescription(),
-		State:        gitalypb.Review_STATE_OPEN_UNSPECIFIED,
-		Files:        files,
+	var stored *gitalypb.Review
+	err = s.writeRoots(ctx, req.GetRepository(), repo, st, func(st store.ReviewStore, check rootsCheck) error {
+		if err := check(head, base); err != nil {
+			return err
+		}
+
+		var err error
+		stored, err = st.Create(&gitalypb.Review{
+			TargetBranch: []byte(branch),
+			BaseCommitId: base.String(),
+			HeadCommitId: head.String(),
+			Author:       identity.Actor(ctx, anonymousActor),
+			Title:        req.GetTitle(),
+			Description:  req.GetDescription(),
+			State:        gitalypb.Review_STATE_OPEN_UNSPECIFIED,
+			Files:        files,
+		})
+		return err
 	})
 	if err != nil {
 		return nil, toStatus(err)
@@ -190,64 +199,79 @@ func (s *server) UpdateReview(ctx context.Context, req *gitalypb.UpdateReviewReq
 		return nil, err
 	}
 
-	updated, err := st.Update(req.GetId(), func(r *gitalypb.Review) error {
-		if err := checkAuthor(ctx, r, "update"); err != nil {
-			return err
-		}
-		if err := checkOpen(r); err != nil {
-			return err
-		}
-		if expected := req.GetExpectedHeadCommitId(); expected != "" && expected != r.GetHeadCommitId() {
-			return structerr.NewFailedPrecondition("review head is %s, expected %s", r.GetHeadCommitId(), expected)
-		}
-		if head.String() == r.GetHeadCommitId() {
-			return nil
-		}
-
-		base := git.ObjectID(r.GetBaseCommitId())
-		descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
-		if err != nil {
-			if !errors.As(err, new(localrepo.InvalidCommitError)) {
-				return structerr.NewInternal("%w", err)
-			}
-			descends = false
-		}
-		if !descends {
-			return structerr.NewFailedPrecondition("head %s does not descend from the review base %s", head, base)
-		}
-
-		files, err := changedFiles(ctx, repo, base, head)
-		if err != nil {
-			return structerr.NewInternal("%w", err)
-		}
-
-		// Verdicts on the same commit have the same outcome, so the change
-		// since that commit is computed once per distinct commit.
-		survivesByCommit := map[string]bool{}
-		for _, v := range r.GetVerdicts() {
-			if !v.GetCurrent() {
-				continue
-			}
-			survives, ok := survivesByCommit[v.GetCommitId()]
-			if !ok {
-				survives, err = onlyCommentOrDocs(ctx, repo, git.ObjectID(v.GetCommitId()), head)
-				if err != nil {
-					return structerr.NewInternal("%w", err)
-				}
-				survivesByCommit[v.GetCommitId()] = survives
-			}
-			v.Current = survives
-		}
-
-		r.Files = files
-		r.HeadCommitId = head.String()
-		return nil
+	var updated *gitalypb.Review
+	err = s.writeRoots(ctx, req.GetRepository(), repo, st, func(st store.ReviewStore, check rootsCheck) error {
+		var err error
+		updated, err = st.Update(req.GetId(), func(r *gitalypb.Review) error {
+			return moveHead(ctx, repo, req, r, head, check)
+		})
+		return err
 	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
 
 	return &gitalypb.UpdateReviewResponse{Review: s.withRequirements(updated)}, nil
+}
+
+// moveHead moves the review r to head, for UpdateReview. check verifies the
+// new head as a root of the storage core (REVIEW ROOTS R1); a head that does
+// not move is not checked.
+func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateReviewRequest, r *gitalypb.Review, head git.ObjectID, check rootsCheck) error {
+	if err := checkAuthor(ctx, r, "update"); err != nil {
+		return err
+	}
+	if err := checkOpen(r); err != nil {
+		return err
+	}
+	if expected := req.GetExpectedHeadCommitId(); expected != "" && expected != r.GetHeadCommitId() {
+		return structerr.NewFailedPrecondition("review head is %s, expected %s", r.GetHeadCommitId(), expected)
+	}
+	if head.String() == r.GetHeadCommitId() {
+		return nil
+	}
+	if err := check(head); err != nil {
+		return err
+	}
+
+	base := git.ObjectID(r.GetBaseCommitId())
+	descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
+	if err != nil {
+		if !errors.As(err, new(localrepo.InvalidCommitError)) {
+			return structerr.NewInternal("%w", err)
+		}
+		descends = false
+	}
+	if !descends {
+		return structerr.NewFailedPrecondition("head %s does not descend from the review base %s", head, base)
+	}
+
+	files, err := changedFiles(ctx, repo, base, head)
+	if err != nil {
+		return structerr.NewInternal("%w", err)
+	}
+
+	// Verdicts on the same commit have the same outcome, so the change
+	// since that commit is computed once per distinct commit.
+	survivesByCommit := map[string]bool{}
+	for _, v := range r.GetVerdicts() {
+		if !v.GetCurrent() {
+			continue
+		}
+		survives, ok := survivesByCommit[v.GetCommitId()]
+		if !ok {
+			survives, err = onlyCommentOrDocs(ctx, repo, git.ObjectID(v.GetCommitId()), head)
+			if err != nil {
+				return structerr.NewInternal("%w", err)
+			}
+			survivesByCommit[v.GetCommitId()] = survives
+		}
+		v.Current = survives
+	}
+
+	r.Files = files
+	r.HeadCommitId = head.String()
+	return nil
 }
 
 // onlyCommentOrDocs reports whether every file changed between from and to is

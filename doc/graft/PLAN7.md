@@ -362,6 +362,18 @@ between a review write and a checkpoint commit.
   keeps this one in the `error_details` metadata). Tested: success after exactly
   one conflict, and exhaustion. Comments, verdicts and closes do not move roots and
   are not checked.
+
+  *As implemented (WP74).* `dbreview.Store` gains `Refs()` (the snapshot) and
+  `WithRootsAt(S)` (a store whose `Create` and `Update` pass `rootsAt = S`); the
+  review service detects this capability with an interface assertion, so the
+  files store (storage core off or in shadow mode) is unchanged. The check runs
+  inside the write, after the snapshot: `CreateReview` checks head and base;
+  `UpdateReview` checks the new head inside the review store's update function,
+  only when the head moves, so an update that keeps the head is not refused. If
+  a reference tip of the snapshot is missing locally (a changeset committed on
+  another node after the gate caught the repository up), the service calls
+  `EnsureFresh` once before checking; afterwards a missing tip is `Internal`.
+  The reachability test is `gitops.IsReachable`.
 * **R2 — checkpoint commit.** The build records the root set it included (the
   open reviews' head and base commits, read after `Refs`). `CreateCheckpoint`, in
   its transaction under the repository row lock, requires every open review's head

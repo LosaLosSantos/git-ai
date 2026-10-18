@@ -90,6 +90,11 @@ design is [PLAN6.md](PLAN6.md).
   (`ChangesetService`, `graft log`, `graft watch`) is written in the same
   database transaction as the reference change, and reviews are stored in the
   database. A watcher on another node sees new entries by polling every 250 ms.
+  The head and base commits of a review must be reachable from the references
+  in the storage core: `CreateReview`, and `UpdateReview` when it moves the
+  head, fail with `FailedPrecondition` for a commit that only the serving
+  node's copy has (push it to a branch first). An open review keeps its
+  commits alive after their branch is deleted; a closed or landed one does not.
 - **Repository IDs.** A repository is identified by its storage name and
   relative path, and gets an ID that is never reused: a repository removed and
   created again is a new repository, and the old caches are recognized as
