@@ -56,7 +56,7 @@ func specParents(t *testing.T, cfg config.Cfg, repoPath string, commit git.Objec
 }
 
 // TestSpecRebaseFastForward: when upstream is already an ancestor of the
-// branch, Rebase returns the branch unchanged.
+// branch, landing returns the branch unchanged.
 func TestSpecRebaseFastForward(t *testing.T) {
 	ctx, cfg, repoPath, repo := specSetup(t)
 
@@ -67,7 +67,7 @@ func TestSpecRebaseFastForward(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	got, err := engine.Rebase(ctx, upstream, branch)
+	got, err := landRebase(ctx, repo, engine, upstream, branch, nil)
 	if err != nil {
 		t.Fatalf("Rebase: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestSpecRebaseReplaysBranchOntoUpstream(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	got, err := engine.Rebase(ctx, upstream, c2)
+	got, err := landRebase(ctx, repo, engine, upstream, c2, nil)
 	if err != nil {
 		t.Fatalf("Rebase: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestSpecRebaseConflictReturnsRebaseConflictError(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	_, err := engine.Rebase(ctx, upstream, branch)
+	_, err := landRebase(ctx, repo, engine, upstream, branch, nil)
 	var conflict *localrepo.RebaseConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("got error %v (%T), want *localrepo.RebaseConflictError", err, err)
@@ -139,7 +139,9 @@ func TestSpecRebaseConflictReturnsRebaseConflictError(t *testing.T) {
 }
 
 // TestSpecRebaseSkipsCherryPickedCommits: a branch commit whose change is
-// already in upstream is not replayed, so the result is upstream itself.
+// already in upstream becomes empty when it is replayed and is dropped, so the
+// result is upstream itself. (Landing reapplies cherry-picks, see
+// computeLandedTip; the commit is dropped as empty, not by patch ID.)
 func TestSpecRebaseSkipsCherryPickedCommits(t *testing.T) {
 	ctx, cfg, repoPath, repo := specSetup(t)
 
@@ -150,7 +152,7 @@ func TestSpecRebaseSkipsCherryPickedCommits(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	got, err := engine.Rebase(ctx, upstream, branch)
+	got, err := landRebase(ctx, repo, engine, upstream, branch, nil)
 	if err != nil {
 		t.Fatalf("Rebase: %v", err)
 	}
@@ -159,10 +161,10 @@ func TestSpecRebaseSkipsCherryPickedCommits(t *testing.T) {
 	}
 }
 
-// TestSpecRebaseIgnoresMergesInRange: merge commits in upstream...branch are
-// not replayed (--no-merges); the result is linear and keeps the changes of
-// both merged sides.
-func TestSpecRebaseIgnoresMergesInRange(t *testing.T) {
+// TestSpecPlanRefusesMergesInRange: a range with a merge commit cannot be
+// rebased. Landing refuses it (InvalidArgument, use STRATEGY_MERGE), so the plan
+// returns ErrMergesInRange instead of a todo list.
+func TestSpecPlanRefusesMergesInRange(t *testing.T) {
 	ctx, cfg, repoPath, repo := specSetup(t)
 
 	base := specCommit(t, cfg, repoPath, nil, map[string]string{"base": "base\n"})
@@ -174,27 +176,13 @@ func TestSpecRebaseIgnoresMergesInRange(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	got, err := engine.Rebase(ctx, upstream, merge)
-	if err != nil {
-		t.Fatalf("Rebase: %v", err)
-	}
-	if n := len(specParents(t, cfg, repoPath, got)); n > 1 {
-		t.Fatalf("rebased tip is a merge with %d parents, want linear history", n)
-	}
-	merges := specGit(t, cfg, repoPath, "rev-list", "--merges", got.String(), "^"+upstream.String())
-	if merges != "" {
-		t.Fatalf("rebased history contains merge commits: %q", merges)
-	}
-	files := specFiles(t, cfg, repoPath, got)
-	for _, want := range []string{"base", "u", "b", "s"} {
-		if !specContains(files, want) {
-			t.Fatalf("rebased tree %v is missing %q", files, want)
-		}
+	if _, err := landRebase(ctx, repo, engine, upstream, merge, nil); !errors.Is(err, ErrMergesInRange) {
+		t.Fatalf("got error %v, want ErrMergesInRange", err)
 	}
 }
 
-// TestSpecEngineMatchesLocalrepoRebase: for the same inputs, Engine.Rebase and
-// (*localrepo.Repo).Rebase produce the same tree, parents and messages on a
+// TestSpecEngineMatchesLocalrepoRebase: for the same inputs, landing (plan and
+// replay) and (*localrepo.Repo).Rebase with reapplied cherry-picks produce the same tree, parents and messages on a
 // clean replay, and the same error type on a conflict.
 func TestSpecEngineMatchesLocalrepoRebase(t *testing.T) {
 	ctx, cfg, repoPath, repo := specSetup(t)
@@ -209,8 +197,8 @@ func TestSpecEngineMatchesLocalrepoRebase(t *testing.T) {
 	engine := New(repo)
 	t.Cleanup(func() { _ = engine.Close() })
 
-	engineOID, engineErr := engine.Rebase(ctx, upstream, c2)
-	localOID, localErr := repo.Rebase(ctx, upstream.String(), c2.String())
+	engineOID, engineErr := landRebase(ctx, repo, engine, upstream, c2, nil)
+	localOID, localErr := repo.Rebase(ctx, upstream.String(), c2.String(), rebaseOptions(nil)...)
 	if engineErr != nil || localErr != nil {
 		t.Fatalf("clean replay errors: engine=%v localrepo=%v", engineErr, localErr)
 	}
@@ -224,8 +212,8 @@ func TestSpecEngineMatchesLocalrepoRebase(t *testing.T) {
 		t.Fatalf("message mismatch: engine %q, localrepo %q", got, want)
 	}
 
-	_, engineErr = engine.Rebase(ctx, conflictUpstream, conflictBranch)
-	_, localErr = repo.Rebase(ctx, conflictUpstream.String(), conflictBranch.String())
+	_, engineErr = landRebase(ctx, repo, engine, conflictUpstream, conflictBranch, nil)
+	_, localErr = repo.Rebase(ctx, conflictUpstream.String(), conflictBranch.String(), rebaseOptions(nil)...)
 	var engineConflict, localConflict *localrepo.RebaseConflictError
 	if !errors.As(engineErr, &engineConflict) || !errors.As(localErr, &localConflict) {
 		t.Fatalf("conflict errors: engine %v (%T), localrepo %v (%T)", engineErr, engineErr, localErr, localErr)
@@ -244,7 +232,7 @@ func TestSpecEngineReuseAndClose(t *testing.T) {
 
 	engine := New(repo)
 	for _, branch := range []git.ObjectID{c1, c2} {
-		if _, err := engine.Rebase(ctx, upstream, branch); err != nil {
+		if _, err := landRebase(ctx, repo, engine, upstream, branch, nil); err != nil {
 			t.Fatalf("Rebase %s: %v", branch, err)
 		}
 	}

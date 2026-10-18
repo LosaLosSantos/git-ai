@@ -403,15 +403,15 @@ func TestLandBatchExecutorInvalidAfterMemberIsEarlyOnlyWhenTipIndependent(t *tes
 	}
 }
 
-// countingRebaser counts the rebases of the batch attempts.
+// countingRebaser counts the replays of the batch attempts.
 type countingRebaser struct {
 	batchRebaser
 	rebases *atomic.Int64
 }
 
-func (r countingRebaser) Rebase(ctx context.Context, upstream, branch git.ObjectID, opts ...localrepo.RebaseOption) (git.ObjectID, error) {
+func (r countingRebaser) Replay(ctx context.Context, upstream git.ObjectID, todo []git.ObjectID, committer *git.Signature) (git.ObjectID, error) {
 	r.rebases.Add(1)
-	return r.batchRebaser.Rebase(ctx, upstream, branch, opts...)
+	return r.batchRebaser.Replay(ctx, upstream, todo, committer)
 }
 
 // TestLandBatch_rebaseGoesThroughRebaser is not parallel: it replaces newBatchRebaser, which the parallel

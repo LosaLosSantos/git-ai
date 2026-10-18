@@ -8,7 +8,6 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
-	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,13 +36,13 @@ func TestEngineRecoversFromBrokenMergeTreeStream(t *testing.T) {
 	engine := newEngine(f.repo, fb.backends())
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	_, err := engine.Rebase(f.ctx, upstream, bad, localrepo.RebaseWithReappliedCherryPicks())
+	_, err := landRebase(f.ctx, f.repo, engine, upstream, bad, nil)
 	require.Error(t, err)
 	require.Equal(t, 1, fb.streamStarts)
 	require.Equal(t, 1, fb.streamClosed, "the broken stream is closed")
 
 	// The next rebase starts a new stream and gives the result of localrepo.
-	require.NoError(t, requireSameRebase(t, f, engine, upstream, good, localrepo.RebaseWithCommitter(testCommitter)))
+	require.NoError(t, requireSameRebase(t, f, engine, upstream, good, &testCommitter))
 	require.Equal(t, 2, fb.streamStarts)
 }
 
@@ -60,11 +59,11 @@ func TestEngineRecoversAfterMergeError(t *testing.T) {
 	engine := newEngine(f.repo, failFirst.backends())
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 
-	_, err := engine.Rebase(f.ctx, upstream, branch, localrepo.RebaseWithCommitter(testCommitter))
+	_, err := landRebase(f.ctx, f.repo, engine, upstream, branch, &testCommitter)
 	require.ErrorIs(t, err, errInjected)
 	require.Equal(t, 1, fb.streamClosed, "the stream that failed is closed")
 
-	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch, localrepo.RebaseWithCommitter(testCommitter)))
+	require.NoError(t, requireSameRebase(t, f, engine, upstream, branch, &testCommitter))
 	require.Equal(t, 2, fb.streamStarts, "the next rebase starts a new stream")
 }
 
@@ -80,14 +79,14 @@ func TestEngineReplacesHelpersOfCanceledContext(t *testing.T) {
 	engine := newEngine(f.repo, fb.backends())
 
 	ctx, cancel := context.WithCancel(f.ctx)
-	want, err := engine.Rebase(ctx, upstream, branch, localrepo.RebaseWithCommitter(testCommitter))
+	want, err := landRebase(ctx, f.repo, engine, upstream, branch, &testCommitter)
 	require.NoError(t, err)
 	require.Equal(t, 1, fb.streamStarts)
 	require.Equal(t, 1, fb.writerStarts)
 
 	cancel()
 
-	got, err := engine.Rebase(f.ctx, upstream, branch, localrepo.RebaseWithCommitter(testCommitter))
+	got, err := landRebase(f.ctx, f.repo, engine, upstream, branch, &testCommitter)
 	require.NoError(t, err)
 	require.Equal(t, want, got)
 	require.Equal(t, 2, fb.streamStarts)

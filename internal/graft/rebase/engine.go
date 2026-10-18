@@ -1,21 +1,19 @@
-// Package rebase implements the rebase used by graft batch landing with long-lived git helper
-// processes. It produces the same results as (*localrepo.Repo).Rebase, without starting several
-// git processes per rebased commit.
+// Package rebase decides how a change lands onto a branch and replays its commits. PlanLanding
+// makes the decision from one listing of the range the change adds (see ancestry.Checker.Range),
+// and an Engine replays the commits of a rebase through long-lived git helper processes. Together
+// they produce the same commits as (*localrepo.Repo).Rebase with reapplied cherry-picks, without
+// starting several git processes per commit.
 package rebase
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
-	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
-	"github.com/feder-cr/git-ai/internal/helper/text"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
@@ -42,14 +40,14 @@ type backends struct {
 	newCommitWriter func(ctx context.Context) (commitWriter, error)
 }
 
-// Engine rebases commits within one batch attempt using one merge-tree stream and one commit
+// Engine replays commits within one batch attempt using one merge-tree stream and one commit
 // writer, started lazily and closed by Close. An Engine is not safe for concurrent use.
 //
 // The helper processes are started with the context of the call that needs them and die with
 // it. A helper whose context is done is replaced by a new one on the next use, so a canceled
-// context of one Rebase does not fail the later Rebase calls of the Engine. A helper that
+// context of one Replay does not fail the later Replay calls of the Engine. A helper that
 // fails with an error other than a merge conflict is replaced in the same way, so that one
-// failed rebase does not fail the rebases that follow it.
+// failed replay does not fail the replays that follow it.
 type Engine struct {
 	repo     *localrepo.Repo
 	backends backends
@@ -63,18 +61,40 @@ type Engine struct {
 	writerDone <-chan struct{}
 }
 
+// Option configures an Engine.
+type Option func(*engineConfig)
+
+type engineConfig struct {
+	helperOpts []localrepo.HelperOption
+}
+
+// WithDeferredDurability starts the helper processes without fsync of the loose objects they write.
+// The caller makes those objects durable before any reference points to them. The batch stepper of
+// UserLand does: it publishes the objects of its quarantine as one fsynced pack (doc/graft/PLAN8.md,
+// section 3.2).
+func WithDeferredDurability() Option {
+	return func(cfg *engineConfig) {
+		cfg.helperOpts = append(cfg.helperOpts, localrepo.WithoutObjectFsync())
+	}
+}
+
 // New returns an Engine for repo.
-func New(repo *localrepo.Repo) *Engine {
+func New(repo *localrepo.Repo, opts ...Option) *Engine {
+	var cfg engineConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	return newEngine(repo, backends{
 		newMergeStream: func(ctx context.Context) (mergeStream, error) {
-			stream, err := repo.NewMergeTreeStream(ctx)
+			stream, err := repo.NewMergeTreeStream(ctx, cfg.helperOpts...)
 			if err != nil {
 				return nil, err
 			}
 			return stream, nil
 		},
 		newCommitWriter: func(ctx context.Context) (commitWriter, error) {
-			writer, err := repo.NewCommitWriter(ctx)
+			writer, err := repo.NewCommitWriter(ctx, cfg.helperOpts...)
 			if err != nil {
 				return nil, err
 			}
@@ -87,46 +107,97 @@ func newEngine(repo *localrepo.Repo, b backends) *Engine {
 	return &Engine{repo: repo, backends: b}
 }
 
-// Rebase has the semantics and errors of (*localrepo.Repo).Rebase(ctx, upstream, branch, opts...).
-func (e *Engine) Rebase(ctx context.Context, upstream, branch git.ObjectID, opts ...localrepo.RebaseOption) (git.ObjectID, error) {
-	settings := localrepo.ResolveRebaseOptions(opts...)
-
-	upstreamOID, err := e.repo.ResolveRevision(ctx, git.Revision(upstream.String()+"^{commit}"))
+// Replay replays the commits of todo, oldest first, onto upstream and returns the last commit
+// written, or upstream when every commit became empty and was dropped. It is the replay of
+// (*localrepo.Repo).Rebase: a commit whose merge onto the running tip changes nothing is dropped
+// unless it is itself empty, each commit keeps its author and message, and its committer is
+// committer, or its own committer when committer is nil. A commit that does not apply cleanly
+// returns *localrepo.RebaseConflictError. The todo list comes from LandPlan.Replay.
+func (e *Engine) Replay(ctx context.Context, upstream git.ObjectID, todo []git.ObjectID, committer *git.Signature) (git.ObjectID, error) {
+	objectHash, err := e.repo.ObjectHash(ctx)
 	if err != nil {
-		return "", structerr.NewInvalidArgument("resolving upstream commit: %w", err).WithMetadata("revision", upstream.String())
+		return "", structerr.NewInternal("getting object hash %w", err)
 	}
 
-	branchOID, err := e.repo.ResolveRevision(ctx, git.Revision(branch.String()+"^{commit}"))
+	upstreamCommit, err := e.repo.ReadCommit(ctx, git.Revision(upstream))
 	if err != nil {
-		return "", structerr.NewInvalidArgument("resolving branch commit: %w", err).WithMetadata("revision", branch.String())
+		return "", fmt.Errorf("reading upstream commit: %w", err)
 	}
 
-	var stdout bytes.Buffer
-	if err := e.repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name: "merge-base",
-			Args: []string{upstreamOID.String(), branchOID.String()},
-		},
-		gitcmd.WithStdout(&stdout),
-	); err != nil {
-		return "", structerr.NewInternal("get merge-base: %w", err)
+	oursCommitOID := upstream
+	oursTreeOID := git.ObjectID(upstreamCommit.GetTreeId())
+	for _, todoItem := range todo {
+		theirsCommit, err := e.repo.ReadCommit(ctx, git.Revision(todoItem))
+		if err != nil {
+			return "", fmt.Errorf("reading todo list commit: %w", err)
+		}
+
+		var base git.ObjectID
+		if len(theirsCommit.GetParentIds()) > 0 {
+			base = git.ObjectID(theirsCommit.GetParentIds()[0])
+		}
+
+		newTreeOID, err := e.merge(ctx, base, oursCommitOID, git.ObjectID(theirsCommit.GetId()))
+		if err != nil {
+			var conflictErr *localrepo.MergeTreeConflictError
+			if errors.As(err, &conflictErr) {
+				return "", &localrepo.RebaseConflictError{
+					Commit:        theirsCommit.GetId(),
+					ConflictError: conflictErr,
+				}
+			}
+			return "", fmt.Errorf("merging todo list commit: %w", err)
+		}
+
+		// Empty commits are handled as in (*localrepo.Repo).Rebase: a commit whose merge changes
+		// nothing is picked only if it is itself empty, a root commit excepted when empty.
+		if newTreeOID == oursTreeOID {
+			if len(theirsCommit.GetParentIds()) == 0 {
+				if theirsCommit.GetTreeId() != objectHash.EmptyTreeOID.String() {
+					continue
+				}
+			} else {
+				theirsParentCommit, err := e.repo.ReadCommit(ctx, git.Revision(theirsCommit.GetParentIds()[0]))
+				if err != nil {
+					return "", fmt.Errorf("reading parent commit: %w", err)
+				}
+
+				if theirsCommit.GetTreeId() != theirsParentCommit.GetTreeId() {
+					continue
+				}
+			}
+		}
+
+		author := signatureFromCommitAuthor(theirsCommit.GetAuthor())
+		commitCommitter := committer
+		if commitCommitter == nil {
+			commitCommitter = signatureFromCommitAuthor(theirsCommit.GetCommitter())
+		}
+
+		message, err := e.fullCommitMessage(ctx, theirsCommit)
+		if err != nil {
+			return "", fmt.Errorf("reading commit message: %w", err)
+		}
+
+		newCommitOID, err := e.writeCommit(ctx, localrepo.WriteCommitConfig{
+			Parents:        []git.ObjectID{oursCommitOID},
+			AuthorName:     author.Name,
+			AuthorEmail:    author.Email,
+			AuthorDate:     author.When,
+			CommitterName:  commitCommitter.Name,
+			CommitterEmail: commitCommitter.Email,
+			CommitterDate:  commitCommitter.When,
+			Message:        string(message),
+			TreeID:         newTreeOID,
+		})
+		if err != nil {
+			return "", fmt.Errorf("write commit: %w", err)
+		}
+		oursCommitOID = newCommitOID
+		oursTreeOID = newTreeOID
 	}
 
-	// fast-forward if possible
-	mergeBase := text.ChompBytes(stdout.Bytes())
-	if mergeBase == upstreamOID.String() {
-		return branchOID, nil
-	}
-	if mergeBase == branchOID.String() {
-		return upstreamOID, nil
-	}
-
-	newOID, err := e.rebaseCommits(ctx, settings, upstreamOID, branchOID)
-	if err != nil {
-		return "", structerr.NewInternal("rebase using merge-tree: %w", err)
-	}
-
-	return newOID, nil
+	return oursCommitOID, nil
 }
 
 // Close ends the helper processes started by the Engine. It is safe to call more than once. A
@@ -163,140 +234,6 @@ func isDone(done <-chan struct{}) bool {
 	default:
 		return false
 	}
-}
-
-func (e *Engine) rebaseCommits(ctx context.Context, settings localrepo.RebaseSettings, upstreamOID, branchOID git.ObjectID) (git.ObjectID, error) {
-	objectHash, err := e.repo.ObjectHash(ctx)
-	if err != nil {
-		return "", structerr.NewInternal("getting object hash %w", err)
-	}
-
-	todoList, err := e.todoList(ctx, settings, upstreamOID, branchOID)
-	if err != nil {
-		return "", err
-	}
-
-	upstreamCommit, err := e.repo.ReadCommit(ctx, git.Revision(upstreamOID))
-	if err != nil {
-		return "", fmt.Errorf("reading upstream commit: %w", err)
-	}
-
-	oursCommitOID := upstreamOID
-	oursTreeOID := git.ObjectID(upstreamCommit.GetTreeId())
-	for _, todoItem := range todoList {
-		theirsCommit, err := e.repo.ReadCommit(ctx, git.Revision(todoItem))
-		if err != nil {
-			return "", fmt.Errorf("reading todo list commit: %w", err)
-		}
-
-		var base git.ObjectID
-		if len(theirsCommit.GetParentIds()) > 0 {
-			base = git.ObjectID(theirsCommit.GetParentIds()[0])
-		}
-
-		newTreeOID, err := e.merge(ctx, base, oursCommitOID, git.ObjectID(theirsCommit.GetId()))
-		if err != nil {
-			var conflictErr *localrepo.MergeTreeConflictError
-			if errors.As(err, &conflictErr) {
-				return newTreeOID, &localrepo.RebaseConflictError{
-					Commit:        theirsCommit.GetId(),
-					ConflictError: conflictErr,
-				}
-			}
-			return "", fmt.Errorf("merging todo list commit: %w", err)
-		}
-
-		// Empty commits are handled as in (*localrepo.Repo).Rebase: a commit whose merge changes
-		// nothing is picked only if it is itself empty, a root commit excepted when empty.
-		if newTreeOID == oursTreeOID {
-			if len(theirsCommit.GetParentIds()) == 0 {
-				if theirsCommit.GetTreeId() != objectHash.EmptyTreeOID.String() {
-					continue
-				}
-			} else {
-				theirsParentCommit, err := e.repo.ReadCommit(ctx, git.Revision(theirsCommit.GetParentIds()[0]))
-				if err != nil {
-					return "", fmt.Errorf("reading parent commit: %w", err)
-				}
-
-				if theirsCommit.GetTreeId() != theirsParentCommit.GetTreeId() {
-					continue
-				}
-			}
-		}
-
-		author := signatureFromCommitAuthor(theirsCommit.GetAuthor())
-		committer := settings.Committer
-		if committer == nil {
-			committer = signatureFromCommitAuthor(theirsCommit.GetCommitter())
-		}
-
-		message, err := e.fullCommitMessage(ctx, theirsCommit)
-		if err != nil {
-			return "", fmt.Errorf("reading commit message: %w", err)
-		}
-
-		newCommitOID, err := e.writeCommit(ctx, localrepo.WriteCommitConfig{
-			Parents:        []git.ObjectID{oursCommitOID},
-			AuthorName:     author.Name,
-			AuthorEmail:    author.Email,
-			AuthorDate:     author.When,
-			CommitterName:  committer.Name,
-			CommitterEmail: committer.Email,
-			CommitterDate:  committer.When,
-			Message:        string(message),
-			TreeID:         newTreeOID,
-		})
-		if err != nil {
-			return "", fmt.Errorf("write commit: %w", err)
-		}
-		oursCommitOID = newCommitOID
-		oursTreeOID = newTreeOID
-	}
-
-	return oursCommitOID, nil
-}
-
-// todoList returns the commits of branch that are not in upstream, oldest first, without the
-// clean cherry-picks of upstream unless they are reapplied. It is the list that
-// (*localrepo.Repo).Rebase replays.
-func (e *Engine) todoList(ctx context.Context, settings localrepo.RebaseSettings, upstreamOID, branchOID git.ObjectID) ([]string, error) {
-	// Flags of git-rev-list to get the pick-only todo_list for a rebase, see
-	// (*localrepo.Repo).Rebase for their origin.
-	var flags []gitcmd.Option
-	if !settings.ReapplyCherryPicks {
-		flags = append(flags, gitcmd.Flag{Name: "--cherry-pick"})
-	}
-	flags = append(flags,
-		gitcmd.Flag{Name: "--right-only"},
-		gitcmd.Flag{Name: "--no-merges"},
-		gitcmd.Flag{Name: "--topo-order"},
-		gitcmd.Flag{Name: "--reverse"},
-	)
-
-	var stderr bytes.Buffer
-	cmd, err := e.repo.Exec(ctx, gitcmd.Command{
-		Name:  "rev-list",
-		Flags: flags,
-		Args:  []string{fmt.Sprintf("%s...%s", upstreamOID, branchOID)},
-	}, gitcmd.WithStderr(&stderr), gitcmd.WithSetupStdout())
-	if err != nil {
-		return nil, structerr.NewInternal("start git rev-list: %w", err)
-	}
-
-	var todoList []string
-	scanner := bufio.NewScanner(cmd)
-	for scanner.Scan() {
-		todoList = append(todoList, strings.TrimSpace(scanner.Text()))
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanning rev-list output: %w", err)
-	}
-	if err := cmd.Wait(); err != nil {
-		return nil, structerr.NewInternal("git rev-list: %w", err).WithMetadata("stderr", stderr.String())
-	}
-
-	return todoList, nil
 }
 
 // merge merges theirs into ours with base as the merge base. base is empty for a root commit.
