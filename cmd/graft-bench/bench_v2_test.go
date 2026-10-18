@@ -376,3 +376,64 @@ func TestRunCompareCommand(t *testing.T) {
 	require.Equal(t, 1, run(context.Background(), []string{"compare", filepath.Join(dir, "missing.json")}, &out, &errOut))
 	require.Contains(t, errOut.String(), "missing.json")
 }
+
+func TestAggregateRPCLatency(t *testing.T) {
+	t.Parallel()
+
+	samples := []Sample{
+		{Landed: true, Committed: true, CommitLatency: 10 * time.Millisecond, LandLatency: 100 * time.Millisecond},
+		{Landed: true, Committed: true, CommitLatency: 20 * time.Millisecond, LandLatency: 200 * time.Millisecond},
+		{Committed: true, CommitLatency: 30 * time.Millisecond, LandLatency: 900 * time.Millisecond, Err: errors.New("merge conflict"), Conflict: true},
+		{CommitLatency: 500 * time.Millisecond, Err: errors.New("commit: unavailable")},
+	}
+
+	res := aggregate(baseConfig(), samples, time.Second)
+
+	commit := res.RPCs[rpcCommitFiles]
+	require.Equal(t, 4, commit.Calls)
+	require.Equal(t, 1, commit.Failed)
+	require.InDelta(t, 20, commit.P50MS, 1e-9, "failed calls are not in the percentiles")
+	require.InDelta(t, 30, commit.P99MS, 1e-9)
+
+	land := res.RPCs[rpcLand]
+	require.Equal(t, 3, land.Calls, "a change whose commit failed does not land")
+	require.Equal(t, 1, land.Failed)
+	require.InDelta(t, 100, land.P50MS, 1e-9)
+	require.InDelta(t, 200, land.P99MS, 1e-9)
+}
+
+// slowBackend takes a fixed time for each call.
+type slowBackend struct {
+	commit, land time.Duration
+}
+
+func (b slowBackend) Prepare(context.Context, Config) (string, error) { return "base", nil }
+
+func (b slowBackend) Commit(context.Context, Change, string) (string, error) {
+	time.Sleep(b.commit)
+	return "commit", nil
+}
+
+func (b slowBackend) Land(context.Context, Config, Change, string) (LandOutcome, error) {
+	time.Sleep(b.land)
+	return LandOutcome{Attempts: 1}, nil
+}
+
+// TestRunMeasuresEachRPC times the commit and the land of a change separately: the latency of the
+// change covers both, each RPC only its own call.
+func TestRunMeasuresEachRPC(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	cfg.Agents, cfg.ChangesPerAgent = 2, 2
+	res, err := Run(context.Background(), cfg, slowBackend{commit: 20 * time.Millisecond, land: 60 * time.Millisecond})
+	require.NoError(t, err)
+
+	commit, land := res.RPCs[rpcCommitFiles], res.RPCs[rpcLand]
+	require.Equal(t, 4, commit.Calls)
+	require.Equal(t, 4, land.Calls)
+	require.GreaterOrEqual(t, commit.P50MS, 20.0)
+	require.Less(t, commit.P50MS, 60.0, "the commit does not include the land")
+	require.GreaterOrEqual(t, land.P50MS, 60.0)
+	require.GreaterOrEqual(t, res.P50MS, 80.0, "a change takes its commit and its land")
+}

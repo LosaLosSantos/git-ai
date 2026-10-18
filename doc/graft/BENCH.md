@@ -53,6 +53,7 @@ Markdown report show the same values.
 | `lands_per_minute` | `landed` divided by the wall-clock duration of the run. |
 | `p50_ms`, `p95_ms`, `p99_ms` | Latency of the LANDED changes, from the start of the commit to the end of the land (nearest rank). Failed changes are not included. |
 | `failed_p95_ms` | p95 latency of the failed changes, measured the same way. 0 when none failed. |
+| `rpcs` | The latency of each RPC as the client measures it around the call: `commit_files` (the `UserCommitFiles` of every change) and `land` (the `UserLand` of every change that was committed, without the wait of queue mode). Each has `calls`, `failed`, and `p50_ms`, `p95_ms`, `p99_ms` of the calls that succeeded (nearest rank). A land that fails on a conflict is a failed call. |
 | `failure_classes` | Failed changes counted by the kind of their error message, with commit IDs removed, so the same conflict on different commits is one kind. |
 | `errors` | Up to five distinct kinds of failure, each as the first full message of its kind. |
 

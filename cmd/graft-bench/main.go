@@ -267,6 +267,8 @@ func writeResult(w io.Writer, format string, res Result) error {
 		{"latency p95", fmt.Sprintf("%.1fms (landed changes)", res.P95MS)},
 		{"latency p99", fmt.Sprintf("%.1fms (landed changes)", res.P99MS)},
 		{"failed p95", fmt.Sprintf("%.1fms (failed changes)", res.FailedP95MS)},
+		{"UserCommitFiles", formatRPCLatency(res.RPCs[rpcCommitFiles])},
+		{"UserLand", formatRPCLatency(res.RPCs[rpcLand])},
 	}
 	for _, row := range rows {
 		if row[0] == "label" && row[1] == "" {
