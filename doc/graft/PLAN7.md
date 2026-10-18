@@ -632,6 +632,24 @@ repository-wide lock.
   write served); stack depth under 4×30 concurrent writes (git's geometric
   compaction, at most 2⌈log₂ n⌉+2 tables; measured 4 for 122 updates).
 
+**Measured** (2026-10-19, same method as the problem's numbers, alternating
+before = b665f56 and after = WP76b, two runs each, load 3–7; mean ms, 50 / 100
+agents):
+
+| | before | after |
+|---|---|---|
+| `UserCommitFiles` | 914–990 / 1013–1954 | 363–432 / 447–450 |
+| git lock wait (`u.prepare`) | 500–552 / 585–878 | 0.4 / 0.4 |
+| git commit (`u.commit`) | 105–143 / 176–452 | 1–2 / 1 |
+| lands/min | 731–972 / 677–817 | 1411–1486 / 1491–1673 |
+| land p99 | 6.4–6.7 s / 8.7–17.2 s | 2.3–2.5 s / 4.1–4.3 s |
+
+The wait that remains is the admission queue (mean 124–190 ms, inside the
+Preparing phase): the held section is now the voter's Prepared phase (database
+commit, about 15 ms) plus a 1–2 ms git write. Bypassed and expired admissions
+were 0. During the load the repository was never idle for a second, so its
+marker stayed while the stack was made durable every second.
+
 ### Data model (new migration, both dialects)
 
 Migration `20261018000000_graft_storage_gc`, appended to `sqliteMigrations` and
