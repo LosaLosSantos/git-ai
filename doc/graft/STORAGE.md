@@ -90,11 +90,22 @@ design is [PLAN6.md](PLAN6.md).
   (`ChangesetService`, `graft log`, `graft watch`) is written in the same
   database transaction as the reference change, and reviews are stored in the
   database. A watcher on another node sees new entries by polling every 250 ms.
-  The head and base commits of a review must be reachable from the references
-  in the storage core: `CreateReview`, and `UpdateReview` when it moves the
-  head, fail with `FailedPrecondition` for a commit that only the serving
-  node's copy has (push it to a branch first). An open review keeps its
-  commits alive after their branch is deleted; a closed or landed one does not.
+- **Review commits are kept by references.** `CreateReview` and `UpdateReview`
+  write a hidden reference `refs/keep-around/<commit>` for the head and base of
+  the review before they record it, so an open review keeps its commits alive
+  after their branch is deleted: on every node (housekeeping keeps what
+  references reach), in checkpoints and through garbage collection. A review of
+  a commit that only the serving node has works: the reference write uploads it.
+  Closing a review deletes the references that no other open review uses; a
+  closed or landed review keeps nothing. Clients never see these references over
+  the git protocols and cannot push or delete them. In authoritative mode the
+  database enforces the rule: a review write requires the references, and no
+  write (`DeleteRefs`, `WriteRef`, `UpdateReferences`, a push) can delete or
+  move one that an open review uses. In off and shadow mode the references are
+  written as well (housekeeping keeps the commits), but nothing enforces them:
+  the review files are the source of truth there. Each review creation and each
+  head move costs one reference transaction, so one changeset and no changelog
+  entry.
 - **Repository IDs.** A repository is identified by its storage name and
   relative path, and gets an ID that is never reused: a repository removed and
   created again is a new repository, and the old caches are recognized as

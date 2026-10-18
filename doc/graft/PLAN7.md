@@ -331,207 +331,146 @@ the changeset log keeps its metadata. **Documented limit:** the diff of a closed
 merged review whose commits are reachable from no reference at a checkpoint may
 no longer be available.
 
-### REVIEW ROOTS RULE (binding, added after the PM approval)
+### REVIEW ROOTS RULE (binding; WP74b, approved by the PM)
 
 **Root cause.** Open reviews are a second kind of root into the object graph,
-next to the references, and phase 6 did not count them: nothing made a review's
-commits live, and the review service accepted any commit present in the serving
-node's local cache, including one the storage core had already pruned. The
-checkpoint closure (above) makes open-review commits live; this rule makes the
-review service create only roots the storage core holds, and closes the race
-between a review write and a checkpoint commit.
+next to the references, and phase 6 did not count them. Every mechanism that
+decides liveness respects references only:
+* local Gitaly housekeeping keeps what local references reach;
+* the voter packs what `--not --all` leaves out;
+* a checkpoint's closure is the references at `N`;
+* GC keeps what the boundary computed from them keeps.
 
-* **R1 — review writes (review service, authoritative mode).** `CreateReview`
-  (head and base) and `UpdateReview` when it moves the head (the base never moves
-  after creation) read `(refs, S) = Meta.Refs(repoID)` in one snapshot and check,
-  in the local repository (which the gate caught up first), that every new root
-  commit is reachable from the object-ID targets of `refs` (one `rev-list` run
-  with the refs as negative tips). Otherwise `FailedPrecondition` ("commit <oid>
-  of the review is not reachable from the references of the repository in the
-  storage core"). The database write of the review then carries `S`: in its
-  transaction, under the repository row lock, it requires that the newest
-  checkpoint's sequence is `<= S`, else it returns `ErrReviewRootsStale`. This is
-  an **optimistic compare-and-swap protocol**, not a retry that hides a race: the
-  condition is decided under the lock, and a conflict means only that a checkpoint
-  was committed between the check and the write. The service then takes a new
-  snapshot and checks again, **at most 3 attempts in all** (checkpoints are minutes
-  apart at the least, so a second conflict is already exceptional); when the
-  attempts are exhausted it returns `Aborted` ("the commits of the review could not
-  be checked against a stable snapshot: checkpoints were recorded concurrently";
-  Gitaly's Aborted interceptor shows clients its generic "try again" message and
-  keeps this one in the `error_details` metadata). Tested: success after exactly
-  one conflict, and exhaustion. Comments, verdicts and closes do not move roots and
-  are not checked.
+So an open review's commit whose branch was deleted was garbage to all of them.
+Tested: real housekeeping (a full repack with an expired cruft pack and a
+prune, expiry now) removed it on today's code, on both dialects
+(`TestOpenReviewCommitsSurviveHousekeeping`, run before the change).
 
-  *As implemented (WP74).* `dbreview.Store` gains `Refs()` (the snapshot) and
-  `WithRootsAt(S)` (a store whose `Create` and `Update` pass `rootsAt = S`); the
-  review service detects this capability with an interface assertion, so the
-  files store (storage core off or in shadow mode) is unchanged. The check runs
-  inside the write, after the snapshot: `CreateReview` checks head and base;
-  `UpdateReview` checks the new head inside the review store's update function,
-  only when the head moves, so an update that keeps the head is not refused. If
-  a reference tip of the snapshot is missing locally (a changeset committed on
-  another node after the gate caught the repository up), the service calls
-  `EnsureFresh` once before checking; afterwards a missing tip is `Internal`.
-  The reachability test is `gitops.IsReachable`.
-* **R2 — checkpoint commit.** The build records the root set it included (the
-  open reviews' head and base commits, read after `Refs`). `CreateCheckpoint`, in
-  its transaction under the repository row lock, requires every open review's head
-  and base to be in that set, else `ErrCheckpointRootsChanged` and nothing is
-  recorded (the CLI returns `FailedPrecondition` "the reviews changed during the
-  checkpoint build, run it again"; the background task tries again at its next
-  tick).
-* **Proof.** Both conditions are checked under the same row lock, so a review
-  write R and a checkpoint commit K are serialized. If R commits before K, R2
-  makes K include R's roots. If R commits after K at checkpoint `N`, R1 gives `N
-  <= S`, and R's roots were reachable from the references at `S`: either they are
-  reachable at `N` (in K's closure), or the changesets `(N, S]` brought them into a
-  pack `> N` (an object present locally but unreachable is packed again by the
-  voter, whose `rev-list --not --all` excludes only reachable objects), which stays
-  live until a later checkpoint whose R2 includes R.
+**Rule: review roots are references.** The head and base commits of a review
+are protected by `refs/keep-around/<oid>` (target `<oid>`), written through
+the ordinary write path: the reference-transaction hook, so the voter and the
+database CAS in shadow and authoritative mode. Then:
+* every node keeps them through housekeeping (they are local references after
+  catch-up or hydration);
+* the voter uploads a commit that only the serving node had;
+* a checkpoint's closure covers them by the ordinary "references at `N`" rule;
+* GC treats their packs like any reference's.
+
+`refs/keep-around/` is a hidden internal prefix in Gitaly: it is neither
+advertised nor writable over the git protocols
+(`uploadpack.hideRefs`/`receive.hideRefs`). The Graft changelog does not
+record it, because it records only branches and tags.
+
+* **Writes (review service, every mode).** `CreateReview` writes the references
+  of head and base (`reviewroots.Protect`: one reference transaction that
+  creates the absent ones), then records the review. `UpdateReview` writes the
+  references of the head and base it stores, then updates the review; this
+  also holds when the head does not move, and it backfills reviews written
+  before this rule. Comments and verdicts write no reference.
+* **Invariant (authoritative mode, enforced in the database).** Every open
+  review written with its roots required has the keep-around references of its
+  head and base in `graft_refs`. Two checks, both under the repository row lock
+  (LOCK ORDER):
+  * `InsertReview` and `UpdateReview` with `requireRoots` (the review store of
+    `CreateReview` and `UpdateReview`, `dbreview.WithRequiredRoots`) require the
+    references to exist with their commit as value, else `ErrReviewRootsMissing`
+    and nothing is written;
+  * `CommitChangeset` refuses a non-forced changeset that deletes or moves a
+    keep-around reference whose value is the head or base of an open review
+    (`ErrReviewRootInUse`, `FailedPrecondition` from the voter). This covers
+    every write path: `DeleteRefs`, `WriteRef`, `UpdateReferences`, pushes,
+    and the sweep.
+  A review write that loses its reference to a sweep between the two steps
+  fails in the database. The service then writes the reference again, at most
+  3 attempts in all, then `Aborted`. This is correct because of the invariant;
+  the bound only stops a pathological loop.
+* **Deletion.**
+  * `CloseReview` deletes the references of the closed review's commits that no
+    other open review uses (`reviewroots.Sweep` with those candidates). Each
+    deletion is its own transaction expecting the value read. A deletion that a
+    concurrent review write makes the database refuse is kept. A deletion that
+    fails otherwise is logged at warning level: the close is already recorded,
+    and the reference only keeps objects alive longer.
+  * The maintenance task (WP77) runs the full sweep, which deletes leftovers
+    such as those of a crash, and the backfill (`reviewroots.Backfill`), which
+    writes the references of open reviews written before this rule or imported
+    from shadow-mode files when their objects are present, and reports the
+    others (counts and review IDs). A review whose objects are already lost
+    blocks nothing.
+  * A sweep may skip references younger than `gc_grace` to make the
+    creation/sweep race rare. That is an efficiency measure only; correctness
+    comes from the invariant and the bounded retry.
+* **Off and shadow mode.** The review store is the files store and the same
+  references are written, so housekeeping keeps the commits there too; in
+  shadow mode the voter records them in the database. The database invariant
+  is not enforced there: the files are the source of truth, and shadow
+  changesets are forced, so `CommitChangeset` does not refuse them. In off
+  mode the references of a closed review are deleted by its close; there is no
+  maintenance sweep.
+* **What it costs.** One reference transaction per review creation and per
+  head move (one changeset, plus a pack only when the commit was not yet in the
+  storage core), one per released commit at a close, and no changelog entry.
+  Measured in WP79.
+* **What it replaced (WP74 → WP74b).** The first design checked, at each review
+  write, that the commits were reachable from a reference snapshot, and recorded
+  a root set with each checkpoint. Because the commits were not references, it
+  could not protect them on the nodes, and a review whose commits were lost
+  blocked every checkpoint. It is removed with its errors, metric, tests and
+  `gitops.IsReachable`. `CheckpointInput` has no root set, and the checkpoint
+  build reads no reviews.
 * **LOCK ORDER (PM check 3).** Every transaction that must serialize with a
-  changeset, a root-moving review write or a checkpoint commit takes the
-  repository row (`SELECT ... FOR UPDATE` on Postgres; SQLite's immediate
-  transaction holds the database write lock from `BEGIN`) **as its first
-  statement**, before it reads or writes any child table: `CommitChangeset`,
-  `RegisterRepository`, `ImportHistory`, `InsertReview`, `UpdateReview` with
-  `rootsAt != 0`, `CreateCheckpoint` and the lease methods. Transactions that touch
-  only child rows without changing their `repo_id` (`UpdateReview` with `rootsAt ==
-  0`, `ReportApplied`, the orphan observations, `DeleteCheckpoint`) never lock the
-  repository row and never upgrade a lock, so they cannot form a cycle with the
-  first group. Insert-only child transactions take Postgres's implicit `KEY SHARE`
-  on the parent and nothing after it. Tested with `-race` on Postgres and SQLite:
-  concurrent lands, review creations and head moves, comments, and checkpoint
-  commits on one repository, with no deadlock or serialization error surfacing
-  (the retry of `withTx` is counted and must stay at zero for deadlocks), and every
-  invariant checked at the end.
-* **Reviews created before phase 7** may already reference a pruned commit (not
-  possible after R1); so may reviews that `ImportHistory` brings in from the
-  shadow-mode files. A checkpoint build whose open-review root is missing from the
-  building node's repository fails with `FailedPrecondition` naming the review IDs
-  (metadata `review_id`), counts
-  `graft_storage_checkpoint_review_objects_missing_total`, and records nothing; GC
-  of the existing checkpoints is unaffected. Closing the review resolves it.
-* **Files.** `internal/gitaly/service/review/**` (the R1 check only, smallest
-  change, with tests), `internal/graft/corestore/dbreview/**` (carries `S` to the
-  store), `sqlstore` (the conditioned review writes and the R2 check).
+  changeset, a review write that requires its roots, or a checkpoint commit
+  takes the repository row (`SELECT ... FOR UPDATE` on Postgres; SQLite's
+  immediate transaction holds the database write lock from `BEGIN`) **as its
+  first statement**, before it reads or writes any child table:
+  `CommitChangeset`, `RegisterRepository`, `ImportHistory`, `InsertReview`,
+  `UpdateReview` with `requireRoots`, `CreateCheckpoint` and the lease methods.
+  Transactions that touch only child rows without changing their `repo_id`
+  (`UpdateReview` without `requireRoots`, `ReportApplied`, the orphan
+  observations, `DeleteCheckpoint`) never lock the repository row and never
+  upgrade a lock, so they cannot form a cycle with the first group.
+  Insert-only child transactions take Postgres's implicit `KEY SHARE` on the
+  parent and nothing after it. Tested with `-race` on Postgres and SQLite
+  (`TestLockOrderConcurrentWriters`): concurrent lands, review creations and
+  head moves (requiring their roots), a sweeper that deletes keep-around
+  references until the writers are done, comments, checkpoint commits and
+  leases on one repository. The test checks that no deadlock surfaces (the
+  retry hook counts them, and the count must stay at zero), the invariant at
+  the end, and dense sequences.
+* **Files.** `internal/graft/corestore/reviewroots/**` (Protect, Sweep,
+  Backfill), `internal/gitaly/service/review/**` (the roots writes and the
+  close release), `internal/graft/corestore/dbreview/**`
+  (`WithRequiredRoots`), `sqlstore` (the two checks), `voter` (the error code).
 
-### REVIEW ROOTS amendment: review roots are references (proposed after WP74, PM decision pending)
-
-**Finding (WP74).** Gitaly housekeeping on a node keeps only what local
-references reach. After its expiry it can drop the commit of an open review
-whose branch was deleted. Checkpoint builds on that node then refuse with
-`FailedPrecondition` until the review closes. Re-hydrating would loop:
-housekeeping would prune the object again. The cause is the same as for R1/R2:
-an open review is a root that neither the local repository nor the reference
-graph of the storage core knows about. Every mechanism that decides liveness
-(local housekeeping, the voter's `--not --all`, the checkpoint closure, GC)
-respects references only.
-
-**Facts in the code (evidence).**
-1. Every reference write by a service goes through the voter:
-   `updateref.Updater` always runs with `gitcmd.WithRefTxHook`
-   (`internal/git/updateref/updateref.go:320`). The hook manager calls
-   Preparing/Prepared for every reference transaction (`voter.go` header). So a
-   ref the review service writes becomes a changeset with a database
-   compare-and-swap. Its pack holds every object not reachable from the local
-   references (`gitops.BuildPack`, `--not --all`), so a commit that only the
-   cache has is uploaded with it.
-2. The database records every reference name, while the Graft changelog records
-   only branches and tags (`sqlstore/changeset.go:202`, `IsChangelogRef`;
-   `changelog.ParseUpdates` names `refs/keep-around/*` as not recorded). A
-   keep-around write therefore adds a changeset but no changelog entry and no
-   `graft watch` event.
-3. `refs/keep-around/` is an internal hidden prefix (`git/reference.go:62`,
-   `InternalReferenceTypeHidden`). Gitaly adds it to `uploadpack.hideRefs` and
-   `receive.hideRefs` (`gitcmd/command_description.go:453-484`), so clients
-   never see it advertised and can neither push nor delete it.
-   `ListRefs` shows it only to a caller whose patterns include it, as in
-   upstream Gitaly. The graft CLI and the SDK list no references.
-4. Hydration, catch-up and verify treat every database reference alike, so
-   keep-around references reach every node through the normal path.
-
-**Option (a), recommended: review roots are references.** A review's head and
-base are protected by `refs/keep-around/<oid>` (target `<oid>`), written
-through the ordinary write path (voter, database CAS, changeset).
-* **Writes.** `CreateReview` writes the keep-around references of head and base
-  (one reference transaction, which creates the absent ones), then inserts the
-  review. `UpdateReview` writes the new head's reference, then updates the
-  review. Comments, verdicts and closes write no reference. The request path
-  never deletes one.
-* **Invariant, in the database (authoritative mode).** "Every open review's head
-  and base has its keep-around reference in `graft_refs`." Two checks, both
-  under the repository row lock (LOCK ORDER), keep it:
-  * `InsertReview` and `UpdateReview` with `requireRoots` (replacing `rootsAt`)
-    require the references to exist with that value, else
-    `ErrReviewRootsMissing`. The service then writes them again and retries, at
-    most 3 attempts, then Aborted. This happens only if a sweep deleted the
-    reference between the two steps.
-  * `CommitChangeset` refuses to delete a `refs/keep-around/<oid>` that an open
-    review uses (a reference conflict). This also protects them from
-    `DeleteRefs`/`WriteRef` callers.
-* **Deletion.** One path: a maintenance sweep (WP77) deletes keep-around
-  references that no open review uses. The changeset constraint makes it safe
-  against a concurrent creation. A leaked reference (crash between the steps,
-  closed review) only keeps objects alive until the next sweep.
-* **What this removes.**
-  * R2: `CheckpointInput.Roots`, `checkReviewRoots`,
-    `ErrCheckpointRootsChanged`.
-  * The checkpoint build's review step: `ListReviews`, the head `H`, and the
-    missing-review-commit path with its metric. The closure is "refs at N" and
-    EnsureFresh needs only `>= N`.
-  * R1's reachability check, its checkpoint-sequence condition (`rootsAt`,
-    `ErrReviewRootsStale`), and `gitops.IsReachable`'s only caller.
-  The roots rule becomes the general reference rule. A checkpoint can no
-  longer be blocked by a review: a review whose commits are already lost
-  simply has no reference.
-* **What it adds.**
-  * One reference transaction per review creation and per head move. Each
-    produces one changeset, plus a pack only when the commit was not yet in
-    the storage core.
-  * The two database checks.
-  * The sweep.
-  * A backfill in maintenance for reviews written before this amendment or
-    imported from files, which writes their references when the objects are
-    present (a review whose objects are missing is logged and counted, and
-    blocks nothing).
-* **UX.** `CreateReview` on a commit that only the serving node has works again:
-  the reference write uploads it. The STORAGE.md sentence added in WP74 ("push
-  it first") is replaced.
-* **Modes.** Off and shadow mode use the file review store. The service writes
-  the same references there too: the same local protection against
-  housekeeping, and in shadow mode the voter records them. The database
-  invariant exists only in authoritative mode, where the database decides.
-  This is one code path for all modes; in off mode it fixes the existing
-  "verdict commit pruned after a force push" limitation for review heads.
-* **Costs to measure (WP79).** The latency of a review creation (one extra
-  reference transaction, comparable to a one-reference land). The number of
-  changesets per review (1 per creation or head move, plus 1 per sweep batch).
-
-**Option (b), rejected: local-only hidden keep-alive references.** References
-present on each serving node but excluded from the database, from verify and
-from the voter.
-* It does not address liveness in the storage core. R1 and R2 stay, and so does
-  everything this amendment removes.
-* Every database-side reader of local references would need an exclusion: the
-  voter's hook input, `ImportRepository`'s `ReadRefs` (it records every local
-  reference), verify, the syncer's checks of local values, and the stale-cache
-  checks.
-* `--not --all` in the voter would count them as reachable. A later changeset's
-  pack could then omit objects that only such a local reference protects:
-  a new class of "present locally, not live in the storage core" objects.
-* A node that hydrates later, or that has not served the repository since a
-  review was created, has no such reference and does not learn about the
-  review until a request arrives. Its housekeeping can prune in between,
-  which is the same stall. A per-node rebuild of the references from the
-  database on every hydration and catch-up would be needed, and it stays
-  racy.
-
-**Recommendation: (a).** It removes R2 and the checkpoint's review step
-entirely, and replaces R1 by a reference-existence check. It uses only existing
-mechanisms (voter, CAS, hidden refs, sweep) and fixes the housekeeping finding
-on every node. Implementation would be a WP74b before WP76, replacing the
-WP74 R1/R2 code (doc and tests included).
+**Tests (WP74b).**
+* `gate`, on real servers in authoritative mode, SQLite and Postgres:
+  * housekeeping keeps an open review's commit after its branch is deleted, on
+    the serving node and on a node that hydrated after the review was created
+    (the reproduction above, now green);
+  * `DeleteRefs`, `WriteRef` and `UpdateReferences` cannot delete or move an
+    open review's keep-around reference, and nothing changes locally or in
+    the database;
+  * an unused keep-around reference can be deleted.
+* `sqlstore`, both dialects: the two checks, writing nothing when they refuse;
+  a forced (shadow) changeset is not refused; closing a review releases its
+  references; the LOCK ORDER race above.
+* `review`:
+  * a review of a commit that only the serving node has records its
+    references in the database;
+  * a head move adds one;
+  * a close releases only what no other open review uses;
+  * a sweep between the reference write and the review write is survived
+    after one retry, and exhaustion is `Aborted` with nothing recorded;
+  * off and shadow mode write the references, and housekeeping keeps the
+    commit.
+* `reviewroots`: Protect (idempotent, fixes a wrong value, refuses an absent
+  object), Sweep (candidates, everything, kept versus deleted), Backfill
+  (counts and missing review IDs, including invalid object IDs).
+* Mutation checks:
+  * disabling the deletion guard fails the gate test and the sqlstore test on
+    both dialects, and the LOCK ORDER invariant on Postgres;
+  * disabling the roots requirement fails the sqlstore test and both review
+    race tests.
 
 ### Data model (new migration, both dialects)
 
@@ -652,9 +591,13 @@ var (
     ErrBlobExists             = errors.New("storage core: blob already exists")
     ErrCheckpointNotFound     = errors.New("storage core: checkpoint not found")
     ErrPackDeadline           = errors.New("storage core: the pack upload is older than the write deadline")
-    ErrReviewRootsStale       = errors.New("storage core: a checkpoint was recorded after the review's commits were checked")
-    ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
+    ErrReviewRootsMissing     = errors.New("storage core: a commit of the review has no keep-around reference")
+    ErrReviewRootInUse        = errors.New("storage core: the keep-around reference is the root of an open review")
 )
+
+// KeepAroundPrefix and KeepAroundRef name the references of the REVIEW ROOTS RULE.
+const KeepAroundPrefix = "refs/keep-around/"
+func KeepAroundRef(oid string) string
 
 // NewPackKey returns a new owned pack key for a pack of the repository with the
 // given SHA-256: "repos/<repo_id>/packs/<hex sha256>-<hex nonce>.pack", with a
@@ -751,7 +694,6 @@ type CheckpointInput struct {
     Refs      map[string]Target // the reference snapshot at Seq: no absent value, not empty
     PackKey   string            // an owned key, already uploaded
     PackBytes int64
-    Roots     []string          // the open-review head and base commits the pack includes (REVIEW ROOTS R2)
 }
 
 type MetaStore interface {
@@ -762,10 +704,8 @@ type MetaStore interface {
     // requires Seq <= head_seq, Seq > the newest checkpoint's Seq and an owned
     // PackKey of the repository (else an error, nothing written). A checkpoint at
     // Seq that exists already is returned unchanged with created=false (its pack
-    // is kept; the caller's pack becomes an orphan). It requires every open
-    // review's head and base commit to be in in.Roots (REVIEW ROOTS R2), else
-    // ErrCheckpointRootsChanged and nothing is written. ErrRepositoryNotFound for
-    // an unknown repository.
+    // is kept; the caller's pack becomes an orphan). ErrRepositoryNotFound for an
+    // unknown repository.
     CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
     // NewestCheckpoint returns the checkpoint with the greatest Seq; ok is false
     // when there is none.
@@ -815,12 +755,17 @@ type MetaStore interface {
 }
 ```
 
-**InsertReview and UpdateReview (changed, REVIEW ROOTS R1).** Both take a new
-last parameter `rootsAt uint64`. When it is not 0, the transaction locks the
-repository row and requires the newest checkpoint's sequence to be `<= rootsAt`,
-else `ErrReviewRootsStale` and nothing is written. Callers that do not move a
-review's roots pass 0 (comments, verdicts, closes, imports). `dbreview` carries the
-value from the review service to the store.
+**InsertReview and UpdateReview (changed, REVIEW ROOTS RULE).** Both take a new
+last parameter `requireRoots bool`. When it is set, the transaction locks the
+repository row first and requires the keep-around references of the review's head
+and base to exist with their commit as value, else `ErrReviewRootsMissing` and
+nothing is written. Comments, verdicts, closes and imports pass false.
+`dbreview.WithRequiredRoots` is the store of the writes that pass true.
+
+**CommitChangeset (changed, REVIEW ROOTS RULE).** A non-forced changeset that
+deletes or moves a keep-around reference whose value is the head or base of an
+open review is refused with `ErrReviewRootInUse`; nothing is written. Forced
+(shadow) changesets are not refused.
 
 **DeleteRepository (changed).** In the transaction that deletes the repository row
 it reads the row's `repo_id` and inserts the `graft_gc_removed` tombstone with
@@ -842,23 +787,13 @@ method `func (c *Core) WriteDeadline() time.Duration` = `GCGrace − GCMargin` (
 // reachable from tips: `git rev-list --objects --stdin` (the tips on stdin, no
 // --not) piped into `git pack-objects --stdout`, hashed into a file in tmpDir.
 // Zero tips are ignored; no tips is an empty Pack. A tip that is not in the
-// repository is an error: callers check the tips with MissingObjects first, so
-// that a missing object is reported precisely and never yields a partial pack.
+// repository is an error, never a partial pack.
 func BuildPackFrom(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID, tmpDir string) (Pack, error)
 
 // MissingObjects returns the tips that are not in the repository, in the order
-// given (one `cat-file --batch-check` run).
+// given (one `cat-file --batch-check` run). Used by reviewroots.Backfill.
 func MissingObjects(ctx context.Context, repo *localrepo.Repo, tips []git.ObjectID) ([]git.ObjectID, error)
-
-// IsReachable reports whether commit is reachable from one of tips (one
-// `rev-list --stdin --max-count=1` run with the tips negated; tips that are
-// blobs or trees reach nothing, annotated tags are peeled). For REVIEW ROOTS R1.
-func IsReachable(ctx context.Context, repo *localrepo.Repo, commit git.ObjectID, tips []git.ObjectID) (bool, error)
 ```
-
-(WP74: an earlier draft had BuildPackFrom report a missing tip through an
-`IsMissingObject` predicate; the build order checks with MissingObjects before
-any pack is built, so no caller needs to tell that error apart.)
 
 ### Writers (WP73, change A on the write path)
 
@@ -918,8 +853,7 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 
 The fault hook is an unexported field of the `Checkpointer` that tests set
 (`export_test.go`), like the syncer's test hook, not a package variable, so
-that parallel tests do not share it. Its points are `after_snapshot` (after
-step 1: a test writes a review at `S > N` there), `after_upload` and
+that parallel tests do not share it. Its points are `after_upload` and
 `after_commit`. `Create` takes `*gitalypb.Repository` because the repository
 factory builds from it; both callers (the RPC handler and the maintenance
 runner) have one.
@@ -929,46 +863,26 @@ Binding order:
 1. Require authoritative mode (else `FailedPrecondition`, SHADOW SCOPE). Read
    `(refs, N) = Meta.Refs(repoID)` (one snapshot). If `NewestCheckpoint` is at
    `N`: return it, `created = false`. (WP74: the reftable check of the draft is
-   dropped. The local repository may not exist before step 3, and EnsureFresh
+   dropped. The local repository may not exist before step 2, and EnsureFresh
    replaces a copy that is not reftable, so the check could only refuse a node
    that has no copy yet. The build only reads objects, which does not depend on
-   the reference backend. The object hash comes from the repository record.)
-2. **Roots before freshness (PM check 1).** Read the open reviews
-   (`ListReviews(repoID, "", false, 0)`): their `head_commit_id` and
-   `base_commit_id` (each validated as an object ID of the repository's hash;
-   empty values skipped) are the build's root set (`Roots`). Then read the record
-   again: its head `H` (`>= N`) is at least the snapshot sequence `S` of every review
-   read, because each of them was written after its own check at `S` and before
-   this read. A review's roots can come from changesets in `(N, S]`, so the
-   reference snapshot `N` alone does not tell which objects the builder needs.
-3. **Change D:** `EnsureFresh(repo)`. EnsureFresh catches up to a head read after
-   the call arrived, which is `>= H`; then read the local watermark and require
-   `wm.RepoID == repoID && wm.Seq >= H` (else `Internal`: the Freshener contract is
+   the reference backend. The object hash comes from the repository record.) The
+   object tips of `refs` (symbolic references skipped) are the closure; the open
+   reviews' commits are among them through their keep-around references (REVIEW
+   ROOTS RULE), so the build reads no reviews. No object tip → return
+   `created = false` (nothing to consolidate).
+2. **Change D:** `EnsureFresh(repo)`. EnsureFresh catches up to a head read after
+   the call arrived, which is `>= N`; then read the local watermark and require
+   `wm.RepoID == repoID && wm.Seq >= N` (else `Internal`: the Freshener contract is
    broken, never retried around). The local repository now holds every object of
-   the changesets `<= H`, hence every object reachable from `refs` and every root
-   of a review checked at `S <= H`.
-4. **All objects present, or a precise error, never a partial pack.**
-   `MissingObjects` over the reference tips and the roots, before any pack is built:
-   a missing reference tip is impossible after step 3 and is `Internal` naming the
-   object; a missing review root can only belong to a review written without R1
-   (created before phase 7, or brought in by `ImportHistory` from the shadow-mode
-   files) and is `FailedPrecondition` naming the review IDs, with the metric;
-   nothing is uploaded. A review commit that is not an object ID of the
-   repository's hash cannot be packed and is refused the same way.
-5. `pack = BuildPackFrom(local, tips ∪ roots, tmpDir)`. No object tips → return
-   `created = false` (nothing to consolidate; hydration of such a repository is
-   already trivial).
-6. Re-read the record (`t_r`), `Core.UploadPack`. `//! after_upload`.
-7. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes, Roots})`
-   under the upload's `CommitContext`. `ErrCheckpointRootsChanged` (a review moved
-   its head after step 2) → the build fails with `FailedPrecondition` (its pack is
-   an orphan). `//! after_commit`.
+   the changesets `<= N`, hence every object reachable from `refs`.
+3. `pack = BuildPackFrom(local, tips, tmpDir)`; a missing object fails the build
+   (`Internal`), never a partial pack.
+4. Re-read the record (`t_r`), `Core.UploadPack`. `//! after_upload`.
+5. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes})` under the
+   upload's `CommitContext`. `//! after_commit`.
 
-The roots of a review written after step 2 are not in `Roots`: either R2 refuses the
-checkpoint (the review committed before step 7) or R1 makes the review's snapshot
-`>= N` (it committed after step 7), so its roots are live without this checkpoint.
-
-A crash after 5 leaves the pack as an orphan (reclaimed by the orphan protocol); a
+A crash after 3 leaves the pack as an orphan (reclaimed by the orphan protocol); a
 re-run starts over from the head at that time. The build holds no reference lock
 and never blocks or fails a write (CKPT-2).
 
@@ -1212,6 +1126,15 @@ sweep of removed repositories and takes no `-repo`.
 
 ## Rejected alternatives
 
+* **Local-only hidden keep-alive references for review roots** (option b of the
+  WP74b decision). They would not touch liveness in the storage core, so a second
+  root mechanism would stay beside the references. Every database-side reader of
+  local references would need an exclusion: the voter's hook input,
+  `ImportRepository`'s `ReadRefs`, verify, and the syncer's checks. The voter's
+  `--not --all` would count them as reachable, so a later pack could omit objects
+  that only such a reference protects. A node that hydrates later has no such
+  reference until it learns about the review, so its housekeeping can prune in
+  between. Review roots are database references instead (REVIEW ROOTS RULE).
 * **Database fencing of deletions** (a `graft_gc_doomed` set serialized with
   `CommitChangeset`, direction 2 of the PM review). It keeps objects shared between
   rows and adds a lookup to every commit under the reftable lock. It is not complete
@@ -1253,9 +1176,11 @@ sweep of removed repositories and takes no `-repo`.
   most one row (legacy keys excepted); `Put` never succeeds on an existing key.
 * **OWN-2.** A writer commits a row referencing its pack only before `t_r + W`; no
   writer of a not-upgraded binary can commit a pack-carrying changeset (trigger).
-* **I1 (preserved).** Every object reachable from the current references, and the
-  head and base commits of the open reviews at the last checkpoint, is in a kept
-  pack.
+* **I1 (preserved).** Every object reachable from the current references (among
+  them the keep-around references of the open reviews' commits) is in a kept pack.
+* **ROOTS-1.** In authoritative mode every open review written with its roots
+  required has the keep-around references of its head and base in the database;
+  on every node that has caught up, housekeeping keeps those commits.
 * **GC-1.** The collector never deletes a pack referenced by a changeset with
   `seq > C_gc` or a checkpoint with `seq >= C_gc`.
 * **GC-2.** The collector never deletes a pack a write in progress may still commit
@@ -1305,8 +1230,10 @@ sweep of removed repositories and takes no `-repo`.
     (bound `t_r + W`), the sweep at `removed_at + gc_grace` deletes it.
 12. Two nodes race for the lease: one wins; a holder that crashes lets the lease
     expire after `lease_ttl`.
-13. An open review whose commits are missing locally: the checkpoint fails with
-    `FailedPrecondition` naming the review; GC still runs.
+13. Housekeeping on a node after an open review's branch is deleted, also on a node
+    that hydrated after the review was created: the commit survives (keep-around
+    reference). A sweep between a review's reference write and its database write:
+    the write fails in the database and the service writes the reference again.
 
 ## Test plan (multilevel; SQLite and Postgres wherever a store is involved)
 
@@ -1330,9 +1257,9 @@ sweep of removed repositories and takes no `-repo`.
   expired → rebuilt; commit past the deadline → refused); the phase-6 voter, import,
   syncer, gate and storagecore suites stay green.
 * **checkpoint unit**: hydration from a checkpoint equals the source at head
-  (references, `fsck`); open-review commits survive the deletion of their branch;
-  closed-review commits do not (documented limit); lagging copy (change D); missing
-  review objects → `FailedPrecondition`; `created=false`.
+  (references, `fsck`); a keep-around reference keeps its commit, a swept one
+  does not; lagging copy (change D); `created=false`.
+* **review roots**: see the REVIEW ROOTS RULE (WP74b tests).
 * **gc unit**: every branch of the sweep; covered vs live per key; dropped
   checkpoints; observations (new, in grace, expired, referenced since); removed
   repositories younger and older than `gc_grace`; dry run deletes and writes
@@ -1358,17 +1285,14 @@ sweep of removed repositories and takes no `-repo`.
   * the trigger: a legacy-format insert is rejected with the documented error, an
     owned key and NULL are accepted, legacy rows stay readable, and GC uses the
     greatest sequence of a shared legacy key;
-  * REVIEW ROOTS: R1 rejects an unreachable head or base; R1's stale snapshot (a
-    checkpoint committed between the check and the write) is detected under the lock
-    and re-checked; R2 refuses a checkpoint whose build missed a review moved during
-    the build;
+  * REVIEW ROOTS (WP74b, PM conditions): the housekeeping reproduction on two
+    nodes; the sweep/create race within 3 attempts; the deletion guard through
+    `DeleteRefs`, `WriteRef` and `UpdateReferences`; off and shadow mode; the
+    backfill counts;
   * a sync round slower than `sync_timeout` and a dry hydration slower than `W` are
     cancelled;
-  * (third review) a checkpoint build on a node whose watermark is below the
-    snapshot `S` of an open review created at `S > N` includes that review's roots
-    (EnsureFresh to `H`); a root missing locally is a precise error and no pack is
-    uploaded; R1 succeeds after exactly one `ErrReviewRootsStale` and returns
-    `Aborted` after 3; the LOCK ORDER `-race` test on Postgres and SQLite.
+  * (third review) a checkpoint build on a lagging node catches up first
+    (EnsureFresh to `>= N`); the LOCK ORDER `-race` test on Postgres and SQLite.
 * **measurement** (WP79, in the benchmark window the PM schedules): bucket size and
   fresh-node hydration time before and after a checkpoint and GC on a repository
   with many changesets; the preparing/prepared histograms before and after WP73.
@@ -1405,7 +1329,8 @@ every entry point returns `FailedPrecondition`.
 | WP71 | migration 2 (tables, trigger), every new `sqlstore` method, `DeleteRepository` tombstone | — |
 | WP72 | `BlobStore` `List`/`Delete`, strict `Put`, owned pack keys in `types.go` | — |
 | WP73 | writers: owned keys and the deadline in the voter, `shadowpack.go`, import; `Core` fields | WP71, WP72 |
-| WP74 | `gitops.BuildPackFrom`/`MissingObjects`, `checkpoint` package, REVIEW ROOTS (R1 in the review service and `dbreview`, R2 in `CreateCheckpoint`) | WP71–WP73 |
+| WP74 | `gitops.BuildPackFrom`/`MissingObjects`, `checkpoint` package | WP71–WP73 |
+| WP74b | REVIEW ROOTS RULE: `reviewroots` (Protect, Sweep, Backfill), the review service, `dbreview.WithRequiredRoots`, the two database checks | WP74 |
 | WP75 | `gc` package | WP71–WP73 |
 | WP76 | syncer (seed, `C_sync`), `verify_objects.go` | WP71, WP74 |
 | WP77 | config, `maintenance` package, `serve.go` wiring | WP74–WP76 |
@@ -1431,9 +1356,9 @@ numbers). Work files live in `/home/feder/m3-work/`, never in `/tmp` (PM.md).
   fails; an import of a very large repository must fit in it after its pack build
   (the deadline starts after the build).
 * **Unreachable-object pruning** loses the diff of closed reviews whose commits are
-  unreachable at a checkpoint (documented limit).
-* **Missing open-review objects** block checkpoints of the repository until the
-  review is closed; the root fix is in the review service (open question).
+  unreachable once their keep-around references are released (documented limit).
+* **Reviews written before the REVIEW ROOTS RULE** whose commits are already lost
+  cannot be protected; the backfill reports them and nothing else is held up.
 * **Re-hydration** discards a far-behind cache's objects (rare).
 * **Lease held by a crashed node** delays maintenance by at most `lease_ttl`.
 * **S3/GCS/Azure untested**; the design reads no bucket times, so the clock risk of
@@ -1444,7 +1369,8 @@ numbers). Work files live in `/home/feder/m3-work/`, never in `/tmp` (PM.md).
 
 1. `graft storage gc -repo R` touches only that repository; removed repositories are
    swept by `graft storage gc --removed` and by the background task.
-2. The checkpoint closure includes the head and base commits of open reviews.
+2. The checkpoint closure includes the head and base commits of open reviews
+   (through their keep-around references since WP74b).
 3. `maintenance` defaults to `off` in this release.
 4. The benchmark window is requested at WP79.
 
@@ -1465,9 +1391,9 @@ New (m3): `corestore/checkpoint/**`, `corestore/gc/**`, `corestore/maintenance/*
 `corestore/{core,types,metastore}.go`, `blobstore/**`, `gitops/gitops.go`,
 `voter/**`, `syncer/syncer.go`, `open/open.go`, `service/storagecore/{import,verify_objects}.go`,
 `cmd/graft/storage.go`, `proto/storage_core.proto` (+ generated code),
-`config_graft_storage.go`, `doc/graft/STORAGE.md`, `corestore/dbreview/**`, and
-`internal/gitaly/service/review/**` (the REVIEW ROOTS R1 check only, assigned to
-m3 by the PM). Shared, my section only:
+`config_graft_storage.go`, `doc/graft/STORAGE.md`, `corestore/dbreview/**`,
+`corestore/reviewroots/**`, and `internal/gitaly/service/review/**` (the REVIEW
+ROOTS RULE writes only, assigned to m3 by the PM). Shared, my section only:
 `internal/cli/gitaly/serve.go`, `doc/graft/CONFIGURATION.md`. No change to the land
 path: the voter is m3's; the land paths call it unchanged.
 
@@ -1490,9 +1416,10 @@ path: the voter is m3's; the land paths call it unchanged.
     tombstone deletion; `Delete` of a missing key is success.
 24. **No fallback paths**: a pack the invariants say exists and does not is reported as
     corruption, never routed around.
-25. **Review roots**: in authoritative mode a review's head and base must be reachable
-    from the database references of the snapshot its write carries (R1), and a
-    checkpoint includes every open review's roots (R2), both under the repository
-    row lock.
+25. **Review roots are references**: a review's head and base are kept by
+    keep-around references written through the ordinary write path before the
+    review is recorded; in authoritative mode the database requires them for a
+    review write and refuses to delete one an open review uses, both under the
+    repository row lock.
 26. **One upload path**: every production upload goes through `Core.UploadPack`, and
     every row that references an upload is committed under its `CommitContext`.
