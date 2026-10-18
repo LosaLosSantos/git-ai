@@ -595,5 +595,57 @@ and commit build (95 to 146 ms), stage 2.
 * `UserSquash` (seen during the audit, not p5w's code): when the merge fails with
   an error that is not a conflict, the error is dropped and the RPC votes and
   migrates with an empty commit ID (`squash.go`, after `s.merge`). Reported to the
-  PM, not changed here.
+  PM; fixed afterwards on the PM's decision (section 14).
 * `cmdCfg.worktreePath` stays: this plan does not touch the command factory.
+
+## 14. Decisions and amendments after approval (recorded by p5w with the PM's decisions)
+
+* **Q1 (custom hooks): both paths.** Custom hooks get the server's `core.fsync` and
+  `core.fsyncMethod` (`GIT_CONFIG_*`, computed like the command factory: its
+  defaults, then the administrator's `[git]` configuration), and a custom hook that
+  runs with a quarantine as its object directory marks it
+  (`quarantine.MarkUntrustedWriter`); the migration of a marked quarantine fsyncs its
+  files in parallel first (`graft_quarantine_untrusted_migrations_total`). The mark
+  is kept in process memory: custom hooks always run in the Gitaly process
+  (`hook.NewManager` is built by `gitaly serve` only; `gitaly-hooks` forwards to the
+  HookService), which an end-to-end test through `UserCommitFiles` with a hook that
+  writes a zlib object with `cp` confirms. A marker file in the quarantine was not
+  used: the hook itself could remove it. The environment golden of the hook tests
+  includes the six variables (case B: Q1 added them).
+* **Q2 (ownership): granted** for `internal/graft/changelog/log.go`,
+  `internal/gitaly/hook/changeset_order.go`, the `recordChangesets` part of
+  `referencetransaction.go`, `cmd/graft-bench`, and `internal/gitaly/hook/custom.go`
+  for the two changes of Q1.
+* **Q3 (G5): kept**, with the guarantee in LIMITATIONS.md in the PM's words: the
+  objects of an update that fails after the migration remain unreferenced until
+  housekeeping prunes them, they passed the pre-receive hook, and until pruned
+  anyone with read access can read them by object ID.
+* **Lost records are visible (binding).** A failed group write cannot fail the
+  update (git committed it), so it is counted (`graft_changelog_records_lost_total`),
+  logged with the references, and stated in LIMITATIONS.md as a limit of the off and
+  shadow modes.
+* **A failed append cuts its bytes off (amendment).** After a failed fsync the kernel
+  may drop the dirty pages while the bytes still read back, so every failure after
+  the write truncates the log to the old durable end; when the truncation fails too,
+  the bytes are remembered as untrusted and never loaded, and the next append
+  truncates them. A failed entry was never visible, so the next entry takes its
+  sequence (the existing test that expected a skipped sequence changed with this
+  contract).
+* **Readers load under the lock file.** A reader that finds the log changed by
+  another process loads it again under the log's lock file, after an fsync, so it
+  waits for an append of that process and never loads bytes before their fsync.
+* **`UserSquash` (binding).** Fixed in its own commit after a reproduction test
+  (`4e8f423`), and shipped in v0.2.0.
+* **WP94 order of links.** The first pass keeps the order of today within each
+  directory (a pack's index after its data); a crash before each link, in a child
+  process, leaves a prefix of the links that `git fsck` accepts.
+* **WP95** is a source scan of the places that set `core.fsync`, `core.fsyncMethod`
+  or use `WithoutObjectFsync`, instead of a run of every writing RPC: it fails on a
+  new place, which must then be checked against the contract.
+* **WP96 count** (diagnosis, before the window): one `UserCommitFiles` of one new
+  file costs 12 git processes on an existing branch and 15 on a new one
+  (`hash-object` 4, `rev-parse` 3 to 5, `for-each-ref` 1 to 2, and one each of
+  `ls-tree`, `commit-tree`, `cat-file`, `update-ref`). The gate of stage 2 is decided
+  with the numbers of the window.
+* **Release.** v0.2.0 is main with phase 4b, the skew fix, its performance fix
+  (`6aecff1`) and the `UserSquash` fix. The rest of this plan goes to v0.3.0.
