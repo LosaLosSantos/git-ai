@@ -381,8 +381,14 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 	return exists, nil
 }
 
-// List implements corestore.BlobStore.
+// List implements corestore.BlobStore. An object deleted while the listing
+// runs is either listed or not, never an error: garbage collection deletes
+// objects while other runs list them.
 func (s *Store) List(ctx context.Context, prefix string, fn func(corestore.BlobInfo) error) error {
+	if s.root != "" {
+		return s.listFiles(ctx, prefix, fn)
+	}
+
 	it := s.bucket.List(&blob.ListOptions{Prefix: prefix})
 	for {
 		obj, err := it.Next(ctx)
@@ -399,6 +405,66 @@ func (s *Store) List(ctx context.Context, prefix string, fn func(corestore.BlobI
 			return err
 		}
 	}
+}
+
+// listFiles lists a file bucket by walking its directory. fileblob's own
+// listing reads a directory and then stats each entry, and fails with NotFound
+// when an entry was deleted in between; here such an entry is an object that is
+// gone and is not listed. Keys are the slash-separated paths below the root
+// (the storage core writes no key that fileblob would escape); directories are
+// not objects.
+func (s *Store) listFiles(ctx context.Context, prefix string, fn func(corestore.BlobInfo) error) error {
+	start := s.root
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
+		start = filepath.Join(s.root, filepath.FromSlash(prefix[:i]))
+	}
+
+	// The error of fn is returned as it is (the BlobStore contract).
+	var fnErr error
+	err := filepath.WalkDir(start, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// The directory, or the entry, is gone: nothing to list there.
+				return nil
+			}
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(s.root, path)
+		if err != nil {
+			return err
+		}
+		key := filepath.ToSlash(rel)
+		if !strings.HasPrefix(key, prefix) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := fn(corestore.BlobInfo{Key: key, Size: info.Size()}); err != nil {
+			fnErr = err
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if fnErr != nil {
+		return fnErr
+	}
+	if err != nil {
+		return fmt.Errorf("blobstore: list %q: %w", prefix, err)
+	}
+	return nil
 }
 
 // Delete implements corestore.BlobStore.

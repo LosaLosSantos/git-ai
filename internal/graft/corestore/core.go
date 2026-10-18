@@ -35,7 +35,8 @@ type BlobStore interface {
 	Exists(ctx context.Context, key string) (bool, error)
 	// List calls fn for every object whose key starts with prefix, in no
 	// defined order. Directories are not objects. An error returned by fn stops
-	// the iteration and is returned as it is.
+	// the iteration and is returned as it is. An object deleted while the
+	// listing runs is listed or not, never an error (collections overlap).
 	List(ctx context.Context, prefix string, fn func(BlobInfo) error) error
 	// Delete removes the object. A key that does not exist is success, so a
 	// collection that is run again never fails on an object it deleted before.

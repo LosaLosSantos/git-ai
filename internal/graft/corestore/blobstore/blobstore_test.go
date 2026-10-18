@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -204,6 +205,52 @@ func TestList(t *testing.T) {
 
 			require.NoError(t, s.List(ctx, "nothing/here/", func(corestore.BlobInfo) error {
 				return errors.New("no object expected")
+			}))
+		})
+	}
+}
+
+// TestListWhileDeleting: an object deleted while a listing runs is listed or
+// not, never an error. Garbage collection runs overlap: one deletes what
+// another lists (fileblob's own listing failed with NotFound here).
+func TestListWhileDeleting(t *testing.T) {
+	for _, tb := range testBuckets(t) {
+		t.Run(tb.name, func(t *testing.T) {
+			ctx := testhelper.Context(t)
+			s := openStore(t, tb.url)
+
+			const objects = 200
+			keys := make([]string, 0, objects)
+			for i := range objects {
+				key := fmt.Sprintf("repos/1/packs/%03d.pack", i)
+				require.NoError(t, s.Put(ctx, key, strings.NewReader(key)))
+				keys = append(keys, key)
+			}
+
+			deleted := make(chan struct{})
+			var g errgroup.Group
+			g.Go(func() error {
+				defer close(deleted)
+				for _, key := range keys {
+					if err := s.Delete(ctx, key); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+
+			for listing := true; listing; {
+				select {
+				case <-deleted:
+					listing = false
+				default:
+				}
+				require.NoError(t, s.List(ctx, "repos/1/", func(corestore.BlobInfo) error { return nil }))
+			}
+			require.NoError(t, g.Wait())
+
+			require.NoError(t, s.List(ctx, "repos/1/", func(info corestore.BlobInfo) error {
+				return fmt.Errorf("object %q listed after its deletion", info.Key)
 			}))
 		})
 	}
