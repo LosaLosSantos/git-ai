@@ -12,25 +12,32 @@
 // gcsblob, azureblob, memblob and fileblob), so no plain-write fallback exists.
 //
 // Exactly one of concurrent Puts of a key wins. memblob checks and inserts
-// under its bucket-wide mutex. fileblob does not: its Close stats the key and
-// then renames the temporary file onto it, under a mutex created per writer, so
-// on its own two writers of one key would both succeed and the second rename
-// would overwrite the first, in one process or across processes sharing the
-// bucket. Put therefore holds an exclusive flock on the key's directory around
-// the writer's Close (lockDir); file buckets need a local filesystem with flock.
-// S3, GCS and Azure use conditional requests that the server decides.
+// under its bucket-wide mutex, and S3, GCS and Azure use conditional requests
+// that the server decides. fileblob does not: its writer's Close stats the key
+// and then renames the temporary file onto it, under a mutex created per writer
+// (gocloud.dev v0.46.0, fileblob.go 764 and 789), so two writers of one key both
+// succeed and the second rename overwrites the first, in one process or across
+// processes and hosts sharing the bucket. For file buckets Put therefore
+// publishes the object itself with link(2) (publishFile), which the filesystem
+// makes atomic and create-only for every writer: fileblob's writer creates the
+// temporary file (<path>.<hex nanos>.tmp, so the key-to-path mapping stays
+// fileblob's) and receives the content, the link gives it the key's name, and
+// the writer is then discarded, which only removes the temporary name. File
+// buckets therefore need a filesystem with hard links; one without them fails
+// every Put with a clear error. No .attrs sidecar is bypassed: file buckets are
+// opened with MetadataDontWrite.
 //
 // Atomic objects. gocloud writers commit the object on Close and discard it
 // when the writer's context is cancelled before Close (probed: a cancelled
 // writer leaves no object). Put cancels before Close on every failure, so a
 // reader never sees a partial object.
 //
-// Durability of file buckets. The fileblob driver renames its temporary file
-// into place on Close without any fsync. A changeset row in the database
-// (synchronous=FULL) can therefore outlive a pack whose data never reached the
-// disk. For file buckets Put fsyncs the content before Close, and fsyncs the
-// directories that hold the new entry (up to the bucket root) after Close. The
-// mem and remote drivers commit their objects durably themselves.
+// Durability of file buckets. Neither fileblob's writer nor a link fsyncs
+// anything, and a changeset row in the database (synchronous=FULL) could
+// outlive a pack whose data never reached the disk. For file buckets Put fsyncs
+// the content before the link publishes it, and fsyncs the directories that
+// hold the new entry (up to the bucket root) after it. The mem and remote
+// drivers commit their objects durably themselves.
 //
 // Listing. List reports objects only. fileblob also reports a writer's
 // temporary file (<key>.<nanos>.tmp, in the key's directory because file
@@ -54,11 +61,12 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"gocloud.dev/blob"
@@ -211,25 +219,30 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 	}
 
 	if file != nil {
-		// Close renames the file into place. The content must reach the disk
+		// The link below publishes the file. The content must reach the disk
 		// first: a database row may reference this object after a power loss.
 		if err := syncFile(file); err != nil {
 			return abort(fmt.Errorf("blobstore: sync %q: %w", key, err))
 		}
 	}
 
-	// fileblob's Close stats the key and renames the temporary file onto it: a
-	// create-only commit only while no other writer of a key in the directory does
-	// the same, so it runs under the directory's lock (see the package doc). A
-	// lock that cannot be taken aborts the write before Close publishes anything.
-	unlock := func() {}
 	if file != nil {
-		if unlock, err = lockDir(filepath.Dir(file.Name())); err != nil {
-			return abort(err)
+		// fileblob's own Close is not a create-only publish (see the package doc):
+		// the content is published by a link, and the writer is then discarded
+		// (abort), which only removes the temporary name.
+		if err := publishFile(file.Name()); err != nil {
+			return abort(fmt.Errorf("blobstore: put %q: %w", key, err))
 		}
+		_ = abort(nil)
+
+		// The new name is durable only once its directory is synced.
+		if err := s.syncDirs(filepath.Dir(file.Name())); err != nil {
+			return fmt.Errorf("blobstore: sync directories of %q: %w", key, err)
+		}
+		return nil
 	}
+
 	closeErr := w.Close()
-	unlock()
 	if gcerrors.Code(closeErr) == gcerrors.FailedPrecondition {
 		// The writer's Close discarded its content: the stored object is untouched.
 		return fmt.Errorf("blobstore: put %q: %w", key, corestore.ErrBlobExists)
@@ -237,15 +250,60 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 	if closeErr != nil {
 		return fmt.Errorf("blobstore: close writer %q: %w", key, closeErr)
 	}
+	return nil
+}
 
-	// The rename is durable only once its directory is synced.
-	if file != nil {
-		if err := s.syncDirs(filepath.Dir(file.Name())); err != nil {
-			return fmt.Errorf("blobstore: sync directories of %q: %w", key, err)
-		}
+// publishFile gives tmp, the temporary file of a fileblob writer, the name of
+// its key, create-only and atomically: link(2) fails with EEXIST when the name
+// exists, for every writer of the filesystem, other hosts of a network
+// filesystem included. A network filesystem can also report EEXIST for a link
+// that succeeded but whose reply was lost and retransmitted: when the name is
+// then the same file as tmp, the link was this writer's and the publish
+// succeeded. A conflict is corestore.ErrBlobExists.
+func publishFile(tmp string) error {
+	final, ok := finalPath(tmp)
+	if !ok {
+		return fmt.Errorf("unexpected temporary file name %q", tmp)
 	}
 
-	return nil
+	err := os.Link(tmp, final)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("link %q (file buckets need a filesystem with hard links): %w", final, err)
+	}
+
+	tmpInfo, statErr := os.Stat(tmp)
+	if statErr != nil {
+		return fmt.Errorf("stat %q after a link conflict: %w", tmp, statErr)
+	}
+	finalInfo, statErr := os.Stat(final)
+	if statErr != nil {
+		return fmt.Errorf("stat %q after a link conflict: %w", final, statErr)
+	}
+	if os.SameFile(tmpInfo, finalInfo) {
+		return nil
+	}
+	return corestore.ErrBlobExists
+}
+
+// finalPath returns the path of the object whose temporary file fileblob named
+// tmp: "<path>.<hex nanoseconds>.tmp" in the object's directory (file buckets
+// are opened with NoTempDir).
+func finalPath(tmp string) (string, bool) {
+	rest, ok := strings.CutSuffix(tmp, ".tmp")
+	if !ok {
+		return "", false
+	}
+	i := strings.LastIndex(rest, ".")
+	if i <= 0 || i == len(rest)-1 {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(rest[i+1:], 16, 64); err != nil {
+		return "", false
+	}
+	return rest[:i], true
 }
 
 // syncFile fsyncs the temporary file of a file bucket writer.
@@ -259,8 +317,8 @@ func syncFile(f *os.File) error {
 }
 
 // syncDirs fsyncs dir and, when dir is inside the bucket root, each of its
-// ancestors up to the root: the directories that Put or the driver may have
-// created, and the entry that the rename created.
+// ancestors up to the root: the directories that the driver may have created,
+// and the entry that the link created.
 func (s *Store) syncDirs(dir string) error {
 	inside := dir == s.root || strings.HasPrefix(dir, s.root+string(filepath.Separator))
 	for d := dir; ; d = filepath.Dir(d) {
@@ -321,26 +379,6 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 		return false, fmt.Errorf("blobstore: exists %q: %w", key, err)
 	}
 	return exists, nil
-}
-
-// lockDir takes an exclusive flock on the directory dir and returns the
-// function that releases it. The lock lives on the open descriptor: closing it
-// releases the lock, and so does the death of the process.
-func lockDir(dir string) (unlock func(), _ error) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return nil, fmt.Errorf("blobstore: open directory to lock: %w", err)
-	}
-	if err := syscall.Flock(int(d.Fd()), syscall.LOCK_EX); err != nil {
-		_ = d.Close()
-		return nil, fmt.Errorf("blobstore: lock directory: %w", err)
-	}
-	return func() {
-		// close(2) releases the descriptor, and with it the lock, even when it
-		// reports an error, and a read-only directory descriptor has no pending
-		// writes whose loss an error could signal: there is nothing to handle.
-		_ = d.Close()
-	}, nil
 }
 
 // List implements corestore.BlobStore.

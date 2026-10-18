@@ -502,6 +502,16 @@ show:
 - **S3, GCS and Azure are untested here.** The bucket is any gocloud URL, but
   the test suite and the benchmark use `file://` and `mem://` buckets only;
   the S3 tests run only when `GRAFT_TEST_S3_URL` points at a test bucket.
+- **File buckets need hard links.** The create-only write of gocloud's file
+  driver (v0.46.0, `IfNotExist`) is not atomic: its writer checks that the key
+  is absent and then renames its temporary file onto it, under a lock that
+  each writer creates for itself (`fileblob.go`, lines 764 and 789), so two
+  concurrent writers of one key both succeed and the second overwrites the
+  first. The storage core does not rely on it: it publishes each object of a
+  file bucket with link(2), which the filesystem makes atomic for every writer,
+  on one host or several sharing the directory over NFS. A file bucket therefore
+  needs a filesystem with hard links (every local Linux or macOS filesystem,
+  NFS); on one without them every write fails with an error that says so.
 - **Concurrent writes to one repository share one lock** in authoritative
   mode: reftable has one reference lock per repository. The voter holds it only
   for the expected values and the database commit (the pack is uploaded before

@@ -121,6 +121,68 @@ func TestPutWithoutFileSyncHookSucceeds(t *testing.T) {
 	require.Equal(t, content, data)
 }
 
+func TestPublishFileIsCreateOnly(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	final := filepath.Join(dir, "k.pack")
+
+	first := write("k.pack.18f3a.tmp", "first")
+	require.NoError(t, publishFile(first))
+	// A network filesystem that lost the reply of a successful link retransmits
+	// it and reports EEXIST: the name is then the same file, and the publish
+	// succeeded.
+	require.NoError(t, publishFile(first))
+
+	second := write("k.pack.18f3b.tmp", "second")
+	require.ErrorIs(t, publishFile(second), corestore.ErrBlobExists)
+
+	data, err := os.ReadFile(final)
+	require.NoError(t, err)
+	require.Equal(t, "first", string(data), "the first publish is kept")
+}
+
+func TestFinalPath(t *testing.T) {
+	for tmp, want := range map[string]string{
+		"/b/repos/1/packs/k.pack.18f3a2b4c.tmp": "/b/repos/1/packs/k.pack",
+		"/b/plain.ff.tmp":                       "/b/plain",
+	} {
+		got, ok := finalPath(tmp)
+		require.True(t, ok, tmp)
+		require.Equal(t, want, got)
+	}
+	for _, tmp := range []string{"/b/k.pack", "/b/k.pack.tmp", "/b/k.pack.xyz.tmp", "/b/k.pack..tmp", ".1.tmp"} {
+		_, ok := finalPath(tmp)
+		require.False(t, ok, tmp)
+	}
+}
+
+func TestPutLeavesOnlyTheObject(t *testing.T) {
+	// The writer's temporary name is removed after the link published the
+	// object: only the object and its directories remain.
+	dir := t.TempDir()
+	s := openFileStoreForTest(t, dir, nil)
+
+	content := []byte("published by a link")
+	key := corestore.NewPackKey(4, sha256.Sum256(content))
+	require.NoError(t, s.Put(testhelper.Context(t), key, bytes.NewReader(content)))
+
+	var files []string
+	require.NoError(t, filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	}))
+	require.Equal(t, []string{filepath.Join(dir, filepath.FromSlash(key))}, files)
+}
+
 func TestPutMemBucketWithoutFileSync(t *testing.T) {
 	// mem buckets have no *os.File: Put must not require one and must not sync.
 	s, err := Open(testhelper.Context(t), "mem://")

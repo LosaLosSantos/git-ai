@@ -515,14 +515,23 @@ under a mutex created per writer (`fileblob.go` 764 and 789), which excludes
 nothing, so two concurrent writers of one key both succeed and the second rename
 overwrites the first; this holds within one process and between processes
 sharing a file bucket. The phase-6 package doc's "fileblob supports IfNotExist" is
-true only for sequential writes and is corrected. For file buckets `Put` takes an
-exclusive `flock` on the key's parent directory (which the driver has created
-when it opened its temporary file) around the writer's `Close`: the stat and the
-rename of every `Put` into that directory are then serialized across processes on
-the host, so exactly one writer of a key wins. The lock adds no object (a
-directory is not listed) and the kernel releases it when a process dies. File
-buckets therefore need a local filesystem with `flock` (they are single-host
-already). S3, GCS and Azure use conditional requests, atomic on the server
+true only for sequential writes and is corrected. For file buckets `Put`
+publishes the object itself with **link(2)**, the filesystem's own atomic
+create-only primitive (PM review: an advisory lock binds only the writers that
+honour it, and lock semantics vary on network filesystems, while a file bucket
+shared by several hosts over NFS is a supported setup): fileblob's writer
+creates the temporary file `<path>.<hex nanos>.tmp` in the key's directory (so
+the key-to-path mapping stays fileblob's) and receives the content, `Put` fsyncs
+it, `os.Link`s it to the key's path (EEXIST is `ErrBlobExists`), discards the
+writer (whose cancelled `Close` only removes the temporary name) and fsyncs the
+directories. A network filesystem can report EEXIST for a link that succeeded
+but whose reply was lost and retransmitted; when the name is the same file as the
+temporary one (`os.SameFile`), the publish was this writer's. No `.attrs`
+sidecar is bypassed (file buckets are opened with `MetadataDontWrite`). File
+buckets therefore need a filesystem with hard links (every local Linux/macOS
+filesystem and NFS); one without them fails every `Put` with a clear error. The
+flock version of 9c8bb58 is replaced. The upstream defect is a stated limit in
+STORAGE.md. S3, GCS and Azure use conditional requests, atomic on the server
 (untested here).
 
 `List` uses `bucket.List(&blob.ListOptions{Prefix: prefix})` and skips `IsDir`
