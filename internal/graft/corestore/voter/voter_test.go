@@ -104,7 +104,12 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 	if opts.files {
 		useFilesBackend(t, cfg, repoPath)
 	}
-	core := coretest.Open(t, coretest.Options{Mode: opts.mode, Dialect: opts.dialect})
+	// The shadow budget is not binding here: these tests check what a shadow
+	// write records, which the budget can legitimately prevent under load
+	// (doc/graft/PLAN7.md, SHADOW BUDGET requirement). The budget itself is
+	// tested with short budgets set explicitly (TestShadowBudgetOverrunInPrepared,
+	// TestPreparingShadowTimeoutCoversBothPhases, TestShadowTimeoutNeverFails).
+	core := coretest.Open(t, coretest.Options{Mode: opts.mode, Dialect: opts.dialect, ShadowTimeout: time.Minute})
 
 	var repoID int64
 	var base uint64
