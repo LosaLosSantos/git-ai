@@ -18,6 +18,8 @@ type Counts struct {
 	Model     int `json:"model_error"`
 	NotRun    int `json:"not_run_cap"`
 	Abstained int `json:"abstained"`
+	// HumanSyntax counts the cases whose human resolution fails the syntax check.
+	HumanSyntax int `json:"human_fails_syntax"`
 }
 
 // Accepted is the number of results that would land: correct and wrong.
@@ -34,6 +36,9 @@ func (c Counts) ErrorRate() float64 {
 
 func (c *Counts) add(r Result) {
 	c.Cases++
+	if r.HumanSyntaxError != "" {
+		c.HumanSyntax++
+	}
 	switch r.Outcome {
 	case OutcomeCorrect:
 		c.Correct++
@@ -108,6 +113,12 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	}
 	row("total", rep.Total)
 	b.WriteString("\nThe error rate is wrong / (correct + wrong): the share of the results that would land and differ from the human resolution. Correct means equal after normalizing line endings and trailing whitespace; exact means byte-identical.\n")
+	syntaxParts := make([]string, 0, len(families))
+	for _, f := range families {
+		syntaxParts = append(syntaxParts, fmt.Sprintf("%s %d", f, rep.Families[f].HumanSyntax))
+	}
+	fmt.Fprintf(&b, "\nHuman resolutions that fail the syntax check themselves, where the check would reject the right answer: %d (%s).\n",
+		rep.Total.HumanSyntax, strings.Join(syntaxParts, ", "))
 	if len(rep.NotSent) > 0 {
 		reasons := make([]string, 0, len(rep.NotSent))
 		for r := range rep.NotSent {

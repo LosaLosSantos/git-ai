@@ -291,9 +291,12 @@ func TestReportCounts(t *testing.T) {
 	rep := NewReport("test", []Result{
 		{Family: FamilyGo, Outcome: OutcomeCorrect, Exact: true},
 		{Family: FamilyGo, Outcome: OutcomeWrong},
-		{Family: FamilyPython, Outcome: OutcomeRejected},
+		{Family: FamilyPython, Outcome: OutcomeRejected, HumanSyntaxError: "syntax check: a.py does not parse"},
 		{Family: FamilyPython, Outcome: OutcomeNotSent, Reason: NotSentGenerated},
 	})
+	if rep.Total.HumanSyntax != 1 || rep.Families[FamilyPython].HumanSyntax != 1 {
+		t.Fatalf("human syntax failures %+v", rep.Families)
+	}
 	if rep.Total.Cases != 4 || rep.Total.Accepted() != 2 || rep.Total.ErrorRate() != 0.5 {
 		t.Fatalf("totals %+v", rep.Total)
 	}
@@ -304,7 +307,7 @@ func TestReportCounts(t *testing.T) {
 	if err := rep.WriteMarkdown(&b); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(b.String(), "| total | 4 | 1 (1) | 1 | 1 | 1 |") {
+	if !strings.Contains(b.String(), "| total | 4 | 1 (1) | 1 | 1 | 1 |") || !strings.Contains(b.String(), "reject the right answer: 1 (go 0, python 1)") {
 		t.Fatalf("markdown:\n%s", b.String())
 	}
 }

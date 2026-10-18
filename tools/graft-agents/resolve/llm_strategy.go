@@ -40,8 +40,9 @@ import (
 // the file is limited to 8M cells, roughly 2800 changed lines on each side),
 // more conflicting regions than max_regions, or a region whose prompt exceeds
 // max_prompt_bytes. A rejected or failed answer is a strategy failure and the
-// chain continues as well. Checks configured for the path still run on the
-// accepted answer.
+// chain continues as well. An answer for a path with a tree-sitter grammar
+// (package syntax: TypeScript, JavaScript, Python, Go, Rust, Java) must parse,
+// or it is a check failure; the checks configured for the path run after.
 //
 // The prompt carries the commit messages of both sides (request.messages) as
 // the intent of each side. The model reports no confidence: an answer is
@@ -138,6 +139,9 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 	}
 	return Resolution{Action: protocol.ActionWrite, Mode: f.Ours.Mode, Content: res.Content}, true, nil
 }
+
+// syntaxChecked marks the llm answers for the syntax check (resolveFile).
+func (s *llmStrategy) syntaxChecked() {}
 
 // llmBytes keeps an empty side distinct from an absent one: ResolveLLM treats
 // nil as absent.

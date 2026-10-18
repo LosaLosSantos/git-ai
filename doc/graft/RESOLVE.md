@@ -272,9 +272,25 @@ asks for a JSON answer:
   and acceptance comes from the checks alone. The former `min_confidence`
   option is gone; a configuration that still sets it fails at startup.
 - Any answer containing conflict markers is rejected.
+- The answer must parse. graft-resolve parses it with the tree-sitter grammar
+  of its language, chosen by extension: TypeScript (`.ts`, `.mts`, `.cts`),
+  TSX (`.tsx`), JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`), Python (`.py`,
+  `.pyi`), Go (`.go`), Rust (`.rs`) and Java (`.java`). Any ERROR or MISSING
+  node rejects the answer, and the reason gives the line and column of the
+  first one. This is a parse, not a build: names, types and imports are not
+  checked, and a few things a compiler refuses still parse (a JSX closing tag
+  that does not match its opening tag, for one). Every other file gets the
+  conflict-marker rule only. The check is always on for `llm` answers and
+  does not apply to the other strategies.
 - The configured checks still run afterwards.
 - For large files the strategy sends only the conflict hunks with context and
   reassembles the file locally.
+
+The grammars are C code compiled with cgo (the MIT-licensed
+`github.com/tree-sitter/go-tree-sitter` bindings and the grammar modules of
+those languages, in the `tools/graft-agents` module only; the gitai server
+has no such dependency). Building graft-resolve therefore needs a C compiler
+and `CGO_ENABLED=1`, the default when a compiler is installed.
 
 The provider's API keys are withheld from the model: they are read from the
 environment or a file by the provider, never put in the prompt. Everything

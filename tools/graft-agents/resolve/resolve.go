@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // DefaultCheckTimeout bounds one check command when the check sets no timeout.
@@ -62,6 +63,12 @@ type Strategy interface {
 	// Resolve returns (answer, true, nil) when it resolved f, (_, false, nil)
 	// when it does not apply, and an error when it failed.
 	Resolve(ctx context.Context, f File, req protocol.Request) (Resolution, bool, error)
+}
+
+// syntaxChecked is implemented by the strategies whose answers always get the syntax check
+// (package syntax): the llm strategy. The check runs before the configured checks.
+type syntaxChecked interface {
+	syntaxChecked()
 }
 
 // Recorder is implemented by strategies that want to learn accepted answers.
@@ -369,6 +376,15 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 		if err := checkResolution(res, maxBytes); err != nil {
 			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: err})
 			continue
+		}
+		if _, ok := b.Strategy.(syntaxChecked); ok && res.Action == protocol.ActionWrite && res.Mode != protocol.ModeSymlink {
+			if err := syntax.Check(ctx, f.Path, res.Content); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return protocol.ResolvedFile{}, "", nil, ctxErr
+				}
+				attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
+				continue
+			}
 		}
 		if err := r.runChecks(ctx, f.Path, res); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {

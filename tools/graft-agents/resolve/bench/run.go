@@ -11,6 +11,7 @@ import (
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // Outcomes of a case.
@@ -45,6 +46,10 @@ type Result struct {
 	Strategy string  `json:"strategy,omitempty"`
 	Reason   string  `json:"reason,omitempty"`
 	Seconds  float64 `json:"seconds"`
+	// HumanSyntaxError is set when the human resolution of a case that was sent fails the
+	// syntax check itself: the check would reject the right answer there (a grammar gap, or a
+	// human merge that did not parse).
+	HumanSyntaxError string `json:"human_syntax_error,omitempty"`
 }
 
 // Sample returns n cases of cases, stratified by family: each family's cases are shuffled with the
@@ -156,6 +161,15 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	if reason := notSentReason(c.Path, contents, maxBytes, generated); reason != "" {
 		res.Outcome, res.Reason = OutcomeNotSent, reason
 		return res, nil
+	}
+
+	if human != nil {
+		if err := syntax.Check(ctx, c.Path, human); err != nil {
+			if ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			res.HumanSyntaxError = err.Error()
+		}
 	}
 
 	oursMessage, err := g.message(ctx, c.Ours)
