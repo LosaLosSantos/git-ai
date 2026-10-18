@@ -88,19 +88,32 @@ outcomes.
 ### How a request is decided and rebased
 
 Since phase 4b ([PLAN8.md](PLAN8.md)), each request of an attempt costs one
-short git process:
+short git process, and one more when it diverges from the tip:
 
-1. The commit ID is peeled to a commit by the object info process of the
-   attempt (`git cat-file --batch-check`, started once per attempt).
+1. The commit ID is peeled to a commit by an object info process of the
+   attempt's quarantine (`git cat-file --batch-check`), taken from the catfile
+   cache for each peel, so a process that dies fails the request that met it
+   and at most the next one.
 2. One listing of the commits that the change adds to the running tip
-   (`ancestry.Checker.Range`, `git rev-list --parents tip..commit`) answers
-   every question of the landing (`rebase.PlanLanding`): the change is already
-   landed when the list is empty; it fast-forwards the tip when the tip is a
-   parent of a listed commit; otherwise it diverges. For the rebase strategy, a
-   listed merge commit refuses the change (`InvalidArgument`, use
-   `STRATEGY_MERGE`), a list that ends at a root commit means unrelated history
-   (`InvalidArgument`), and otherwise the listed commits, oldest first, are the
-   commits to replay.
+   (`ancestry.Checker.List`, `git rev-list --parents commit ^tip`) decides the
+   landing (`rebase.Plan`): the change is already landed when the list is
+   empty; it fast-forwards the tip when the tip is a parent of a listed commit;
+   otherwise it diverges. Both facts are exact even when committer dates are
+   skewed. A skewed history can make `git rev-list` list commits that the tip
+   already has (its walk stops early when the commits it still has to visit are
+   older than those it listed), never fewer. So a diverging change has its
+   listing made exact first (`revrange.Refine`): one
+   `git merge-base --is-ancestor` per bottom of the listing (a listed commit
+   none of whose parents is listed), usually one. If a bottom is reachable from
+   the tip, the listing held extra commits: it is listed again below the exact
+   merge bases (`git merge-base --all`), and the bottoms that the tip reaches
+   are removed one check at a time (counted by
+   `graft_revrange_skewed_listings_total` and
+   `graft_revrange_skew_checks_total`). For the rebase strategy, a merge commit
+   in the exact range refuses the change (`InvalidArgument`, use
+   `STRATEGY_MERGE`), a range that ends at a root commit means unrelated
+   history (`InvalidArgument`), and otherwise its commits, oldest first, are
+   the commits to replay.
 3. The commits are replayed by the `rebase.Engine` of the attempt, which keeps
    one `git merge-tree --stdin` process and one `git hash-object --stdin-paths`
    process running for the whole attempt. The replay has the rules, errors and
