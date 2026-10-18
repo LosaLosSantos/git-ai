@@ -347,7 +347,7 @@ prune, expiry now) removed it on today's code, on both dialects
 (`TestOpenReviewCommitsSurviveHousekeeping`, run before the change).
 
 **Rule: review roots are references.** The head and base commits of a review
-are protected by `refs/keep-around/<oid>` (target `<oid>`), written through
+are protected by `refs/keep-around/review/<oid>` (target `<oid>`), written through
 the ordinary write path: the reference-transaction hook, so the voter and the
 database CAS in shadow and authoritative mode. Then:
 * every node keeps them through housekeeping (they are local references after
@@ -359,7 +359,12 @@ database CAS in shadow and authoritative mode. Then:
 `refs/keep-around/` is a hidden internal prefix in Gitaly: it is neither
 advertised nor writable over the git protocols
 (`uploadpack.hideRefs`/`receive.hideRefs`). The Graft changelog does not
-record it, because it records only branches and tags.
+record it, because it records only branches and tags. The review roots have a
+namespace of their own, `refs/keep-around/review/`, because GitLab writes
+`refs/keep-around/<oid>` for its own purposes (pipelines, merge requests). No
+sweep and no database check ever touches a reference outside that namespace
+(tested: a GitLab keep-around reference of an open review's commit is neither
+guarded nor swept).
 
 * **Writes (review service, every mode).** `CreateReview` writes the references
   of head and base (`reviewroots.Protect`: one reference transaction that
@@ -386,27 +391,54 @@ record it, because it records only branches and tags.
   the bound only stops a pathological loop.
 * **Deletion.**
   * `CloseReview` deletes the references of the closed review's commits that no
-    other open review uses (`reviewroots.Sweep` with those candidates). Each
-    deletion is its own transaction expecting the value read. A deletion that a
-    concurrent review write makes the database refuse is kept. A deletion that
-    fails otherwise is logged at warning level: the close is already recorded,
-    and the reference only keeps objects alive longer.
-  * The maintenance task (WP77) runs the full sweep, which deletes leftovers
-    such as those of a crash, and the backfill (`reviewroots.Backfill`), which
-    writes the references of open reviews written before this rule or imported
-    from shadow-mode files when their objects are present, and reports the
-    others (counts and review IDs). A review whose objects are already lost
-    blocks nothing.
+    other open review uses (`reviewroots.DefaultSweeper.Sweep` with those
+    candidates, trigger `close`). Each deletion is its own transaction expecting
+    the value read. A deletion that a concurrent review write makes the database
+    refuse is kept. A deletion that fails otherwise is not the request's error,
+    because the close is already recorded: it is logged at warning level and
+    counted (`graft_review_roots_sweep_failures_total{trigger="close"}`), and
+    the backstop below deletes the reference. Not returning it is a design
+    decision with a backstop, not a swallowed error.
+  * **Backstop, every mode.** After Gitaly's daily housekeeping of a repository
+    (`DailyOptimizationWorker`, on by default, the same job that prunes
+    unreferenced objects), `reviewroots.Sweeper.Housekeep` runs the backfill
+    and then the full sweep of the repository's review references. The
+    backfill writes the references that open reviews lack: reviews written
+    before this rule, or imported from shadow-mode files. The full sweep
+    deletes the references no open review uses: leftovers of a failed close
+    sweep or of a crash. In authoritative mode it first catches the repository
+    up and uses the database's reviews; it skips an untracked repository or an
+    incomplete import. In off and shadow mode it uses the review files. Metrics
+    (`reviewroots.DefaultSweeper`, registered by `gitaly serve`):
+    `graft_review_roots_deleted_total`, `graft_review_roots_backfilled_total`,
+    `graft_review_roots_missing_total`, and
+    `graft_review_roots_sweep_failures_total{trigger}`, so a persistent failure
+    shows as a growing counter. Lost commits are logged with their review ID
+    and commit. Limit: an operator who disables the daily maintenance also
+    disables this backstop (and the scheduled object pruning it guards).
   * A sweep may skip references younger than `gc_grace` to make the
     creation/sweep race rare. That is an efficiency measure only; correctness
     comes from the invariant and the bounded retry.
+* **A review whose commit is lost (decision).** A review written before this rule
+  whose head or base commit is gone from the repository cannot be kept any
+  more. `UpdateReview` refuses it with `FailedPrecondition` naming the review
+  (metadata `review_id`) and the commit (`commit_id`). The base is protected
+  before the descent check, so the error is never a misleading "head does not
+  descend". The backfill reports the same pair (`MissingRoot{ReviewID,
+  Commit}`). The review can still be read and closed.
+  Why not fetch the object from the storage core as hydration does: nothing
+  kept it live there either. Only references keep objects live, and this commit
+  had none, so after GC no pack holds it. Before GC some changeset pack may
+  still hold it, but no index maps an object to its pack, so finding it means
+  downloading packs until it turns up. That would be a fallback that works only
+  until the next collection (RULE 24 forbids such paths). The state is known
+  and documented, so a precise `FailedPrecondition` is the answer.
 * **Off and shadow mode.** The review store is the files store and the same
   references are written, so housekeeping keeps the commits there too; in
   shadow mode the voter records them in the database. The database invariant
   is not enforced there: the files are the source of truth, and shadow
-  changesets are forced, so `CommitChangeset` does not refuse them. In off
-  mode the references of a closed review are deleted by its close; there is no
-  maintenance sweep.
+  changesets are forced, so `CommitChangeset` does not refuse them. The close
+  sweep and the housekeeping backstop run there as in authoritative mode.
 * **What it costs.** One reference transaction per review creation and per
   head move (one changeset, plus a pack only when the commit was not yet in the
   storage core), one per released commit at a close, and no changelog entry.
@@ -596,7 +628,7 @@ var (
 )
 
 // KeepAroundPrefix and KeepAroundRef name the references of the REVIEW ROOTS RULE.
-const KeepAroundPrefix = "refs/keep-around/"
+const KeepAroundPrefix = "refs/keep-around/review/"
 func KeepAroundRef(oid string) string
 
 // NewPackKey returns a new owned pack key for a pack of the repository with the

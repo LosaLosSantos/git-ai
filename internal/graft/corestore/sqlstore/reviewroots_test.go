@@ -129,6 +129,14 @@ func TestOpenReviewRootsCannotBeReleased(t *testing.T) {
 		_, err = commit(ctx, s, repo.ID, update(corestore.KeepAroundRef(string(closed)), closed, ""))
 		require.NoError(t, err)
 
+		// GitLab's own keep-around reference of the same commit is not a review
+		// root: it is not guarded.
+		gitlab := "refs/keep-around/" + string(head)
+		_, err = commit(ctx, s, repo.ID, create(gitlab, head))
+		require.NoError(t, err)
+		_, err = commit(ctx, s, repo.ID, update(gitlab, head, ""))
+		require.NoError(t, err)
+
 		// Shadow mode records what git did: forced changesets are not refused.
 		_, err = s.CommitChangeset(ctx, corestore.ChangesetInput{
 			RepoID:    repo.ID,

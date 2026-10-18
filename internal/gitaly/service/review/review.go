@@ -82,7 +82,7 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 
 	var stored *gitalypb.Review
 	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
-		if err := protect(head, base); err != nil {
+		if err := protect("", head, base); err != nil {
 			return err
 		}
 
@@ -231,7 +231,14 @@ func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateRev
 
 	base := git.ObjectID(r.GetBaseCommitId())
 	if head.String() == r.GetHeadCommitId() {
-		return protect(reviewCommits(head, base)...)
+		return protect(r.GetId(), reviewCommits(head, base)...)
+	}
+	// The base is a root of the open review whatever this update does; a base
+	// that is gone is reported as such, not as a head that does not descend.
+	if base != "" {
+		if err := protect(r.GetId(), base); err != nil {
+			return err
+		}
 	}
 
 	descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
@@ -268,7 +275,7 @@ func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateRev
 		v.Current = survives
 	}
 
-	if err := protect(reviewCommits(head, base)...); err != nil {
+	if err := protect(r.GetId(), reviewCommits(head, base)...); err != nil {
 		return err
 	}
 

@@ -29,10 +29,23 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/review/store"
 )
 
+// MissingCommitsError is the error of Protect for commits that are not in the
+// repository: a commit can only be kept while it exists. It happens for reviews
+// written before the REVIEW ROOTS RULE whose commit was lost since; the storage
+// core cannot bring it back either (nothing kept it live).
+type MissingCommitsError struct {
+	Commits []git.ObjectID
+}
+
+func (e *MissingCommitsError) Error() string {
+	return fmt.Sprintf("commits %v are not in the repository", e.Commits)
+}
+
 // Protect writes the keep-around reference of every commit that does not have
-// it, in one reference transaction. The commits must be in the repository. A
-// commit whose reference exists with its value is left alone, so Protect of
-// protected commits writes nothing.
+// it, in one reference transaction. A commit that is not in the repository is a
+// *MissingCommitsError and nothing is written. A commit whose reference exists
+// with its value is left alone, so Protect of protected commits writes
+// nothing.
 func Protect(ctx context.Context, repo *localrepo.Repo, commits []git.ObjectID) error {
 	names := make([]string, 0, len(commits))
 	byName := make(map[string]git.ObjectID, len(commits))
@@ -61,6 +74,18 @@ func Protect(ctx context.Context, repo *localrepo.Repo, commits []git.ObjectID) 
 	}
 	if len(missing) == 0 {
 		return nil
+	}
+
+	unprotected := make([]git.ObjectID, 0, len(missing))
+	for _, name := range missing {
+		unprotected = append(unprotected, byName[name])
+	}
+	absent, err := gitops.MissingObjects(ctx, repo, unprotected)
+	if err != nil {
+		return fmt.Errorf("look up the commits: %w", err)
+	}
+	if len(absent) > 0 {
+		return &MissingCommitsError{Commits: absent}
 	}
 
 	updater, err := updateref.New(ctx, repo)
@@ -212,9 +237,17 @@ type BackfillReport struct {
 	// Protected is the number of commits whose keep-around reference was
 	// written.
 	Protected int
-	// Missing are the IDs of the open reviews with a commit that is not in the
-	// repository (or not an object ID): it cannot be protected any more.
-	Missing []string
+	// Missing are the commits of open reviews that are not in the repository
+	// (or not object IDs): they cannot be protected any more. Such a review
+	// can still be read and closed; UpdateReview refuses it with
+	// FailedPrecondition naming the same review and commit.
+	Missing []MissingRoot
+}
+
+// MissingRoot is a commit of an open review that the repository does not have.
+type MissingRoot struct {
+	ReviewID string
+	Commit   string
 }
 
 // Backfill writes the keep-around references of the open reviews that do not
@@ -240,7 +273,7 @@ func Backfill(ctx context.Context, repo *localrepo.Repo, reviews store.ReviewSto
 				continue
 			}
 			if hash.ValidateHex(commit) != nil {
-				report.Missing = appendOnce(report.Missing, r.GetId())
+				report.Missing = append(report.Missing, MissingRoot{ReviewID: r.GetId(), Commit: commit})
 				continue
 			}
 			oid := git.ObjectID(commit)
@@ -271,7 +304,7 @@ func Backfill(ctx context.Context, repo *localrepo.Repo, reviews store.ReviewSto
 	for _, oid := range missing {
 		absent[oid] = struct{}{}
 		for _, id := range byCommit[oid] {
-			report.Missing = appendOnce(report.Missing, id)
+			report.Missing = append(report.Missing, MissingRoot{ReviewID: id, Commit: oid.String()})
 		}
 	}
 
@@ -285,7 +318,10 @@ func Backfill(ctx context.Context, repo *localrepo.Repo, reviews store.ReviewSto
 		return report, err
 	}
 	report.Protected = len(present)
-	sort.Strings(report.Missing)
+	sort.Slice(report.Missing, func(i, j int) bool {
+		a, b := report.Missing[i], report.Missing[j]
+		return a.ReviewID < b.ReviewID || (a.ReviewID == b.ReviewID && a.Commit < b.Commit)
+	})
 	return report, nil
 }
 
@@ -304,13 +340,4 @@ func openRoots(reviews store.ReviewStore) (map[string]struct{}, error) {
 		}
 	}
 	return used, nil
-}
-
-func appendOnce(ids []string, id string) []string {
-	for _, existing := range ids {
-		if existing == id {
-			return ids
-		}
-	}
-	return append(ids, id)
 }

@@ -232,6 +232,46 @@ func TestAuthoritativeReviewWriteSurvivesASweep(t *testing.T) {
 	}
 }
 
+// TestUpdateOfAReviewWhoseCommitIsLost: a review written before the REVIEW
+// ROOTS RULE whose base commit is gone cannot be kept any more. UpdateReview
+// refuses it with FailedPrecondition naming the review and the commit (the
+// same pair the housekeeping backfill reports), never Internal; the review can
+// still be read and closed.
+func TestUpdateOfAReviewWhoseCommitIsLost(t *testing.T) {
+	ctx, cfg, core, client := setupAuthoritative(t)
+
+	repo, repoPath := createLocalRepository(t, ctx, cfg)
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
+	head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base), gittest.WithBranch("feature"))
+	lost := strings.Repeat("c", gittest.DefaultObjectHash.EncodedLen())
+	importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{
+		Reviews: []*gitalypb.Review{{
+			Id:           "7",
+			TargetBranch: []byte("main"),
+			HeadCommitId: head.String(),
+			BaseCommitId: lost,
+			Author:       anonymousActor,
+		}},
+	})
+	// The first request lets the gate replace the imported copy by a cache built
+	// from the storage core.
+	require.Len(t, listStoredReviews(t, ctx, client, repo, true), 1)
+	next := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("next"), gittest.WithParents(head))
+
+	for _, moveTo := range []git.ObjectID{head, next} {
+		_, err := client.UpdateReview(ctx, &gitalypb.UpdateReviewRequest{Repository: repo, Id: "7", HeadCommitId: moveTo.String()})
+		require.Equal(t, codes.FailedPrecondition, status.Code(err), "%v", err)
+		require.ErrorContains(t, err, lost)
+		require.ErrorContains(t, err, `review "7"`)
+	}
+
+	got, err := client.GetReview(ctx, &gitalypb.GetReviewRequest{Repository: repo, Id: "7"})
+	require.NoError(t, err)
+	require.Equal(t, head.String(), got.GetReview().GetHeadCommitId())
+	_, err = client.CloseReview(ctx, &gitalypb.CloseReviewRequest{Repository: repo, Id: "7"})
+	require.NoError(t, err)
+}
+
 // TestReviewRootsOutsideAuthoritativeMode: with the storage core off or in
 // shadow mode the reviews are files, and the service still writes the
 // keep-around references: housekeeping keeps an open review's commit after its

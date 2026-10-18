@@ -109,9 +109,14 @@ func TestProtect(t *testing.T) {
 	require.NoError(t, reviewroots.Protect(f.ctx, f.repo, []git.ObjectID{c3}))
 	require.Equal(t, keepAroundOf(c1, c2, c3), f.keepArounds())
 
-	// A commit that is not in the repository cannot be protected.
+	// A commit that is not in the repository cannot be protected; nothing is
+	// written, also for the commits that are present.
 	absent := git.ObjectID(strings.Repeat("a", gittest.DefaultObjectHash.EncodedLen()))
-	require.Error(t, reviewroots.Protect(f.ctx, f.repo, []git.ObjectID{absent}))
+	c4 := f.write("c4", c3)
+	err := reviewroots.Protect(f.ctx, f.repo, []git.ObjectID{c4, absent})
+	var missing *reviewroots.MissingCommitsError
+	require.ErrorAs(t, err, &missing)
+	require.Equal(t, []git.ObjectID{absent}, missing.Commits)
 	require.Equal(t, keepAroundOf(c1, c2, c3), f.keepArounds())
 }
 
@@ -126,6 +131,16 @@ func TestSweep(t *testing.T) {
 	f.review(c1.String(), c0.String(), gitalypb.Review_STATE_OPEN_UNSPECIFIED)
 	f.review(c2.String(), c0.String(), gitalypb.Review_STATE_CLOSED)
 	require.NoError(t, reviewroots.Protect(f.ctx, f.repo, []git.ObjectID{c0, c1, c2, c3}))
+
+	// GitLab's own keep-around references are not review roots: no sweep
+	// touches them.
+	gitlab := git.ReferenceName("refs/keep-around/" + c2.String())
+	gittest.WriteRef(t, testcfg.Build(t), f.path, gitlab, c2)
+	defer func() {
+		refs, err := gitops.ReadRefs(f.ctx, f.repo)
+		require.NoError(t, err)
+		require.Equal(t, corestore.Target(c2), refs[gitlab.String()], "GitLab's keep-around reference is kept")
+	}()
 
 	// Candidates only: the open review's head is kept, the closed review's goes.
 	report, err := reviewroots.Sweep(f.ctx, f.repo, f.reviews, []git.ObjectID{c1, c2})
@@ -163,7 +178,10 @@ func TestBackfill(t *testing.T) {
 	report, err := reviewroots.Backfill(f.ctx, f.repo, f.reviews)
 	require.NoError(t, err)
 	require.Equal(t, 1, report.Protected, "the open review's head; its base had its reference")
-	require.Equal(t, []string{lost.GetId(), garbled.GetId()}, report.Missing)
+	require.Equal(t, []reviewroots.MissingRoot{
+		{ReviewID: lost.GetId(), Commit: absent},
+		{ReviewID: garbled.GetId(), Commit: "not an object ID"},
+	}, report.Missing)
 	require.Equal(t, keepAroundOf(c0, c1), f.keepArounds(), "closed reviews are not backfilled")
 
 	// A second backfill has nothing left to protect.

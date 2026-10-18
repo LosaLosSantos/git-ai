@@ -23,8 +23,9 @@ type requiredRootsStore interface {
 }
 
 // rootsProtect writes the keep-around references of commits that a review
-// write is about to record.
-type rootsProtect func(commits ...git.ObjectID) error
+// write is about to record; reviewID names the review in an error, empty for a
+// review that is not created yet.
+type rootsProtect func(reviewID string, commits ...git.ObjectID) error
 
 // writeRoots runs write, a review write that may record new head or base
 // commits, under the REVIEW ROOTS RULE (doc/graft/PLAN7.md). write calls
@@ -38,8 +39,18 @@ type rootsProtect func(commits ...git.ObjectID) error
 // writes the reference again), at most maxRootsAttempts times in all, after
 // which the request is Aborted.
 func (s *server) writeRoots(ctx context.Context, repo *localrepo.Repo, st store.ReviewStore, write func(store.ReviewStore, rootsProtect) error) error {
-	protect := func(commits ...git.ObjectID) error {
+	protect := func(reviewID string, commits ...git.ObjectID) error {
 		if err := reviewroots.Protect(ctx, repo, commits); err != nil {
+			var missing *reviewroots.MissingCommitsError
+			if errors.As(err, &missing) {
+				// A review written before its commits were kept by references,
+				// whose commit was lost since: nothing in the storage core kept it
+				// live either, so it cannot be brought back (doc/graft/PLAN7.md,
+				// REVIEW ROOTS RULE). The backfill reports the same commit.
+				return structerr.NewFailedPrecondition("commits %v of review %q are not in the repository any more; the review can only be closed", missing.Commits, reviewID).
+					WithMetadata("review_id", reviewID).
+					WithMetadata("commit_id", missing.Commits)
+			}
 			return structerr.NewInternal("protect the commits of the review: %w", err)
 		}
 		if s.rootsProtected != nil {
@@ -65,12 +76,13 @@ func (s *server) writeRoots(ctx context.Context, repo *localrepo.Repo, st store.
 
 // releaseRoots deletes the keep-around references of the commits of a review
 // that was just closed, unless another open review uses them. The close is
-// already recorded: a reference that cannot be deleted now only keeps its
-// objects alive longer, until the next close of a review of the same commit or
-// the maintenance sweep of the storage core.
+// already recorded, so a failure is not the request's: it is logged and counted
+// (graft_review_roots_sweep_failures_total{trigger="close"}), and the reference
+// only keeps its objects alive until the housekeeping backstop deletes it
+// (reviewroots.Sweeper.Housekeep, which runs in every mode).
 func (s *server) releaseRoots(ctx context.Context, repo *localrepo.Repo, st store.ReviewStore, commits []git.ObjectID) {
-	if _, err := reviewroots.Sweep(ctx, repo, st, commits); err != nil {
+	if _, err := reviewroots.DefaultSweeper.Sweep(ctx, repo, st, commits, reviewroots.TriggerClose); err != nil {
 		s.deps.GetLogger().WithError(err).WithField("commits", commits).WarnContext(ctx,
-			"review: the keep-around references of a closed review were not deleted; they keep their objects until a later sweep")
+			"review: the keep-around references of a closed review were not deleted; the housekeeping backstop deletes them")
 	}
 }

@@ -38,6 +38,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gate"
 	corestoreopen "github.com/feder-cr/git-ai/internal/graft/corestore/open"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	corestoresyncer "github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/voter"
 	"github.com/feder-cr/git-ai/internal/graft/derived"
@@ -604,6 +605,9 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		return fmt.Errorf("graft storage core: %w", err)
 	}
 	defer func() { _ = storageCore.Close() }()
+	// The review roots are written and swept in every mode, also without the
+	// storage core.
+	prometheus.MustRegister(reviewroots.DefaultSweeper)
 
 	hookManagerOpts := []hook.ManagerOption{hook.WithEagerObserver(eagerObserver)}
 	var (
@@ -839,7 +843,14 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			ctx,
 			logger,
 			maintenance.DailyOptimizationWorker(cfg, maintenance.OptimizerFunc(func(ctx context.Context, logger log.Logger, repo storage.Repository) error {
-				return housekeepingManager.OptimizeRepository(ctx, localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo))
+				local := localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
+				if err := housekeepingManager.OptimizeRepository(ctx, local); err != nil {
+					return err
+				}
+				// Graft: the backstop of the review roots, in every mode, where the
+				// housekeeping that prunes unreferenced objects runs
+				// (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+				return housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo)
 			})),
 		)
 		if err != nil {
@@ -884,6 +895,32 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 // newPackObjectsAdaptiveLimit builds the adaptive limit backing a pack objects limiter. The limit
 // only moves when the configuration asks for an adaptive one, and is otherwise pinned to the
 // configured concurrency.
+// housekeepReviewRoots runs the backstop of the review roots after the daily
+// housekeeping of a repository: it writes the keep-around references that
+// open reviews lack and deletes those no open review uses (in authoritative
+// mode after catching the repository up). Open reviews whose commits are lost
+// are logged with their IDs and commits; the counts are metrics of
+// reviewroots.DefaultSweeper.
+func housekeepReviewRoots(ctx context.Context, logger log.Logger, core *corestore.Core, fresh corestore.Freshener, local *localrepo.Repo, repo storage.Repository) error {
+	backfill, sweep, err := reviewroots.DefaultSweeper.Housekeep(ctx, core, fresh, local, repo)
+	for _, missing := range backfill.Missing {
+		logger.WithFields(log.Fields{
+			"review_id": missing.ReviewID,
+			"commit_id": missing.Commit,
+		}).Warn("review roots: a commit of an open review is not in the repository; the review can only be closed")
+	}
+	if backfill.Protected > 0 || sweep.Deleted > 0 {
+		logger.WithFields(log.Fields{
+			"backfilled": backfill.Protected,
+			"deleted":    sweep.Deleted,
+		}).Info("review roots: housekeeping")
+	}
+	if err != nil {
+		return fmt.Errorf("review roots: %w", err)
+	}
+	return nil
+}
+
 func newPackObjectsAdaptiveLimit(name string, limits config.ConcurrencyLimits) *limiter.AdaptiveLimit {
 	if !limits.Adaptive {
 		return limiter.NewAdaptiveLimit(name, limiter.AdaptiveSetting{

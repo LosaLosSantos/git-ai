@@ -328,10 +328,13 @@ func parsePackKey(key string) (repoID int64, sum [32]byte, owned, ok bool) {
 }
 
 // KeepAroundPrefix is the prefix of the references that keep the commits of
-// open reviews alive: Gitaly hides it from clients (it is neither advertised
-// nor writable over the git protocols), housekeeping and garbage collection
-// respect it like every reference (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
-const KeepAroundPrefix = "refs/keep-around/"
+// open reviews alive (doc/graft/PLAN7.md, REVIEW ROOTS RULE). It is under
+// refs/keep-around/, which Gitaly hides from clients (neither advertised nor
+// writable over the git protocols) and which housekeeping and garbage
+// collection respect like every reference. It is a namespace of its own:
+// GitLab writes refs/keep-around/<oid> for its own purposes, and the sweeps of
+// the review roots must never delete those.
+const KeepAroundPrefix = "refs/keep-around/review/"
 
 // KeepAroundRef returns the keep-around reference of a commit; its target is
 // the commit itself.

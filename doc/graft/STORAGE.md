@@ -91,7 +91,7 @@ design is [PLAN6.md](PLAN6.md).
   database transaction as the reference change, and reviews are stored in the
   database. A watcher on another node sees new entries by polling every 250 ms.
 - **Review commits are kept by references.** `CreateReview` and `UpdateReview`
-  write a hidden reference `refs/keep-around/<commit>` for the head and base of
+  write a hidden reference `refs/keep-around/review/<commit>` for the head and base of
   the review before they record it, so an open review keeps its commits alive
   after their branch is deleted: on every node (housekeeping keeps what
   references reach), in checkpoints and through garbage collection. A review of
@@ -105,7 +105,13 @@ design is [PLAN6.md](PLAN6.md).
   written as well (housekeeping keeps the commits), but nothing enforces them:
   the review files are the source of truth there. Each review creation and each
   head move costs one reference transaction, so one changeset and no changelog
-  entry.
+  entry. GitLab's own `refs/keep-around/<commit>` references are never touched.
+  The daily housekeeping of every repository (on by default) also writes the
+  references that open reviews lack and deletes those no open review uses;
+  watch `graft_review_roots_sweep_failures_total` and
+  `graft_review_roots_missing_total`. A review written by an older version
+  whose commit was lost since can still be read and closed, but `UpdateReview`
+  refuses it with `FailedPrecondition` naming the review and the commit.
 - **Repository IDs.** A repository is identified by its storage name and
   relative path, and gets an ID that is never reused: a repository removed and
   created again is a new repository, and the old caches are recognized as
