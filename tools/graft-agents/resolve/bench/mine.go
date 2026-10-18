@@ -23,7 +23,8 @@ type MineStats struct {
 	Merges            int `json:"merges"`
 	ConflictingMerges int `json:"conflicting_merges"`
 	// SkippedMergeBases counts merges whose parents have no single merge base (criss-cross or
-	// unrelated histories): the resolver is given one base.
+	// unrelated histories): the resolver is given one base. Merges of unrelated histories are
+	// counted here whether they conflict or not, since git merge-tree refuses to replay them.
 	SkippedMergeBases int `json:"skipped_merge_bases"`
 	ConflictingFiles  int `json:"conflicting_files"`
 	// OtherFamily counts conflicting files of no benchmark family.
@@ -65,6 +66,13 @@ func Mine(ctx context.Context, repo Repo, dir string, opts MineOptions) ([]Case,
 
 		paths, err := g.conflicts(ctx, ours, theirs)
 		if err != nil {
+			// git merge-tree refuses unrelated histories (a repository that absorbed another
+			// one): the merge is skipped when its parents have no merge base, and the error
+			// stands otherwise.
+			if bases, baseErr := g.mergeBases(ctx, ours, theirs); baseErr == nil && len(bases) == 0 {
+				stats.SkippedMergeBases++
+				continue
+			}
 			return nil, stats, fmt.Errorf("merge %s: %w", merge, err)
 		}
 		if len(paths) == 0 {

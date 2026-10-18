@@ -151,6 +151,35 @@ func TestMineKeepsRealResolutions(t *testing.T) {
 	}
 }
 
+// TestMineSkipsUnrelatedHistories mines a repository that absorbed another one with a merge of
+// unrelated histories, which git merge-tree refuses: the merge is skipped and counted, and the
+// conflicting merge after it is still mined.
+func TestMineSkipsUnrelatedHistories(t *testing.T) {
+	f := newFixture(t)
+	f.commit("base", map[string]string{"a.go": "package a\n\nvar x = 1\n"})
+	f.git("checkout", "-q", "--orphan", "other")
+	f.git("rm", "-q", "-r", "--cached", ".")
+	f.commit("other root", map[string]string{"b.py": "y = 1\n"})
+	f.git("checkout", "-q", "-f", "main")
+	f.git("merge", "-q", "--no-ff", "--allow-unrelated-histories", "-m", "absorb other", "other")
+
+	f.git("checkout", "-q", "-b", "feature")
+	f.commit("three", map[string]string{"a.go": "package a\n\nvar x = 3\n"})
+	f.git("checkout", "-q", "main")
+	f.commit("two", map[string]string{"a.go": "package a\n\nvar x = 2\n"})
+	f.conflictMerge("feature", map[string]string{"a.go": "package a\n\nvar x = 2 + 3\n"})
+	head := f.git("rev-parse", "HEAD")
+
+	cases, stats, err := Mine(context.Background(), Repo{Name: "fixture", Commit: head, License: "MIT"}, f.dir, MineOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := MineStats{Merges: 2, ConflictingMerges: 1, SkippedMergeBases: 1, ConflictingFiles: 1, Kept: 1}
+	if stats != want || len(cases) != 1 {
+		t.Fatalf("stats %+v (%d cases), want %+v and 1 case", stats, len(cases), want)
+	}
+}
+
 // fixedStrategy answers every file with content, or fails with err.
 type fixedStrategy struct {
 	content []byte
