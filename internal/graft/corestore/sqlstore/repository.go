@@ -37,6 +37,18 @@ func (s *Store) selectRepository(ctx context.Context, q querier, where string, a
 		query += " FOR UPDATE"
 	}
 
+	r, err := scanRepoState(q.QueryRowContext(ctx, s.bind(query), args...).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return repoState{}, corestore.ErrRepositoryNotFound
+	}
+	if err != nil {
+		return repoState{}, fmt.Errorf("select repository: %w", err)
+	}
+	return r, nil
+}
+
+// scanRepoState reads a row of repoColumns.
+func scanRepoState(scan func(...any) error) (repoState, error) {
 	var (
 		r                     repoState
 		storage, relativePath string
@@ -44,21 +56,16 @@ func (s *Store) selectRepository(ctx context.Context, q querier, where string, a
 		nextReviewID          int64
 		createdRaw            any
 	)
-	err := q.QueryRowContext(ctx, s.bind(query), args...).Scan(
-		&r.id, &storage, &relativePath, &r.objectFormat, &headSeq, &logSeq, &nextReviewID, &createdRaw,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return repoState{}, corestore.ErrRepositoryNotFound
-	}
-	if err != nil {
-		return repoState{}, fmt.Errorf("select repository: %w", err)
+	if err := scan(&r.id, &storage, &relativePath, &r.objectFormat, &headSeq, &logSeq, &nextReviewID, &createdRaw); err != nil {
+		return repoState{}, err
 	}
 
-	r.createdAt, err = scanTime(createdRaw)
+	createdAt, err := scanTime(createdRaw)
 	if err != nil {
-		return repoState{}, fmt.Errorf("select repository: %w", err)
+		return repoState{}, err
 	}
 
+	r.createdAt = createdAt
 	r.key = corestore.RepoKey{Storage: storage, RelativePath: relativePath}
 	r.headSeq = uint64(headSeq)
 	r.logSeq = uint64(logSeq)
@@ -393,22 +400,77 @@ func (s *Store) DeleteRepository(ctx context.Context, key corestore.RepoKey) (bo
 
 	var deleted bool
 	err := s.withTx(ctx, nil, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, s.bind("DELETE FROM graft_repositories WHERE storage = ? AND relative_path = ?"),
-			key.Storage, key.RelativePath)
+		deleted = false
+
+		repo, err := s.selectRepository(ctx, tx, "storage = ? AND relative_path = ?", []any{key.Storage, key.RelativePath}, true)
+		if errors.Is(err, corestore.ErrRepositoryNotFound) {
+			return nil
+		}
 		if err != nil {
+			return err
+		}
+
+		now, err := s.wallTime(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		// The cascade removes everything recorded for the repository; the
+		// tombstone, which has no foreign key, outlives it so that garbage
+		// collection deletes the repository's objects from the bucket
+		// (doc/graft/PLAN7.md, "Removed repositories").
+		if _, err := tx.ExecContext(ctx, s.bind("DELETE FROM graft_repositories WHERE repo_id = ?"), repo.id); err != nil {
 			return fmt.Errorf("delete repository: %w", err)
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("delete repository: %w", err)
+		if _, err := tx.ExecContext(ctx, s.bind(`
+			INSERT INTO graft_gc_removed (repo_id, storage, relative_path, removed_at)
+			VALUES (?, ?, ?, ?)
+		`), repo.id, repo.key.Storage, repo.key.RelativePath, s.timeArg(now)); err != nil {
+			return fmt.Errorf("record the tombstone of repository %d: %w", repo.id, err)
 		}
-		deleted = n > 0
+
+		deleted = true
 		return nil
 	})
 	if err != nil {
 		return false, err
 	}
 	return deleted, nil
+}
+
+// ListRepositories implements corestore.MetaStore.
+func (s *Store) ListRepositories(ctx context.Context, storage string) ([]corestore.Repository, error) {
+	query := "SELECT " + repoColumns + " FROM graft_repositories WHERE head_seq > 0"
+	var args []any
+	if storage != "" {
+		query += " AND storage = ?"
+		args = append(args, storage)
+	}
+	query += " ORDER BY repo_id"
+
+	var repos []corestore.Repository
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		repos = nil
+
+		rows, err := tx.QueryContext(ctx, s.bind(query), args...)
+		if err != nil {
+			return fmt.Errorf("list repositories: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			r, err := scanRepoState(rows.Scan)
+			if err != nil {
+				return fmt.Errorf("scan repository: %w", err)
+			}
+			repos = append(repos, toRepository(r))
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repos, nil
 }
 
 // Refs implements corestore.MetaStore.

@@ -152,6 +152,45 @@ type Changeset struct {
 	Updates []AppliedUpdate
 }
 
+// Checkpoint is a consolidated state of a repository at a changeset sequence:
+// one pack with every object reachable from the references at Seq and from the
+// roots of the reviews open when it was built, plus the reference snapshot at
+// Seq (MetaStore.CheckpointRefs). Hydration starts from the newest checkpoint
+// and replays only the changesets after it (doc/graft/PLAN7.md).
+type Checkpoint struct {
+	RepoID    int64
+	Seq       uint64
+	PackKey   string
+	PackBytes int64
+	// CreatedAt is a database time (doc/graft/PLAN7.md, CLOCK RULE).
+	CreatedAt time.Time
+}
+
+// RemovedRepository is the tombstone of a removed repository whose objects
+// are still to be deleted from the bucket.
+type RemovedRepository struct {
+	RepoID int64
+	Key    RepoKey
+	// RemovedAt is a database time (doc/graft/PLAN7.md, CLOCK RULE).
+	RemovedAt time.Time
+}
+
+// GCState is what garbage collection decides on for one repository, read in
+// one database snapshot (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 5).
+type GCState struct {
+	// Now is the database time of the snapshot: every row committed before it is
+	// part of the snapshot.
+	Now time.Time
+	// Packs maps every changeset pack key to the greatest sequence of the
+	// changesets that reference it (a legacy key can be shared by several).
+	Packs map[string]uint64
+	// Checkpoints are the checkpoints, ascending by sequence.
+	Checkpoints []Checkpoint
+	// Orphans maps the keys observed unreferenced to the database time they were
+	// first observed.
+	Orphans map[string]time.Time
+}
+
 // RefConflict is one reference whose current value did not satisfy its
 // RefUpdate.
 type RefConflict struct {
@@ -185,6 +224,14 @@ var (
 	// ErrBlobExists is returned by BlobStore.Put for a key that exists already:
 	// objects are never overwritten nor shared between writers.
 	ErrBlobExists = errors.New("storage core: blob already exists")
+	// ErrCheckpointNotFound is returned for a checkpoint sequence the
+	// repository has no checkpoint at.
+	ErrCheckpointNotFound = errors.New("storage core: checkpoint not found")
+	// ErrCheckpointRootsChanged is returned by MetaStore.CreateCheckpoint when an
+	// open review has a head or base commit that the checkpoint's pack does not
+	// include: the review was created or moved during the build
+	// (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
+	ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
 	// ErrBlobCorrupt is returned by the reader of BlobStore.Get when the content
 	// does not hash to its key.
 	ErrBlobCorrupt = errors.New("storage core: blob content does not match its key")

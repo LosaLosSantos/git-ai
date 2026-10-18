@@ -113,6 +113,13 @@ func ParseDSN(dsn string) (Dialect, string, error) {
 // the lock is acquired in slices of sqliteBusySlice, never longer than the
 // context's deadline.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	return open(ctx, dsn, 0)
+}
+
+// open is Open applying only the first migrations of the schema when
+// migrations is greater than 0 (tests build a database as an earlier version
+// left it), every migration otherwise.
+func open(ctx context.Context, dsn string, migrations int) (*Store, error) {
 	dialect, target, err := ParseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -141,7 +148,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("ping %s database: %w", dialect, err)
 	}
 
-	if err := applyMigrations(ctx, db, dialect); err != nil {
+	if err := applyMigrations(ctx, db, dialect, migrations); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply migrations: %w", err)
 	}
@@ -186,10 +193,11 @@ func ping(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	}
 }
 
-// applyMigrations brings the schema of the dialect up to date. Postgres
-// processes are serialized with an advisory lock held on a dedicated
-// connection; SQLite processes that race on a new database retry.
-func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
+// applyMigrations brings the schema of the dialect up to date, or up to its
+// first limit migrations when limit is greater than 0. Postgres processes are
+// serialized with an advisory lock held on a dedicated connection; SQLite
+// processes that race on a new database retry.
+func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect, limit int) error {
 	migrations := sqliteMigrations
 	name := "sqlite3"
 	attempts := maxMigrationAttempts
@@ -197,7 +205,12 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		migrations = postgresMigrations
 		name = "postgres"
 		attempts = 1
+	}
+	if limit > 0 {
+		migrations = migrations[:min(limit, len(migrations))]
+	}
 
+	if dialect == Postgres {
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			return fmt.Errorf("get migration connection: %w", err)
@@ -332,12 +345,20 @@ func (s *Store) withReadTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return s.retryTx(ctx, s.readDB, s.readTxOptions(), fn)
 }
 
+// retryHook, when set by a test, is called with the error of every transaction
+// that is retried, so that a test can assert which kind of conflict occurred
+// (doc/graft/PLAN7.md, LOCK ORDER: no deadlock). It is nil in production.
+var retryHook func(err error)
+
 func (s *Store) retryTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn func(*sql.Tx) error) error {
 	var err error
 	for attempt := 0; ; attempt++ {
 		err = s.runTx(ctx, db, opts, fn)
 		if err == nil || attempt >= maxTxRetries || !isRetryable(err) || ctx.Err() != nil {
 			return err
+		}
+		if retryHook != nil {
+			retryHook(err)
 		}
 		if serr := sleep(ctx, attempt); serr != nil {
 			return err

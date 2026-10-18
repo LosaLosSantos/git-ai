@@ -3,6 +3,7 @@ package corestore
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -67,6 +68,23 @@ type InitialState struct {
 	Reviews []*gitalypb.Review
 }
 
+// CheckpointInput is the state MetaStore.CreateCheckpoint records.
+type CheckpointInput struct {
+	// Seq is the changeset sequence of the reference snapshot: 1..head sequence,
+	// greater than the newest checkpoint's.
+	Seq uint64
+	// Refs is the reference snapshot at Seq (every existing reference, HEAD
+	// included); it holds no absent value and is not empty.
+	Refs map[string]Target
+	// PackKey is the owned key (NewPackKey) of the already uploaded consolidated
+	// pack, PackBytes its size.
+	PackKey   string
+	PackBytes int64
+	// Roots are the head and base commits of the open reviews that the pack
+	// includes (doc/graft/PLAN7.md, REVIEW ROOTS RULE R2).
+	Roots []string
+}
+
 var (
 	// ErrReviewNotFound is returned for an unknown review ID.
 	ErrReviewNotFound = errors.New("storage core: review not found")
@@ -84,9 +102,15 @@ type MetaStore interface {
 	RegisterRepository(ctx context.Context, key RepoKey, objectFormat string, init InitialState) (Repository, CommitResult, error)
 	// GetRepository returns ErrRepositoryNotFound for an unknown key.
 	GetRepository(ctx context.Context, key RepoKey) (Repository, error)
-	// DeleteRepository removes the repository and everything recorded for it.
-	// It returns false when the repository was not known.
+	// DeleteRepository removes the repository and everything recorded for it,
+	// and records a tombstone (ListRemovedRepositories) in the same transaction
+	// so that garbage collection deletes its objects from the bucket. It returns
+	// false, writing nothing, when the repository was not known.
 	DeleteRepository(ctx context.Context, key RepoKey) (bool, error)
+	// ListRepositories returns the repositories of the storage whose import is
+	// complete (head sequence > 0), ascending by ID; every storage's when storage
+	// is empty.
+	ListRepositories(ctx context.Context, storage string) ([]Repository, error)
 
 	// CommitChangeset checks every update against the current references and
 	// records the changeset, the reference changes and the changelog entries
@@ -134,6 +158,61 @@ type MetaStore interface {
 	// UpdateReview stores r if the review is still at version, which becomes
 	// version+1. It returns ErrReviewVersionConflict otherwise.
 	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review) error
+
+	// CreateCheckpoint records a checkpoint and its reference snapshot in one
+	// transaction, with the database time as its creation time. Its first
+	// statement locks the repository row (doc/graft/PLAN7.md, LOCK ORDER). It
+	// requires Seq <= head sequence, Seq greater than the newest checkpoint's,
+	// an owned pack key of the repository and a valid snapshot, else an error and
+	// nothing is written. A checkpoint at Seq that exists already is returned
+	// unchanged with created false (its pack is kept; the caller's becomes an
+	// orphan). It requires every open review's head and base commit to be in
+	// Roots, else ErrCheckpointRootsChanged and nothing is written.
+	// ErrRepositoryNotFound for an unknown repository.
+	CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
+	// NewestCheckpoint returns the checkpoint with the greatest sequence; ok is
+	// false when the repository has none.
+	NewestCheckpoint(ctx context.Context, repoID int64) (cp Checkpoint, ok bool, err error)
+	// SyncBoundary returns the sequence of the newest checkpoint created at
+	// least age ago on the database clock, 0 when there is none
+	// (doc/graft/PLAN7.md, GC BOUNDARY rule). ErrRepositoryNotFound for an unknown
+	// repository.
+	SyncBoundary(ctx context.Context, repoID int64, age time.Duration) (uint64, error)
+	// CheckpointRefs returns the reference snapshot of the checkpoint at seq,
+	// ErrCheckpointNotFound when there is none.
+	CheckpointRefs(ctx context.Context, repoID int64, seq uint64) (map[string]Target, error)
+	// DeleteCheckpoint removes the checkpoint at seq and its snapshot; false when
+	// there was none. The caller deletes the pack afterwards.
+	DeleteCheckpoint(ctx context.Context, repoID int64, seq uint64) (bool, error)
+
+	// GCSnapshot reads what garbage collection decides on, in one read
+	// transaction (see GCState). ErrRepositoryNotFound for an unknown repository.
+	GCSnapshot(ctx context.Context, repoID int64) (GCState, error)
+	// RecordOrphans records the database time as the first observation of every
+	// key that has none; existing observations are kept.
+	RecordOrphans(ctx context.Context, repoID int64, keys []string) error
+	// ForgetOrphans removes the observations of the keys.
+	ForgetOrphans(ctx context.Context, repoID int64, keys []string) error
+
+	// AcquireMaintenanceLease takes the repository's maintenance lease for
+	// holder until the database time plus ttl, by compare-and-swap: it succeeds
+	// when there is no lease, when it has expired, or when holder holds it.
+	// RenewMaintenanceLease extends it when holder holds it (held false
+	// otherwise); ReleaseMaintenanceLease frees it when holder holds it. A lease
+	// only keeps two nodes from doing the same maintenance at once: no read,
+	// write or correctness argument depends on it. ErrRepositoryNotFound for an
+	// unknown repository, except from ReleaseMaintenanceLease, which has nothing
+	// to free then.
+	AcquireMaintenanceLease(ctx context.Context, repoID int64, holder string, ttl time.Duration) (acquired bool, err error)
+	RenewMaintenanceLease(ctx context.Context, repoID int64, holder string, ttl time.Duration) (held bool, err error)
+	ReleaseMaintenanceLease(ctx context.Context, repoID int64, holder string) error
+
+	// ListRemovedRepositories returns the tombstones of the storage (of every
+	// storage when it is empty) recorded at least minAge ago on the database
+	// clock, ascending by repository ID.
+	ListRemovedRepositories(ctx context.Context, storage string, minAge time.Duration) ([]RemovedRepository, error)
+	// DeleteRemovedRepository removes a tombstone; a missing one is success.
+	DeleteRemovedRepository(ctx context.Context, repoID int64) error
 
 	// Close releases the database.
 	Close() error
