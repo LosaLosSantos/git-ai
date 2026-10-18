@@ -168,7 +168,7 @@ func (s *Server) landAncestry(ctx context.Context, quarantineRepo *localrepo.Rep
 // landAttempt performs a single compare-and-swap attempt of UserLand. It returns a landConflict
 // if the branch was moved by a concurrent writer, in which case the caller retries.
 func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
-	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), ignoreLandPhase)
+	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), landPublishLoose, ignoreLandPhase)
 	if err != nil {
 		return nil, err
 	}

@@ -26,12 +26,13 @@ var packBatchObjects = packAttemptObjects
 // holds no loose object, and nothing is done.
 //
 // This is how a batch makes its objects durable once (doc/graft/PLAN8.md, section 3.2): the rebaser
-// writes them without fsync, git pack-objects writes and fsyncs the pack and its index with the
-// fsync configuration of the server, and the quarantine migration of the update then moves only the
-// pack files, fsyncing them again, before the reference is updated. The loose files are removed only
-// after git pack-objects succeeded; on any error they are left as they are, and the attempt, whose
-// quarantine is discarded, publishes nothing. A file that is not a loose object, such as a pack that
-// a helper wrote, is left for the migration, which fsyncs it.
+// writes them without fsync, and git pack-objects writes and fsyncs the pack and its index with the
+// fsync configuration of the server, so that every object file of the quarantine is durable before
+// the quarantine migration of the update moves it, as a quarantine requires. The loose files are
+// removed only after git pack-objects succeeded; on any error they are left as they are, and the
+// attempt, whose quarantine is discarded, publishes nothing. The rebaser writes only loose objects;
+// the other writers of an attempt (conflict resolution, the merge strategy) write with the fsync
+// configuration of the server, so their files are durable already.
 //
 // objectDir must be a quarantine object directory that only the attempt writes to: the files are
 // listed once, so an object written while the pack is built would stay loose.

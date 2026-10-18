@@ -69,8 +69,10 @@ type engineConfig struct {
 }
 
 // WithDeferredDurability starts the helper processes without fsync of the loose objects they write.
-// The caller makes those objects durable before any reference points to them. The batch stepper of
-// UserLand does: it publishes the objects of its quarantine as one fsynced pack (doc/graft/PLAN8.md,
+// The caller takes over their durability: a quarantine's contract is that every object file in it
+// is durable before the quarantine migration moves it into the repository, so the caller must make
+// the objects durable before the migration, not rely on it. The batch attempts of UserLand do: they
+// pack the objects of their quarantine into one fsynced pack before the update (doc/graft/PLAN8.md,
 // section 3.2).
 func WithDeferredDurability() Option {
 	return func(cfg *engineConfig) {

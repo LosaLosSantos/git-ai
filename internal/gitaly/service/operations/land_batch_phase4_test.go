@@ -421,8 +421,8 @@ func TestLandBatch_rebaseGoesThroughRebaser(t *testing.T) {
 
 	var rebases atomic.Int64
 	original := newBatchRebaser
-	newBatchRebaser = func(repo *localrepo.Repo) batchRebaser {
-		return countingRebaser{batchRebaser: original(repo), rebases: &rebases}
+	newBatchRebaser = func(repo *localrepo.Repo, mode landPublishMode) batchRebaser {
+		return countingRebaser{batchRebaser: original(repo, mode), rebases: &rebases}
 	}
 	t.Cleanup(func() { newBatchRebaser = original })
 

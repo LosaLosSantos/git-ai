@@ -368,9 +368,10 @@ type helperConfig struct {
 
 // WithoutObjectFsync starts the helper processes with core.fsync=none. A MergeTreeStream and a
 // CommitWriter write nothing but objects, so the option only drops the fsync of the objects they
-// write. The caller must make those objects durable before any reference points to them: the batch
-// stepper of UserLand packs every loose object of its quarantine into one fsynced pack, and the
-// quarantine migration fsyncs whatever else it moves (see doc/graft/PLAN8.md, section 3.2).
+// write. The caller must make those objects durable itself, before a quarantine that holds them is
+// migrated: every object file in a quarantine must be durable at migration time, and the migration
+// is not relied on to fsync them. The batch attempts of UserLand pack every loose object of their
+// quarantine into one fsynced pack before the update (see doc/graft/PLAN8.md, section 3.2).
 //
 // The value replaces the core.fsync of the server for the helper. It cannot be derived from it: git
 // does not subtract a component from a value set earlier (a later "-loose-object" replaces the

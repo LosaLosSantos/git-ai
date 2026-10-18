@@ -25,11 +25,27 @@ type landPhaseObserver func(phase string, start time.Time)
 // ignoreLandPhase is the landPhaseObserver of an unbatched land.
 func ignoreLandPhase(string, time.Time) {}
 
+// landPublishMode is how a landing attempt makes the objects it writes durable. Both modes keep the
+// durability contract of a quarantine: every object file in it is durable before the quarantine
+// migration moves it into the repository, which therefore only has to make the links durable.
+type landPublishMode int
+
+const (
+	// landPublishPack is the mode of a batch attempt. Its rebaser writes the objects of all members
+	// without fsync, and publish packs every loose object of the quarantine into one pack, which git
+	// pack-objects fsyncs, before the update. A pack is the cheap way to make many objects durable.
+	landPublishPack landPublishMode = iota + 1
+	// landPublishLoose is the mode of an unbatched attempt. Its rebaser writes the few objects of
+	// one change with the server's fsync configuration, and the migration moves them as they are.
+	// A pack would cost a process and as many fsyncs for these few objects, and the attempts that
+	// lose the compare-and-swap would each leave a pack in the repository.
+	landPublishLoose
+)
+
 // landingAttempt is one attempt to land changes onto a branch, in a quarantine of its own. The
-// unbatched land and every attempt of a batch use it, so both decide how a change lands, rebase it
-// and publish its objects the same way (doc/graft/PLAN8.md): one listing of the commits a change
-// adds to the tip decides, one rebase engine replays, and the objects the attempt wrote are made
-// durable once, as one pack, before the reference moves.
+// unbatched land and every attempt of a batch use it, so both decide how a change lands and
+// rebase it the same way (doc/graft/PLAN8.md): one listing of the commits a change adds to the tip
+// decides, and one rebase engine replays. How the objects become durable is the mode of the attempt.
 type landingAttempt struct {
 	server        *Server
 	repository    *gitalypb.Repository
@@ -45,6 +61,8 @@ type landingAttempt struct {
 	ancestry ancestry.Checker
 	// observe observes the phases of the attempt.
 	observe landPhaseObserver
+	// mode is how the attempt makes its objects durable.
+	mode landPublishMode
 }
 
 // batchRebaser replays the commits of the changes of an attempt. It is rebase.Engine.
@@ -53,17 +71,24 @@ type batchRebaser interface {
 	Close() error
 }
 
-// newBatchRebaser starts the rebaser of an attempt on the quarantine of the attempt. The objects it
-// writes are not fsynced one by one: the publish of the attempt packs them into one fsynced pack
-// before the reference points to them (see publish). It is a variable so that tests can observe the
-// replays.
-var newBatchRebaser = func(repo *localrepo.Repo) batchRebaser {
-	return rebase.New(repo, rebase.WithDeferredDurability())
+// newBatchRebaser starts the rebaser of an attempt in mode on the quarantine of the attempt. Only
+// the pack mode defers the durability of the objects it writes to the publish of the attempt (see
+// landPublishPack); the loose mode writes them with the server's fsync configuration. It is a
+// variable so that tests can observe the replays.
+var newBatchRebaser = func(repo *localrepo.Repo, mode landPublishMode) batchRebaser {
+	if mode == landPublishPack {
+		return rebase.New(repo, rebase.WithDeferredDurability())
+	}
+	return rebase.New(repo)
 }
 
-// newLandingAttempt starts an attempt on repository: it opens the quarantine of the attempt and the
-// processes that serve it. The returned function ends the attempt.
-func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Repository, observe landPhaseObserver) (*landingAttempt, func(), error) {
+// newLandingAttempt starts an attempt on repository in mode: it opens the quarantine of the attempt
+// and the processes that serve it. The returned function ends the attempt.
+func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Repository, mode landPublishMode, observe landPhaseObserver) (*landingAttempt, func(), error) {
+	if mode != landPublishPack && mode != landPublishLoose {
+		return nil, nil, structerr.NewInternal("unknown publish mode %d", mode)
+	}
+
 	defer observe(landBatchPhaseQuarantine, time.Now())
 
 	quarantineDir, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, repository)
@@ -92,9 +117,8 @@ func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Rep
 		return nil, nil, structerr.NewInternal("reading object info: %w", err)
 	}
 
-	// One rebase engine serves the whole attempt, and the attempt ends with it. Its objects are
-	// made durable by the publish of the attempt, as one pack (see publish).
-	rebaser := newBatchRebaser(quarantineRepo)
+	// One rebase engine serves the whole attempt, and the attempt ends with it.
+	rebaser := newBatchRebaser(quarantineRepo, mode)
 
 	return &landingAttempt{
 			server:        s,
@@ -106,6 +130,7 @@ func (s *Server) newLandingAttempt(ctx context.Context, repository *gitalypb.Rep
 			rebaser:       rebaser,
 			ancestry:      checker,
 			observe:       observe,
+			mode:          mode,
 		}, func() {
 			releaseInfo()
 			releaseChecker()
@@ -328,11 +353,16 @@ func (a *landingAttempt) computeTip(ctx context.Context, in *gitalypb.UserLandRe
 	}
 }
 
-// publish makes the objects that the attempt wrote durable before its compare-and-swap: it packs
-// every loose object of the quarantine into one fsynced pack (see packAttemptObjects), which the
-// quarantine migration of the update then moves into the repository. A failure fails the update of
-// the attempt: nothing is published.
+// publish makes the objects that the attempt wrote durable before its compare-and-swap, so that the
+// quarantine migration of the update only moves durable files. In the pack mode it packs every
+// loose object of the quarantine into one fsynced pack (see packAttemptObjects); a failure fails the
+// update of the attempt, and nothing is published. In the loose mode the objects were fsynced when
+// they were written, and there is nothing to do.
 func (a *landingAttempt) publish(ctx context.Context) error {
+	if a.mode == landPublishLoose {
+		return nil
+	}
+
 	defer a.observe(landBatchPhasePack, time.Now())
 
 	repoPath, err := a.repo.Path(ctx)

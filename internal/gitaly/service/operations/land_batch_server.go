@@ -179,7 +179,7 @@ func (s *Server) executeLandBatch(ctx context.Context, _ landlane.Key, reqs []*l
 // newLandBatchStepper starts a batch attempt on repository. Its phases are observed in
 // graft_land_batch_phase_seconds. The returned function ends the attempt.
 func (s *Server) newLandBatchStepper(ctx context.Context, repository *gitalypb.Repository) (*serverLandBatchStepper, func(), error) {
-	attempt, cleanup, err := s.newLandingAttempt(ctx, repository, observeLandBatchPhase)
+	attempt, cleanup, err := s.newLandingAttempt(ctx, repository, landPublishPack, observeLandBatchPhase)
 	if err != nil {
 		return nil, nil, err
 	}
