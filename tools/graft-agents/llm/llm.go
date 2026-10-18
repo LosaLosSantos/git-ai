@@ -73,6 +73,9 @@ type Provider interface {
 
 // Config selects and configures a provider. It is embedded in the TOML
 // configuration of the Graft agents.
+//
+// A provider honours every field it is given or fails at construction: no
+// setting is dropped silently.
 type Config struct {
 	// Type is "anthropic", "openai", "command" or "none".
 	Type string `toml:"type" json:"type"`
@@ -92,8 +95,8 @@ type Config struct {
 	Timeout string `toml:"timeout" json:"timeout"`
 	// MaxTokens is the default Request.MaxTokens.
 	MaxTokens int `toml:"max_tokens" json:"max_tokens"`
-	// Effort is a provider-specific reasoning-effort hint ("low", "medium",
-	// "high", ...); providers that do not support it ignore it.
+	// Effort is a provider-specific reasoning effort ("low", "medium",
+	// "high", ...); a provider that cannot send it rejects it.
 	Effort string `toml:"effort" json:"effort"`
 	// Options holds extra provider-specific settings.
 	Options map[string]string `toml:"options" json:"options"`

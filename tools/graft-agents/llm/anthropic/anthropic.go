@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -76,6 +77,20 @@ func New(cfg llm.Config) (*Provider, error) {
 	model := strings.TrimSpace(cfg.Model)
 	if model == "" {
 		model = DefaultModel
+	}
+
+	// No setting is dropped silently: the provider runs no command and supports
+	// no options.
+	if len(cfg.Command) > 0 {
+		return nil, errors.New("anthropic: command is for the command provider; this provider takes none")
+	}
+	if len(cfg.Options) > 0 {
+		keys := make([]string, 0, len(cfg.Options))
+		for k := range cfg.Options {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return nil, fmt.Errorf("anthropic: unsupported options %v: this provider takes none", keys)
 	}
 
 	effortName := strings.ToLower(strings.TrimSpace(cfg.Effort))

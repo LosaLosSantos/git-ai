@@ -59,6 +59,7 @@ func TestNewRejectsUnsupportedSettings(t *testing.T) {
 	}{
 		"unknown effort": {llm.Config{Type: "openai", Model: "m", Effort: "turbo"}, `invalid effort "turbo"`},
 		"options":        {llm.Config{Type: "openai", Model: "m", Options: map[string]string{"region": "eu", "a": "b"}}, "unsupported options [a region]"},
+		"command":        {llm.Config{Type: "openai", Model: "m", Command: []string{"x"}}, "command is for the command provider"},
 	} {
 		_, err := New(tc.cfg)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

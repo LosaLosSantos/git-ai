@@ -111,8 +111,11 @@ func New(cfg llm.Config) (*Provider, error) {
 	if cfg.MaxTokens < 0 {
 		return nil, errors.New("openai: max_tokens must not be negative")
 	}
-	// No setting is dropped silently: the provider supports no options, and an
-	// effort it cannot send is an error.
+	// No setting is dropped silently: the provider runs no command and supports
+	// no options, and an effort it cannot send is an error.
+	if len(cfg.Command) > 0 {
+		return nil, errors.New("openai: command is for the command provider; this provider takes none")
+	}
 	if len(cfg.Options) > 0 {
 		keys := make([]string, 0, len(cfg.Options))
 		for k := range cfg.Options {

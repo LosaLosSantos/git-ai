@@ -296,11 +296,32 @@ configured, with a message naming that requirement. The syntax check itself
 fails closed in such a build (it rejects every file that has a grammar), and
 `graft-resolve bench run` refuses to start.
 
-With the `openai` provider, `effort` (`minimal`, `low`, `medium`, `high` or
-`xhigh`) is sent as OpenRouter's `reasoning` parameter (`{"effort": ...}`) on
-every call; configure it only for an endpoint that takes that parameter. The
-provider takes no `options`, and a configuration that sets any, or an effort
-it does not know, fails at startup. No setting is dropped silently. An llm
+Every setting of `[strategy.llm]` is either honoured by the provider or an
+error at startup. None is dropped silently:
+
+| setting | `openai` | `anthropic` | `command` |
+|---|---|---|---|
+| `model` | sent | sent (default `claude-opus-5-5`) | `GRAFT_LLM_MODEL`, and the reported model |
+| `base_url` | the endpoint | the endpoint | error |
+| `api_key_env` | the key's variable (default `OPENAI_API_KEY`) | the key's variable | error |
+| `command` | error | error | the program (argv, no shell) |
+| `timeout` | per call | per call | per call, the program is killed |
+| `max_tokens` | `max_tokens` | `max_tokens` (default 16000) | `GRAFT_LLM_MAX_TOKENS` |
+| `effort` | OpenRouter's `reasoning: {"effort": ...}`; `minimal`, `low`, `medium`, `high`, `xhigh` | `output_config.effort`; `low` to `max` (default `high`) | `GRAFT_LLM_EFFORT`, verbatim |
+| `options` | error | error | error |
+
+The `openai` provider's `reasoning` parameter is OpenRouter's. Set `effort`
+only for an endpoint that takes it.
+
+The `command` program inherits graft-resolve's environment, and gets three
+extra variables for its settings: `GRAFT_LLM_MODEL`, `GRAFT_LLM_EFFORT` and
+`GRAFT_LLM_MAX_TOKENS`. The token limit is the call's, else the configured
+default. Each variable is set only when its setting is, and inherited
+variables of those names are removed. The program reads its own endpoint and
+credentials, which is why `base_url` and `api_key_env` are errors for it. It
+is expected to honour the variables. In particular, the AI budget counts a
+call's output as at most `GRAFT_LLM_MAX_TOKENS`, and a command reports no
+usage, so each of its calls is booked at that worst case. An llm
 strategy also refuses to start in a graft-resolve built without cgo (see
 above).
 

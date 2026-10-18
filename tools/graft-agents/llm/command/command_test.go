@@ -69,6 +69,17 @@ func runHelper(mode string, args []string) int {
 	case "sleep":
 		time.Sleep(30 * time.Second)
 		return 0
+	case "env":
+		// Write the GRAFT_LLM_ variables as a JSON object; absent ones are left out.
+		env := map[string]string{}
+		for _, k := range []string{EnvModel, EnvEffort, EnvMaxTokens} {
+			if v, ok := os.LookupEnv(k); ok {
+				env[k] = v
+			}
+		}
+		b, _ := json.Marshal(env)
+		_, _ = os.Stdout.Write(b)
+		return 0
 	case "args":
 		b, _ := json.Marshal(args)
 		_, _ = os.Stdout.Write(b)
