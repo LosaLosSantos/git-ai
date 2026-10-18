@@ -203,7 +203,36 @@ func NewResolver(bindings []Binding, checks []Check, timeout time.Duration) (*Re
 type Failure struct {
 	Path    string
 	Reasons []string
+	// Attempts are the strategies that applied to the file and did not resolve
+	// it, in chain order, with what happened. Reasons holds the same in text.
+	Attempts []Attempt
 }
+
+// AttemptKind says why a strategy that applied to a file did not resolve it.
+type AttemptKind string
+
+const (
+	// AttemptFailed: the strategy returned an error (for a model, the call or
+	// its answer failed; errors.Is(Err, ErrBudgetExhausted) when the AI budget
+	// is spent).
+	AttemptFailed AttemptKind = "failed"
+	// AttemptRejected: the result broke a rule that every result must keep
+	// (conflict markers, mode, size, or its syntax).
+	AttemptRejected AttemptKind = "rejected"
+	// AttemptCheckFailed: a configured check rejected the result.
+	AttemptCheckFailed AttemptKind = "check_failed"
+)
+
+// Attempt is one strategy that applied to a file without resolving it.
+type Attempt struct {
+	Strategy string
+	Kind     AttemptKind
+	Err      error
+}
+
+// ErrBudgetExhausted is returned by a strategy that does not call its model
+// because the AI budget is spent.
+var ErrBudgetExhausted = errors.New("AI budget exhausted")
 
 // UnresolvedError reports files that stayed unresolved.
 type UnresolvedError struct {
@@ -240,12 +269,12 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 	var failures []Failure
 
 	for _, f := range req.Files {
-		out, name, reasons, err := r.resolveFile(ctx, req, f, maxBytes)
+		out, name, attempts, err := r.resolveFile(ctx, req, f, maxBytes)
 		if err != nil {
 			return protocol.Response{}, err
 		}
 		if name == "" {
-			failures = append(failures, Failure{Path: f.Path, Reasons: reasons})
+			failures = append(failures, Failure{Path: f.Path, Reasons: attemptReasons(attempts), Attempts: attempts})
 			continue
 		}
 		if !seen[name] {
@@ -294,11 +323,31 @@ func resolverName(used []string) string {
 	return fmt.Sprintf("%s+%d", resolverNamePrefix, len(used))
 }
 
+// attemptReasons returns the text form of the attempts, the reasons of a
+// Failure.
+func attemptReasons(attempts []Attempt) []string {
+	if len(attempts) == 0 {
+		return []string{"no strategy resolved this conflict"}
+	}
+	reasons := make([]string, 0, len(attempts))
+	for _, a := range attempts {
+		switch a.Kind {
+		case AttemptRejected:
+			reasons = append(reasons, fmt.Sprintf("%s: rejected: %v", a.Strategy, a.Err))
+		case AttemptCheckFailed:
+			reasons = append(reasons, fmt.Sprintf("%s: check failed: %v", a.Strategy, a.Err))
+		default:
+			reasons = append(reasons, fmt.Sprintf("%s: %v", a.Strategy, a.Err))
+		}
+	}
+	return reasons
+}
+
 // resolveFile runs the chain for one file. It returns the strategy name that
-// accepted the answer, or an empty name and the collected reasons. err is set
-// only when ctx ended.
-func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File, maxBytes int64) (protocol.ResolvedFile, string, []string, error) {
-	var reasons []string
+// accepted the answer, or an empty name and the attempts of the strategies
+// that applied. err is set only when ctx ended.
+func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File, maxBytes int64) (protocol.ResolvedFile, string, []Attempt, error) {
+	var attempts []Attempt
 	for _, b := range r.bindings {
 		if err := ctx.Err(); err != nil {
 			return protocol.ResolvedFile{}, "", nil, err
@@ -311,21 +360,21 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return protocol.ResolvedFile{}, "", nil, ctxErr
 			}
-			reasons = append(reasons, fmt.Sprintf("%s: %v", b.Name, err))
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptFailed, Err: err})
 			continue
 		}
 		if !ok {
 			continue
 		}
 		if err := checkResolution(res, maxBytes); err != nil {
-			reasons = append(reasons, fmt.Sprintf("%s: rejected: %v", b.Name, err))
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: err})
 			continue
 		}
 		if err := r.runChecks(ctx, f.Path, res); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return protocol.ResolvedFile{}, "", nil, ctxErr
 			}
-			reasons = append(reasons, fmt.Sprintf("%s: check failed: %v", b.Name, err))
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
 			continue
 		}
 		r.record(ctx, f, res)
@@ -336,10 +385,7 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			Content: contentOf(res),
 		}, b.Name, nil, nil
 	}
-	if len(reasons) == 0 {
-		reasons = []string{"no strategy resolved this conflict"}
-	}
-	return protocol.ResolvedFile{}, "", reasons, nil
+	return protocol.ResolvedFile{}, "", attempts, nil
 }
 
 func modeOf(res Resolution) string {
