@@ -11,6 +11,13 @@ contracts** (the pack key format and `BlobStore.Put`, see the PACK OWNERSHIP
 RULE), authorized by the PM provided every phase-6 storage test is green
 afterwards. It never edits a released migration.
 
+Second amendment (PM approval of be50089): change A (per-row pack ownership)
+approved; the B/C refinement (GC BOUNDARY rule, no missing-pack restart)
+confirmed; the REVIEW ROOTS RULE added (open reviews are a second kind of root
+into the object graph, and the review service is now m3's for that check);
+the enforcement points made explicit (every upload goes through one deadline
+helper, `sync_timeout` and `W` are context deadlines, not assumptions).
+
 Owner workstream: **m3** (`internal/graft/corestore/**`,
 `internal/gitaly/service/storagecore/**`, the storage sub-commands of
 `cmd/graft`, `proto/storage_core.proto`, the `GraftStorage` part of the config,
@@ -167,7 +174,10 @@ alternatives".
    smaller than `gc_margin`; absolute skew between machines does not enter.
    `gc_margin` also absorbs the latency of a commit that is in flight when the
    writer's deadline passes (a commit message sent just before the deadline may
-   still complete after it).
+   still complete after it). **Stated assumption** (repeated in STORAGE.md):
+   `gc_margin` > about 2 × (relative clock-rate drift) × `gc_grace` + the longest
+   in-flight commit. With ordinary clocks (drift well below 10⁻⁴) 5 min against
+   1 h is far above it.
 6. **Covered and superseded packs need no time.** A covered changeset pack (its
    owner row has `seq <= C_gc`) or the pack of a dropped checkpoint is owned by a
    committed row, so no writer relies on it (new writers never reuse a key, rule
@@ -223,7 +233,15 @@ Consequence: under the invariant a sync never meets a reclaimed pack, so a
 missing pack is corruption and stays an Internal error naming the pack (as in
 phase 6). The restart on a missing covered pack of the first review is not added:
 with these boundaries it would be unreachable code. (This refines B and C of the
-PM review; confirmed with the PM before WP76.)
+PM review; confirmed by the PM.)
+
+**Enforcement (binding).** The proof needs both bounds to be enforced, not
+assumed. `sync_timeout` must bound **every** sync round and every hydration as a
+context deadline that cancels the git processes and the bucket reads of the round;
+WP76 audits the syncer's paths (the single-flight retry rounds, `fetch`,
+`indexPack`, `applyBuild`, `install`), fixes any that can outlive the deadline, and
+tests that a round slower than the bound is cancelled. Verify's dry hydration runs
+under a deadline of `W` from its start, tested the same way.
 
 ### Liveness is per key (change G)
 
@@ -250,15 +268,54 @@ the changeset log keeps its metadata. **Documented limit:** the diff of a closed
 merged review whose commits are reachable from no reference at a checkpoint may
 no longer be available.
 
-An open review whose head or base commit is not in the building node's local
-repository (it can only happen when the commit was pruned by an earlier
-checkpoint and the review was opened later on a node whose old cache still had
-it) is a review whose commits the storage core no longer holds. The build fails
-with `FailedPrecondition` naming the review IDs (metadata `review_id`), counts
-`graft_storage_checkpoint_review_objects_missing_total`, and records nothing; GC
-of the existing checkpoints is unaffected. The fix at the source belongs in the
-review service (refuse, in authoritative mode, a review whose commits are not in
-the storage core), which is not m3's file: raised with the PM.
+### REVIEW ROOTS RULE (binding, added after the PM approval)
+
+**Root cause.** Open reviews are a second kind of root into the object graph,
+next to the references, and phase 6 did not count them: nothing made a review's
+commits live, and the review service accepted any commit present in the serving
+node's local cache, including one the storage core had already pruned. The
+checkpoint closure (above) makes open-review commits live; this rule makes the
+review service create only roots the storage core holds, and closes the race
+between a review write and a checkpoint commit.
+
+* **R1 — review writes (review service, authoritative mode).** `CreateReview`
+  (head and base) and `UpdateReview` when it moves the head (the base never moves
+  after creation) read `(refs, S) = Meta.Refs(repoID)` in one snapshot and check,
+  in the local repository (which the gate caught up first), that every new root
+  commit is reachable from the object-ID targets of `refs` (one `rev-list` run
+  with the refs as negative tips). Otherwise `FailedPrecondition` ("commit <oid>
+  of the review is not reachable from the references of the repository in the
+  storage core"). The database write of the review then carries `S`: in its
+  transaction, under the repository row lock, it requires that the newest
+  checkpoint's sequence is `<= S`, else it returns `ErrReviewRootsStale` and the
+  service runs the check again with a new snapshot (a compare-and-swap checked
+  under the lock, bounded by the request context; it fails only when a
+  checkpoint was committed during the check). Comments, verdicts and closes do
+  not move roots and are not checked.
+* **R2 — checkpoint commit.** The build records the root set it included (the
+  open reviews' head and base commits, read after `Refs`). `CreateCheckpoint`, in
+  its transaction under the repository row lock, requires every open review's head
+  and base to be in that set, else `ErrCheckpointRootsChanged` and nothing is
+  recorded (the CLI returns `FailedPrecondition` "the reviews changed during the
+  checkpoint build, run it again"; the background task tries again at its next
+  tick).
+* **Proof.** Both conditions are checked under the same row lock, so a review
+  write R and a checkpoint commit K are serialized. If R commits before K, R2
+  makes K include R's roots. If R commits after K at checkpoint `N`, R1 gives `N
+  <= S`, and R's roots were reachable from the references at `S`: either they are
+  reachable at `N` (in K's closure), or the changesets `(N, S]` brought them into a
+  pack `> N` (an object present locally but unreachable is packed again by the
+  voter, whose `rev-list --not --all` excludes only reachable objects), which stays
+  live until a later checkpoint whose R2 includes R.
+* **Reviews created before phase 7** may already reference a pruned commit (not
+  possible after R1). A checkpoint build whose open-review root is missing from the
+  building node's repository fails with `FailedPrecondition` naming the review IDs
+  (metadata `review_id`), counts
+  `graft_storage_checkpoint_review_objects_missing_total`, and records nothing; GC
+  of the existing checkpoints is unaffected. Closing the review resolves it.
+* **Files.** `internal/gitaly/service/review/**` (the R1 check only, smallest
+  change, with tests), `internal/graft/corestore/dbreview/**` (carries `S` to the
+  store), `sqlstore` (the conditioned review writes and the R2 check).
 
 ### Data model (new migration, both dialects)
 
@@ -376,8 +433,11 @@ type GCState struct {
 }
 
 var (
-    ErrBlobExists         = errors.New("storage core: blob already exists")
-    ErrCheckpointNotFound = errors.New("storage core: checkpoint not found")
+    ErrBlobExists             = errors.New("storage core: blob already exists")
+    ErrCheckpointNotFound     = errors.New("storage core: checkpoint not found")
+    ErrPackDeadline           = errors.New("storage core: the pack upload is older than the write deadline")
+    ErrReviewRootsStale       = errors.New("storage core: a checkpoint was recorded after the review's commits were checked")
+    ErrCheckpointRootsChanged = errors.New("storage core: the open reviews changed during the checkpoint build")
 )
 
 // NewPackKey returns a new owned pack key for a pack of the repository with the
@@ -443,6 +503,7 @@ type CheckpointInput struct {
     Refs      map[string]Target // the reference snapshot at Seq: no absent value, not empty
     PackKey   string            // an owned key, already uploaded
     PackBytes int64
+    Roots     []string          // the open-review head and base commits the pack includes (REVIEW ROOTS R2)
 }
 
 type MetaStore interface {
@@ -453,8 +514,10 @@ type MetaStore interface {
     // requires Seq <= head_seq, Seq > the newest checkpoint's Seq and an owned
     // PackKey of the repository (else an error, nothing written). A checkpoint at
     // Seq that exists already is returned unchanged with created=false (its pack
-    // is kept; the caller's pack becomes an orphan). ErrRepositoryNotFound for an
-    // unknown repository.
+    // is kept; the caller's pack becomes an orphan). It requires every open
+    // review's head and base commit to be in in.Roots (REVIEW ROOTS R2), else
+    // ErrCheckpointRootsChanged and nothing is written. ErrRepositoryNotFound for
+    // an unknown repository.
     CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
     // NewestCheckpoint returns the checkpoint with the greatest Seq; ok is false
     // when there is none.
@@ -504,6 +567,13 @@ type MetaStore interface {
 }
 ```
 
+**InsertReview and UpdateReview (changed, REVIEW ROOTS R1).** Both take a new
+last parameter `rootsAt uint64`. When it is not 0, the transaction locks the
+repository row and requires the newest checkpoint's sequence to be `<= rootsAt`,
+else `ErrReviewRootsStale` and nothing is written. Callers that do not move a
+review's roots pass 0 (comments, verdicts, closes, imports). `dbreview` carries the
+value from the review service to the store.
+
 **DeleteRepository (changed).** In the transaction that deletes the repository row
 it reads the row's `repo_id` and inserts the `graft_gc_removed` tombstone with
 `removed_at` = the database time. The cascade removes changesets, references,
@@ -533,6 +603,35 @@ func MissingObjects(ctx context.Context, repo *localrepo.Repo, tips []git.Object
 ```
 
 ### Writers (WP73, change A on the write path)
+
+**One upload helper (binding).** Every path that uploads a pack and then records
+a row (the voter's Preparing and Prepared phases, `ImportRepository`, the
+checkpoint builder; no other production code calls `Put`) goes through
+
+```go
+// PackUpload is a pack uploaded under a new owned key, with the deadline before
+// which a row may reference it (PACK OWNERSHIP RULE 4).
+type PackUpload struct {
+    Key      string
+    Bytes    int64
+    Deadline time.Time // readAt + WriteDeadline(), monotonic
+}
+
+// UploadPack uploads the pack read from r (size bytes, SHA-256 sum) under
+// NewPackKey(repoID, sum), with the Put under a context whose deadline is
+// readAt + WriteDeadline(). readAt is the time of a repository-record read that
+// found the repository, taken before the upload.
+func (c *Core) UploadPack(ctx context.Context, repoID int64, readAt time.Time, sum [32]byte, size int64, r io.Reader) (PackUpload, error)
+
+// CommitContext returns ctx bounded by the upload's deadline, or an error
+// (ErrPackDeadline) when the deadline has passed: the caller must not start the
+// commit and must not reference the key.
+func (u PackUpload) CommitContext(ctx context.Context) (context.Context, context.CancelFunc, error)
+```
+
+Each path is tested past `W` (with a shortened `gc_grace` or a hook): the `Put` is
+cancelled or the commit is not started, the write fails as a storage failure, and
+no row references the key.
 
 * **Voter.** `preparePack` records `t_r` after its `GetRepository` and uploads with
   `NewPackKey` under a context with deadline `t_r + W`; `preparedPack` keeps the
@@ -575,17 +674,19 @@ Binding order:
 3. Tips = the object-ID targets of `refs` (symbolic and absent skipped) plus the
    `head_commit_id` and `base_commit_id` of every open review
    (`ListReviews(repoID, "", false, 0)`, each value validated as an object ID of
-   the repository's hash; empty values skipped). `MissingObjects` on the review
-   tips: any missing → `FailedPrecondition` naming the reviews (see "unreachable
-   objects"), metric, nothing uploaded. A missing reference tip is impossible after
-   step 2 and is `Internal`.
+   the repository's hash; empty values skipped); the review commits are the
+   build's root set (`Roots`). `MissingObjects` on the review tips: any missing →
+   `FailedPrecondition` naming the reviews (REVIEW ROOTS RULE, reviews created
+   before phase 7), metric, nothing uploaded. A missing reference tip is impossible
+   after step 2 and is `Internal`.
 4. `pack = BuildPackFrom(local, tips, tmpDir)`. No object tips → return
    `created = false` (nothing to consolidate; hydration of such a repository is
    already trivial).
 5. Re-read the record (`t_r`), upload under `NewPackKey(repoID, pack.SHA256)` with
    deadline `t_r + W`. `//! after_upload`.
-6. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes})` under the
-   same deadline. `//! after_commit`.
+6. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes, Roots})`
+   under the upload's `CommitContext`. `ErrCheckpointRootsChanged` → the build fails
+   (its pack is an orphan). `//! after_commit`.
 
 A crash after 5 leaves the pack as an orphan (reclaimed by the orphan protocol); a
 re-run starts over from the head at that time. The build holds no reference lock
@@ -966,6 +1067,22 @@ sweep of removed repositories and takes no `-repo`.
   `graft_storage_sync_*` metrics), serves, verify is consistent; a node below
   `C_sync` re-hydrates; `graft storage gc --removed` reclaims a removed repository;
   changelog and reviews intact.
+* **binding tests of the second review** (each on SQLite and Postgres):
+  * the deadline on every upload path (voter Preparing, voter Prepared, import,
+    checkpoint): past `W` the `Put` is cancelled or the commit is not started, the
+    write fails as a storage failure, and no row references the key;
+  * `graft_gc_orphans` lifecycle: an observed key that a slow write then committed is
+    forgotten by the next run and kept; an observed key gone from the bucket is
+    forgotten; a crash between the blob deletion and the row deletion converges;
+  * the trigger: a legacy-format insert is rejected with the documented error, an
+    owned key and NULL are accepted, legacy rows stay readable, and GC uses the
+    greatest sequence of a shared legacy key;
+  * REVIEW ROOTS: R1 rejects an unreachable head or base; R1's stale snapshot (a
+    checkpoint committed between the check and the write) is detected under the lock
+    and re-checked; R2 refuses a checkpoint whose build missed a review moved during
+    the build;
+  * a sync round slower than `sync_timeout` and a dry hydration slower than `W` are
+    cancelled.
 * **measurement** (WP79, in the benchmark window the PM schedules): bucket size and
   fresh-node hydration time before and after a checkpoint and GC on a repository
   with many changesets; the preparing/prepared histograms before and after WP73.
@@ -1002,7 +1119,7 @@ every entry point returns `FailedPrecondition`.
 | WP71 | migration 2 (tables, trigger), every new `sqlstore` method, `DeleteRepository` tombstone | — |
 | WP72 | `BlobStore` `List`/`Delete`, strict `Put`, owned pack keys in `types.go` | — |
 | WP73 | writers: owned keys and the deadline in the voter, `shadowpack.go`, import; `Core` fields | WP71, WP72 |
-| WP74 | `gitops.BuildPackFrom`/`MissingObjects`, `checkpoint` package | WP71–WP73 |
+| WP74 | `gitops.BuildPackFrom`/`MissingObjects`, `checkpoint` package, REVIEW ROOTS (R1 in the review service and `dbreview`, R2 in `CreateCheckpoint`) | WP71–WP73 |
 | WP75 | `gc` package | WP71–WP73 |
 | WP76 | syncer (seed, `C_sync`), `verify_objects.go` | WP71, WP74 |
 | WP77 | config, `maintenance` package, `serve.go` wiring | WP74–WP76 |
@@ -1045,16 +1162,14 @@ numbers). Work files live in `/home/feder/m3-work/`, never in `/tmp` (PM.md).
 3. `maintenance` defaults to `off` in this release.
 4. The benchmark window is requested at WP79.
 
+5. (Second review) Change A approved; the B/C refinement confirmed; the review
+   service check is m3's (REVIEW ROOTS RULE); old running nodes' pack-carrying
+   writes are counted as shadow errors in shadow mode, write failures in
+   authoritative mode.
+
 ## Open questions for the PM
 
-1. **Refinement of B and C** (GC BOUNDARY rule): decide catch-up versus re-hydration
-   with `C_sync` and keep a missing pack an Internal error, instead of adding a
-   restart on a missing covered pack, which this boundary makes unreachable. Confirm
-   before WP76.
-2. **Open reviews whose commits the storage core no longer holds**: the plan fails
-   the checkpoint and names them. The source of the condition is the review service
-   accepting such a review in authoritative mode; should p4b/the PM own a change
-   there, or may m3 add that check?
+None open.
 
 ## Foundation touchpoints and ownership
 
@@ -1064,7 +1179,9 @@ New (m3): `corestore/checkpoint/**`, `corestore/gc/**`, `corestore/maintenance/*
 `corestore/{core,types,metastore}.go`, `blobstore/**`, `gitops/gitops.go`,
 `voter/**`, `syncer/syncer.go`, `open/open.go`, `service/storagecore/{import,verify_objects}.go`,
 `cmd/graft/storage.go`, `proto/storage_core.proto` (+ generated code),
-`config_graft_storage.go`, `doc/graft/STORAGE.md`. Shared, my section only:
+`config_graft_storage.go`, `doc/graft/STORAGE.md`, `corestore/dbreview/**`, and
+`internal/gitaly/service/review/**` (the REVIEW ROOTS R1 check only, assigned to
+m3 by the PM). Shared, my section only:
 `internal/cli/gitaly/serve.go`, `doc/graft/CONFIGURATION.md`. No change to the land
 path: the voter is m3's; the land paths call it unchanged.
 
@@ -1087,3 +1204,9 @@ path: the voter is m3's; the land paths call it unchanged.
     tombstone deletion; `Delete` of a missing key is success.
 24. **No fallback paths**: a pack the invariants say exists and does not is reported as
     corruption, never routed around.
+25. **Review roots**: in authoritative mode a review's head and base must be reachable
+    from the database references of the snapshot its write carries (R1), and a
+    checkpoint includes every open review's roots (R2), both under the repository
+    row lock.
+26. **One upload path**: every production upload goes through `Core.UploadPack`, and
+    every row that references an upload is committed under its `CommitContext`.
