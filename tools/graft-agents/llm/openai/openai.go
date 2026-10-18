@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -89,6 +90,7 @@ type Provider struct {
 	apiKey           string
 	model            string
 	maxTokens        int
+	effort           string
 	timeout          time.Duration
 	client           *http.Client
 	maxResponseBytes int64
@@ -108,6 +110,20 @@ func New(cfg llm.Config) (*Provider, error) {
 	}
 	if cfg.MaxTokens < 0 {
 		return nil, errors.New("openai: max_tokens must not be negative")
+	}
+	// No setting is dropped silently: the provider supports no options, and an
+	// effort it cannot send is an error.
+	if len(cfg.Options) > 0 {
+		keys := make([]string, 0, len(cfg.Options))
+		for k := range cfg.Options {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return nil, fmt.Errorf("openai: unsupported options %v: this provider takes none", keys)
+	}
+	effort := strings.ToLower(strings.TrimSpace(cfg.Effort))
+	if effort != "" && !efforts[effort] {
+		return nil, fmt.Errorf("openai: invalid effort %q (want minimal, low, medium, high or xhigh)", cfg.Effort)
 	}
 	timeout, err := cfg.TimeoutOrDefault()
 	if err != nil {
@@ -132,6 +148,7 @@ func New(cfg llm.Config) (*Provider, error) {
 		apiKey:           os.Getenv(keyEnv),
 		model:            model,
 		maxTokens:        cfg.MaxTokens,
+		effort:           effort,
 		timeout:          timeout,
 		client:           &http.Client{},
 		maxResponseBytes: defaultMaxResponseBytes,
@@ -272,11 +289,22 @@ func appendSchemaInstruction(system string, schemaJSON []byte) string {
 	return system + "\n\n" + instruction
 }
 
+// efforts are the reasoning efforts the provider sends.
+var efforts = map[string]bool{"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true}
+
 type chatRequest struct {
-	Model          string    `json:"model"`
-	Messages       []message `json:"messages"`
-	MaxTokens      int       `json:"max_tokens,omitempty"`
-	ResponseFormat any       `json:"response_format,omitempty"`
+	Model          string     `json:"model"`
+	Messages       []message  `json:"messages"`
+	MaxTokens      int        `json:"max_tokens,omitempty"`
+	ResponseFormat any        `json:"response_format,omitempty"`
+	Reasoning      *reasoning `json:"reasoning,omitempty"`
+}
+
+// reasoning is OpenRouter's reasoning parameter, sent when an effort is
+// configured. An endpoint that does not know it may reject the request, so
+// configure an effort only for an endpoint that takes it.
+type reasoning struct {
+	Effort string `json:"effort"`
 }
 
 type message struct {
@@ -289,6 +317,9 @@ func (p *Provider) body(system, prompt string, maxTokens int, format any) []byte
 		Model:          p.model,
 		MaxTokens:      maxTokens,
 		ResponseFormat: format,
+	}
+	if p.effort != "" {
+		req.Reasoning = &reasoning{Effort: p.effort}
 	}
 	if system != "" {
 		req.Messages = append(req.Messages, message{Role: "system", Content: system})

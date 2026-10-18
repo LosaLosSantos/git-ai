@@ -291,8 +291,18 @@ The grammars are C code compiled with cgo (the MIT-licensed
 those languages, in the `tools/graft-agents` module only; the gitai server
 has no such dependency). Building graft-resolve therefore needs a C compiler
 and `CGO_ENABLED=1`, the default when a compiler is installed. A
-graft-resolve built without cgo fails closed: it rejects every `llm` answer
-for a file that has a grammar, and `graft-resolve bench run` refuses to start.
+graft-resolve built without cgo refuses to start with an `llm` strategy
+configured, with a message naming that requirement. The syntax check itself
+fails closed in such a build (it rejects every file that has a grammar), and
+`graft-resolve bench run` refuses to start.
+
+With the `openai` provider, `effort` (`minimal`, `low`, `medium`, `high` or
+`xhigh`) is sent as OpenRouter's `reasoning` parameter (`{"effort": ...}`) on
+every call; configure it only for an endpoint that takes that parameter. The
+provider takes no `options`, and a configuration that sets any, or an effort
+it does not know, fails at startup. No setting is dropped silently. An llm
+strategy also refuses to start in a graft-resolve built without cgo (see
+above).
 
 The provider's API keys are withheld from the model: they are read from the
 environment or a file by the provider, never put in the prompt. Everything

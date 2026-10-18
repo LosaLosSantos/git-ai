@@ -8,6 +8,7 @@ import (
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // The "llm" strategy resolves content conflicts with a language model. It is
@@ -68,6 +69,11 @@ type llmStrategy struct {
 }
 
 func newLLMStrategy(spec StrategySpec) (Strategy, error) {
+	// Every llm answer gets the syntax check, which needs the tree-sitter grammars: a build
+	// without them would reject every answer for those languages, so it does not start.
+	if !syntax.Available {
+		return nil, fmt.Errorf("strategy %q: the llm strategy needs the tree-sitter grammars of its syntax check, which this graft-resolve lacks: build it with CGO_ENABLED=1 and a C compiler", spec.Name)
+	}
 	if _, ok := spec.Options["min_confidence"]; ok {
 		return nil, fmt.Errorf("strategy %q: min_confidence is gone: the model reports no confidence and an answer is accepted on the checks alone; remove the option", spec.Name)
 	}
