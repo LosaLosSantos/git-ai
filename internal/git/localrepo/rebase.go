@@ -11,6 +11,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/revrange"
 	"github.com/feder-cr/git-ai/internal/helper/text"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -94,10 +95,32 @@ func (repo *Repo) Rebase(ctx context.Context, upstream, branch string, options .
 	return newOID, nil
 }
 
-func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, upstreamOID, branchOID git.ObjectID) (git.ObjectID, error) {
-	objectHash, err := repo.ObjectHash(ctx)
+// rebaseTodo returns the commits of branch that are not in upstream, oldest first, without merge
+// commits and, unless reapplyCherryPicks is set, without the commits that are patch-equivalent to a
+// commit of upstream that is not in branch: the pick-only todo list of git-rebase(1).
+//
+// git rev-list upstream...branch alone may list commits of the history that both share when
+// committer dates are skewed (see revrange): a commit that upstream already has would be replayed
+// again, and with --cherry-pick a commit of the branch could be dropped as equivalent to a commit
+// that is not on the side of upstream. The listing therefore also excludes the boundaries of both
+// sides, computed exactly: every path from either tip into the shared history runs through one of
+// them, so the walk lists exactly the commits of each side.
+func (repo *Repo) rebaseTodo(ctx context.Context, upstreamOID, branchOID git.ObjectID, reapplyCherryPicks bool) ([]string, error) {
+	walker := revrange.Git(repo)
+
+	branchSide, err := revrange.Exact(ctx, walker, upstreamOID, branchOID)
 	if err != nil {
-		return "", structerr.NewInternal("getting object hash %w", err)
+		return nil, structerr.NewInternal("listing the commits of the branch: %w", err)
+	}
+	exclude := revrange.Boundary(branchSide)
+
+	// The side of upstream only matters to --cherry-pick, which compares the branch with it.
+	if !reapplyCherryPicks {
+		upstreamSide, err := revrange.Exact(ctx, walker, branchOID, upstreamOID)
+		if err != nil {
+			return nil, structerr.NewInternal("listing the commits of upstream: %w", err)
+		}
+		exclude = append(exclude, revrange.Boundary(upstreamSide)...)
 	}
 
 	// Flags of git-rev-list to get the pick-only todo_list for a rebase.
@@ -105,7 +128,7 @@ func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, up
 	// merge commits, which is also what git2go does.
 	// The flags are inferred from https://github.com/git/git/blob/v2.41.0/sequencer.c#L5704-L5714
 	var flags []gitcmd.Option
-	if !cfg.reapplyCherryPicks {
+	if !reapplyCherryPicks {
 		flags = append(flags, gitcmd.Flag{Name: "--cherry-pick"})
 	}
 	flags = append(flags,
@@ -113,7 +136,15 @@ func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, up
 		gitcmd.Flag{Name: "--no-merges"},
 		gitcmd.Flag{Name: "--topo-order"},
 		gitcmd.Flag{Name: "--reverse"},
+		// The excluded boundaries are read from the standard input, whose size is not limited
+		// like the command line.
+		gitcmd.Flag{Name: "--stdin"},
 	)
+
+	var excluded strings.Builder
+	for _, id := range exclude {
+		excluded.WriteString("^" + id.String() + "\n")
+	}
 
 	var stderr bytes.Buffer
 	cmd, err := repo.Exec(ctx, gitcmd.Command{
@@ -125,9 +156,9 @@ func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, up
 		// the provided --right-only flag, the result should be only commits which
 		// exist on the branch that is to be rebased.
 		Args: []string{fmt.Sprintf("%s...%s", upstreamOID, branchOID)},
-	}, gitcmd.WithStderr(&stderr), gitcmd.WithSetupStdout())
+	}, gitcmd.WithStdin(strings.NewReader(excluded.String())), gitcmd.WithStderr(&stderr), gitcmd.WithSetupStdout())
 	if err != nil {
-		return "", structerr.NewInternal("start git rev-list: %w", err)
+		return nil, structerr.NewInternal("start git rev-list: %w", err)
 	}
 
 	var todoList []string
@@ -136,10 +167,24 @@ func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, up
 		todoList = append(todoList, strings.TrimSpace(scanner.Text()))
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scanning rev-list output: %w", err)
+		return nil, fmt.Errorf("scanning rev-list output: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		return "", structerr.NewInternal("git rev-list: %w", err).WithMetadata("stderr", stderr.String())
+		return nil, structerr.NewInternal("git rev-list: %w", err).WithMetadata("stderr", stderr.String())
+	}
+
+	return todoList, nil
+}
+
+func (repo *Repo) rebaseUsingMergeTree(ctx context.Context, cfg rebaseConfig, upstreamOID, branchOID git.ObjectID) (git.ObjectID, error) {
+	objectHash, err := repo.ObjectHash(ctx)
+	if err != nil {
+		return "", structerr.NewInternal("getting object hash %w", err)
+	}
+
+	todoList, err := repo.rebaseTodo(ctx, upstreamOID, branchOID, cfg.reapplyCherryPicks)
+	if err != nil {
+		return "", err
 	}
 
 	upstreamCommit, err := repo.ReadCommit(ctx, git.Revision(upstreamOID))
