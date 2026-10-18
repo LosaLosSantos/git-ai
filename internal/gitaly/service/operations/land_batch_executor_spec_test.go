@@ -86,19 +86,14 @@ func TestSpecAncestryNewEnabledAgreesWithGit(t *testing.T) {
 	checker := ancestry.New(ctx, true, repo, nil, nil, testhelper.NewLogger(t))
 	require.NotNil(t, checker)
 
+	// Phase 4b: the checker answers one question, the range of a change (PLAN8).
 	pairs := [][2]git.ObjectID{{base, merge}, {merge, base}, {left, right}, {right, left}, {base, base}}
 	for _, p := range pairs {
-		want, wantErr := reference.IsAncestor(ctx, p[0], p[1])
-		got, gotErr := checker.IsAncestor(ctx, p[0], p[1])
+		want, wantErr := reference.Range(ctx, p[0], p[1])
+		got, gotErr := checker.Range(ctx, p[0], p[1])
 		require.Equal(t, wantErr != nil, gotErr != nil)
-		require.Equal(t, want, got, "IsAncestor(%s, %s)", p[0], p[1])
+		require.ElementsMatch(t, want, got, "Range(%s, %s)", p[0], p[1])
 	}
-
-	wantBase, wantFound, wantErr := reference.MergeBase(ctx, left, right)
-	gotBase, gotFound, gotErr := checker.MergeBase(ctx, left, right)
-	require.Equal(t, wantErr != nil, gotErr != nil)
-	require.Equal(t, wantFound, gotFound)
-	require.Equal(t, wantBase, gotBase)
 }
 
 // Spec: WP37 — CompleteEarly returns false unless ctx is an executor context of

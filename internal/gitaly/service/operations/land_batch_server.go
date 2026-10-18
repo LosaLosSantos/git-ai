@@ -3,21 +3,15 @@ package operations
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
-	"github.com/feder-cr/git-ai/internal/git/catfile"
-	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/git/mvcc"
-	"github.com/feder-cr/git-ai/internal/git/quarantine"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook/updateref"
-	"github.com/feder-cr/git-ai/internal/graft/ancestry"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
-	"github.com/feder-cr/git-ai/internal/graft/rebase"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -182,58 +176,15 @@ func (s *Server) executeLandBatch(ctx context.Context, _ landlane.Key, reqs []*l
 	return results, nil
 }
 
-// newLandBatchStepper starts a batch attempt on repository: it opens the quarantine of the attempt
-// and the processes that serve it. The returned function ends the attempt.
+// newLandBatchStepper starts a batch attempt on repository. Its phases are observed in
+// graft_land_batch_phase_seconds. The returned function ends the attempt.
 func (s *Server) newLandBatchStepper(ctx context.Context, repository *gitalypb.Repository) (*serverLandBatchStepper, func(), error) {
-	defer observeLandBatchPhase(landBatchPhaseQuarantine, time.Now())
-
-	quarantineDir, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, repository)
+	attempt, cleanup, err := s.newLandingAttempt(ctx, repository, observeLandBatchPhase)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	objectHash, err := quarantineRepo.ObjectHash(ctx)
-	if err != nil {
-		cleanup()
-		return nil, nil, structerr.NewInternal("detecting object hash: %w", err)
-	}
-
-	checker, releaseChecker, err := s.landAncestry(ctx, quarantineRepo)
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-
-	// The commit IDs of the requests are peeled by the object info process of the
-	// quarantine, which the attempt starts once.
-	info, releaseInfo, err := s.catfileCache.ObjectInfoReader(ctx, quarantineRepo)
-	if err != nil {
-		releaseChecker()
-		cleanup()
-		return nil, nil, structerr.NewInternal("reading object info: %w", err)
-	}
-
-	// One rebase engine serves the whole attempt, and the attempt ends with it. Its objects
-	// are made durable by the publish of the attempt, as one pack (see publish).
-	rebaser := newBatchRebaser(quarantineRepo)
-
-	return &serverLandBatchStepper{
-			server:        s,
-			repository:    repository,
-			quarantineDir: quarantineDir,
-			repo:          quarantineRepo,
-			objectHash:    objectHash,
-			info:          info,
-			rebaser:       rebaser,
-			ancestry:      checker,
-		}, func() {
-			releaseInfo()
-			releaseChecker()
-			if err := rebaser.Close(); err != nil {
-				s.logger.WithError(err).Error("graft: closing the rebaser of a land batch")
-			}
-			cleanup()
-		}, nil
+	return &serverLandBatchStepper{landingAttempt: attempt}, cleanup, nil
 }
 
 // landBatchResult builds the result of a request of a batch.
@@ -272,55 +223,17 @@ func landBatchGiveUp(req *landBatchRequest, cause error, attempts int) error {
 	return landKeptMovingError(req.in, conflict, attempts)
 }
 
-// batchRebaser replays the commits of the members of a batch attempt. It is rebase.Engine.
-type batchRebaser interface {
-	Replay(ctx context.Context, upstream git.ObjectID, todo []git.ObjectID, committer *git.Signature) (git.ObjectID, error)
-	Close() error
-}
-
-// newBatchRebaser starts the rebaser of a batch attempt on the quarantine of the attempt. The objects
-// it writes are not fsynced one by one: the publish of the attempt packs them into one fsynced pack
-// before the reference points to them (see publish). It is a variable so that tests can observe the
-// replays.
-var newBatchRebaser = func(repo *localrepo.Repo) batchRebaser {
-	return rebase.New(repo, rebase.WithDeferredDurability())
-}
-
-// serverLandBatchStepper implements landBatchStepper on the quarantine of one batch attempt.
+// serverLandBatchStepper implements landBatchStepper on one batch attempt: the landing attempt that
+// every land uses (see landingAttempt), plus the in-process admission of each request and the
+// combined update of the batch.
 type serverLandBatchStepper struct {
-	server        *Server
-	repository    *gitalypb.Repository
-	quarantineDir *quarantine.Dir
-	repo          *localrepo.Repo
-	objectHash    git.ObjectHash
-	// info peels the commit IDs of the requests. It serves the whole attempt.
-	info catfile.ObjectInfoReader
-	// rebaser replays the members of the attempt. It serves the whole attempt.
-	rebaser batchRebaser
-	// ancestry lists the commits that each request adds to the running tip, with the graph index
-	// when it is enabled.
-	ancestry ancestry.Checker
+	*landingAttempt
 }
 
-// Tip returns the tip of the reference. A missing reference yields an empty ID.
-func (st *serverLandBatchStepper) Tip(ctx context.Context, reference git.ReferenceName) (git.ObjectID, error) {
-	defer observeLandBatchPhase(landBatchPhaseTip, time.Now())
-
-	tip, err := st.repo.ResolveRevision(ctx, reference.Revision())
-	if err != nil {
-		if errors.Is(err, git.ErrReferenceNotFound) {
-			return "", nil
-		}
-
-		return "", structerr.NewInternal("resolving branch: %w", err)
-	}
-
-	return tip, nil
-}
-
-// Land lands the request onto tip. It mirrors the decision of landAttempt for a single request. The
-// standalone policy is evaluated for the actor on the new tip the request would create, before the
-// request changes the running tip.
+// Land lands the request onto tip with the decision that every land makes (landingAttempt.decide).
+// The standalone policy is then evaluated for the actor on the new tip the request would create,
+// before the request changes the running tip: the combined update runs as graft-batch, so the hooks
+// do not judge the request.
 //
 // The git work runs in the context of the batch, which a submitter does not cancel: the request is
 // part of the batch from the moment it lands. The identity is the one of the request, not the one of
@@ -328,151 +241,26 @@ func (st *serverLandBatchStepper) Tip(ctx context.Context, reference git.Referen
 func (st *serverLandBatchStepper) Land(ctx context.Context, tip git.ObjectID, req *landBatchRequest) (landStep, error) {
 	defer observeLandBatchPhase(landBatchPhaseLandMember, time.Now())
 
-	ctx = requestIdentityContext(ctx, req)
-	in := req.in
-	reference := req.reference()
-
-	commitID, err := st.objectHash.FromHex(in.GetCommitId())
+	step, err := st.decide(ctx, tip, req)
 	if err != nil {
-		return landStep{tipIndependent: true}, structerr.NewInvalidArgument("cannot parse commit ID: %w", err).
-			WithMetadata("commit_id", in.GetCommitId())
+		return step, err
 	}
 
-	commitID, err = st.peel(ctx, commitID)
-	if err != nil {
-		if errors.As(err, new(catfile.NotFoundError)) {
-			return landStep{tipIndependent: true}, structerr.NewInvalidArgument("cannot resolve commit ID: %w", err).
-				WithMetadata("commit_id", in.GetCommitId())
-		}
-
-		return landStep{}, structerr.NewInternal("peeling commit ID: %w", err)
+	// A request that changes the running tip is admitted for the update it makes. A created branch
+	// is updated from the zero OID.
+	if step.alreadyLanded || (!step.created && step.tip == tip) {
+		return step, nil
 	}
 
-	if tip == "" {
-		if !in.GetCreateBranch() {
-			return landStep{}, structerr.NewNotFound("branch %q does not exist", string(in.GetBranch()))
-		}
-
-		if err := st.admit(req, reference, st.objectHash.ZeroOID, commitID); err != nil {
-			return landStep{}, err
-		}
-
-		return landStep{commit: commitID, tip: commitID, created: true}, nil
+	oldTip := tip
+	if step.created {
+		oldTip = st.objectHash.ZeroOID
 	}
-
-	plan, err := st.plan(ctx, tip, commitID)
-	if err != nil {
+	if err := st.admit(req, req.reference(), oldTip, step.tip); err != nil {
 		return landStep{}, err
 	}
 
-	switch plan.Kind() {
-	case rebase.LandAlreadyLanded:
-		return landStep{commit: commitID, tip: tip, alreadyLanded: true}, nil
-
-	case rebase.LandFastForward:
-		if err := st.admit(req, reference, tip, commitID); err != nil {
-			return landStep{}, err
-		}
-
-		return landStep{commit: commitID, tip: commitID}, nil
-	}
-
-	newTip, err := st.computeTip(ctx, in, plan, tip, commitID, req.committer)
-	var resolution *landResolution
-	if err != nil {
-		if !in.GetResolveConflicts() || !isLandMergeConflict(err) {
-			return landStep{}, err
-		}
-
-		res, resolveErr := st.server.resolveLandConflicts(ctx, in, st.repo, tip, commitID, req.committer)
-		if resolveErr != nil {
-			st.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
-				Info("graft: conflict resolution of land failed")
-			return landStep{}, err
-		}
-
-		resolution = &res
-		newTip = res.commit
-	}
-
-	// The rebase dropped the change because the tip already holds all of it. The request reports
-	// a landing that changed nothing, as landAttempt does.
-	if resolution == nil && newTip == tip {
-		return landStep{commit: commitID, tip: tip}, nil
-	}
-
-	if err := st.admit(req, reference, tip, newTip); err != nil {
-		return landStep{}, err
-	}
-
-	return landStep{commit: commitID, tip: newTip, rewritten: true, resolution: resolution}, nil
-}
-
-// peel returns the commit that commitID is or peels to, through the object info process of the
-// attempt. commitID is a full object ID, so nothing is abbreviated or ambiguous. An object that does
-// not exist or does not peel to a commit is a catfile.NotFoundError.
-func (st *serverLandBatchStepper) peel(ctx context.Context, commitID git.ObjectID) (git.ObjectID, error) {
-	info, err := st.info.Info(ctx, git.Revision(commitID.String()+"^{commit}"))
-	if err != nil {
-		return "", err
-	}
-
-	return info.Oid, nil
-}
-
-// plan decides how commitID lands onto tip from one listing of the commits it adds to tip (see
-// rebase.PlanLanding).
-func (st *serverLandBatchStepper) plan(ctx context.Context, tip, commitID git.ObjectID) (rebase.LandPlan, error) {
-	defer observeLandBatchPhase(landBatchPhasePlan, time.Now())
-
-	rng, err := st.ancestry.Range(ctx, tip, commitID)
-	if err != nil {
-		return rebase.LandPlan{}, structerr.NewInternal("listing the commits of the change: %w", err)
-	}
-
-	plan, err := rebase.PlanLanding(tip, commitID, rng)
-	if err != nil {
-		return rebase.LandPlan{}, structerr.NewInternal("planning the landing: %w", err)
-	}
-
-	return plan, nil
-}
-
-// computeTip computes the new tip of the attempt for a commit whose plan is diverged: it is neither
-// reachable from the tip nor a fast-forward of it. The merge and fast-forward-only strategies are
-// computeLandedTip. The rebase strategy replays the commits of the plan with the rebaser of the
-// attempt, with the errors of computeLandedTip: a range with merge commits or without a common
-// ancestor is InvalidArgument, a conflict is a merge conflict.
-func (st *serverLandBatchStepper) computeTip(ctx context.Context, in *gitalypb.UserLandRequest, plan rebase.LandPlan, tip, commitID git.ObjectID, committer git.Signature) (git.ObjectID, error) {
-	if in.GetStrategy() != gitalypb.UserLandRequest_STRATEGY_REBASE_UNSPECIFIED {
-		return st.server.computeLandedTip(ctx, in, st.repo, tip, commitID, committer)
-	}
-
-	todo, err := plan.Replay()
-	switch {
-	case errors.Is(err, rebase.ErrMergesInRange):
-		return "", structerr.NewInvalidArgument("commit range contains merge commits, which cannot be rebased: use STRATEGY_MERGE")
-	case errors.Is(err, rebase.ErrUnrelated):
-		// Rebasing needs a merge base. Unrelated histories can only be landed with STRATEGY_MERGE.
-		return "", structerr.NewInvalidArgument("commit shares no history with branch %q: use STRATEGY_MERGE to land unrelated history", string(in.GetBranch()))
-	case err != nil:
-		return "", structerr.NewInternal("planning the rebase: %w", err)
-	}
-
-	// The commits are reapplied as computeLandedTip reapplies cherry-picks: see the comment there.
-	defer observeLandBatchPhase(landBatchPhaseReplay, time.Now())
-	rebasedCommitID, err := st.rebaser.Replay(ctx, tip, todo, &committer)
-	if err != nil {
-		// The conflict error is passed as the cause itself, see computeLandedTip.
-		var conflictErr *localrepo.RebaseConflictError
-		if errors.As(err, &conflictErr) {
-			return "", landMergeConflictError(tip, commitID, conflictingFileNames(conflictErr.ConflictError), conflictErr)
-		}
-
-		return "", structerr.NewInternal("rebasing commit: %w", err)
-	}
-
-	return rebasedCommitID, nil
+	return step, nil
 }
 
 // admit evaluates the standalone access policy for the actor of req on the update of reference from
@@ -544,32 +332,6 @@ func (st *serverLandBatchStepper) UpdateSolo(ctx context.Context, req *landBatch
 	ctx = changelog.WithBatch(changelog.WithOperation(ctx, changelogOperationLand), []changelog.Member{member})
 
 	return st.updateKind(st.server.updateLandedReference(ctx, req.in, st.quarantineDir, st.repo, reference, oldOID, newTip, rewritten))
-}
-
-// publish makes the objects that the attempt wrote durable before its compare-and-swap: it packs
-// every loose object of the quarantine into one fsynced pack (see packAttemptObjects), which the
-// quarantine migration of the update then moves into the repository. A failure fails the update
-// of the attempt, as a failed compare-and-swap that a rebuild does not fix: nothing is published.
-func (st *serverLandBatchStepper) publish(ctx context.Context) error {
-	defer observeLandBatchPhase(landBatchPhasePack, time.Now())
-
-	repoPath, err := st.repo.Path(ctx)
-	if err != nil {
-		return structerr.NewInternal("getting quarantine path: %w", err)
-	}
-
-	objectDir := st.quarantineDir.QuarantinedRepo().GetGitObjectDirectory()
-	if !filepath.IsAbs(objectDir) {
-		objectDir = filepath.Join(repoPath, objectDir)
-	}
-
-	packed, err := packBatchObjects(ctx, st.repo, objectDir)
-	if err != nil {
-		return structerr.NewInternal("packing the objects of the batch: %w", err)
-	}
-	landBatchPackedObjectsTotal.Add(float64(packed))
-
-	return nil
 }
 
 // changelogOperationLand is the operation of an unbatched land in the changelog. The lanes run outside

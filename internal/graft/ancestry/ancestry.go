@@ -1,8 +1,8 @@
-// Package ancestry answers the ancestry questions of a landing: whether a commit is reachable from
-// another one, what their merge base is, and which commits a change adds to a branch. Git answers
-// them by running git merge-base and git rev-list, and the graph checker answers them from the
-// stored graph index (see internal/graft/derived/graph). Both answer the same questions with the
-// same results, so a landing gives the same outcome with either.
+// Package ancestry answers the history question of a landing: which commits a change adds to a
+// branch (Checker.Range), from which the land decision follows (rebase.PlanLanding). Git answers it
+// by running git rev-list, and the graph checker from the stored graph index (see
+// internal/graft/derived/graph). Both return the same commits, so a landing gives the same outcome
+// with either.
 package ancestry
 
 import (
@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -32,16 +31,9 @@ const (
 	graphKindVersion = graph.KindVersion
 )
 
-// Checker answers the ancestry questions of one landing attempt. A Checker is used by one
-// goroutine at a time.
+// Checker answers the history question of one landing attempt. A Checker is used by one goroutine
+// at a time.
 type Checker interface {
-	// IsAncestor reports whether ancestor is reachable from descendant, including when both are
-	// the same commit.
-	IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error)
-	// MergeBase returns the merge base of a and b. When several best common ancestors exist, it
-	// returns the one with the smallest object ID, so that Git and the graph checker agree. The
-	// boolean is false when a and b have no common ancestor.
-	MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error)
 	// Range returns the commits reachable from head and not from base, as git rev-list
 	// base..head lists them, each with all of its parents, in no particular order. It is empty
 	// when head is reachable from base.
@@ -143,44 +135,9 @@ func requireAbsent(path string) error {
 	}
 }
 
-// gitChecker answers the questions with git.
+// gitChecker answers with git.
 type gitChecker struct {
 	repo *localrepo.Repo
-}
-
-func (c gitChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return c.repo.IsAncestor(ctx, ancestor.Revision(), descendant.Revision())
-}
-
-func (c gitChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error) {
-	var stdout, stderr bytes.Buffer
-	if err := c.repo.ExecAndWait(ctx,
-		gitcmd.Command{
-			Name:  "merge-base",
-			Flags: []gitcmd.Option{gitcmd.Flag{Name: "--all"}},
-			Args:  []string{a.String(), b.String()},
-		},
-		gitcmd.WithStdout(&stdout),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		// git merge-base exits with status 1 when there is no common ancestor.
-		if status, ok := command.ExitStatus(err); ok && status == 1 {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
-	}
-
-	var best string
-	for _, line := range strings.Fields(stdout.String()) {
-		if best == "" || line < best {
-			best = line
-		}
-	}
-	if best == "" {
-		return "", false, nil
-	}
-
-	return git.ObjectID(best), true, nil
 }
 
 // Range lists the range with one git rev-list --parents process.
@@ -224,27 +181,11 @@ func (c gitChecker) Range(ctx context.Context, base, head git.ObjectID) ([]Range
 	return commits, nil
 }
 
-// graphChecker answers the questions with the graph index.
+// graphChecker answers with the graph index.
 type graphChecker struct {
 	index *graph.Index
 	// source reads the parents of the commits of a range.
 	source graph.Source
-}
-
-func (c graphChecker) IsAncestor(ctx context.Context, ancestor, descendant git.ObjectID) (bool, error) {
-	return c.index.IsAncestor(ctx, ancestor, descendant)
-}
-
-func (c graphChecker) MergeBase(ctx context.Context, a, b git.ObjectID) (git.ObjectID, bool, error) {
-	base, err := c.index.MergeBase(ctx, a, b)
-	if err != nil {
-		return "", false, err
-	}
-	if base == "" {
-		return "", false, nil
-	}
-
-	return base, true, nil
 }
 
 // Range walks down from head through the parents of the commits that the index does not find

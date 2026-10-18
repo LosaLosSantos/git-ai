@@ -154,18 +154,11 @@ func TestGraphMatchesGitOnRandomDAG(t *testing.T) {
 				t.Helper()
 
 				for _, p := range pairs {
-					wantAncestor, err := gitChecker.IsAncestor(ctx, p.a, p.b)
+					want, err := gitChecker.Range(ctx, p.a, p.b)
 					require.NoError(t, err)
-					gotAncestor, err := checker.IsAncestor(ctx, p.a, p.b)
+					got, err := checker.Range(ctx, p.a, p.b)
 					require.NoError(t, err)
-					require.Equal(t, wantAncestor, gotAncestor, "%s: IsAncestor(%s, %s)", label, p.a, p.b)
-
-					wantBase, wantOK, err := gitChecker.MergeBase(ctx, p.a, p.b)
-					require.NoError(t, err)
-					gotBase, gotOK, err := checker.MergeBase(ctx, p.a, p.b)
-					require.NoError(t, err)
-					require.Equal(t, wantOK, gotOK, "%s: MergeBase(%s, %s) found", label, p.a, p.b)
-					require.Equal(t, wantBase, gotBase, "%s: MergeBase(%s, %s)", label, p.a, p.b)
+					require.Equal(t, rangeSet(want), rangeSet(got), "%s: Range(%s, %s)", label, p.a, p.b)
 				}
 			}
 
@@ -184,7 +177,7 @@ func TestGraphMatchesGitOnRandomDAG(t *testing.T) {
 	}
 }
 
-func TestMergeBaseWithoutCommonAncestor(t *testing.T) {
+func TestRangeWithoutCommonAncestor(t *testing.T) {
 	t.Parallel()
 
 	ctx := testhelper.Context(t)
@@ -199,14 +192,10 @@ func TestMergeBaseWithoutCommonAncestor(t *testing.T) {
 
 	for name, checker := range map[string]Checker{"git": Git(repo), "graph": graphChecker} {
 		t.Run(name, func(t *testing.T) {
-			base, ok, err := checker.MergeBase(ctx, a, b)
+			// Nothing of b's history is reachable from a, so the range is b down to its root.
+			rng, err := checker.Range(ctx, a, b)
 			require.NoError(t, err)
-			require.False(t, ok)
-			require.Empty(t, base)
-
-			ancestor, err := checker.IsAncestor(ctx, a, b)
-			require.NoError(t, err)
-			require.False(t, ancestor)
+			require.Equal(t, map[git.ObjectID][]git.ObjectID{b: nil}, rangeSet(rng))
 		})
 	}
 }
@@ -259,11 +248,15 @@ func TestNewChoosesCheckerAndFallsBack(t *testing.T) {
 }
 
 // rangeSet returns the range as a map from commit to its parents, which does not depend on the
-// order of the listing.
+// order of the listing. A root commit maps to nil.
 func rangeSet(commits []RangeCommit) map[git.ObjectID][]git.ObjectID {
 	set := make(map[git.ObjectID][]git.ObjectID, len(commits))
 	for _, c := range commits {
-		set[c.ID] = c.Parents
+		var parents []git.ObjectID
+		if len(c.Parents) > 0 {
+			parents = c.Parents
+		}
+		set[c.ID] = parents
 	}
 	return set
 }
@@ -313,8 +306,7 @@ func TestRangeGraphMatchesGit(t *testing.T) {
 				require.Len(t, want, len(listed))
 
 				// A range is empty exactly when head is reachable from base.
-				reachable, err := gitChecker.IsAncestor(ctx, p.head, p.base)
-				require.NoError(t, err)
+				reachable := gittest.NewCommand(t, cfg, "-C", repoPath, "merge-base", "--is-ancestor", p.head.String(), p.base.String()).Run() == nil
 				require.Equal(t, reachable, len(want) == 0)
 				if len(want) > 0 {
 					nonEmpty++
