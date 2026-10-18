@@ -508,8 +508,31 @@ type BlobStore interface {
 }
 ```
 
+**Atomic create-only on every driver (verified in the gocloud v0.46.0 sources).**
+memblob checks and inserts under its bucket-wide mutex, so its `IfNotExist` is
+atomic. fileblob is not: its writer's `Close` runs `os.Stat` then `os.Rename`
+under a mutex created per writer (`fileblob.go` 764 and 789), which excludes
+nothing, so two concurrent writers of one key both succeed and the second rename
+overwrites the first; this holds within one process and between processes
+sharing a file bucket. The phase-6 package doc's "fileblob supports IfNotExist" is
+true only for sequential writes and is corrected. For file buckets `Put` takes an
+exclusive `flock` on the key's parent directory (which the driver has created
+when it opened its temporary file) around the writer's `Close`: the stat and the
+rename of every `Put` into that directory are then serialized across processes on
+the host, so exactly one writer of a key wins. The lock adds no object (a
+directory is not listed) and the kernel releases it when a process dies. File
+buckets therefore need a local filesystem with `flock` (they are single-host
+already). S3, GCS and Azure use conditional requests, atomic on the server
+(untested here).
+
 `List` uses `bucket.List(&blob.ListOptions{Prefix: prefix})` and skips `IsDir`
-entries; `Delete` maps `gcerrors.NotFound` to success. `BlobInfo` carries no
+entries; `Delete` maps `gcerrors.NotFound` to success. fileblob lists every file
+except its `.attrs` sidecars, **including the temporary file of a write in flight
+and one that a crashed writer left behind** (`<path>.<nanos>.tmp`, in the key's
+directory because the store opens file buckets with `NoTempDir`). The collector
+therefore applies the orphan protocol to every unreferenced object under a
+repository prefix, whether its key parses as a pack key or not: a temporary file
+older than `gc_grace` belongs to a writer whose deadline has passed. `BlobInfo` carries no
 modification time on purpose (the CLOCK RULE: GC never reads bucket times). A
 file bucket may keep empty directories after the last key under them is deleted;
 the keys, which are what matters, are gone (documented).
@@ -783,7 +806,8 @@ var FaultHook func(point string) error
 4. **Sweep** `Blobs.List("repos/<repoID>/packs/")`, for each key:
    * live → keep;
    * covered → `Blobs.Delete`;
-   * referenced by no row: if `st.Orphans[key] <= st.Now − gc_grace` →
+   * referenced by no row (a pack key or any other object under the prefix, such
+     as a file bucket's leftover temporary file): if `st.Orphans[key] <= st.Now − gc_grace` →
      `Blobs.Delete` and then forget the observation; if it has a younger
      observation → keep (in grace); if it has none → collect it for
      `RecordOrphans`.
