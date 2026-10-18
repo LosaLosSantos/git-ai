@@ -138,7 +138,13 @@ func SaveManifest(file string, m Manifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(file, append(data, '\n'), 0o644)
+	// Written under a temporary name and renamed, so that a stopped run never leaves a truncated
+	// manifest (bench mine resumes from the manifests of the repositories already mined).
+	tmp := file + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, file)
 }
 
 // LoadManifest reads a manifest.

@@ -24,8 +24,17 @@ func EnsureClone(ctx context.Context, root string, repo Repo) (string, error) {
 		if err := os.MkdirAll(root, 0o755); err != nil {
 			return "", err
 		}
+		// The clone is made under a temporary name and renamed once complete, so an interrupted
+		// clone is never taken for a complete one; a left-over temporary clone is started again.
+		tmp := dir + ".partial"
+		if err := os.RemoveAll(tmp); err != nil {
+			return "", err
+		}
 		g := gitRepo{dir: root}
-		if _, _, err := g.run(ctx, nil, nil, "clone", "--bare", "--quiet", repo.URL, dir); err != nil {
+		if _, _, err := g.run(ctx, nil, nil, "clone", "--bare", "--quiet", repo.URL, tmp); err != nil {
+			return "", err
+		}
+		if err := os.Rename(tmp, dir); err != nil {
 			return "", err
 		}
 	} else if err != nil {

@@ -68,6 +68,25 @@ func TestBenchMineAndRun(t *testing.T) {
 		t.Fatalf("mine output: %s", stdout.String())
 	}
 
+	// A second run takes the repository from its part, without the clone.
+	moved := filepath.Join(work, "moved")
+	if err := os.Rename(clones, moved); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if code := run([]string{"bench", "mine", "--corpus", corpus, "--clones", clones, "--manifest", manifest}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("resumed mine exited %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1 cases in") {
+		t.Fatalf("resumed mine output: %s", stdout.String())
+	}
+	if _, err := os.Stat(clones); !os.IsNotExist(err) {
+		t.Fatalf("resumed mine cloned again: %v", err)
+	}
+	if err := os.Rename(moved, clones); err != nil {
+		t.Fatal(err)
+	}
+
 	stdout.Reset()
 	stderr.Reset()
 	jsonOut := filepath.Join(work, "report.json")

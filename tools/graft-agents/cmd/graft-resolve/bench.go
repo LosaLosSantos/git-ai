@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/bench"
@@ -57,19 +60,41 @@ func benchMine(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return 1
 	}
 
+	// Each repository's cases are kept in a part of their own as soon as it is mined, so a run
+	// that is stopped resumes with the next repository.
+	partsDir := *manifestPath + ".parts"
+	if err := os.MkdirAll(partsDir, 0o755); err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench mine: %v\n", err)
+		return 1
+	}
+
 	manifest := bench.Manifest{Version: bench.ManifestVersion, Stats: map[string]bench.MineStats{}}
 	for _, repo := range corpus.Repos {
-		dir, err := bench.EnsureClone(ctx, *clones, repo)
+		partPath := filepath.Join(partsDir, strings.ReplaceAll(repo.Name, "/", "__")+"@"+repo.Commit+".json")
+		part, err := bench.LoadManifest(partPath)
 		if err != nil {
-			fmt.Fprintf(stderr, "graft-resolve bench mine: %s: %v\n", repo.Name, err)
-			return 1
+			if !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(stderr, "graft-resolve bench mine: %s: %v\n", repo.Name, err)
+				return 1
+			}
+			dir, err := bench.EnsureClone(ctx, *clones, repo)
+			if err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench mine: %s: %v\n", repo.Name, err)
+				return 1
+			}
+			cases, stats, err := bench.Mine(ctx, repo, dir, bench.MineOptions{MaxCases: *maxCases})
+			if err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench mine: %s: %v\n", repo.Name, err)
+				return 1
+			}
+			part = bench.Manifest{Version: bench.ManifestVersion, Cases: cases, Stats: map[string]bench.MineStats{repo.Name: stats}}
+			if err := bench.SaveManifest(partPath, part); err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench mine: %v\n", err)
+				return 1
+			}
 		}
-		cases, stats, err := bench.Mine(ctx, repo, dir, bench.MineOptions{MaxCases: *maxCases})
-		if err != nil {
-			fmt.Fprintf(stderr, "graft-resolve bench mine: %s: %v\n", repo.Name, err)
-			return 1
-		}
-		manifest.Cases = append(manifest.Cases, cases...)
+		stats := part.Stats[repo.Name]
+		manifest.Cases = append(manifest.Cases, part.Cases...)
 		manifest.Stats[repo.Name] = stats
 		fmt.Fprintf(stdout, "%s: %d merges, %d conflicting, %d conflicting files, %d kept\n",
 			repo.Name, stats.Merges, stats.ConflictingMerges, stats.ConflictingFiles, stats.Kept)
