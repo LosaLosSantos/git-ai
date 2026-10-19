@@ -66,12 +66,13 @@ A client asks for resolution per call:
   (4 MiB) before sending it.
 - CLI: `graft land --resolve`, `graft commit --land BRANCH --resolve`.
   `graft land --resolve` prints the package when the land fails, and with
-  `--conflicts-dir DIR` writes it: `DIR/<path>` is the merge with git's
+  `--conflicts-dir DIR` writes it: `DIR/files/<path>` is the merge with git's
   diff3 markers (the clean changes of both sides applied), the sides are in
-  `DIR/.graft/sides/<path>.base|.ours|.theirs`, the package in
-  `DIR/.graft/conflict.json`. Edit the files, then `graft land --resolved DIR`
-  lands them: a present file is written (with the tip side's mode), an absent
-  one is deleted.
+  `DIR/sides/<path>.base|.ours|.theirs`, the package in `DIR/conflict.json`.
+  The files and the sides live in separate directories, so no repository
+  path can collide with a side or the package. Edit the files under
+  `DIR/files`, then `graft land --resolved DIR` lands them: a present file is
+  written (with the tip side's mode), an absent one is deleted.
 - RPC: `UserLandRequest.resolve_conflicts` (field 10). The response carries
   `resolved_paths` (field 7) and `resolver` (field 8). The re-land is
   `UserLandRequest.resolution` (field 11).

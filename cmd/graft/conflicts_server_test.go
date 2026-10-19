@@ -40,18 +40,18 @@ func TestCLILandConflictsAndResolved(t *testing.T) {
 	require.Contains(t, stdout, "graft land --resolved "+conflicts)
 
 	// The file to edit holds the merge with git's diff3 markers; the sides are beside it.
-	marked, err := os.ReadFile(filepath.Join(conflicts, "x.txt"))
+	marked, err := os.ReadFile(filepath.Join(conflicts, "files", "x.txt"))
 	require.NoError(t, err)
 	require.Equal(t, "1\n<<<<<<< ours (the branch tip)\ntip\n||||||| base\nbase\n=======\nlocal\n>>>>>>> theirs (the change)\n3\n", string(marked))
 	for side, want := range map[string]string{"base": "1\nbase\n3\n", "ours": "1\ntip\n3\n", "theirs": "1\nlocal\n3\n"} {
-		got, err := os.ReadFile(filepath.Join(conflicts, ".graft", "sides", "x.txt."+side))
+		got, err := os.ReadFile(filepath.Join(conflicts, "sides", "x.txt."+side))
 		require.NoError(t, err)
 		require.Equal(t, want, string(got), side)
 	}
-	require.FileExists(t, filepath.Join(conflicts, ".graft", "conflict.json"))
+	require.FileExists(t, filepath.Join(conflicts, "conflict.json"))
 
 	// The agent resolves the file and lands the resolution.
-	require.NoError(t, os.WriteFile(filepath.Join(conflicts, "x.txt"), []byte("1\ntip and local\n3\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(conflicts, "files", "x.txt"), []byte("1\ntip and local\n3\n"), 0o644))
 	code, stdout, stderr = runCLI(t, "land", "-C", dir, "-author", "Dev <dev@example.com>", "-resolved", conflicts)
 	require.Equal(t, exitOK, code, stderr)
 	require.Contains(t, stdout, "landed at ")
@@ -72,6 +72,51 @@ func TestCLILandConflictsAndResolved(t *testing.T) {
 	require.Equal(t, []string{"agent"}, shown.Trailers["Graft-Resolved-By"])
 	require.Equal(t, []string{"x.txt"}, shown.Trailers["Graft-Resolved-Path"])
 	require.NotContains(t, shown.Trailers, "Graft-Checked-By", "no resolver checked it")
+}
+
+// TestCLILandConflictsDirectoryNamespacesAreDisjoint: conflicting paths named like the package
+// or like a side of another file are written and resolved like any other.
+func TestCLILandConflictsDirectoryNamespacesAreDisjoint(t *testing.T) {
+	env := startServer(t)
+	names := []string{"conflict.json", "x.txt", "sides/x.txt.base", "files/x.txt"}
+	seed := map[string]string{}
+	for _, n := range names {
+		seed[n] = "base\n"
+	}
+	base := env.seedMain(t, seed)
+
+	dir := filepath.Join(t.TempDir(), "ws")
+	code, _, stderr := runCLI(t, "clone", "-storage", env.storage, env.addr, env.relPath, dir)
+	require.Equal(t, exitOK, code, stderr)
+
+	remote := map[string]string{}
+	for _, n := range names {
+		remote[n] = "remote " + n + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, filepath.FromSlash(n)), []byte("local "+n+"\n"), 0o644))
+	}
+	gittest.WriteCommit(t, env.cfg, env.repoPath, gittest.WithTree(env.writeTree(t, remote)), gittest.WithParents(base), gittest.WithBranch("main"))
+	code, _, stderr = runCLI(t, "commit", "-C", dir, "-author", "Dev <dev@example.com>", "-m", "local")
+	require.Equal(t, exitOK, code, stderr)
+
+	conflicts := filepath.Join(t.TempDir(), "conflicts")
+	code, stdout, _ := runCLI(t, "land", "-C", dir, "-author", "Dev <dev@example.com>", "-resolve", "-conflicts-dir", conflicts)
+	require.Equal(t, exitError, code, stdout)
+	for _, n := range names {
+		marked, err := os.ReadFile(filepath.Join(conflicts, "files", filepath.FromSlash(n)))
+		require.NoError(t, err, n)
+		require.Contains(t, string(marked), "local "+n, n)
+		require.FileExists(t, filepath.Join(conflicts, "sides", filepath.FromSlash(n)+".theirs"), n)
+		require.NoError(t, os.WriteFile(filepath.Join(conflicts, "files", filepath.FromSlash(n)), []byte("resolved "+n+"\n"), 0o644))
+	}
+	require.FileExists(t, filepath.Join(conflicts, "conflict.json"))
+
+	code, _, stderr = runCLI(t, "land", "-C", dir, "-author", "Dev <dev@example.com>", "-resolved", conflicts)
+	require.Equal(t, exitOK, code, stderr)
+	for _, n := range names {
+		code, stdout, _ = runCLI(t, "cat", "-C", dir, "main:"+n)
+		require.Equal(t, exitOK, code, n)
+		require.Equal(t, "resolved "+n+"\n", stdout, n)
+	}
 }
 
 func TestCLILandConflictFlagsAreChecked(t *testing.T) {

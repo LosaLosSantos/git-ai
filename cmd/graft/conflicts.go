@@ -21,20 +21,22 @@ import (
 
 // The conflicts directory of graft land --conflicts-dir DIR holds, for every conflicting path:
 //
-//	DIR/<path>                         the file as the merge leaves it, with git's diff3 conflict
-//	                                   markers around each conflict (or the tip's side when the
-//	                                   file is not text, or a side is absent)
-//	DIR/.graft/sides/<path>.base       the three sides
-//	DIR/.graft/sides/<path>.ours
-//	DIR/.graft/sides/<path>.theirs
-//	DIR/.graft/conflict.json           the conflict package
+//	DIR/files/<path>          the file as the merge leaves it, with git's diff3 conflict markers
+//	                          around each conflict (or the tip's side when the file is not text,
+//	                          or a side is absent)
+//	DIR/sides/<path>.base     the three sides
+//	DIR/sides/<path>.ours
+//	DIR/sides/<path>.theirs
+//	DIR/conflict.json         the conflict package
 //
-// graft land --resolved DIR lands the files of DIR as the resolution: a path whose file is present
-// is written, one whose file is absent is deleted.
+// The files to edit and the sides live under separate directories, so that no repository path,
+// whatever its name, can collide with a side or with the package. graft land --resolved DIR lands
+// the files of DIR/files as the resolution: a path whose file is present is written, one whose
+// file is absent is deleted.
 const (
-	conflictsMetaDir  = ".graft"
-	conflictsPackage  = "conflict.json"
+	conflictsFilesDir = "files"
 	conflictsSidesDir = "sides"
+	conflictsPackage  = "conflict.json"
 )
 
 // printConflict describes a conflict package: the reason the server gave, and each file with its
@@ -54,13 +56,13 @@ func printConflict(out io.Writer, c *gitalypb.LandConflict) {
 	}
 }
 
-// conflictPath returns the file of the conflicts directory for a conflicting path, refusing a
-// path that would leave the directory.
-func conflictPath(dir, p string) (string, error) {
-	if p == "" || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") || p == conflictsMetaDir || strings.HasPrefix(p, conflictsMetaDir+"/") {
+// conflictPath returns the file under sub of the conflicts directory for a conflicting path,
+// refusing a path that would leave it.
+func conflictPath(dir, sub, p string) (string, error) {
+	if p == "" || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
 		return "", fmt.Errorf("conflicting path %q cannot be written into the conflicts directory", p)
 	}
-	return filepath.Join(dir, filepath.FromSlash(p)), nil
+	return filepath.Join(dir, sub, filepath.FromSlash(p)), nil
 }
 
 // writeConflicts writes the conflicts directory of a conflict package (see the layout above).
@@ -93,7 +95,11 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 
 	for _, f := range c.GetFiles() {
 		p := string(f.GetPath())
-		target, err := conflictPath(dir, p)
+		target, err := conflictPath(dir, conflictsFilesDir, p)
+		if err != nil {
+			return err
+		}
+		sideBase, err := conflictPath(dir, conflictsSidesDir, p)
 		if err != nil {
 			return err
 		}
@@ -107,8 +113,7 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 			if contents[i] == nil {
 				continue
 			}
-			sidePath := filepath.Join(dir, conflictsMetaDir, conflictsSidesDir, filepath.FromSlash(p)+"."+ext)
-			if err := writeFileAll(sidePath, contents[i]); err != nil {
+			if err := writeFileAll(sideBase+"."+ext, contents[i]); err != nil {
 				return err
 			}
 		}
@@ -121,7 +126,7 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 	if err != nil {
 		return err
 	}
-	return writeFileAll(filepath.Join(dir, conflictsMetaDir, conflictsPackage), append(raw, '\n'))
+	return writeFileAll(filepath.Join(dir, conflictsPackage), append(raw, '\n'))
 }
 
 // conflictFileContent is the file an agent edits: the merge with markers when both sides are text,
@@ -152,21 +157,21 @@ func writeFileAll(p string, data []byte) error {
 }
 
 // readResolution reads the resolution of a conflicts directory: the package's tip and commit, and
-// for every conflicting path its file, or a deletion when the file is absent. The mode is the
+// for every conflicting path its file under DIR/files, or a deletion when the file is absent. The mode is the
 // tip's side's, else the landed commit's.
 func readResolution(dir string) (*workspace.Resolution, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, conflictsMetaDir, conflictsPackage))
+	raw, err := os.ReadFile(filepath.Join(dir, conflictsPackage))
 	if err != nil {
 		return nil, fmt.Errorf("reading the conflict package of %s (written by graft land --conflicts-dir): %w", dir, err)
 	}
 	var c gitalypb.LandConflict
 	if err := protojson.Unmarshal(raw, &c); err != nil {
-		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, conflictsMetaDir, conflictsPackage), err)
+		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, conflictsPackage), err)
 	}
 	res := &workspace.Resolution{Tip: c.GetTip(), Commit: c.GetCommit()}
 	for _, f := range c.GetFiles() {
 		p := string(f.GetPath())
-		target, err := conflictPath(dir, p)
+		target, err := conflictPath(dir, conflictsFilesDir, p)
 		if err != nil {
 			return nil, err
 		}
