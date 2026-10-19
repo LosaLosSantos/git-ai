@@ -38,6 +38,9 @@ type Server struct {
 	// checkBatchBytes, when set, replaces the bound of the file data of one check request
 	// (landCheckBatchBytes); only tests set it.
 	checkBatchBytes int64
+	// landCheckBatchHook, when set, runs in every check batch while it holds its slot; only tests
+	// set it.
+	landCheckBatchHook func()
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
 	// or when the configured resolver cannot be built: then resolverErr says why, and every land
 	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).
@@ -58,14 +61,19 @@ type Server struct {
 func NewServer(deps *service.Dependencies) *Server {
 	resolveCfg := deps.GetCfg().Graft.Land.Resolver
 
-	// The configuration is validated at startup (config.GraftResolver.validate), so New fails
-	// only when something changed since (a token file removed, say). A configured resolver is then
-	// never treated as no resolver: resolverErr makes every land that needs it fail closed.
-	conflictResolver, resolverErr := resolver.New(resolveCfg)
-	if resolverErr != nil {
-		deps.GetLogger().WithError(resolverErr).Error("graft: the conflict resolver of land cannot be built: lands that need it fail")
-		conflictResolver = nil
+	// The configuration is validated at startup (config.GraftResolver.validate), so the resolver
+	// fails to build only when something changed since (a token file removed, say). A configured
+	// resolver is then never treated as no resolver: resolverErr makes every land that needs it
+	// fail closed. The resolver of the process is shared by every server (service.Dependencies);
+	// a server without one builds its own.
+	shared := deps.GetGraftResolver()
+	if shared == nil {
+		shared = resolver.NewShared(resolveCfg)
+		if shared.Err != nil {
+			deps.GetLogger().WithError(shared.Err).Error("graft: the conflict resolver of land cannot be built: lands that need it fail")
+		}
 	}
+	conflictResolver, resolverErr := shared.Client, shared.Err
 	if conflictResolver != nil && resolverActorsUnmatchable(deps.GetCfg().Graft) {
 		deps.GetLogger().Warn("graft: [graft.land.resolver] actors is set but no [[graft.agent]] is " +
 			"configured, so callers carry no identity and no landing may resolve conflicts")

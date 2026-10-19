@@ -334,3 +334,24 @@ func TestValidateFile_pointerLine(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidResponse)
 	require.ErrorContains(t, err, "the pointer to a binary side")
 }
+
+// TestValidateFile_pointerLineOfTheSides: a pointer line that a side of the conflict has of its own
+// is content, not a pointer left in place: Validate takes the sides from the request, and
+// ValidateFileWithSides from its caller. Without such a side the rule holds.
+func TestValidateFile_pointerLineOfTheSides(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("doc\n" + ConflictPointerPrefix + "an example of the line\n")
+	f := ResponseFile{Path: "c.md", Action: ActionWrite, Mode: ModeRegular, Content: content}
+
+	require.ErrorIs(t, ValidateFile(f, 1<<20), ErrConflictPointer)
+	require.NoError(t, ValidateFileWithSides(f, 1<<20, []byte("base\n"), content))
+	require.ErrorIs(t, ValidateFileWithSides(f, 1<<20, []byte("base\n"), []byte("ours\n")), ErrConflictPointer)
+
+	req := &Request{Files: []File{{Path: "c.md", Ours: &Side{Content: content}, Theirs: &Side{Content: []byte("t\n")}}}, Limits: Limits{MaxFileBytes: 1 << 20}}
+	require.NoError(t, Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{f}}))
+	req.Files[0].Ours.Content = []byte("o\n")
+	err := Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{f}})
+	require.ErrorIs(t, err, ErrInvalidResponse)
+	require.ErrorIs(t, err, ErrConflictPointer)
+}

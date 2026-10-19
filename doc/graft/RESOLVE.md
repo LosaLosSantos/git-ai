@@ -39,7 +39,8 @@ actors = ["builder", "planner"]
   lists every conflicting file, and the check of an agent's resolution covers
   all its files.
 - `check_concurrency` (default 2): the checks of agents' resolutions that run
-  at once (see the check below).
+  at once in the Gitaly process, whatever listener the lands arrive on (see
+  the check below).
 - A configuration the server could not use is a startup error (see
   [CONFIGURATION](CONFIGURATION.md)). A configured resolver is never treated
   as no resolver: if it cannot be built later, every land that needs it fails
@@ -99,7 +100,9 @@ A client asks for resolution per call:
   rule of the server refuses it until the agent resolves it, and
   `graft land --resolved` refuses a file that still holds a pointer line, so
   that a pointer can never land in place of a binary side; the server refuses
-  such a line too, so a client of the SDK gets the same rule. `DIR` must not
+  such a line too, so a client of the SDK gets the same rule. Both accept the
+  line when a side of the conflict has one of its own (a file that documents
+  the line, say). `DIR` must not
   hold a conflicts directory yet: one being edited is never overwritten. A
   path that cannot be a file under `DIR` on this system (a backslash, on
   Windows a colon or a name the system reserves) is an error, and so are two paths that
@@ -417,9 +420,9 @@ content) or `delete`. The server accepts it only when:
   with a fresh package for the new tip);
 - it resolves exactly the conflicting paths, each once;
 - every file passes the acceptance rules of an answer (modes, size, conflict
-  markers, no `graft-conflict-pointer:` line, no symbolic link named like a
-  file git reads from the tree), and writes a mode one of the conflict's sides
-  has;
+  markers, no `graft-conflict-pointer:` line unless a side of the conflict has
+  one of its own, no symbolic link named like a file git reads from the tree),
+  and writes a mode one of the conflict's sides has;
 - the merge has at most 1000 conflicting files, the bound of a package (a
   merge with more cannot be resolved through a land, and nothing is read or
   checked);

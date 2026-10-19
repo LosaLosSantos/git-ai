@@ -290,6 +290,39 @@ func isBinaryContent(b []byte) bool {
 	return bytes.IndexByte(b, 0) >= 0
 }
 
+// hasPointerLine reports whether a line of content starts with conflictPointerPrefix.
+func hasPointerLine(content []byte) bool {
+	for _, line := range bytes.Split(content, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte(conflictPointerPrefix)) {
+			return true
+		}
+	}
+	return false
+}
+
+// sideHasPointerLine reports whether a side of the conflicting path p under DIR/sides has a pointer
+// line of its own: the file then holds such a line legitimately (the server exempts it the same
+// way). A side that is absent has none.
+func sideHasPointerLine(dir, p string) (bool, error) {
+	for _, side := range conflictSides {
+		sideFile, err := conflictPath(dir, filepath.Join(conflictsSidesDir, side), p)
+		if err != nil {
+			return false, err
+		}
+		content, err := os.ReadFile(sideFile)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if hasPointerLine(content) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // readResolution reads the resolution of a conflicts directory: the package's tip and commit, and
 // for every conflicting path its file under DIR/files, or a deletion when the file is absent. The
 // mode is the file mode of the tip's side, else of the landed commit's, else of the base's: a side
@@ -319,8 +352,12 @@ func readResolution(dir string) (*workspace.Resolution, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, line := range bytes.Split(content, []byte("\n")) {
-			if bytes.HasPrefix(line, []byte(conflictPointerPrefix)) {
+		if hasPointerLine(content) {
+			own, err := sideHasPointerLine(dir, p)
+			if err != nil {
+				return nil, err
+			}
+			if !own {
 				return nil, fmt.Errorf("%s still holds the pointer to a binary side: copy the side you want over it from %s, or remove it to delete the path", target, filepath.Join(dir, conflictsSidesDir))
 			}
 		}

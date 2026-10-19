@@ -121,6 +121,7 @@ func (c *Client) check(ctx context.Context, req Request) (*CheckResponse, error)
 		return nil, fmt.Errorf("check request of %d bytes is over the bound of %d", len(body), MaxCheckRequestBytes)
 	}
 
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
@@ -134,8 +135,12 @@ func (c *Client) check(ctx context.Context, req Request) (*CheckResponse, error)
 		raw, err = c.callCommand(ctx, body, limit)
 	}
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("resolver check timed out after %s: %w", c.timeout, ctx.Err())
+		switch {
+		case parent.Err() != nil:
+			// The deadline of the whole check (or the caller's) ended first.
+			return nil, fmt.Errorf("resolver check stopped at the deadline of the check: %w", parent.Err())
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			return nil, fmt.Errorf("resolver check request timed out after %s: %w", c.timeout, ctx.Err())
 		}
 		return nil, fmt.Errorf("resolver check: %w", err)
 	}

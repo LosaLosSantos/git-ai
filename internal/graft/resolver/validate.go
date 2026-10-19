@@ -18,7 +18,8 @@ import (
 //   - no written content exceeds req.Limits.MaxFileBytes;
 //   - no written text file (content without NUL bytes) contains a conflict
 //     marker line ("<<<<<<< ", "=======", ">>>>>>> " at line start);
-//   - no written file contains a line starting with ConflictPointerPrefix.
+//   - no written file contains a line starting with ConflictPointerPrefix,
+//     unless a side of its conflict has such a line of its own.
 //
 // Violations are reported wrapping ErrInvalidResponse. A request without a
 // positive req.Limits.MaxFileBytes is a caller error and is reported without
@@ -52,7 +53,7 @@ func Validate(req *Request, resp *Response) error {
 		}
 		answered[f.Path] = struct{}{}
 
-		if err := validateFile(f, req.Limits.MaxFileBytes); err != nil {
+		if err := validateFile(f, req.Limits.MaxFileBytes, sidesHavePointer(req.Files, f.Path)); err != nil {
 			return fmt.Errorf("%w: path %q: %w", ErrInvalidResponse, f.Path, err)
 		}
 	}
@@ -69,18 +70,49 @@ func Validate(req *Request, resp *Response) error {
 
 // ConflictPointerPrefix starts the line that graft land --conflicts-dir writes in the file to
 // edit in place of a binary side, which that file cannot embed. A resolution that still holds such
-// a line would land the pointer instead of the side, so no written file may hold one.
+// a line would land the pointer instead of the side, so no written file may hold one, unless a
+// side of its conflict has such a line of its own (as the patch-lines rule of graft-resolve does).
 const ConflictPointerPrefix = "graft-conflict-pointer: "
+
+// ErrConflictPointer is the rejection of a written file that holds a pointer line. A caller that
+// did not give the sides (ValidateFile) may read them and validate again with
+// ValidateFileWithSides, which exempts a file whose sides have such a line.
+var ErrConflictPointer = errors.New("the pointer to a binary side that graft land --conflicts-dir writes was not replaced by the side")
 
 // ValidateFile applies the acceptance rules of Validate to one resolved file: the action, the
 // mode, the size, the conflict markers and the pointer lines. The server applies it to an agent's
 // resolution too.
 func ValidateFile(f ResponseFile, maxBytes int64) error {
-	return validateFile(f, maxBytes)
+	return validateFile(f, maxBytes, false)
 }
 
-// validateFile checks one answered file.
-func validateFile(f ResponseFile, maxBytes int64) error {
+// ValidateFileWithSides is ValidateFile for a file whose conflict has the given sides: a pointer
+// line is accepted when one of them has one too.
+func ValidateFileWithSides(f ResponseFile, maxBytes int64, sides ...[]byte) error {
+	pointerAllowed := false
+	for _, s := range sides {
+		pointerAllowed = pointerAllowed || HasConflictPointer(s)
+	}
+	return validateFile(f, maxBytes, pointerAllowed)
+}
+
+// sidesHavePointer reports whether a side of the conflict of path in files has a pointer line.
+func sidesHavePointer(files []File, path string) bool {
+	for _, f := range files {
+		if f.Path != path {
+			continue
+		}
+		for _, s := range []*Side{f.Base, f.Ours, f.Theirs} {
+			if s != nil && HasConflictPointer(s.Content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validateFile checks one answered file. pointerAllowed exempts it from the pointer-line rule.
+func validateFile(f ResponseFile, maxBytes int64, pointerAllowed bool) error {
 	switch f.Action {
 	case ActionWrite:
 		if !validMode(f.Mode) {
@@ -101,8 +133,8 @@ func validateFile(f ResponseFile, maxBytes int64) error {
 			return errors.New("content contains a conflict marker line")
 		}
 
-		if hasConflictPointer(f.Content) {
-			return fmt.Errorf("content contains a line starting with %q, the pointer to a binary side that graft land --conflicts-dir writes: the side was not put in its place", ConflictPointerPrefix)
+		if !pointerAllowed && HasConflictPointer(f.Content) {
+			return fmt.Errorf("content contains a line starting with %q: %w", ConflictPointerPrefix, ErrConflictPointer)
 		}
 
 		return nil
@@ -224,8 +256,8 @@ func isBinary(content []byte) bool {
 	return bytes.IndexByte(content, 0) >= 0
 }
 
-// hasConflictPointer reports whether a line of content starts with ConflictPointerPrefix.
-func hasConflictPointer(content []byte) bool {
+// HasConflictPointer reports whether a line of content starts with ConflictPointerPrefix.
+func HasConflictPointer(content []byte) bool {
 	prefix := []byte(ConflictPointerPrefix)
 	for len(content) > 0 {
 		line := content

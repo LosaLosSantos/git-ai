@@ -101,6 +101,10 @@ func (s *Server) landReviewResolution(ctx context.Context, in *gitalypb.UserLand
 	for _, f := range l.files {
 		rf := resolved[f.conflict.path]
 		err := resolver.ValidateFile(rf, maxBytes)
+		if errors.Is(err, resolver.ErrConflictPointer) {
+			// A pointer line is the agent's own when a side has one too: read the sides only then.
+			err = landValidateWithSides(ctx, repo, f.conflict, rf, maxBytes, err)
+		}
 		if err == nil {
 			err = landModeOfSides(f.conflict, rf)
 		}
@@ -110,6 +114,32 @@ func (s *Server) landReviewResolution(ctx context.Context, in *gitalypb.UserLand
 		}
 	}
 	return review, nil
+}
+
+// landValidateWithSides validates rf again with the sides of its conflict, which exempt a pointer
+// line when one of them has one (resolver.ValidateFileWithSides). A side over maxBytes, or a
+// gitlink, cannot be one of the agent's files and is not read; a side that cannot be read keeps
+// the rejection, with why.
+func landValidateWithSides(ctx context.Context, repo *localrepo.Repo, c landFileConflict, rf resolver.ResponseFile, maxBytes int64, rejection error) error {
+	var sides [][]byte
+	for _, b := range []*landBlob{c.base, c.ours, c.theirs} {
+		if b == nil || b.mode == landModeGitlink {
+			continue
+		}
+		info, err := repo.ReadObjectInfo(ctx, b.oid.Revision())
+		if err != nil {
+			return fmt.Errorf("%w (reading its sides for a pointer line of their own: %v)", rejection, err)
+		}
+		if info.Size > maxBytes {
+			continue
+		}
+		content, err := repo.ReadObject(ctx, b.oid)
+		if err != nil {
+			return fmt.Errorf("%w (reading its sides for a pointer line of their own: %v)", rejection, err)
+		}
+		sides = append(sides, content)
+	}
+	return resolver.ValidateFileWithSides(rf, maxBytes, sides...)
 }
 
 // landPrecheck is the check of an agent's resolution, run before the land enters its lane
@@ -152,14 +182,16 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 
 	// A resolution for a tip the branch has left, or for a change that already landed, needs no
 	// check: the lane refuses or answers it at once, as it reads the tip again under the lane.
-	branch, err := repo.GetReference(ctx, git.NewReferenceNameFromBranchName(string(in.GetBranch())))
+	// The branch is read as the lane reads it (landingAttempt.Tip): a symbolic reference resolves
+	// to its target's commit.
+	branchTip, err := repo.ResolveRevision(ctx, git.NewReferenceNameFromBranchName(string(in.GetBranch())).Revision())
 	switch {
 	case errors.Is(err, git.ErrReferenceNotFound):
 		return &landPrecheck{skipped: fmt.Sprintf("branch %q does not exist", string(in.GetBranch()))}, nil
 	case err != nil:
 		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("reading the branch: %v", err), failureErr: err}}, nil
-	case git.ObjectID(branch.Target) != tip:
-		return &landPrecheck{skipped: fmt.Sprintf("the branch was at %s, not at the tip of the resolution", branch.Target)}, nil
+	case branchTip != tip:
+		return &landPrecheck{skipped: fmt.Sprintf("the branch was at %s, not at the tip of the resolution", branchTip)}, nil
 	}
 	if landed, err := repo.IsAncestor(ctx, commitID.Revision(), tip.Revision()); err != nil {
 		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("checking whether the change already landed: %v", err), failureErr: err}}, nil
@@ -377,20 +409,10 @@ func (s *Server) landCheckResolution(
 
 	var unchecked []string
 	for _, batch := range batches {
-		slot, err := s.conflictResolver.AcquireCheckSlot(ctx)
-		if err != nil {
-			return fail("waiting for the resolver", err)
-		}
-		checked, resp, err := s.landCheckBatch(ctx, in, repo, l, actor, resolved, batch, cache, slot, &unchecked)
-		slot.Release()
-		// The sides of the batch are released once it is checked: the next batch reads its own, and
-		// a package reads again, within its own bounds, what its hunks need.
-		for _, f := range batch {
-			f.sides, f.read = [3][]byte{}, false
-		}
+		checked, resp, stage, err := s.landCheckSlotted(ctx, in, repo, l, actor, resolved, batch, cache, &unchecked)
 		switch {
 		case err != nil:
-			return fail("checking", err)
+			return fail(stage, err)
 		case resp == nil:
 			continue
 		case !landResolverNameValid(resp.Resolver):
@@ -420,6 +442,39 @@ func (s *Server) landCheckResolution(
 		"not_checked":    unchecked,
 	}).InfoContext(ctx, "graft: agent's resolution checked")
 	return result
+}
+
+// landCheckSlotted takes a check slot and checks one batch with it (landCheckBatch). The slot and
+// the sides of the batch are released when it returns, even on a panic: a lost slot would refuse
+// every later check of the process. stage names what failed, for the result's failure.
+func (s *Server) landCheckSlotted(
+	ctx context.Context,
+	in *gitalypb.UserLandRequest,
+	repo *localrepo.Repo,
+	l landListing,
+	actor string,
+	resolved map[string]resolver.ResponseFile,
+	batch []*landFileState,
+	cache *landClassifyCache,
+	unchecked *[]string,
+) ([]*landFileState, *resolver.CheckResponse, string, error) {
+	slot, err := s.conflictResolver.AcquireCheckSlot(ctx)
+	if err != nil {
+		return nil, nil, "waiting for the resolver", err
+	}
+	defer slot.Release()
+	// The sides of the batch are released once it is checked: the next batch reads its own, and a
+	// package reads again, within its own bounds, what its hunks need.
+	defer func() {
+		for _, f := range batch {
+			f.sides, f.read = [3][]byte{}, false
+		}
+	}()
+	if s.landCheckBatchHook != nil {
+		s.landCheckBatchHook()
+	}
+	checked, resp, err := s.landCheckBatch(ctx, in, repo, l, actor, resolved, batch, cache, slot, unchecked)
+	return checked, resp, "checking", err
 }
 
 // landCheckBatch reads and checks one batch of files with a check slot taken. It returns the files

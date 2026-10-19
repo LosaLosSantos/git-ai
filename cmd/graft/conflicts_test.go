@@ -186,6 +186,24 @@ func TestReadResolutionRefusesAPointerLine(t *testing.T) {
 	require.ErrorContains(t, err, "still holds the pointer to a binary side")
 }
 
+// TestReadResolutionAcceptsAPointerLineOfTheSides: a file that holds a pointer line which a side
+// has of its own (a document about the line, say) is content, as the server exempts it too.
+func TestReadResolutionAcceptsAPointerLineOfTheSides(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	side := &gitalypb.LandConflictSide{Mode: "100644", Oid: "1"}
+	writePackage(t, dir, &gitalypb.LandConflict{Files: []*gitalypb.LandConflictFile{{Path: []byte("doc/c.md"), Base: side, Ours: side, Theirs: side}}})
+	line := conflictPointerPrefix + "an example of the line\n"
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sides", "ours", "doc"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sides", "ours", "doc", "c.md"), []byte("doc\n"+line), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "files", "doc"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "files", "doc", "c.md"), []byte("doc, resolved\n"+line), 0o644))
+	res, err := readResolution(dir)
+	require.NoError(t, err)
+	require.Len(t, res.Files, 1)
+}
+
 // TestReadResolutionModes: the mode is the first file mode of ours, theirs and the base; a path
 // that is a file on none of its sides (a submodule) can only be deleted.
 func TestReadResolutionModes(t *testing.T) {

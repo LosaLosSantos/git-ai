@@ -44,6 +44,7 @@ import (
 	_ "github.com/feder-cr/git-ai/internal/graft/derived/graph" // registers the graph warmer
 	"github.com/feder-cr/git-ai/internal/graft/eager"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
 	"github.com/feder-cr/git-ai/internal/grpc/client"
 	housekeepingmw "github.com/feder-cr/git-ai/internal/grpc/middleware/housekeeping"
@@ -714,6 +715,14 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	prometheus.MustRegister(landLanes)
 	defer landLanes.Close()
 
+	// The conflict resolver is built once and shared by the operations servers of every
+	// listener, so that its check slots bound the process (check_concurrency) and a resolver
+	// that cannot be built is one error, which makes every land that needs it fail closed.
+	graftResolver := resolver.NewShared(cfg.Graft.Land.Resolver)
+	if graftResolver.Err != nil {
+		logger.WithError(graftResolver.Err).Error("graft: the conflict resolver of land cannot be built: lands that need it fail")
+	}
+
 	for _, c := range []starter.Config{
 		{Name: starter.Unix, Addr: cfg.SocketPath, HandoverOnUpgrade: true},
 		{Name: starter.Unix, Addr: cfg.InternalSocketPath(), HandoverOnUpgrade: false},
@@ -774,6 +783,7 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			ObjectPoolStateManager: objectPoolStateManager,
 			PostReceiveRegistry:    postReceiveRegistry,
 			GraftLandLanes:         landLanes,
+			GraftResolver:          graftResolver,
 			GraftStorage:           storageCore,
 			GraftStorageSyncer:     storageSyncer,
 			ShutdownContext:        shutdownCtx,

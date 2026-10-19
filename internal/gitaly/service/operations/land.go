@@ -76,16 +76,7 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	// enters its lane, so that no branch is held while it runs (landPrecheckResolution).
 	var precheck *landPrecheck
 	if in.GetResolution() != nil && s.conflictResolver != nil {
-		// The precheck merges the tip and the change, which writes objects: it works in a
-		// quarantine that is discarded, so that it leaves nothing in the repository, whatever the
-		// storage mode.
-		_, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, in.GetRepository())
-		if err != nil {
-			return nil, err
-		}
-		precheck, err = s.landPrecheckResolution(ctx, in, quarantineRepo)
-		cleanup()
-		if err != nil {
+		if precheck, err = s.landPrecheckInQuarantine(ctx, in); err != nil {
 			return nil, err
 		}
 	}
@@ -104,6 +95,18 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	resp.BatchPosition = 1
 
 	return resp, nil
+}
+
+// landPrecheckInQuarantine runs the precheck in a quarantine that it discards, even on a panic:
+// the precheck merges the tip and the change, which writes objects, and it leaves nothing in the
+// repository, whatever the storage mode.
+func (s *Server) landPrecheckInQuarantine(ctx context.Context, in *gitalypb.UserLandRequest) (*landPrecheck, error) {
+	_, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, in.GetRepository())
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return s.landPrecheckResolution(ctx, in, quarantineRepo)
 }
 
 // landWithRetries lands the request alone, retrying the compare-and-swap while the branch moves. It

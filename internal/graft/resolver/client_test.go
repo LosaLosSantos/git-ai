@@ -726,3 +726,43 @@ func TestAcquireCheckSlot_defaultConcurrency(t *testing.T) {
 	client := newClient(t, commandConfig([]string{"/bin/true"}))
 	require.Equal(t, config.DefaultGraftResolverCheckConcurrency, cap(client.checkSlots))
 }
+
+// TestCheck_namesTheDeadlineThatEnded: a check request that runs out of its own timeout says so; one
+// that runs out of the deadline of the whole check names that deadline instead.
+func TestCheck_namesTheDeadlineThatEnded(t *testing.T) {
+	requireUnix(t)
+
+	cfg := commandConfig([]string{writeScript(t, "cat > /dev/null\nsleep 5\n")})
+	req := sampleRequest()
+	req.Resolution = validResponse("merged\n").Files
+
+	cfg.Timeout = "100ms"
+	_, err := checkWithSlot(t, newClient(t, cfg), req)
+	require.ErrorContains(t, err, "resolver check request timed out after 100ms")
+
+	cfg.Timeout = "1m"
+	client := newClient(t, cfg)
+	slot, err := client.AcquireCheckSlot(testhelper.Context(t))
+	require.NoError(t, err)
+	defer slot.Release()
+	ctx, cancel := context.WithTimeout(testhelper.Context(t), 100*time.Millisecond)
+	defer cancel()
+	_, err = slot.Check(ctx, req)
+	require.ErrorContains(t, err, "resolver check stopped at the deadline of the check")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// TestNewShared: the resolver of the process carries the client, or why it cannot be built.
+func TestNewShared(t *testing.T) {
+	shared := NewShared(commandConfig([]string{"/bin/true"}))
+	require.NoError(t, shared.Err)
+	require.NotNil(t, shared.Client)
+
+	shared = NewShared(config.GraftResolver{Enabled: true, URL: "https://resolver.example/", TokenFile: filepath.Join(t.TempDir(), "gone")})
+	require.ErrorContains(t, shared.Err, "read token file")
+	require.Nil(t, shared.Client)
+
+	shared = NewShared(config.GraftResolver{})
+	require.NoError(t, shared.Err)
+	require.Nil(t, shared.Client, "resolution disabled")
+}

@@ -629,6 +629,20 @@ way.
     error. The pointer-line rule is in the server's validation (resolver.ConflictPointerPrefix), so
     clients of the SDK get it; the CLI keeps its earlier message.
 
+* **Re-review of fcf5f8d** (PM: fix first).
+  * The resolver client is built once per process (resolver.Shared in service.Dependencies, as the
+    land lanes are): its check slots bound the process across listeners, and a configuration that
+    cannot be built is one error. A server whose dependencies carry none builds its own.
+  * A panic can no longer lose a check slot or the precheck's quarantine: both are released by
+    defer (a test panics inside a batch and takes the only slot again).
+  * The pointer-line rule exempts a file whose conflict has a side with such a line of its own, in
+    Validate (sides from the request), on the server for agents' resolutions (the sides are read
+    only when the rule fires) and in the CLI.
+  * The precheck reads the branch as the lane does (ResolveRevision), so a branch that is a
+    symbolic reference is checked at its target's tip.
+  * A check request that runs out of the check's deadline says so; one that runs out of its own
+    timeout names the timeout.
+
 ## 13. Prompt first (PM and Federico, approved)
 
 Direction from Federico: the prompt first, then the models; adopt a structure that is already used
