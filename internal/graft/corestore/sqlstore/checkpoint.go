@@ -62,7 +62,11 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 			return err
 		}
 		if ok && newest.Seq > in.Seq {
-			return fmt.Errorf("storage core: checkpoint at changeset %d is older than the newest checkpoint at %d of repository %d", in.Seq, newest.Seq, repoID)
+			// A newer checkpoint (the background maintenance's, another node's)
+			// covers this one: it is returned, and this build's pack is an orphan
+			// that garbage collection reclaims.
+			cp = newest
+			return nil
 		}
 
 		if err := s.checkPackDeadline(ctx, tx, in.PackDeadline); err != nil {

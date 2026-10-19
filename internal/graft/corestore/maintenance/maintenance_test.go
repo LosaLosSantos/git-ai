@@ -24,6 +24,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gc"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/maintenance"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
@@ -223,6 +224,37 @@ func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
 	before := e.metric("graft_storage_maintenance_skipped_total", "nothing_due")
 	require.NoError(t, e.runner.RunOnce(ctx))
 	require.Equal(t, before+1, e.metric("graft_storage_maintenance_skipped_total", "nothing_due"))
+}
+
+// leaseExpiry returns the expiry of the repository's maintenance lease, which
+// holder must hold.
+func (e *env) leaseExpiry(holder string) time.Time {
+	e.t.Helper()
+	store := e.core.Meta.(*sqlstore.Store)
+	query := "SELECT holder, expires_at FROM graft_gc_leases WHERE repo_id = ?"
+	if store.Dialect() == sqlstore.Postgres {
+		query = "SELECT holder, expires_at FROM graft_gc_leases WHERE repo_id = $1"
+	}
+	var (
+		got string
+		raw any
+	)
+	require.NoError(e.t, store.DB().QueryRowContext(testhelper.Context(e.t), query, e.repo.ID).Scan(&got, &raw))
+	require.Equal(e.t, holder, got)
+	switch v := raw.(type) {
+	case time.Time:
+		return v
+	case string:
+		expiry, err := time.Parse(time.RFC3339Nano, v)
+		require.NoError(e.t, err)
+		return expiry
+	case []byte:
+		expiry, err := time.Parse(time.RFC3339Nano, string(v))
+		require.NoError(e.t, err)
+		return expiry
+	}
+	require.FailNow(e.t, "unexpected expiry type", "%T", raw)
+	return time.Time{}
 }
 
 // checkpoints returns the checkpoints of the repository.
@@ -434,33 +466,31 @@ func TestRunOnceStopsWhenTheLeaseIsLost(t *testing.T) {
 }
 
 // TestHoldLeaseRenewsUntilReleased verifies the lease the background
-// maintenance and the CollectGarbage request hold while they work: no other
-// holder takes it for several times its time to live, and it is free once
-// released.
+// maintenance and the CollectGarbage request hold while they work: the renewal
+// moves its expiry forward, the holder keeps it, and it is free once released.
+// The test waits for the renewal itself (the expiry in the database moving past
+// the one the acquisition set), not for a span of time, so it does not depend
+// on how fast the database writes on the host.
 func TestHoldLeaseRenewsUntilReleased(t *testing.T) {
 	t.Parallel()
 	ctx := testhelper.Context(t)
 	e := newEnv(t, coretest.Options{}, config3(0, 0))
-	// The renewal runs every third of the time to live, so a renewal delayed by
-	// up to two thirds of it (2 s) keeps the lease. Every renewal and every
-	// probe below is a database write transaction (SQLite: the write admission
-	// and an fsync), whose latency on a loaded host is what a shorter time to
-	// live would measure instead of the renewal. The probes are spaced for the
-	// same reason.
-	const ttl = 3 * time.Second
+	const ttl = 900 * time.Millisecond
 	const holder = "node-a/1/request-1"
 
 	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, holder, ttl)
 	require.NoError(t, err)
 	require.True(t, acquired)
+	first := e.leaseExpiry(holder)
 	var lost atomic.Bool
 	leaseCtx, release := maintenance.HoldLease(ctx, e.core, testhelper.NewLogger(t), e.repo.ID, holder, ttl, func() { lost.Store(true) })
 
-	require.Never(t, func() bool {
-		acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", ttl)
-		require.NoError(t, err)
-		return acquired
-	}, 5*ttl/2, ttl/6, "the lease is renewed")
+	for renewals := 0; renewals < 2; renewals++ {
+		previous := e.leaseExpiry(holder)
+		require.Eventually(t, func() bool { return e.leaseExpiry(holder).After(previous) },
+			30*time.Second, 10*time.Millisecond, "renewal %d moves the expiry forward", renewals+1)
+	}
+	require.True(t, e.leaseExpiry(holder).After(first))
 	require.NoError(t, leaseCtx.Err())
 	require.False(t, lost.Load())
 

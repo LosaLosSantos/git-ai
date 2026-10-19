@@ -216,7 +216,9 @@ func (s GraftStorage) validateGC() error {
 	}
 
 	if grace <= sync+margin {
-		return fmt.Errorf("graft storage: gc_grace %s must be greater than sync_timeout %s + gc_margin %s", grace, sync, margin)
+		return fmt.Errorf("graft storage: gc_grace %s must be greater than sync_timeout %s + gc_margin %s: "+
+			"raise gc_grace or lower sync_timeout (a rule since v0.3.0: a v0.2 configuration with sync_timeout of %s or more must set gc_grace)",
+			grace, sync, margin, DefaultGraftStorageGCGrace-DefaultGraftStorageGCMargin)
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package sqlstore_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +11,52 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 )
+
+// TestConcurrentCheckpointsOfOneSequence verifies that builds of the same
+// checkpoint racing each other (a CreateCheckpoint request and the background
+// maintenance, two nodes) all succeed: one records it, the others get it back
+// (integrated review m7). The record does not lock the repository row, so on
+// Postgres they meet at the primary key.
+func TestConcurrentCheckpointsOfOneSequence(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, ctx context.Context, s *sqlstore.Store) {
+		repo, _ := headRepo(t, ctx, s, "racing checkpoints", 1)
+		const builds = 6
+
+		type result struct {
+			cp      corestore.Checkpoint
+			created bool
+			err     error
+		}
+		start := make(chan struct{})
+		results := make(chan result, builds)
+		for i := 0; i < builds; i++ {
+			go func() {
+				<-start
+				cp, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
+					Seq: 1, Refs: map[string]corestore.Target{"refs/heads/main": oid(1)},
+					PackKey: ownedKey(repo.ID, fmt.Sprint("build ", i)), PackBytes: 1, PackDeadline: time.Now().Add(time.Hour),
+				})
+				results <- result{cp: cp, created: created, err: err}
+			}()
+		}
+		close(start)
+
+		var recorded []corestore.Checkpoint
+		created := 0
+		for i := 0; i < builds; i++ {
+			r := <-results
+			require.NoError(t, r.err)
+			if r.created {
+				created++
+			}
+			recorded = append(recorded, r.cp)
+		}
+		require.Equal(t, 1, created, "one build records the checkpoint")
+		for _, cp := range recorded {
+			require.Equal(t, recorded[0], cp, "every build gets the recorded checkpoint")
+		}
+	})
+}
 
 // TestCommitChecksThePackDeadlineOnTheDatabaseClock verifies the write
 // deadline of a pack in the commit transaction (integrated review m6). A

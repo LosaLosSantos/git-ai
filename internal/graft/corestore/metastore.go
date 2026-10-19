@@ -74,8 +74,8 @@ type InitialState struct {
 
 // CheckpointInput is the state MetaStore.CreateCheckpoint records.
 type CheckpointInput struct {
-	// Seq is the changeset sequence of the reference snapshot: 1..head sequence,
-	// greater than the newest checkpoint's.
+	// Seq is the changeset sequence of the reference snapshot: 1..head sequence.
+	// A newer checkpoint covers it (CreateCheckpoint returns that one).
 	Seq uint64
 	// Refs is the reference snapshot at Seq (every existing reference, HEAD
 	// included); it holds no absent value and is not empty.
@@ -181,13 +181,14 @@ type MetaStore interface {
 	UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, requireRoots bool) error
 
 	// CreateCheckpoint records a checkpoint and its reference snapshot in one
-	// transaction, with the database time as its creation time. Its first
-	// statement locks the repository row (doc/graft/PLAN7.md, LOCK ORDER). It
-	// requires Seq <= head sequence, Seq greater than the newest checkpoint's,
-	// an owned pack key of the repository and a valid snapshot, else an error and
-	// nothing is written. A checkpoint at Seq that exists already is returned
-	// unchanged with created false (its pack is kept; the caller's becomes an
-	// orphan). ErrRepositoryNotFound for an unknown repository.
+	// transaction, with the database time as its creation time. It does not lock
+	// the repository row (doc/graft/PLAN7.md, LOCK ORDER). It requires Seq <=
+	// head sequence, an owned pack key of the repository, a valid snapshot and
+	// the pack's write deadline not reached on the database clock, else an error
+	// and nothing is written. A checkpoint that covers the request (one at Seq,
+	// or a newer one) is returned unchanged with created false: its pack is
+	// kept, and the caller's becomes an orphan. ErrRepositoryNotFound for an
+	// unknown repository.
 	CreateCheckpoint(ctx context.Context, repoID int64, in CheckpointInput) (cp Checkpoint, created bool, err error)
 	// NewestCheckpoint returns the checkpoint with the greatest sequence; ok is
 	// false when the repository has none.

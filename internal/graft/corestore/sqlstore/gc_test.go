@@ -197,16 +197,24 @@ func TestCheckpointLifecycle(t *testing.T) {
 		require.False(t, created)
 		require.Equal(t, cp, again)
 
+		// An older build is covered by the newest checkpoint, which it gets back
+		// (a request that lost the race against the background maintenance).
+		older, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
+			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "older build"), PackDeadline: time.Now().Add(time.Hour),
+		})
+		require.NoError(t, err)
+		require.False(t, created)
+		require.Equal(t, cp, older)
+
 		for name, bad := range map[string]corestore.CheckpointInput{
-			"sequence 0":            {Seq: 0, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"beyond the head":       {Seq: 4, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"older than the newest": {Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"legacy pack key":       {Seq: 3, Refs: refs, PackKey: legacyKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"another repository":    {Seq: 3, Refs: refs, PackKey: ownedKey(repo.ID+1000, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"no pack key":           {Seq: 3, Refs: refs},
-			"no references":         {Seq: 3, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"absent target":         {Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": ""}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
-			"empty name":            {Seq: 3, Refs: map[string]corestore.Target{"": oid(1)}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"sequence 0":         {Seq: 0, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"beyond the head":    {Seq: 4, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"legacy pack key":    {Seq: 3, Refs: refs, PackKey: legacyKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"another repository": {Seq: 3, Refs: refs, PackKey: ownedKey(repo.ID+1000, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"no pack key":        {Seq: 3, Refs: refs},
+			"no references":      {Seq: 3, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"absent target":      {Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": ""}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"empty name":         {Seq: 3, Refs: map[string]corestore.Target{"": oid(1)}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
 		} {
 			_, _, err := s.CreateCheckpoint(ctx, repo.ID, bad)
 			require.Error(t, err, name)
