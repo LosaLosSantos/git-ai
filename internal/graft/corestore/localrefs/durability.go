@@ -78,6 +78,14 @@ const (
 	crashExitCode    = 75
 )
 
+// staleGitFileAge is the age past which a git lock or temporary file of a
+// reftable stack belongs to a git process that died: Gitaly's housekeeping
+// removes such a lock (housekeeping.ReftableLockfileGracePeriod, the same
+// value), and no git process holds a stack's lock for that long. Such a file is
+// not git activity, and the durable step removes a stale lock of the list as
+// housekeeping would, so that it never keeps a marker forever.
+const staleGitFileAge = time.Hour
+
 // stackLockTag starts the content of the reference lock the durable step
 // takes, followed by a random nonce of that lock. git never writes it (a lock
 // of git holds table names), so a lock with this tag found by a new owner was
@@ -645,17 +653,15 @@ func (d *Durability) Settle(path string, final bool) error {
 	due := st.nLive == 0 && (final || time.Since(st.lastWrite) >= d.idle)
 	d.mu.Unlock()
 
-	exists := true
-	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
-		exists = false
-	} else if err != nil {
-		return fmt.Errorf("stat the repository: %w", err)
+	stack, err := hasStack(path)
+	if err != nil {
+		return err
 	}
-	if !dirty || !exists {
-		// A repository that is gone has no stack; a clean state only leaves the
-		// map. A transaction that marked an existing repository meanwhile leaves
-		// it to the next step, under git's reference lock (dropMarker refuses
-		// otherwise).
+	if !dirty || !stack {
+		// A repository without a stack (gone, or not reftable) has nothing to
+		// make durable; a clean state only leaves the map. A transaction that
+		// marked a repository with a stack meanwhile leaves it to the next step,
+		// under git's reference lock (dropMarker refuses otherwise).
 		st := d.lockState(path)
 		defer st.file.Unlock()
 		_, err := d.dropMarker(path, st, false)
@@ -710,12 +716,13 @@ func (d *Durability) settleLocked(path string, repo RepoRef) error {
 //   - no git process of this process that writes the references without fsync
 //     is live (nLive);
 //   - the repository is not untrusted;
-//   - when the repository exists, the caller holds git's reference lock
-//     (ownLock) and made the stack durable under it (settleLocked): no git
-//     process can write meanwhile, and the ones that exited before are in what
-//     was made durable. A repository that does not exist has no stack, and a
-//     git process cannot write it (the caller holds the syncer's repository
-//     lock, so it is not hydrated meanwhile);
+//   - when the repository has a reftable stack, the caller holds git's
+//     reference lock (ownLock) and made the stack durable under it
+//     (settleLocked): no git process can write meanwhile, and the ones that
+//     exited before are in what was made durable. A repository without one
+//     (gone, or not reftable: hasStack) has nothing written without fsync, and
+//     none is created meanwhile (the caller holds the syncer's repository lock,
+//     so it is not hydrated meanwhile);
 //   - no git process writes the stack now (gitActive: a git lock or a table
 //     being written; seeing one also pushes settleAfter a recovery grace
 //     forward), and settleAfter has passed.
@@ -727,18 +734,13 @@ func (d *Durability) settleLocked(path string, repo RepoRef) error {
 // trusted leaves the map, so that the states do not grow with every repository
 // ever written.
 func (d *Durability) dropMarker(path string, st *refState, ownLock bool) (bool, error) {
-	exists := true
-	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
-		exists = false
-	} else if err != nil {
-		return false, fmt.Errorf("stat the repository: %w", err)
+	stack, err := hasStack(path)
+	if err != nil {
+		return false, err
 	}
-	active := false
-	if exists {
-		var err error
-		if active, err = gitActive(path, ownLock); err != nil {
-			return false, err
-		}
+	active, err := gitActive(path, ownLock)
+	if err != nil {
+		return false, err
 	}
 
 	d.mu.Lock()
@@ -748,7 +750,7 @@ func (d *Durability) dropMarker(path string, st *refState, ownLock bool) (bool, 
 			st.settleAfter = until
 		}
 	}
-	safe := st.dirty && st.nLive == 0 && st.untrusted == nil && (ownLock || !exists) && !active && !now.Before(st.settleAfter)
+	safe := st.dirty && st.nLive == 0 && st.untrusted == nil && (ownLock || !stack) && !active && !now.Before(st.settleAfter)
 	if safe {
 		st.dirty = false
 		d.dirty.Dec()
@@ -818,7 +820,8 @@ func (d *Durability) stepErrorLocked(st *refState, repo RepoRef, path string, er
 // the repository at path: git's lock of the list (unless ownLock: the caller
 // holds it), a lock of a table being compacted, or a table being written is
 // there (the names of git's reftable/stack.c). A repository without a reftable
-// directory has no stack to write.
+// directory has no stack to write. A file older than staleGitFileAge is left by
+// a git process that died, not activity.
 func gitActive(path string, ownLock bool) (bool, error) {
 	entries, err := os.ReadDir(filepath.Join(path, "reftable"))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -832,11 +835,38 @@ func gitActive(path string, ownLock bool) (bool, error) {
 		if ownLock && name == "tables.list.lock" {
 			continue
 		}
-		if strings.HasSuffix(name, ".lock") || strings.Contains(name, ".temp.") {
+		if !strings.HasSuffix(name, ".lock") && !strings.Contains(name, ".temp.") {
+			continue
+		}
+		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			// Gone since the listing: the git process finished with it.
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("stat %q: %w", name, err)
+		}
+		if time.Since(info.ModTime()) < staleGitFileAge {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// hasStack reports whether the repository at path has a reftable stack: its
+// reftable directory. A repository that is gone, or one without the reftable
+// backend (a files-backend copy being imported), has none, so nothing of it is
+// written without fsync and nothing needs to be made durable. A reftable
+// directory whose table list cannot be read is a stack all the same (git
+// replaces the list by a rename, so it never lacks one): making it durable
+// fails, and the marker stays.
+func hasStack(path string) (bool, error) {
+	if _, err := os.Lstat(filepath.Join(path, "reftable")); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("stat the reftable directory: %w", err)
+	}
+	return true, nil
 }
 
 // stackLock is git's reference lock of a repository, taken by the durable
@@ -881,13 +911,45 @@ func lockStack(path string) (*stackLock, bool, error) {
 		return nil, false, fmt.Errorf("take the reference lock: %w", err)
 	}
 
-	if err := os.Link(tmp.Name(), lockPath); err != nil {
-		if errors.Is(err, fs.ErrExist) {
+	for attempt := 0; ; attempt++ {
+		err := os.Link(tmp.Name(), lockPath)
+		if err == nil {
+			return &stackLock{path: lockPath, content: content, info: info}, true, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, false, fmt.Errorf("take the reference lock: %w", err)
+		}
+		if attempt > 0 {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("take the reference lock: %w", err)
+		stale, err := removeStaleGitLock(lockPath)
+		if err != nil {
+			return nil, false, err
+		}
+		if !stale {
+			return nil, false, nil
+		}
 	}
-	return &stackLock{path: lockPath, content: content, info: info}, true, nil
+}
+
+// removeStaleGitLock removes the lock of a stack's table list when it is older
+// than staleGitFileAge: a git process that died left it, and Gitaly's
+// housekeeping would remove it by the same rule. It reports whether it did.
+func removeStaleGitLock(lockPath string) (bool, error) {
+	info, err := os.Lstat(lockPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("stat the reference lock: %w", err)
+	}
+	if time.Since(info.ModTime()) < staleGitFileAge {
+		return false, nil
+	}
+	if err := os.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, fmt.Errorf("remove a stale reference lock: %w", err)
+	}
+	return true, nil
 }
 
 // release removes the lock if it is still the one the step created (same file,
@@ -1089,10 +1151,12 @@ func (d *Durability) Forget(ctx context.Context, repo RepoRef, path string) erro
 // durable step does; when the lock is busy the marker stays for the next step.
 // The caller holds the state's file lock.
 func (d *Durability) forgetLocked(path string, st *refState, repo RepoRef) (bool, error) {
-	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+	stack, err := hasStack(path)
+	if err != nil {
+		return false, err
+	}
+	if !stack {
 		return d.dropMarker(path, st, false)
-	} else if err != nil {
-		return false, fmt.Errorf("stat the repository: %w", err)
 	}
 
 	lock, ok, err := lockStack(path)

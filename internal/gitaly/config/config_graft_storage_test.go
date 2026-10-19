@@ -40,11 +40,13 @@ func TestGraftStorageValidate(t *testing.T) {
 		{desc: "bad gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCMargin: "0"}, err: "gc_margin"},
 		{desc: "gc_grace not above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "6m", GCMargin: "5m", SyncTimeout: "1m"}, err: "gc_grace 6m0s must be greater than sync_timeout 1m0s + gc_margin 5m0s"},
 		{desc: "gc_grace just above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "361s", GCMargin: "5m", SyncTimeout: "1m"}},
-		{desc: "maintenance auto in authoritative mode", storage: GraftStorage{Mode: "authoritative", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "auto", MaintenanceInterval: "15m", LeaseTTL: "2m", CheckpointChangesets: ptr[uint64](0), CheckpointPackBytes: ptr[int64](0)}, standalone: true},
-		{desc: "maintenance off", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "off"}},
-		{desc: "maintenance auto in shadow mode", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "auto"}, err: `maintenance = "auto" requires mode = "authoritative"`},
-		{desc: "maintenance auto with the storage core off", storage: GraftStorage{Maintenance: "auto"}, err: `requires mode = "authoritative"`},
-		{desc: "unknown maintenance", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "nightly"}, err: "unknown maintenance"},
+		{desc: "checkpoints and gc auto in authoritative mode", storage: GraftStorage{Mode: "authoritative", Database: valid.Database, Bucket: valid.Bucket, Checkpoints: "auto", GC: "auto", MaintenanceInterval: "15m", LeaseTTL: "2m", CheckpointChangesets: ptr[uint64](0), CheckpointPackBytes: ptr[int64](0)}, standalone: true},
+		{desc: "checkpoints and gc off", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Checkpoints: "off", GC: "off"}},
+		{desc: "checkpoints auto in shadow mode", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Checkpoints: "auto"}, err: `checkpoints = "auto" requires mode = "authoritative"`},
+		{desc: "gc auto in shadow mode", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GC: "auto"}, err: `gc = "auto" requires mode = "authoritative"`},
+		{desc: "gc auto with the storage core off", storage: GraftStorage{GC: "auto"}, err: `requires mode = "authoritative"`},
+		{desc: "unknown checkpoints", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Checkpoints: "nightly"}, err: "unknown checkpoints"},
+		{desc: "unknown gc", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GC: "yes"}, err: "unknown gc"},
 		{desc: "bad maintenance interval", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, MaintenanceInterval: "0s"}, err: "maintenance_interval"},
 		{desc: "bad lease ttl", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, LeaseTTL: "never"}, err: "lease_ttl"},
 		{desc: "negative checkpoint pack bytes", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, CheckpointPackBytes: ptr[int64](-1)}, err: "checkpoint_pack_bytes"},
@@ -85,7 +87,7 @@ func TestGraftStorageDefaults(t *testing.T) {
 	require.Equal(t, DefaultGraftStorageGCMargin, margin)
 	require.NoError(t, s.validateGC(), "the defaults are consistent")
 
-	require.False(t, s.MaintenanceAuto(), "the background maintenance is off by default")
+	require.False(t, s.MaintenanceAuto(), "the background maintenance is off with the storage core off")
 	interval, err := s.MaintenanceIntervalOrDefault()
 	require.NoError(t, err)
 	require.Equal(t, DefaultGraftStorageMaintenanceInterval, interval)
@@ -100,6 +102,19 @@ func TestGraftStorageDefaults(t *testing.T) {
 	sync, err = s.SyncTimeoutOrDefault()
 	require.NoError(t, err)
 	require.Equal(t, 250*time.Millisecond, sync)
+	require.False(t, s.MaintenanceAuto(), "no checkpoints outside authoritative mode")
+
+	// Authoritative mode checkpoints by default (checkpoints delete nothing);
+	// the garbage collection, which deletes, is opt-in.
+	s = GraftStorage{Mode: "authoritative"}
+	require.True(t, s.CheckpointsAuto())
+	require.False(t, s.GCAuto())
+	require.True(t, s.MaintenanceAuto())
+	s.Checkpoints = "off"
+	require.False(t, s.MaintenanceAuto())
+	s.GC = "auto"
+	require.True(t, s.GCAuto())
+	require.True(t, s.MaintenanceAuto())
 }
 
 // TestGraftStorageMaintenanceFromTOML checks that a threshold set to 0 in the
@@ -110,7 +125,7 @@ func TestGraftStorageMaintenanceFromTOML(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
 [graft.storage]
 mode = "authoritative"
-maintenance = "auto"
+gc = "auto"
 maintenance_interval = "30m"
 checkpoint_changesets = 0
 checkpoint_pack_bytes = 1048576
@@ -119,7 +134,8 @@ lease_ttl = "3m"
 	require.NoError(t, err)
 
 	s := cfg.Graft.Storage
-	require.True(t, s.MaintenanceAuto())
+	require.True(t, s.CheckpointsAuto())
+	require.True(t, s.GCAuto())
 	require.Equal(t, uint64(0), s.CheckpointChangesetsOrDefault())
 	require.Equal(t, int64(1<<20), s.CheckpointPackBytesOrDefault())
 	interval, err := s.MaintenanceIntervalOrDefault()

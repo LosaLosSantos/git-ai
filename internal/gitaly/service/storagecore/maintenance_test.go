@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +15,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
@@ -209,6 +214,38 @@ func TestStorageCoreRejectsReservedRelativePaths(t *testing.T) {
 		require.Equal(t, codes.InvalidArgument, status.Code(err), "%s: %v", name, err)
 		require.ErrorContains(t, err, "Gitaly's data directory", name)
 	}
+}
+
+// TestImportRefusesAnUntrustedRepository verifies that ImportRepository, which
+// the gate does not see, never makes a local copy whose references may have
+// lost writes the database's truth.
+func TestImportRefusesAnUntrustedRepository(t *testing.T) {
+	t.Parallel()
+
+	h := setup(t, corestore.ModeAuthoritative, sqlstore.SQLite)
+	ref := localrefs.RepoRef{Storage: h.repo.GetStorageName(), RelativePath: h.repo.GetRelativePath()}
+
+	// A marker that records a failed fsync, as a durable step of the previous
+	// process left it; this process recovers it.
+	coretest.EnableLocalRefs(t, h.core, h.cfg)
+	require.NoError(t, h.core.RefDurability.MarkDirty(h.ctx, ref, h.repoPath))
+	markers, err := filepath.Glob(filepath.Join(h.cfg.Storages[0].Path, localrefs.MarkerDirName, "*.json"))
+	require.NoError(t, err)
+	require.Len(t, markers, 1)
+	content, err := os.ReadFile(markers[0])
+	require.NoError(t, err)
+	content = []byte(strings.Replace(string(content), "}", `,"untrusted":"fsync: input/output error"}`, 1))
+	require.NoError(t, os.WriteFile(markers[0], content, 0o600))
+
+	coretest.EnableLocalRefs(t, h.core, h.cfg)
+	_, err = h.core.RefDurability.Recover(h.ctx, []string{h.repo.GetStorageName()})
+	require.NoError(t, err)
+	require.True(t, h.core.RefDurability.Untrusted(h.repoPath))
+
+	_, err = h.client.ImportRepository(h.ctx, &gitalypb.ImportRepositoryRequest{Repository: h.repo})
+	require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+	_, err = h.core.Meta.GetRepository(h.ctx, corestore.KeyOf(h.repo))
+	require.ErrorIs(t, err, corestore.ErrRepositoryNotFound, "nothing was imported")
 }
 
 // packKeys returns the objects of the repository in the bucket.

@@ -1,15 +1,17 @@
 // Package maintenance runs the background checkpoints and garbage collection
-// of the storage core (doc/graft/PLAN7.md, "Background maintenance"). It is
-// off by default and runs in authoritative mode only; the graft storage
-// commands do the same work on demand.
+// of the storage core (doc/graft/PLAN7.md, "Background maintenance"), in
+// authoritative mode only. The checkpoints run by default, since they delete
+// nothing and keep the hydrations short; the garbage collection, which deletes,
+// is opt-in. The graft storage commands do the same work on demand.
 //
-// Every interval it collects the removed repositories of the node's storages,
-// then, for every repository of those storages that this node has a current
-// local copy of, it takes the repository's maintenance lease (skipping a
-// repository whose lease another process holds), checkpoints the repository
-// when enough changesets or pack bytes follow its newest checkpoint, and
-// collects its dead packs. The lease only keeps two nodes from doing the same
-// work at once: the checkpoint and the collector are correct without it.
+// Every interval it collects the removed repositories of the node's storages
+// (with Collect), then, for every repository of those storages that this node
+// has a current local copy of, it takes the repository's maintenance lease
+// (skipping a repository whose lease another process holds), checkpoints the
+// repository when enough changesets or pack bytes follow its newest checkpoint
+// (with Checkpoints), and collects its dead packs (with Collect). The lease
+// only keeps two nodes from doing the same work at once: the checkpoint and the
+// collector are correct without it.
 package maintenance
 
 import (
@@ -49,6 +51,13 @@ const (
 type Config struct {
 	// Interval is the time between two runs.
 	Interval time.Duration
+	// Checkpoints makes the runs checkpoint the repositories (by the thresholds
+	// below). Checkpoints delete nothing.
+	Checkpoints bool
+	// Collect makes the runs collect garbage: the dead packs of the
+	// repositories and the objects of the removed ones. It deletes data, so it
+	// is configured on its own.
+	Collect bool
 	// CheckpointChangesets checkpoints a repository once this many changesets
 	// follow its newest checkpoint; 0 never checkpoints by count.
 	CheckpointChangesets uint64
@@ -186,6 +195,9 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 	}
 
 	for _, storageName := range r.storages {
+		if !r.cfg.Collect {
+			break
+		}
 		report, err := r.collector.CollectRemoved(ctx, storageName, false)
 		if err != nil {
 			fail(stepCollectRemoved, err, log.Fields{"storage": storageName})
@@ -264,6 +276,9 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 		}
 	}
 
+	if !r.cfg.Collect {
+		return "", nil
+	}
 	report, err := r.collector.CollectRepository(leaseCtx, record.ID, false)
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return "", nil
@@ -323,7 +338,7 @@ func HoldLease(ctx context.Context, core *corestore.Core, logger log.Logger, rep
 // checkpointDue reports whether the repository needs a checkpoint: enough
 // changesets, or enough pack bytes, follow its newest checkpoint.
 func (r *Runner) checkpointDue(ctx context.Context, record corestore.Repository) (bool, error) {
-	if r.cfg.CheckpointChangesets == 0 && r.cfg.CheckpointPackBytes == 0 {
+	if !r.cfg.Checkpoints || (r.cfg.CheckpointChangesets == 0 && r.cfg.CheckpointPackBytes == 0) {
 		return false, nil
 	}
 

@@ -169,8 +169,53 @@ func (e *env) metric(name, label string) float64 {
 	return 0
 }
 
+// config3 is a configuration with the checkpoints and the garbage collection
+// on, and the given checkpoint thresholds.
 func config3(changesets uint64, packBytes int64) maintenance.Config {
-	return maintenance.Config{Interval: time.Hour, CheckpointChangesets: changesets, CheckpointPackBytes: packBytes, LeaseTTL: time.Minute}
+	return maintenance.Config{Interval: time.Hour, Checkpoints: true, Collect: true, CheckpointChangesets: changesets, CheckpointPackBytes: packBytes, LeaseTTL: time.Minute}
+}
+
+// TestRunOnceDoesOnlyWhatIsOn verifies that the checkpoints and the garbage
+// collection are configured apart: checkpoints alone delete nothing, and the
+// collection alone creates no checkpoint.
+func TestRunOnceDoesOnlyWhatIsOn(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	orphan := func(e *env) string {
+		content := []byte("an orphan pack")
+		key := corestore.NewPackKey(e.repo.ID, sha256.Sum256(content))
+		require.NoError(t, e.core.Blobs.Put(ctx, key, bytes.NewReader(content)))
+		return key
+	}
+	opts := coretest.Options{GCGrace: 200 * time.Millisecond, GCMargin: 50 * time.Millisecond}
+
+	checkpointsOnly := config3(1, 0)
+	checkpointsOnly.Collect = false
+	e := newEnv(t, opts, checkpointsOnly)
+	e.fresh()
+	key := orphan(e)
+	require.Never(t, func() bool {
+		require.NoError(t, e.runner.RunOnce(ctx))
+		exists, err := e.core.Blobs.Exists(ctx, key)
+		require.NoError(t, err)
+		return !exists
+	}, time.Second, 100*time.Millisecond, "checkpoints alone delete nothing")
+	_, ok := e.newestCheckpoint()
+	require.True(t, ok)
+
+	collectOnly := config3(1, 0)
+	collectOnly.Checkpoints = false
+	e = newEnv(t, opts, collectOnly)
+	e.fresh()
+	key = orphan(e)
+	require.Eventually(t, func() bool {
+		require.NoError(t, e.runner.RunOnce(ctx))
+		exists, err := e.core.Blobs.Exists(ctx, key)
+		require.NoError(t, err)
+		return !exists
+	}, 30*time.Second, 100*time.Millisecond)
+	_, ok = e.newestCheckpoint()
+	require.False(t, ok, "the collection alone creates no checkpoint")
 }
 
 func TestRunOnceCheckpointsAfterEnoughChangesets(t *testing.T) {
@@ -338,7 +383,13 @@ func TestHoldLeaseRenewsUntilReleased(t *testing.T) {
 	t.Parallel()
 	ctx := testhelper.Context(t)
 	e := newEnv(t, coretest.Options{}, config3(0, 0))
-	const ttl = 300 * time.Millisecond
+	// The renewal runs every third of the time to live, so a renewal delayed by
+	// up to two thirds of it (2 s) keeps the lease. Every renewal and every
+	// probe below is a database write transaction (SQLite: the write admission
+	// and an fsync), whose latency on a loaded host is what a shorter time to
+	// live would measure instead of the renewal. The probes are spaced for the
+	// same reason.
+	const ttl = 3 * time.Second
 	const holder = "node-a/1/request-1"
 
 	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, holder, ttl)
@@ -351,7 +402,7 @@ func TestHoldLeaseRenewsUntilReleased(t *testing.T) {
 		acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", ttl)
 		require.NoError(t, err)
 		return acquired
-	}, 5*ttl, ttl/10, "the lease is renewed")
+	}, 5*ttl/2, ttl/6, "the lease is renewed")
 	require.NoError(t, leaseCtx.Err())
 	require.False(t, lost.Load())
 

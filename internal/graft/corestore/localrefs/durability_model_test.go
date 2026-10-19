@@ -12,6 +12,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/housekeeping"
 )
 
 // TestMarkerLifecycleModel drives random interleavings of everything that
@@ -165,6 +169,72 @@ func TestGitActivityPushesTheGraceForward(t *testing.T) {
 	next.mu.Lock()
 	require.True(t, next.repos[f.path].settleAfter.After(before.Add(time.Hour-time.Minute)))
 	next.mu.Unlock()
+}
+
+// TestStaleGitLockDoesNotPinTheMarker verifies git's lock files left by a git
+// process that died: a lock of the table list or a temporary table older than
+// housekeeping's grace is not activity, and the durable step removes such a
+// list lock as housekeeping would, takes its own and settles. A younger one
+// keeps the marker.
+func TestStaleGitLockDoesNotPinTheMarker(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, housekeeping.ReftableLockfileGracePeriod, staleGitFileAge, "the rule of Gitaly's housekeeping")
+
+	f := setupDurability(t)
+	d := f.durability(t, "boot-a", 0)
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+
+	lock := filepath.Join(f.path, "reftable", "tables.list.lock")
+	temp := filepath.Join(f.path, "reftable", "0x000000000009-0x000000000009-abcdef01.ref.temp.XyZ123")
+	for _, file := range []string{lock, temp} {
+		require.NoError(t, os.WriteFile(file, nil, 0o666))
+	}
+	require.NoError(t, d.Settle(f.path, true))
+	require.FileExists(t, f.markerPath(t, d), "a git process may hold them")
+
+	old := time.Now().Add(-staleGitFileAge - time.Minute)
+	for _, file := range []string{lock, temp} {
+		require.NoError(t, os.Chtimes(file, old, old))
+	}
+	require.NoError(t, d.Settle(f.path, true))
+	require.NoFileExists(t, f.markerPath(t, d))
+	require.NoFileExists(t, lock, "removed as housekeeping would, and the step's own released")
+}
+
+// TestRepositoryWithoutAStackHasNothingToMakeDurable verifies a repository
+// that is not reftable (a files-backend copy being imported at the path): it
+// has no stack, so its marker is settled and handed over without one, and the
+// recovery of a kernel restart does not fail on it.
+func TestRepositoryWithoutAStackHasNothingToMakeDurable(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	ctx := f.ctx
+	pb, path := gittest.CreateRepository(t, ctx, f.cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+		ReferenceBackend:       git.ReferenceBackendFiles,
+	})
+	repo := RepoRef{Storage: pb.GetStorageName(), RelativePath: pb.GetRelativePath()}
+	markerPath := func(d *Durability) string {
+		p, err := d.markerPath(ctx, repo, path)
+		require.NoError(t, err)
+		return p
+	}
+
+	d := f.durability(t, "boot-a", 0)
+	require.NoError(t, d.MarkDirty(ctx, repo, path))
+	require.NoError(t, d.Settle(path, false))
+	require.NoFileExists(t, markerPath(d))
+
+	require.NoError(t, d.MarkDirty(ctx, repo, path))
+	require.NoError(t, d.Close())
+	next := f.durability(t, "boot-b", 0)
+	found, err := next.Recover(ctx, []string{repo.Storage})
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	require.True(t, found[0].Reboot)
+	require.NoError(t, next.Forget(ctx, repo, path), "kept in place: not a cache of the storage core")
+	require.NoFileExists(t, markerPath(next))
+	require.Empty(t, next.Tracked())
 }
 
 // modelProc is a git process of the model.

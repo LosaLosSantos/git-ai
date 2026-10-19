@@ -472,7 +472,8 @@ func TestStorageLocalReferencesDuringAGracefulUpgrade(t *testing.T) {
 }
 
 // TestStorageBackgroundMaintenanceCheckpoints runs the real server with the
-// background maintenance on (doc/graft/PLAN7.md, "Background maintenance"): a
+// default background maintenance of authoritative mode (doc/graft/PLAN7.md,
+// "Background maintenance": checkpoints on, garbage collection off): a
 // repository that gets enough changesets is checkpointed without a request,
 // and keeps serving every write.
 func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
@@ -480,7 +481,6 @@ func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
 
 	changesets := uint64(2)
 	n := newRealNode(t, func(s *config.GraftStorage) {
-		s.Maintenance = config.GraftStorageMaintenanceAuto
 		s.MaintenanceInterval = "1s"
 		s.CheckpointChangesets = &changesets
 	})

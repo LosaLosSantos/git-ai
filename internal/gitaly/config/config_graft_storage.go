@@ -40,13 +40,20 @@ type GraftStorage struct {
 	// Empty means DefaultGraftStorageGCMargin. See doc/graft/STORAGE.md for the
 	// clock assumption it covers.
 	GCMargin string `json:"gc_margin" toml:"gc_margin,omitempty"`
-	// Maintenance is "off" (the default, also when empty) or "auto": the
-	// background checkpoints and garbage collection of the storage core, in
-	// authoritative mode only (doc/graft/PLAN7.md, "Background maintenance").
+	// Checkpoints is "auto" or "off": the background checkpoints of the storage
+	// core (doc/graft/PLAN7.md, "Background maintenance"). Empty means "auto" in
+	// authoritative mode, where checkpoints exist, and "off" otherwise. A
+	// checkpoint deletes nothing (it adds a pack and rows), and without one a
+	// fresh node replays every changeset of a repository.
+	Checkpoints string `json:"checkpoints" toml:"checkpoints,omitempty"`
+	// GC is "off" (the default, also when empty) or "auto": the background
+	// garbage collection, which deletes packs of the bucket. Opt-in, since it is
+	// the one operation that destroys data. "auto" requires authoritative mode.
 	// The graft storage commands work in either case.
-	Maintenance string `json:"maintenance" toml:"maintenance,omitempty"`
-	// MaintenanceInterval is how often the background maintenance runs (Go
-	// duration). Empty means DefaultGraftStorageMaintenanceInterval.
+	GC string `json:"gc" toml:"gc,omitempty"`
+	// MaintenanceInterval is how often the background checkpoints and garbage
+	// collection run (Go duration). Empty means
+	// DefaultGraftStorageMaintenanceInterval.
 	MaintenanceInterval string `json:"maintenance_interval" toml:"maintenance_interval,omitempty"`
 	// CheckpointChangesets makes the maintenance checkpoint a repository once
 	// this many changesets follow its newest checkpoint; 0 never checkpoints by
@@ -63,7 +70,7 @@ type GraftStorage struct {
 	LeaseTTL string `json:"lease_ttl" toml:"lease_ttl,omitempty"`
 }
 
-// Values of GraftStorage.Maintenance.
+// Values of GraftStorage.Checkpoints and GraftStorage.GC.
 const (
 	GraftStorageMaintenanceOff  = "off"
 	GraftStorageMaintenanceAuto = "auto"
@@ -83,8 +90,24 @@ const (
 	DefaultGraftStorageLeaseTTL = 10 * time.Minute
 )
 
-// MaintenanceAuto reports whether the background maintenance runs.
-func (s GraftStorage) MaintenanceAuto() bool { return s.Maintenance == GraftStorageMaintenanceAuto }
+// CheckpointsAuto reports whether the background checkpoints run: "auto", or
+// unset in authoritative mode.
+func (s GraftStorage) CheckpointsAuto() bool {
+	switch s.Checkpoints {
+	case GraftStorageMaintenanceAuto:
+		return true
+	case "":
+		return s.Mode == "authoritative"
+	}
+	return false
+}
+
+// GCAuto reports whether the background garbage collection runs.
+func (s GraftStorage) GCAuto() bool { return s.GC == GraftStorageMaintenanceAuto }
+
+// MaintenanceAuto reports whether the background maintenance runs: its
+// checkpoints, its garbage collection, or both.
+func (s GraftStorage) MaintenanceAuto() bool { return s.CheckpointsAuto() || s.GCAuto() }
 
 // MaintenanceIntervalOrDefault parses MaintenanceInterval, applying the default.
 func (s GraftStorage) MaintenanceIntervalOrDefault() (time.Duration, error) {
@@ -116,14 +139,16 @@ func (s GraftStorage) CheckpointPackBytesOrDefault() int64 {
 
 // validateMaintenance checks the background maintenance settings.
 func (s GraftStorage) validateMaintenance() error {
-	switch s.Maintenance {
-	case "", GraftStorageMaintenanceOff:
-	case GraftStorageMaintenanceAuto:
-		if s.Mode != "authoritative" {
-			return fmt.Errorf("graft storage: maintenance = %q requires mode = \"authoritative\" (checkpoints exist in authoritative mode only)", s.Maintenance)
+	for _, setting := range []struct{ name, value string }{{"checkpoints", s.Checkpoints}, {"gc", s.GC}} {
+		switch setting.value {
+		case "", GraftStorageMaintenanceOff:
+		case GraftStorageMaintenanceAuto:
+			if s.Mode != "authoritative" {
+				return fmt.Errorf("graft storage: %s = %q requires mode = \"authoritative\" (the background maintenance runs in authoritative mode only)", setting.name, setting.value)
+			}
+		default:
+			return fmt.Errorf("graft storage: unknown %s %q (want off or auto)", setting.name, setting.value)
 		}
-	default:
-		return fmt.Errorf("graft storage: unknown maintenance %q (want off or auto)", s.Maintenance)
 	}
 
 	if _, err := s.MaintenanceIntervalOrDefault(); err != nil {

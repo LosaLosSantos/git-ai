@@ -804,6 +804,33 @@ repository-wide lock.
       `TestDropMarkerGuards`. The conditions: live processes, git's lock, git
       activity, untrusted, the plain-marker rewrite, the missing-path removal,
       the recovered untrusted record, the reboot distrust.
+    * Known limits of the model, each covered elsewhere:
+      * the grace floor is 0 in the model, so time does not decide
+        (`TestGitActivityPushesTheGraceForward`, and the recovery tests);
+      * the syncer's own writer, which marks the repository under the
+        repository lock, is not modelled (the syncer tests);
+      * auto-compaction is not a separate step: it holds git's lock and
+        temporary tables, which `gitActive` sees (`TestRecoveredMarkerWaitsForGit`);
+      * the steps are sequential: what git's reference lock excludes is the
+        `ownLock` guard (`TestDropMarkerGuards`).
+* Fifth review (of 70d4a2b): no blocker, no major. Minors:
+  * A repository without a reftable stack (gone, or a files-backend copy being
+    imported) has nothing written without fsync (`hasStack`). Settle, Forget and
+    `dropMarker` treat it so, and the recovery never fails on one
+    (`TestRepositoryWithoutAStackHasNothingToMakeDurable`).
+  * Lock and temporary files of a stack older than an hour, the grace of
+    Gitaly's housekeeping (`ReftableLockfileGracePeriod`), are left by a git
+    process that died. They are not activity, and the durable step removes such
+    a list lock as housekeeping would, so a crash cannot pin a marker
+    (`TestStaleGitLockDoesNotPinTheMarker`).
+  * `ImportRepository` (passthrough) refuses an untrusted repository
+    (`TestImportRefusesAnUntrustedRepository`). The other passthrough RPCs:
+    * `VerifyRepository` and `CreateCheckpoint` run `EnsureFresh`, which
+      refuses;
+    * `GetStorageState`, `CollectGarbage` and `CollectRemovedRepositories`
+      read no local references;
+    * the hook RPCs run inside a write that the gate admitted.
+  * STORAGE.md: "never served" means from the next request on.
 
 **Tests.**
 * `localrefs`:
@@ -1423,6 +1450,57 @@ wm.Seq < C_sync`; otherwise it catches up as in phase 6 (the WP55 RULE unchanged
 * `TestSyncerRoundBoundedBySyncTimeout` shows that a bucket read is cancelled by
   the round's deadline and nothing is installed.
 
+### Resumable rounds and the per-pack unit (after WP79's benchmark, approved by the PM)
+
+The WP79 benchmark found that a hydration was one round, all or nothing,
+within `sync_timeout`. At the default 10 s, a fresh node could not hydrate a
+repository of about 1100 changesets with no checkpoint: every round started
+from zero. Two root causes, both fixed. The bound itself stays: the GC BOUNDARY
+rule needs every round to end within `sync_timeout`.
+
+1. *Rounds keep what they did.*
+   * `round` (`newRound`) stops the fetch from starting packs once only a
+     quarter of the budget is left (`roundReserve`). The fetch then ends at the
+     last changeset whose pack, and those of every changeset before it, are
+     indexed.
+   * A hydration installs its build at that changeset, with that watermark. It
+     is at or above `C_sync`, since the seed is the newest checkpoint.
+   * A catch-up applies the range it fetched; its extensions (a newer local
+     write, an unexplained local value) are not bounded, because they are what
+     makes the range explain the local repository.
+   * A round that leaves the copy below the head answers `Unavailable` ("at
+     changeset p of H"), counted as `graft_storage_sync_total{result="partial"}`.
+     The next request's round goes on from p.
+   * A round that fetched no changeset at all installs nothing.
+2. *The unit of work is cheaper.*
+   * `indexPacks` downloads, verifies and indexes up to `fetchConcurrency` (8)
+     packs at once: a bucket read, a SHA-256 and a `git index-pack` each.
+   * The packs are self-contained (index-pack without `--fix-thin`), so their
+     order does not matter, and git writes each under its own name.
+   * The reference changes were already folded in memory and applied once
+     (`applyBuild` for a hydration, `applyMoves` for a catch-up).
+
+**Who reads a partial copy outside `EnsureFresh`.** A partial copy is a valid
+local repository at changeset p ≥ `C_sync`: what a node that was offline has.
+It is read by the same readers as such a copy, and none of them serves it as
+current:
+* Every repository-scoped RPC goes through the gate, whose `EnsureFresh`
+  answers `Unavailable` while the copy is below the head.
+* The storage core RPCs: `VerifyRepository` runs `EnsureFresh` first;
+  `GetStorageState` reports p as `applied_sequence`, which is what it is.
+* The background workers:
+  * the maintenance reads only the watermark, and its checkpoint runs
+    `EnsureFresh`, so it waits for the head;
+  * the review-roots sweeper runs `EnsureFresh`;
+  * Gitaly's housekeeping optimizes the objects and serves nothing.
+* Offline tools (`gitaly git`, `gitaly-debug`) read whatever is on disk, as for
+  any lagging copy (STORAGE.md).
+
+**Tests.** `TestSyncerResumesAHydrationAcrossRounds`: rounds of 4 changesets
+on a 10-changeset repository give Unavailable at 4 and at 8, with the
+watermark installed each time, and then the head. All the existing syncer
+tests run through the concurrent fetch.
+
 ### Verify after compaction (`verify_objects.go`, WP76)
 
 `checkStoredObjects` indexes the newest checkpoint's pack and the changeset packs
@@ -1482,6 +1560,15 @@ shutdown.
   an orphan pack deleted gc_grace after a run observed it; Start/stop.
 * Not tested: a lease lost in the middle of a run (it needs a build slower than
   the renewal).
+* **Changed after WP79 (PM): checkpoints are on by default, GC is opt-in.**
+  With `maintenance = "off"` nothing created checkpoints, so every large
+  repository eventually hit the hydration wall above. A checkpoint deletes
+  nothing (it adds a pack and rows). So the setting is split:
+  * `checkpoints` defaults to `"auto"` in authoritative mode;
+  * `gc`, which deletes, defaults to `"off"`.
+  `maintenance_interval` and the lease serve both, and `Config.Checkpoints` and
+  `Config.Collect` gate the steps. Test: `TestRunOnceDoesOnlyWhatIsOn`. The e2e
+  test of the background checkpoints runs with the defaults.
 * **Database openers (audit).** Only `gitaly serve` opens the storage database
   (`corestoreopen.Open`, one `sqlstore.Store` per process). The `graft` CLI and
   every other binary reach it through gRPC. Two Stores on one SQLite file exist
@@ -1493,7 +1580,8 @@ shutdown.
 ```toml
 [graft.storage]
 # ... mode, database, bucket, node_id, sync_timeout, shadow_timeout ...
-maintenance           = "off"      # off | auto: background checkpoints and GC (authoritative only). Default off.
+checkpoints           = "auto"     # auto | off: background checkpoints (authoritative only). Default auto there (changed after WP79).
+gc                    = "off"      # off | auto: background GC (authoritative only). Default off.
 maintenance_interval  = "1h"       # how often the background task runs
 checkpoint_changesets = 1000       # checkpoint after this many changesets since the newest one (0 = never)
 checkpoint_pack_bytes = 268435456  # ...or after this many pack bytes since the newest one (0 = never)
@@ -1503,7 +1591,7 @@ lease_ttl             = "10m"      # maintenance lease duration, renewed during 
 ```
 
 Defaults are `Default*` constants with the values above. Validation (extends
-`GraftStorage.validate`): `maintenance in {"", "off", "auto"}`; durations positive;
+`GraftStorage.validate`): `checkpoints` and `gc` in `{"", "off", "auto"}`, `"auto"` in authoritative mode only; durations positive;
 thresholds `>= 0`; `gc_margin < gc_grace`; **`gc_grace > sync_timeout + gc_margin`**
 (GC BOUNDARY rule). `checkpoint_retain` of the first version does not exist.
 
@@ -1887,7 +1975,9 @@ numbers). Work files live in `/home/feder/m3-work/`, never in `/tmp` (PM.md).
    swept by `graft storage gc --removed` and by the background task.
 2. The checkpoint closure includes the head and base commits of open reviews
    (through their keep-around references since WP74b).
-3. `maintenance` defaults to `off` in this release.
+3. `maintenance` defaults to `off` in this release. Superseded after WP79's
+   benchmark (PM): `checkpoints` defaults to `auto` in authoritative mode, and
+   `gc` stays `off` (see "Background maintenance").
 4. The benchmark window is requested at WP79.
 
 5. (Second review) Change A approved; the B/C refinement confirmed; the review

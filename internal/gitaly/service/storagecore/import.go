@@ -64,6 +64,15 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	if err := s.validateRepository(ctx, repo); err != nil {
 		return nil, err
 	}
+	// An import makes the local copy the database's truth. One whose references
+	// may have lost writes is never imported (the gate does not see this RPC).
+	path, err := s.deps.GetLocator().GetRepoPath(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if core.RefDurability.Untrusted(path) {
+		return nil, structerr.NewUnavailable("storage core: the local references of the repository may have lost writes; it cannot be imported until it is rebuilt")
+	}
 
 	local := s.localRepo(repo)
 	backend, err := local.ReferenceBackend(ctx)

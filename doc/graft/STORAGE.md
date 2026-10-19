@@ -197,11 +197,12 @@ mode = "authoritative"                          # off | shadow | authoritative
 database = "sqlite:///var/opt/graft/meta.db"    # or postgres://graft@db.internal:5432/graft?sslmode=verify-full
 bucket = "file:///var/opt/graft/objects"        # gocloud URL: file://, s3://, gs://, azblob://
 node_id = "node-a"                              # default: the host name
-sync_timeout = "10s"                            # catch-up budget per request
+sync_timeout = "10s"                            # budget of one sync round per request
 shadow_timeout = "5s"                           # shadow work budget per transaction
 gc_grace = "1h"                                 # age before a dead pack is deleted
 gc_margin = "5m"                                # writers' deadline is gc_grace - gc_margin
-maintenance = "auto"                            # off (default) | auto: background checkpoints and GC
+checkpoints = "auto"                            # auto (default in authoritative mode) | off
+gc = "auto"                                     # off (default) | auto: background garbage collection
 maintenance_interval = "1h"
 checkpoint_changesets = 1000                    # 0 = never by count
 checkpoint_pack_bytes = 268435456               # 0 = never by size
@@ -223,10 +224,19 @@ Startup fails when the mode is unknown, authoritative mode is set without
 `standalone = true`, the database URL is missing or neither `sqlite:///` nor
 `postgres://` (`postgresql://`), the bucket is missing or not a URL, `node_id`
 contains spaces or slashes, a duration is not a positive Go duration,
-`gc_grace` is not greater than `sync_timeout + gc_margin`, or `maintenance =
-"auto"` is set outside authoritative mode. The background maintenance is off by
-default; its metrics are `graft_storage_maintenance_*` (runs, checkpoints, packs
-and bytes deleted, skipped repositories, failed steps).
+`gc_grace` is not greater than `sync_timeout + gc_margin`, or `checkpoints` or
+`gc` is `"auto"` outside authoritative mode. In authoritative mode the
+background checkpoints run by default and the background garbage collection
+does not:
+- A checkpoint deletes nothing (it adds one pack and its rows), and it is what
+  keeps a hydration short. Without one, a node that joins replays every
+  changeset of the repository.
+- Garbage collection deletes packs, so it is turned on deliberately
+  (`gc = "auto"`), or run with `graft storage gc`. Until it runs, the bucket
+  only grows.
+
+The metrics are `graft_storage_maintenance_*` (runs, checkpoints, packs and
+bytes deleted, skipped repositories, failed steps).
 
 ## Operations
 
@@ -525,7 +535,11 @@ or re-import the repository from scratch (see
     durable step's fsync fails, the repository is moved aside at once and logged,
     and the next request hydrates it. The kernel reports such a failure once, so
     from then on the repository is untrusted. Every request for it fails with
-    `Unavailable`, and its marker is never removed, until it is moved aside. If
+    `Unavailable`, and its marker is never removed, until it is moved aside.
+    "Every request" means from the next one on. Each request checks once, in
+    its sync round, so a request already past its round when the failure was
+    found completes on what it read. `graft storage import` refuses an
+    untrusted repository too. If
     the move fails, it is retried every second. A repository that is not a
     cache of the storage core (the database cannot rebuild it) stays in place,
     untrusted and not served, for an operator. Other errors of the step (a file
@@ -731,12 +745,17 @@ show:
   and the bucket, not that nodes keep no local state. Every request runs git
   on a local copy, a node's first request for a repository downloads all of its
   packs, and there is no virtual filesystem.
-- **Checkpoints and pack garbage collection run in the background only when
-  `maintenance = "auto"`** (authoritative mode; off by default). Without it,
-  they run when an operator runs `graft storage checkpoint` and `graft storage
-  gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection));
-  otherwise packs are never deleted and hydration replays every changeset after
-  the newest checkpoint, from 1 when there is none.
+- **Pack garbage collection runs in the background only with `gc = "auto"`**
+  (authoritative mode; off by default). Otherwise it runs when an operator runs
+  `graft storage gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)),
+  and packs are never deleted. The background checkpoints are on by default.
+  With `checkpoints = "off"` and no `graft storage checkpoint`, a hydration
+  replays every changeset of the repository from 1. Its rounds resume, but that
+  takes many requests on a long history.
+- **A sync round is bounded by `sync_timeout`.** A hydration or catch-up that
+  needs more than one round answers `Unavailable` until it reaches the head;
+  each round keeps what it did. A single pack that cannot be downloaded and
+  indexed within one round never completes.
 - **Praefect is not supported in authoritative mode.** Configuration validation
   requires `[graft] standalone = true` for authoritative mode. Shadow mode
   works with or without Praefect.

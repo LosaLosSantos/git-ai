@@ -975,8 +975,9 @@ func openLocalReferenceWrites(core *corestore.Core, locator storage.Locator, log
 }
 
 // startStorageMaintenance starts the background checkpoints and garbage
-// collection of the storage core ([graft.storage] maintenance = "auto",
-// authoritative mode only; doc/graft/PLAN7.md, "Background maintenance").
+// collection of the storage core ([graft.storage] checkpoints, on by default,
+// and gc, opt-in; authoritative mode only; doc/graft/PLAN7.md, "Background
+// maintenance").
 func startStorageMaintenance(ctx context.Context, cfg config.Cfg, core *corestore.Core, fresh corestore.Freshener, locator storage.Locator, repoFactory localrepo.Factory, logger log.Logger, storageNames []string) (func(), error) {
 	interval, err := cfg.Graft.Storage.MaintenanceIntervalOrDefault()
 	if err != nil {
@@ -993,14 +994,19 @@ func startStorageMaintenance(ctx context.Context, cfg config.Cfg, core *corestor
 		fresh, logger,
 		storagemaintenance.Config{
 			Interval:             interval,
+			Checkpoints:          cfg.Graft.Storage.CheckpointsAuto(),
 			CheckpointChangesets: cfg.Graft.Storage.CheckpointChangesetsOrDefault(),
 			CheckpointPackBytes:  cfg.Graft.Storage.CheckpointPackBytesOrDefault(),
+			Collect:              cfg.Graft.Storage.GCAuto(),
 			LeaseTTL:             leaseTTL,
 		},
 		storageNames,
 	)
 	prometheus.MustRegister(runner)
-	logger.WithField("interval", interval.String()).Info("graft storage core: background maintenance enabled")
+	logger.WithField("interval", interval.String()).
+		WithField("checkpoints", cfg.Graft.Storage.CheckpointsAuto()).
+		WithField("gc", cfg.Graft.Storage.GCAuto()).
+		Info("graft storage core: background maintenance enabled")
 	return runner.Start(ctx), nil
 }
 
