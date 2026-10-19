@@ -96,7 +96,10 @@ const (
 	resultHydrated = "hydrated"
 	// resultPartial is a round that ran out of its budget and left the local
 	// repository at a changeset before the head: the next round goes on from it.
-	resultPartial   = "partial"
+	resultPartial = "partial"
+	// resultSeeding is a round that ended while the repository was being
+	// seeded from its checkpoint in the background.
+	resultSeeding   = "seeding"
 	resultError     = "error"
 	tmpPackPattern  = "graft-sync-pack-*"
 	tmpHydratePatt  = "hydrate-*"
@@ -141,6 +144,8 @@ type Syncer struct {
 	pending map[string]*pendingSeqs
 	// reported is the last ReportApplied time per repository ID.
 	reported map[int64]time.Time
+	// seeds are the running seed jobs, keyed by corestore.RepoKey.String().
+	seeds map[string]*seedJob
 
 	syncTotal      *prometheus.CounterVec
 	syncSeconds    prometheus.Histogram
@@ -180,9 +185,10 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoF
 		locks:         map[string]*repoLock{},
 		pending:       map[string]*pendingSeqs{},
 		reported:      map[int64]time.Time{},
+		seeds:         map[string]*seedJob{},
 		syncTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_sync_total",
-			Help: "Number of storage core syncs before a request, by result (fresh, caught_up, hydrated, partial: the round's budget ran out before the head and the next round goes on, error).",
+			Help: "Number of storage core syncs before a request, by result (fresh, caught_up, hydrated, partial: the round's budget ran out before the head and the next round goes on, seeding: the round ended while the repository is seeded from its checkpoint in the background, error).",
 		}, []string{"result"}),
 		syncSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "graft_storage_sync_seconds",
@@ -202,7 +208,7 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoF
 			Help: "Number of hydrations that started from a checkpoint instead of changeset 1.",
 		}),
 	}
-	for _, result := range []string{resultFresh, resultCaughtUp, resultHydrated, resultPartial, resultError} {
+	for _, result := range []string{resultFresh, resultCaughtUp, resultHydrated, resultPartial, resultSeeding, resultError} {
 		s.syncTotal.WithLabelValues(result)
 	}
 	return s
@@ -368,6 +374,9 @@ func (s *Syncer) sync(ctx context.Context, key corestore.RepoKey) error {
 	}
 
 	rd := s.newRound(ctx)
+	// seeded is set once a seed job installed the repository in this round,
+	// which then counts as a hydration.
+	seeded := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return structerr.NewUnavailable("storage core: sync: %w", err)
@@ -405,6 +414,9 @@ func (s *Syncer) sync(ctx context.Context, key corestore.RepoKey) error {
 			}
 			if wm.Seq >= r.HeadSeq {
 				result = resultFresh
+				if seeded {
+					result = resultHydrated
+				}
 				return nil
 			}
 			boundary, err = s.syncBoundary(ctx, r.ID)
@@ -421,6 +433,33 @@ func (s *Syncer) sync(ctx context.Context, key corestore.RepoKey) error {
 			if err := s.checkReplaceable(ctx, r, path, wm, ok); err != nil {
 				return err
 			}
+			readAt := time.Now()
+			cp, hasCheckpoint, err := s.core.Meta.NewestCheckpoint(ctx, r.ID)
+			if err != nil {
+				return structerr.NewUnavailable("storage core: newest checkpoint: %w", err)
+			}
+			if hasCheckpoint {
+				// The checkpoint pack is a whole repository: it is seeded in the
+				// background, and the round waits for it within its budget.
+				job := s.startSeed(ctx, key, repo, r, hash, path, cp, readAt)
+				select {
+				case <-job.done:
+					if job.err != nil && !errors.Is(job.err, errSeedSuperseded) {
+						return job.err
+					}
+					// Installed (or superseded, or the local copy became current):
+					// the next pass catches up or seeds from the newest checkpoint.
+					seeded = seeded || job.err == nil
+					continue
+				case <-rd.stopped():
+					result = resultSeeding
+					return structerr.NewUnavailable("storage core: %s is being seeded from its checkpoint at changeset %d; the next request goes on from there", key, cp.Seq).
+						WithMetadata("checkpoint", cp.Seq)
+				case <-ctx.Done():
+					return structerr.NewUnavailable("storage core: sync: %w", ctx.Err())
+				}
+			}
+
 			reached, err := s.hydrate(ctx, repo, r, hash, path, boundary, rd)
 			if errors.Is(err, errRestart) {
 				continue
@@ -447,6 +486,8 @@ func (s *Syncer) sync(ctx context.Context, key corestore.RepoKey) error {
 		case reached < r.HeadSeq:
 			result = resultPartial
 			return partialError(key, reached, r.HeadSeq)
+		case seeded:
+			result = resultHydrated
 		case fresh:
 			result = resultFresh
 		default:
@@ -1487,74 +1528,96 @@ func refTransaction(ctx context.Context, repo *localrepo.Repo, w refWriter, comm
 	}
 }
 
-// hydrate builds a bare repository in the temporary directory of the storage,
-// then moves it to path. It starts from the newest checkpoint when there is one
-// (its pack and its reference snapshot) and replays the changesets after it,
-// otherwise from changeset 1 (doc/graft/PLAN7.md, "Hydration from a
-// checkpoint"). A local repository at path (another repository ID, invalid, or
-// below boundary, C_sync) is moved away first and removed in the background.
-// Only the final moves are done under the repository lock.
+// build is a bare repository being hydrated in the temporary directory of its
+// storage, renamed into place by finishBuild.
+type build struct {
+	dir    string
+	path   string
+	tmpDir string
+	repo   *localrepo.Repo
+}
+
+// newBuild creates an empty bare repository to hydrate in the temporary
+// directory of the storage. The caller removes it (build.remove) once it was
+// installed or abandoned.
+func (s *Syncer) newBuild(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository) (*build, error) {
+	storageName := repo.GetStorageName()
+	storagePath, err := s.locator.GetStorageByName(ctx, storageName)
+	if err != nil {
+		return nil, err
+	}
+	tmpDir, err := s.tmpDir(storageName)
+	if err != nil {
+		return nil, err
+	}
+
+	dir, err := os.MkdirTemp(tmpDir, tmpHydratePatt)
+	if err != nil {
+		return nil, structerr.NewInternal("storage core: create hydration directory: %w", err)
+	}
+	b := &build{dir: dir, path: filepath.Join(dir, "repo.git"), tmpDir: tmpDir}
+	if err := gitops.InitBare(ctx, s.gitCmdFactory, b.path, r.ObjectFormat); err != nil {
+		b.remove()
+		return nil, structerr.NewInternal("storage core: init repository: %w", err)
+	}
+	rel, err := filepath.Rel(storagePath, b.path)
+	if err != nil {
+		b.remove()
+		return nil, structerr.NewInternal("storage core: relative hydration path: %w", err)
+	}
+	b.repo = s.repoFactory.Build(&gitalypb.Repository{StorageName: storageName, RelativePath: rel})
+	return b, nil
+}
+
+// remove deletes what is left of the build (nothing once it was installed).
+func (b *build) remove() { _ = os.RemoveAll(b.dir) }
+
+// finishBuild sets the references of the build, writes its watermark at seq
+// and installs it at path (install, with boundary).
+func (s *Syncer) finishBuild(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository, path string, b *build, refs map[string]corestore.Target, seq, boundary uint64) error {
+	if err := s.applyBuild(ctx, b.repo, refs); err != nil {
+		return err
+	}
+	if err := gitops.WriteWatermark(b.path, corestore.Watermark{RepoID: r.ID, Seq: seq}); err != nil {
+		return structerr.NewInternal("storage core: write watermark: %w", err)
+	}
+	return s.install(ctx, repo, r, path, b.path, b.tmpDir, boundary)
+}
+
+// hydrate builds a bare repository from changeset 1 in the temporary directory
+// of the storage, then moves it to path: the repository has no checkpoint (one
+// that has is seeded in the background, startSeed). A local repository at path
+// (another repository ID, invalid, or below boundary, C_sync) is moved away
+// first and removed in the background. Only the final moves are done under the
+// repository lock.
 //
 // When the round is over before the head (rd), the build is installed at the
 // changeset it reached, with that watermark: a valid local repository behind
 // the head, like that of a node that was offline, which the next round catches
-// up. It is at or above boundary, since the seed is the newest checkpoint. It
-// returns the changeset reached. A round that reached nothing installs nothing
-// and fails as a round out of budget.
+// up. It is at or above boundary, which is 0 without a checkpoint. It returns
+// the changeset reached. A round that reached nothing installs nothing and
+// fails as a round out of budget.
 func (s *Syncer) hydrate(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository, hash git.ObjectHash, path string, boundary uint64, rd *round) (uint64, error) {
-	storageName := repo.GetStorageName()
-
-	storagePath, err := s.locator.GetStorageByName(ctx, storageName)
+	b, err := s.newBuild(ctx, repo, r)
 	if err != nil {
 		return 0, err
 	}
-	tmpDir, err := s.tmpDir(storageName)
-	if err != nil {
-		return 0, err
-	}
+	defer b.remove()
 
-	build, err := os.MkdirTemp(tmpDir, tmpHydratePatt)
-	if err != nil {
-		return 0, structerr.NewInternal("storage core: create hydration directory: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(build) }()
-
-	buildPath := filepath.Join(build, "repo.git")
-	if err := gitops.InitBare(ctx, s.gitCmdFactory, buildPath, r.ObjectFormat); err != nil {
-		return 0, structerr.NewInternal("storage core: init repository: %w", err)
-	}
-
-	rel, err := filepath.Rel(storagePath, buildPath)
-	if err != nil {
-		return 0, structerr.NewInternal("storage core: relative hydration path: %w", err)
-	}
-	buildRepo := s.repoFactory.Build(&gitalypb.Repository{StorageName: storageName, RelativePath: rel})
-
-	refs, f, err := s.seed(ctx, buildRepo, tmpDir, r, hash)
-	if err != nil {
-		return 0, err
-	}
-	if err := s.fetch(ctx, buildRepo, tmpDir, r.ID, hash, f, r.HeadSeq, rd); err != nil {
+	f := newFetched(0)
+	if err := s.fetch(ctx, b.repo, b.tmpDir, r.ID, hash, f, r.HeadSeq, rd); err != nil {
 		return 0, err
 	}
 	if f.head == 0 {
 		return 0, structerr.NewUnavailable("storage core: the hydration of %s fetched no changeset within %s", r.Key, s.syncTimeout())
 	}
+	refs := map[string]corestore.Target{}
 	for name, target := range f.finalRefs() {
-		if target.Absent() {
-			delete(refs, name)
-		} else {
+		if !target.Absent() {
 			refs[name] = target
 		}
 	}
-	if err := s.applyBuild(ctx, buildRepo, refs); err != nil {
-		return 0, err
-	}
-	if err := gitops.WriteWatermark(buildPath, corestore.Watermark{RepoID: r.ID, Seq: f.head}); err != nil {
-		return 0, structerr.NewInternal("storage core: write watermark: %w", err)
-	}
-
-	if err := s.install(ctx, repo, r, path, buildPath, tmpDir, boundary); err != nil {
+	if err := s.finishBuild(ctx, repo, r, path, b, refs, f.head, boundary); err != nil {
 		return 0, err
 	}
 
@@ -1564,51 +1627,123 @@ func (s *Syncer) hydrate(ctx context.Context, repo *gitalypb.Repository, r cores
 	return f.head, nil
 }
 
-// seed starts a hydration: from the newest checkpoint when there is one (its
-// pack, verified against its key and indexed into repo, and its validated
-// reference snapshot), else from nothing. It returns the references to start
-// from and the fetch state positioned after the seed.
-func (s *Syncer) seed(ctx context.Context, repo *localrepo.Repo, tmpDir string, r corestore.Repository, hash git.ObjectHash) (map[string]corestore.Target, *fetched, error) {
-	cp, ok, err := s.core.Meta.NewestCheckpoint(ctx, r.ID)
-	if err != nil {
-		return nil, nil, structerr.NewUnavailable("storage core: newest checkpoint: %w", err)
-	}
-	if !ok {
-		return map[string]corestore.Target{}, newFetched(0), nil
+// errSeedSuperseded ends a seed whose checkpoint is below C_sync by the time it
+// would be installed: a newer checkpoint is old enough that the changeset packs
+// after the seed may be collected. The next round seeds from the newest.
+var errSeedSuperseded = errors.New("storage core: a newer checkpoint superseded the seed")
+
+// seedJob is the hydration of one repository from its newest checkpoint, run
+// in the background (doc/graft/PLAN7.md, "Seeding in the background"). The
+// checkpoint pack is a whole repository: it can take longer than a sync round
+// to download and index, so it is not bound to one.
+type seedJob struct {
+	cp   corestore.Checkpoint
+	done chan struct{}
+	// err is set before done is closed.
+	err error
+}
+
+// startSeed returns the seed job of the repository, starting one from cp when
+// none runs. cp was read as the newest checkpoint at readAt (before the read).
+// The job runs until readAt + W (Core.WriteDeadline: gc_grace − gc_margin), the
+// bound under which the checkpoint cannot be collected (it was the newest at
+// readAt, and none newer can be C_gc before readAt + gc_grace), detached from
+// the request that started it. It seeds a build from the checkpoint and
+// installs it at the checkpoint's sequence, if that is still at or above
+// C_sync; the rounds that follow catch it up.
+func (s *Syncer) startSeed(ctx context.Context, key corestore.RepoKey, repo *gitalypb.Repository, r corestore.Repository, hash git.ObjectHash, path string, cp corestore.Checkpoint, readAt time.Time) *seedJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if j := s.seeds[key.String()]; j != nil {
+		return j
 	}
 
+	j := &seedJob{cp: cp, done: make(chan struct{})}
+	s.seeds[key.String()] = j
+	jobCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), readAt.Add(s.core.WriteDeadline()))
+	go func() {
+		defer cancel()
+		err := s.runSeed(jobCtx, repo, r, hash, path, cp)
+		if err != nil && !errors.Is(err, errSeedSuperseded) {
+			s.logger.WithError(err).WithField("repository_path", path).WithField("checkpoint", cp.Seq).
+				Warn("storage core: seeding from the checkpoint failed; the next request starts again")
+		}
+		s.mu.Lock()
+		delete(s.seeds, key.String())
+		j.err = err
+		close(j.done)
+		s.mu.Unlock()
+	}()
+	return j
+}
+
+// runSeed seeds a build from the checkpoint cp and installs it at path with
+// the watermark cp.Seq.
+func (s *Syncer) runSeed(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository, hash git.ObjectHash, path string, cp corestore.Checkpoint) error {
+	b, err := s.newBuild(ctx, repo, r)
+	if err != nil {
+		return err
+	}
+	defer b.remove()
+
+	refs, n, err := s.seed(ctx, b.repo, b.tmpDir, r, hash, cp)
+	if err != nil {
+		return err
+	}
+	boundary, err := s.syncBoundary(ctx, r.ID)
+	if err != nil {
+		return err
+	}
+	if cp.Seq < boundary {
+		return errSeedSuperseded
+	}
+	switch err := s.finishBuild(ctx, repo, r, path, b, refs, cp.Seq, boundary); {
+	case errors.Is(err, errRestart):
+		// The local repository became current meanwhile: it is caught up
+		// instead.
+	case err != nil:
+		return err
+	}
+
+	s.syncBytes.Add(float64(n))
+	s.report(ctx, r, cp.Seq)
+	return nil
+}
+
+// seed indexes the pack of the checkpoint cp into repo (verified against its
+// key) and returns its validated reference snapshot and the size of the pack.
+func (s *Syncer) seed(ctx context.Context, repo *localrepo.Repo, tmpDir string, r corestore.Repository, hash git.ObjectHash, cp corestore.Checkpoint) (map[string]corestore.Target, int64, error) {
 	// Data read from the database is validated before it touches the
 	// repository (RULE 22).
 	if id, _, ok := corestore.ParsePackKey(cp.PackKey); !ok || id != r.ID {
-		return nil, nil, structerr.NewInternal("storage core: checkpoint %d has an invalid pack key", cp.Seq)
+		return nil, 0, structerr.NewInternal("storage core: checkpoint %d has an invalid pack key", cp.Seq)
 	}
 	refs, err := s.core.Meta.CheckpointRefs(ctx, r.ID, cp.Seq)
 	if err != nil {
-		return nil, nil, structerr.NewUnavailable("storage core: checkpoint %d references: %w", cp.Seq, err)
+		return nil, 0, structerr.NewUnavailable("storage core: checkpoint %d references: %w", cp.Seq, err)
 	}
 	for name, target := range refs {
 		if target.Absent() {
-			return nil, nil, structerr.NewInternal("storage core: checkpoint %d: reference %q has no value", cp.Seq, name)
+			return nil, 0, structerr.NewInternal("storage core: checkpoint %d: reference %q has no value", cp.Seq, name)
 		}
 		if err := gitops.ValidateName(name); err != nil {
-			return nil, nil, structerr.NewInternal("storage core: checkpoint %d: invalid reference name %q: %w", cp.Seq, name, err)
+			return nil, 0, structerr.NewInternal("storage core: checkpoint %d: invalid reference name %q: %w", cp.Seq, name, err)
 		}
 		if err := gitops.ValidateTarget(target, hash); err != nil {
-			return nil, nil, structerr.NewInternal("storage core: checkpoint %d: invalid target of %q: %w", cp.Seq, name, err)
+			return nil, 0, structerr.NewInternal("storage core: checkpoint %d: invalid target of %q: %w", cp.Seq, name, err)
 		}
 		if err := validateSymbolicTarget(name, target); err != nil {
-			return nil, nil, structerr.NewInternal("storage core: checkpoint %d: invalid target of %q: %w", cp.Seq, name, err)
+			return nil, 0, structerr.NewInternal("storage core: checkpoint %d: invalid target of %q: %w", cp.Seq, name, err)
 		}
 	}
 
-	f := newFetched(cp.Seq)
+	s.hook("seed")
 	n, err := s.indexPack(ctx, repo, tmpDir, cp.PackKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, err
 	}
-	f.bytes += n
 	s.syncSeeds.Inc()
-	return refs, f, nil
+	return refs, n, nil
 }
 
 // install moves the hydrated repository at buildPath to path under the
@@ -1808,6 +1943,15 @@ func (rd *round) over() bool {
 		return true
 	}
 	return !rd.stopBy.IsZero() && !time.Now().Before(rd.stopBy)
+}
+
+// stopped returns a channel closed when the round must stop: at stopBy. A
+// round without a deadline never stops (nil channel).
+func (rd *round) stopped() <-chan time.Time {
+	if rd == nil || rd.stopBy.IsZero() {
+		return nil
+	}
+	return time.After(time.Until(rd.stopBy))
 }
 
 // count records one more changeset fetched in the round.

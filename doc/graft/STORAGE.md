@@ -767,8 +767,12 @@ show:
   takes many requests on a long history.
 - **A sync round is bounded by `sync_timeout`.** A hydration or catch-up that
   needs more than one round answers `Unavailable` until it reaches the head;
-  each round keeps what it did. A single pack that cannot be downloaded and
-  indexed within one round never completes. Measured (2026-10-19, Postgres,
+  each round keeps what it did. The checkpoint pack, a whole copy of the
+  repository, is not bound to a round. A node that rebuilds a repository from
+  its checkpoint downloads and indexes that pack in the background, for up to
+  `gc_grace − gc_margin`, and answers `Unavailable` ("being seeded") until it is
+  done. A changeset pack that cannot be downloaded and indexed within one
+  round never completes. Measured (2026-10-19, Postgres,
   file bucket, small changesets of the land benchmark): about 4 ms per
   changeset, so at the default `sync_timeout` of 10 s (7.5 s of fetch per
   round) one round covers about 1800–2000 changesets after the newest

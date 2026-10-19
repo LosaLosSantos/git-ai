@@ -1496,6 +1496,48 @@ current:
 * Offline tools (`gitaly git`, `gitaly-debug`) read whatever is on disk, as for
   any lagging copy (STORAGE.md).
 
+### Seeding in the background (integrated review M3)
+
+The checkpoint pack is a whole repository. A hydration from it had to
+download and index that pack within one sync round: at the default 10 s, a
+repository of hundreds of MB was never hydrated again on a node that joined,
+lagged below `C_sync` or had its copy moved aside. v0.2.0 caught up
+incrementally instead. The round bound stays (GC BOUNDARY rule); the seed
+leaves it:
+
+* When a copy must be rebuilt and a checkpoint exists, `startSeed` runs the
+  seed in a job of its own, one per repository. The job:
+  * runs detached from the request, until `readAt + W` (W =
+    `Core.WriteDeadline()`, `gc_grace − gc_margin`; `readAt` is taken before
+    the checkpoint is read);
+  * downloads, verifies and indexes the checkpoint pack, applies its validated
+    snapshot and writes the watermark `cp.Seq`;
+  * installs the build if `cp.Seq` is still at or above `C_sync`; otherwise it
+    discards it (`errSeedSuperseded`), and the next round seeds from the
+    newest checkpoint.
+* Why W is enough, the argument of `checkStoredObjects`: the checkpoint read
+  at `readAt` was the newest then. A newer one can become `C_gc`, and so let
+  the collector delete this pack, only `gc_grace` after its own creation,
+  which is after `readAt`.
+* After the install, the changeset packs above `cp.Seq` are read by the
+  ordinary bounded rounds, each of which checks `C_sync` again.
+* The round waits for the job within its budget (`round.stopped`).
+  * A seed that ends in time (a small repository) is caught up in the same
+    round, counted `hydrated`.
+  * Otherwise the round answers `Unavailable` ("being seeded from its
+    checkpoint at changeset N"), counted
+    `graft_storage_sync_total{result="seeding"}`, and the job goes on; later
+    rounds join it rather than starting another.
+  * A copy being seeded is never served: the local repository is the old one
+    (moved aside at install), or none.
+* A repository without a checkpoint is hydrated from changeset 1 by the
+  resumable rounds.
+* Test: `TestSyncerSeedsInTheBackground`. The seed is held by the test until
+  three rounds have answered `Unavailable`; one seed only; then the next round
+  catches up and every reference matches.
+* Bench with a checkpoint pack of hundreds of MB: requested in a window (see
+  the final report).
+
 **Tests.** `TestSyncerResumesAHydrationAcrossRounds`: rounds of 4 changesets
 on a 10-changeset repository give Unavailable at 4 and at 8, with the
 watermark installed each time, and then the head. All the existing syncer
