@@ -167,7 +167,7 @@ func TestLandCheckoutTree(t *testing.T) {
 	require.Equal(t, "$Format:%H$\n", archived["subst.txt"])
 
 	dir := t.TempDir()
-	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir))
+	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{}))
 
 	for path, want := range map[string]string{
 		".gitattributes":                  "export-ignore.log export-ignore\nsubst.txt export-subst\ncrlf.txt text eol=crlf\n*.bin -text\n",
@@ -213,7 +213,7 @@ func TestLandCheckoutTree_theCheckIsPartOfIt(t *testing.T) {
 	fx := newTreeFixture(t)
 	ctx := testhelper.Context(t)
 
-	require.NoError(t, landCheckoutTreeThen(ctx, fx.repo, fx.tree, t.TempDir(), func() {}), "without damage it passes")
+	require.NoError(t, landCheckoutTreeThen(ctx, fx.repo, fx.tree, t.TempDir(), landCheckoutLimits{}, func() {}), "without damage it passes")
 	for name, damage := range map[string]func(dir string){
 		"a file written in": func(dir string) { _ = os.WriteFile(filepath.Join(dir, "planted"), []byte("x"), 0o644) },
 		"a file of the tree gone": func(dir string) {
@@ -224,7 +224,7 @@ func TestLandCheckoutTree_theCheckIsPartOfIt(t *testing.T) {
 		},
 	} {
 		dir := t.TempDir()
-		err := landCheckoutTreeThen(ctx, fx.repo, fx.tree, dir, func() { damage(dir) })
+		err := landCheckoutTreeThen(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{}, func() { damage(dir) })
 		require.ErrorContains(t, err, "the checkout differs from the tree", name)
 	}
 }
@@ -242,18 +242,27 @@ func batchOf(contents map[string]string, entries []landTreeEntry) *bufio.Reader 
 	return bufio.NewReader(&b)
 }
 
-func fakeEntries() ([]landTreeEntry, map[string]string) {
-	oid := func(c string) git.ObjectID { return git.ObjectID(strings.Repeat(c, 40)) }
+// blobOID is the object ID git gives a blob with this content.
+func blobOID(t testing.TB, content string) git.ObjectID {
+	t.Helper()
+	oid, err := landBlobOID(strings.NewReader(content), int64(len(content)), git.ObjectID(strings.Repeat("0", 40)))
+	require.NoError(t, err)
+	return oid
+}
+
+func fakeEntries(t testing.TB) ([]landTreeEntry, map[string]string) {
+	t.Helper()
+	contents := map[string]string{
+		"a.txt":   "content\n",
+		"bin/run": "#!/bin/sh\n",
+		"link":    "a.txt",
+	}
 	return []landTreeEntry{
-			{mode: 0o100644, oid: oid("1"), path: "a.txt"},
-			{mode: 0o100755, oid: oid("2"), path: "bin/run"},
-			{mode: 0o120000, oid: oid("3"), path: "link"},
-			{mode: 0o160000, oid: oid("4"), path: "mod"},
-		}, map[string]string{
-			"a.txt":   "content\n",
-			"bin/run": "#!/bin/sh\n",
-			"link":    "a.txt",
-		}
+		{mode: 0o100644, oid: blobOID(t, contents["a.txt"]), path: "a.txt"},
+		{mode: 0o100755, oid: blobOID(t, contents["bin/run"]), path: "bin/run"},
+		{mode: 0o120000, oid: blobOID(t, contents["link"]), path: "link"},
+		{mode: 0o160000, oid: git.ObjectID(strings.Repeat("4", 40)), path: "mod"},
+	}, contents
 }
 
 // TestLandMaterialize_refusesWhatLeavesTheDirectory: a path that is not clean, that is absolute or that
@@ -279,7 +288,7 @@ func TestLandMaterialize_refusesWhatLeavesTheDirectory(t *testing.T) {
 func TestLandMaterialize_refusesAnswersItDidNotAskFor(t *testing.T) {
 	t.Parallel()
 
-	entries, contents := fakeEntries()
+	entries, contents := fakeEntries(t)
 	good := batchOf(contents, entries)
 	require.NoError(t, landMaterialize(entries, good, t.TempDir()))
 
@@ -291,7 +300,7 @@ func TestLandMaterialize_refusesAnswersItDidNotAskFor(t *testing.T) {
 		"a short blob":        entries[0].oid.String() + " blob 30\nabc\n",
 		"no line feed behind": entries[0].oid.String() + " blob 3\nabcX",
 	} {
-		fresh, _ := fakeEntries()
+		fresh, _ := fakeEntries(t)
 		require.Error(t, landMaterialize(fresh, bufio.NewReader(strings.NewReader(answer)), t.TempDir()), name)
 	}
 }
@@ -303,7 +312,7 @@ func TestLandCheckMaterialized_failsClosed(t *testing.T) {
 
 	materialized := func(t *testing.T) ([]landTreeEntry, string) {
 		t.Helper()
-		entries, contents := fakeEntries()
+		entries, contents := fakeEntries(t)
 		dir := t.TempDir()
 		require.NoError(t, landMaterialize(entries, batchOf(contents, entries), dir))
 		require.NoError(t, landCheckMaterialized(entries, dir), "an exact checkout passes")
@@ -322,6 +331,9 @@ func TestLandCheckMaterialized_failsClosed(t *testing.T) {
 		},
 		"a missing file": func(t *testing.T, dir string) {
 			require.NoError(t, os.Remove(filepath.Join(dir, "a.txt")))
+		},
+		"a changed content of the same length": func(t *testing.T, dir string) {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("CONTENT\n"), 0o644))
 		},
 		"a changed length": func(t *testing.T, dir string) {
 			require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("longer than before\n"), 0o644))
@@ -410,6 +422,245 @@ func TestUserLand_verifySeesTheWholeTree(t *testing.T) {
 			require.NoError(t, err, "the verification saw the hidden file and the unexpanded content")
 			landed := git.ObjectID(resp.GetLandedCommitId())
 			require.Equal(t, "must be seen\n", fx.blobAt(t, landed, "hidden.txt"))
+		})
+	}
+}
+
+// fakeTreeEntry is an entry of a tree that landMaterialize writes, with the content that git-cat-file(1)
+// would answer for it.
+type fakeTreeEntry struct {
+	mode    uint32
+	path    string
+	content string
+}
+
+func materializeFake(t *testing.T, dir string, in ...fakeTreeEntry) error {
+	t.Helper()
+
+	entries := make([]landTreeEntry, len(in))
+	contents := map[string]string{}
+	for i, f := range in {
+		entries[i] = landTreeEntry{mode: f.mode, oid: blobOID(t, f.content), path: f.path}
+		contents[f.path] = f.content
+	}
+	return landMaterialize(entries, batchOf(contents, entries), dir)
+}
+
+// TestLandMaterialize_pathSafety: what the checkout refuses to write, with the reason, and that nothing
+// is written outside the directory whatever the order of the entries (PLAN10 15.9): the paths that name
+// .git on some file system (the operator's command may run git in the checkout, and a .git of the tree is
+// its repository), an entry under a symbolic link, also when a case-insensitive file system sees the same
+// name, a link or a file where a directory is needed, and a link that is already there.
+func TestLandMaterialize_pathSafety(t *testing.T) {
+	t.Parallel()
+
+	reg, link, gitlink := uint32(0o100644), uint32(0o120000), uint32(0o160000)
+	// The links point out of the checkout, at the directory that holds it.
+	for name, tc := range map[string]struct {
+		entries func(outer string) []fakeTreeEntry
+		planted bool // a symbolic link "p" to outer is in the checkout before the first entry
+	}{
+		"a .git directory":           {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".git/config", "[core]\n"}} }},
+		"a .GIT directory":           {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".GIT/hooks/pre-commit", "x"}} }},
+		"a nested .Git":              {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, "a/b/.Git/config", "x"}} }},
+		"a .git file":                {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".git", "gitdir: /elsewhere\n"}} }},
+		"a .git gitlink":             {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{gitlink, ".git", ""}} }},
+		"an NTFS .git with a space":  {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".git /config", "x"}} }},
+		"an NTFS .git with a period": {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".git./config", "x"}} }},
+		"the NTFS short name":        {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, "GIT~1/config", "x"}} }},
+		"an HFS .git":                {entries: func(string) []fakeTreeEntry { return []fakeTreeEntry{{reg, ".g\u200cit/config", "x"}} }},
+		"an entry under a link": {entries: func(outer string) []fakeTreeEntry {
+			return []fakeTreeEntry{{link, "l", outer}, {reg, "l/x", "planted"}}
+		}},
+		"an entry under a link, case folded": {entries: func(outer string) []fakeTreeEntry {
+			return []fakeTreeEntry{{link, "L", outer}, {reg, "l/x", "planted"}}
+		}},
+		"a link over an entry's directory, case folded, reversed": {entries: func(outer string) []fakeTreeEntry {
+			return []fakeTreeEntry{{reg, "l/x", "planted"}, {link, "L", outer}}
+		}},
+		"a link over an entry's directory, reversed": {entries: func(outer string) []fakeTreeEntry {
+			return []fakeTreeEntry{{reg, "l/x", "planted"}, {link, "l", outer}}
+		}},
+		"a file where a directory is needed": {entries: func(string) []fakeTreeEntry {
+			return []fakeTreeEntry{{reg, "a", "file"}, {reg, "a/x", "planted"}}
+		}},
+		"a link that is already there": {planted: true, entries: func(string) []fakeTreeEntry {
+			return []fakeTreeEntry{{reg, "p/x", "planted"}}
+		}},
+		"a link that is already there, as a parent of a gitlink": {planted: true, entries: func(string) []fakeTreeEntry {
+			return []fakeTreeEntry{{gitlink, "p/mod", ""}}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			outer := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(outer, "sentinel"), []byte("keep"), 0o644))
+			dir := filepath.Join(outer, "checkout")
+			require.NoError(t, os.Mkdir(dir, 0o755))
+			if tc.planted {
+				require.NoError(t, os.Symlink(outer, filepath.Join(dir, "p")))
+			}
+
+			err := materializeFake(t, dir, tc.entries(outer)...)
+			var refusal *landCheckoutRefusal
+			require.ErrorAs(t, err, &refusal, "a refusal, with its reason")
+			require.NotEmpty(t, refusal.reason)
+
+			// Nothing is written outside the checkout: only the checkout and the sentinel are in outer.
+			names := []string{}
+			children, err := os.ReadDir(outer)
+			require.NoError(t, err)
+			for _, c := range children {
+				names = append(names, c.Name())
+			}
+			require.ElementsMatch(t, []string{"checkout", "sentinel"}, names)
+			got, err := os.ReadFile(filepath.Join(outer, "sentinel"))
+			require.NoError(t, err)
+			require.Equal(t, "keep", string(got))
+		})
+	}
+
+	t.Run("what looks like these and is not is written", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		require.NoError(t, materializeFake(t, dir,
+			fakeTreeEntry{reg, ".gitignore", "x\n"},
+			fakeTreeEntry{reg, ".github/workflows/ci.yml", "x\n"},
+			fakeTreeEntry{reg, "gitx/a", "x\n"},
+			fakeTreeEntry{reg, "git~2/a", "x\n"},
+			fakeTreeEntry{reg, "README", "upper\n"},
+			fakeTreeEntry{reg, "readme", "lower\n"}, // two files that differ in case only: no link in it
+			fakeTreeEntry{link, "ok", "README"},
+		))
+	})
+}
+
+// TestIsGitDirName: the one rule of the resolver package, used by the checkout and by nobody else's copy.
+func TestIsGitDirName(t *testing.T) {
+	t.Parallel()
+
+	for _, n := range []string{".git", ".GIT", ".Git", ".git ", ".git.", ".git . ", "git~1", "GIT~1", "git~1 ", ".g\u200cit", ".gi\ufeffT", ".git:stream"} {
+		require.True(t, resolver.IsGitDirName(n), "%q", n)
+	}
+	for _, n := range []string{"", "git", ".gitignore", ".github", "gitx", "git~2", ".git~1", "x.git", "a.git ", ".gi t", "git~10"} {
+		require.False(t, resolver.IsGitDirName(n), "%q", n)
+	}
+}
+
+// TestLandCheckoutTree_limits: a tree with more entries or more bytes than the limits is refused, closed,
+// with the reason, and exactly at the limit it is written; the limits are checked before the content is
+// read, from the listing.
+func TestLandCheckoutTree_limits(t *testing.T) {
+	t.Parallel()
+
+	fx := newTreeFixture(t)
+	ctx := testhelper.Context(t)
+
+	listing := gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "ls-tree", "-r", "-z", "-l", "--full-tree", fx.tree.String())
+	entries, err := landParseTreeListing(listing)
+	require.NoError(t, err)
+	var total int64
+	for _, e := range entries {
+		require.True(t, e.isGitlink() || e.sized, "the listing gives the size of %q", e.path)
+		if !e.isGitlink() {
+			total += e.listed
+		}
+	}
+
+	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, t.TempDir(), landCheckoutLimits{entries: len(entries), bytes: total}), "at the limits")
+
+	var refusal *landCheckoutRefusal
+	dir := t.TempDir()
+	require.ErrorAs(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{entries: len(entries) - 1}), &refusal)
+	require.Contains(t, refusal.reason, "more than")
+	require.Contains(t, refusal.reason, "verify.max_tree_entries")
+
+	dir = t.TempDir()
+	require.ErrorAs(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{bytes: total - 1}), &refusal)
+	require.Contains(t, refusal.reason, "verify.max_tree_bytes")
+	// The bytes were refused from the listing, before the file that goes over was read: less than the tree is there.
+	var written int64
+	require.NoError(t, filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			info, _ := d.Info()
+			written += info.Size()
+		}
+		return nil
+	}))
+	require.Less(t, written, total)
+}
+
+// TestLandCheckoutTree_streamsALargeTree: a tree whose listing and blobs are far over the buffers between
+// the commands (the pipe of the object IDs, the batch reader, the entries in flight) is written exactly:
+// nothing waits for the whole listing, and nothing is lost or reordered.
+func TestLandCheckoutTree_streamsALargeTree(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	var in []gittest.TreeEntry
+	want := map[string]string{}
+	for i := 0; i < 1700; i++ {
+		name := fmt.Sprintf("d%02d/f%04d.txt", i%50, i)
+		content := strings.Repeat(fmt.Sprintf("%d\n", i), 400)
+		in = append(in, gittest.TreeEntry{Mode: "100644", Path: name, Content: content})
+		want[name] = content
+	}
+	tree := gittest.WriteTree(t, cfg, repoPath, nestTreeEntries(t, cfg, repoPath, in))
+
+	dir := t.TempDir()
+	require.NoError(t, landCheckoutTree(ctx, localrepo.NewTestRepo(t, cfg, repoProto), tree, dir, landCheckoutLimits{entries: 5000, bytes: 1 << 30}))
+	for name, content := range want {
+		got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(name)))
+		require.NoError(t, err, name)
+		require.Equal(t, content, string(got), name)
+	}
+}
+
+// TestLandVerify_aTreeThatCannotBeCheckedOutIsNotVerified: a tree that holds a .git, or more than the
+// limits, makes the verification fail with the reason, and the operator's command does not run.
+func TestLandVerify_aTreeThatCannotBeCheckedOutIsNotVerified(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	hostile := gittest.WriteTree(t, cfg, repoPath, nestTreeEntries(t, cfg, repoPath, []gittest.TreeEntry{
+		{Mode: "100644", Path: "a", Content: "x\n"},
+		{Mode: "100644", Path: ".git/config", Content: "[core]\n\tfsmonitor = touch /tmp/pwned\n"},
+	}))
+	plain := gittest.WriteTree(t, cfg, repoPath, nestTreeEntries(t, cfg, repoPath, []gittest.TreeEntry{
+		{Mode: "100644", Path: "a", Content: "x\n"},
+		{Mode: "100644", Path: "b", Content: "y\n"},
+	}))
+
+	for name, tc := range map[string]struct {
+		tree   git.ObjectID
+		tune   func(*config.GraftResolverVerify)
+		reason string
+	}{
+		"a .git":              {hostile, func(*config.GraftResolverVerify) {}, "names .git"},
+		"too many entries":    {plain, func(v *config.GraftResolverVerify) { v.MaxTreeEntries = 1 }, "verify.max_tree_entries"},
+		"too many bytes":      {plain, func(v *config.GraftResolverVerify) { v.MaxTreeBytes = 3 }, "verify.max_tree_bytes"},
+		"no time to check it": {plain, func(v *config.GraftResolverVerify) { v.Timeout = "1ns" }, "did not finish within 1ns"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			vdir, vargv := countingVerify(t, "exit 0")
+			rcfg := withVerify(config.GraftResolver{}, vargv, "")
+			tc.tune(&rcfg.Verify)
+			s := newResolveFixture(t, rcfg).server(t, rcfg)
+
+			err := s.landVerify(ctx, repo, tc.tree)
+			var verifyErr *landVerifyError
+			require.ErrorAs(t, err, &verifyErr, "a rejection with its reason, not an error of the server")
+			require.Contains(t, verifyErr.reason, tc.reason)
+			require.Equal(t, 0, verifyRuns(t, vdir), "the command did not run")
 		})
 	}
 }

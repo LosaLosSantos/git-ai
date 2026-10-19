@@ -411,8 +411,16 @@ contents of `git cat-file --batch`, with their modes, the symbolic links as
 links and the submodules as empty directories. No attribute is applied: not
 `export-ignore`, which would hide a file from the command (`git archive`
 honours it), nor `export-subst`, `eol`, a filter or a smudge. The directory is
-read back and compared with the listing, and a difference fails the checkout
-closed. It then runs `command` there, with a minimal environment
+read back and compared with the listing, the content of every file included (it
+is hashed as a git blob and must be the object ID of the tree), and a difference
+fails the checkout closed. The listing and the blobs are streamed, not held in
+memory, and the checkout refuses, with the reason in the package and without
+running the command: a tree over `verify.max_tree_entries` entries or
+`verify.max_tree_bytes` bytes, a path component that names `.git` on any file
+system (the command may run git there, and a `.git` of the tree would be its
+repository), and an entry under a symbolic link, also when a case-insensitive
+file system would see the same name. The checkout and the command run inside
+`verify.timeout` together. It then runs `command` there, with a minimal environment
 (`PATH`, and `HOME` and `TMPDIR` in a directory of their own). A non-zero exit or a
 timeout rejects the resolution: the land fails, every file of the package is
 `REJECTED`, and the reason is `verification failed:` with the exit status and
@@ -518,8 +526,9 @@ that contend for a file all land, one per round. The rounds are bounded by the
 resolver's `timeout` for the whole land, and by `resolve_rounds`, a safety cap
 well above realistic contention. The limit, stated: under continuous new
 arrivals on the same file, one land can keep losing until its deadline; it then
-fails with the merge conflict and the reason `files kept changing while the land
-was resolved, until the deadline of <timeout>: <paths>`.
+ends with the merge conflict and its package: the files that changed under it are
+`NOT_ATTEMPTED` with the reason `the files changed again before they could be
+resolved`, the others keep their verdicts (a model's `PROPOSED`).
 
 `verify.command` still runs in the lane, on the merged tree of the lane's tip.
 

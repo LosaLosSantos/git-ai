@@ -212,7 +212,9 @@ cause.
 | `minified.longest_line_bytes` | int | `5000` | A side larger than 2 KiB with a longer line is minified. |
 | `verify.enabled` | bool | `false` | Run `verify.command` on the merged tree of every resolution (a resolver's or an agent's) before it lands; it applies even when `enabled` is false. It is also what lets a model's resolution land: only a tree it passed on lands, and without it a model's resolution is only ever a proposal. |
 | `verify.command` | array of strings | empty | Program and arguments, run in a temporary checkout of the merged tree with `PATH`, `HOME` and `TMPDIR` only. A non-zero exit rejects the resolution. |
-| `verify.timeout` | string | `"5m"` | Bound on one run (Go duration); a run that does not finish rejects the resolution. When `verify.enabled`, it is added to `timeout` for the deadline of a resolved land. |
+| `verify.timeout` | string | `"5m"` | Bound on one verification, the checkout of the tree and the command together (Go duration); one that does not finish rejects the resolution. When `verify.enabled`, it is added to `timeout` for the deadline of a resolved land. |
+| `verify.max_tree_entries` | int | `200000` | Files, links and submodules in the tree that is checked out for the command; a bigger tree is not verified, and the package says why. |
+| `verify.max_tree_bytes` | int | `2147483648` | Bytes of the files of that tree (checked from the listing, before any content is read). |
 
 A file that is never sent goes to the agent with its reason in the conflict
 package: large (a side over `max_file_bytes`), binary (a NUL byte), lockfile,

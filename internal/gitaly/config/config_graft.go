@@ -380,10 +380,40 @@ type GraftResolverVerify struct {
 	// Timeout bounds one run, as a Go duration. Empty means
 	// DefaultGraftResolverVerifyTimeout.
 	Timeout string `json:"timeout" toml:"timeout,omitempty"`
+	// MaxTreeEntries bounds the files, links and submodules of the tree that is checked out for
+	// the command; a bigger tree is not verified, and the reason says so. Zero means
+	// DefaultGraftResolverVerifyMaxTreeEntries.
+	MaxTreeEntries int `json:"max_tree_entries" toml:"max_tree_entries,omitempty"`
+	// MaxTreeBytes bounds the bytes of the files of that tree. Zero means
+	// DefaultGraftResolverVerifyMaxTreeBytes.
+	MaxTreeBytes int64 `json:"max_tree_bytes" toml:"max_tree_bytes,omitempty"`
 }
 
 // DefaultGraftResolverVerifyTimeout is the default GraftResolverVerify.Timeout.
 const DefaultGraftResolverVerifyTimeout = "5m"
+
+const (
+	// DefaultGraftResolverVerifyMaxTreeEntries is the default GraftResolverVerify.MaxTreeEntries.
+	DefaultGraftResolverVerifyMaxTreeEntries = 200000
+	// DefaultGraftResolverVerifyMaxTreeBytes is the default GraftResolverVerify.MaxTreeBytes: 2 GiB.
+	DefaultGraftResolverVerifyMaxTreeBytes int64 = 2 << 30
+)
+
+// MaxTreeEntriesOrDefault returns MaxTreeEntries or its default.
+func (v GraftResolverVerify) MaxTreeEntriesOrDefault() int {
+	if v.MaxTreeEntries > 0 {
+		return v.MaxTreeEntries
+	}
+	return DefaultGraftResolverVerifyMaxTreeEntries
+}
+
+// MaxTreeBytesOrDefault returns MaxTreeBytes or its default.
+func (v GraftResolverVerify) MaxTreeBytesOrDefault() int64 {
+	if v.MaxTreeBytes > 0 {
+		return v.MaxTreeBytes
+	}
+	return DefaultGraftResolverVerifyMaxTreeBytes
+}
 
 // TimeoutOrDefault parses Timeout, applying the default.
 func (v GraftResolverVerify) TimeoutOrDefault() (time.Duration, error) {
@@ -399,6 +429,9 @@ func (v GraftResolverVerify) TimeoutOrDefault() (time.Duration, error) {
 }
 
 func (v GraftResolverVerify) validate() error {
+	if v.MaxTreeEntries < 0 || v.MaxTreeBytes < 0 {
+		return fmt.Errorf("graft land resolver verify: max_tree_entries and max_tree_bytes must not be negative (0 means the default)")
+	}
 	if !v.Enabled {
 		return nil
 	}

@@ -52,6 +52,7 @@ var stdinWriters = map[string]stdinWriter{
 	"internal/graft/corestore/syncer/syncer.go":                           {safety: stdinNULDelimited},
 	"internal/git/gitattributes/check_attr.go":                            {safety: stdinNULDelimited},
 	"internal/gitaly/service/operations/land_package.go":                  {safety: stdinNULDelimited},
+	"internal/gitaly/service/operations/land_verify.go":                   {safety: stdinServerInput},
 	"internal/git/catfile/object_reader.go":                               {safety: stdinNULDelimited},
 	"internal/gitaly/service/diff/find_changed_paths.go":                  {safety: stdinServerInput},
 	"internal/git/localrepo/merge_tree_stream.go":                         {safety: stdinServerInput},

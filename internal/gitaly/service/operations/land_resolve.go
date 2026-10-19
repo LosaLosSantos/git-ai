@@ -137,6 +137,7 @@ func (s *Server) landResolveAt(
 	if err := s.landClassify(ctx, repo, files, base, tip, commitID, newLandClassifyCache(files, tip)); err != nil {
 		return l, nil, err
 	}
+	pre.setCurrent(files)
 
 	// A file the classification sends and that has a verdict with its key is not resolved again.
 	// mine are the files with an answer, reused or fresh, whose outcome the answer decides.
@@ -422,6 +423,7 @@ func (s *Server) landApplyVerdicts(
 		if err := s.landClassify(ctx, repo, l.files, l.base, tip, commitID, newLandClassifyCache(l.files, tip)); err != nil {
 			return landResolution{}, err
 		}
+		pre.setCurrent(l.files)
 		for _, f := range l.files {
 			if _, ok := pre.verdicts[landKeyOf(f.conflict)]; !ok || !f.sent() {
 				missing = append(missing, f.conflict.path)

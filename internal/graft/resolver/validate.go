@@ -175,22 +175,54 @@ var gitSpecialFiles = []struct {
 //     each followed by spaces and periods only. An alternate data stream (":stream") is cut
 //     first, which refuses more than git does.
 func gitSpecialFile(name string) string {
-	folded := strings.ToLower(strings.Map(func(r rune) rune {
-		if hfsIgnorable(r) {
-			return -1
-		}
-		return r
-	}, name))
-	ntfs := strings.ToLower(name)
-	if i := strings.IndexByte(ntfs, ':'); i >= 0 {
-		ntfs = ntfs[:i]
-	}
+	folded := FoldGitName(name)
+	ntfs := ntfsName(name)
 	for _, s := range gitSpecialFiles {
 		if folded == s.name || ntfsSpecialName(ntfs, s.name[1:], s.shortHash) {
 			return s.name
 		}
 	}
 	return ""
+}
+
+// FoldGitName is the name as a case-insensitive file system that ignores the HFS+ ignorable code
+// points sees it: lower case, without those code points. Two names that fold to the same string
+// may be one name on such a file system.
+func FoldGitName(name string) string {
+	return strings.ToLower(strings.Map(func(r rune) rune {
+		if hfsIgnorable(r) {
+			return -1
+		}
+		return r
+	}, name))
+}
+
+// ntfsName is the lower-case name without an alternate data stream (":stream"), as the NTFS
+// rules read it.
+func ntfsName(name string) string {
+	ntfs := strings.ToLower(name)
+	if i := strings.IndexByte(ntfs, ':'); i >= 0 {
+		ntfs = ntfs[:i]
+	}
+	return ntfs
+}
+
+// IsGitDirName reports whether the path component name stands for ".git" on some file system, by
+// the rules of git's verify_path: ".git" case-insensitively, ignoring the code points HFS+
+// ignores, and on NTFS ".git" or its 8.3 short name "git~1" followed by spaces and periods only.
+// A tree is never to hold such a component, as git would treat the directory as the repository's
+// own: its config and hooks would run.
+func IsGitDirName(name string) bool {
+	if FoldGitName(name) == ".git" {
+		return true
+	}
+	ntfs := ntfsName(name)
+	for _, prefix := range []string{".git", "git~1"} {
+		if strings.HasPrefix(ntfs, prefix) && onlySpacesAndPeriods(ntfs[len(prefix):]) {
+			return true
+		}
+	}
+	return false
 }
 
 // ntfsSpecialName reports whether the lower-case name stands on NTFS for "." + dotName, whose

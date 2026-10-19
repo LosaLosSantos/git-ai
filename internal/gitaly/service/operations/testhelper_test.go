@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	gitalyauth "github.com/feder-cr/git-ai/auth"
@@ -92,7 +93,11 @@ func runOperationServiceServerWithLanes(tb testing.TB, cfg config.Cfg, lanes *la
 		if lanes != nil {
 			deps.GraftLandLanes = lanes
 		}
-		gitalypb.RegisterOperationServiceServer(srv, NewServer(deps))
+		operationServer := NewServer(deps)
+		if hook, ok := operationServerHooks.Load(tb.Name()); ok {
+			hook.(func(*Server))(operationServer)
+		}
+		gitalypb.RegisterOperationServiceServer(srv, operationServer)
 		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 		gitalypb.RegisterRepositoryServiceServer(srv, repository.NewServer(deps))
 		gitalypb.RegisterRefServiceServer(srv, ref.NewServer(deps))
@@ -101,6 +106,12 @@ func runOperationServiceServerWithLanes(tb testing.TB, cfg config.Cfg, lanes *la
 		gitalypb.RegisterSSHServiceServer(srv, ssh.NewServer(deps))
 	}, options...)
 }
+
+// operationServerHooks hands the operation Server that a test's service runs to the test, by the
+// name of the test: a func(*Server) stored under t.Name() before the service starts is called with the
+// Server before it serves. The Server is the real one, with every dependency, which a Server built by
+// hand in a test is not.
+var operationServerHooks sync.Map
 
 func newOperationClient(tb testing.TB, serverSocketPath string) (gitalypb.OperationServiceClient, *grpc.ClientConn) {
 	conn, err := client.New(testhelper.Context(tb), serverSocketPath)

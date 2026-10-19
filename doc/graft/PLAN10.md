@@ -937,10 +937,10 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
               resolver is called only for files that changed), VERIFY it, enter the lane again
  The rounds are bounded by the deadline of the land (the resolver's timeout, plus verify.timeout when
  a verify.command is configured) and by resolve_rounds (default 32, a safety cap, no contract). At
- the deadline: files that kept changing -> merge_conflict, "files kept changing: a, b"; a model's
- resolution that was not verified in time -> PACKAGE, the model's files PROPOSED, "could not verify
- before the branch moved again" (a verified AI land is opportunistic: losing the race is harmless,
- the agent gets the proposal).
+ the deadline: the final pass (15.9): the merge conflict with its PACKAGE, the model's files PROPOSED
+ ("could not verify before the branch moved again"), the rules' files RESOLVED, the files that changed
+ under the land NOT_ATTEMPTED with the reason (a verified AI land is opportunistic: losing the race
+ is harmless, the agent gets the proposal).
  The resolver is never called inside the lane, and neither is the verification of a model's resolution.
 
  PACKAGE to the agent (merge_conflict detail): sides by OID, hunks, per-file outcome + reason,
@@ -1187,8 +1187,10 @@ The resolution is bound to the files instead (the PM's correction):
   32) is a safety cap well above realistic contention, documented as a cap and not a contract
   (decided after the 12-concurrent graft-bench test failed with a cap of 3). The limit, stated:
   under continuous new arrivals on the same file, one land can keep losing until its deadline,
-  and then fails with the merge conflict and the reason "files kept changing while the land was
-  resolved, until the deadline of <timeout>: a"; past the cap, "after <n> rounds".
+  and then ends with the merge conflict and its package (15.9, the final pass): the files that
+  changed under it are NOT_ATTEMPTED with the reason "the files changed again before they could be
+  resolved" (the old "files kept changing" message is gone, as it carried no package); past the cap
+  the same.
 * **Rules alike.** The operator rules' verdicts (trivial, union, rerere, command) are kept and
   reused by the same key, so the policy is the same for every strategy.
 * **Slots: two pools.** check_concurrency bounds the checks of agents' resolutions and
@@ -1299,8 +1301,23 @@ and the tree it verifies depends on the tip.
   agent or by a model could therefore decide what the operator's tests see. The checkout is written
   from git-ls-tree(1) -r and git-cat-file(1) --batch, which apply no attribute (no export-*, eol,
   filter or smudge), with modes, symbolic links as links and gitlinks as empty directories, and is
-  read back and compared with the listing; a difference fails the checkout closed. The same function
+  read back and compared with the listing, the content included (every file and link is hashed as a
+  git blob and must be the OID of the tree); a difference fails the checkout closed. The same function
   serves the verification of rules and of agents' resolutions.
+* **What the checkout refuses, and what it costs.** The operator's command may run git in the checkout,
+  so a path component that names .git on any file system is refused, by the one rule the resolver
+  already uses for the special files (resolver.IsGitDirName: case-insensitive, the code points HFS+
+  ignores, NTFS "git~1" and trailing spaces and periods): a .git of the tree would be the repository
+  of the command, and its configuration and hooks would run. Also refused: an entry under a symbolic
+  link of the tree, also when a case-insensitive file system would see the same name (a link "A" and
+  an entry "a/x"), a parent that is a link or a file, a path over 4096 bytes. Each directory is made
+  one component at a time and looked at with Lstat (never MkdirAll, which follows links), a file is
+  created with O_EXCL and O_NOFOLLOW. Resources: verify.max_tree_entries (default 200000) and
+  verify.max_tree_bytes (default 2 GiB), checked from the listing (ls-tree -l) before the content is
+  read; the listing and the blobs are streamed, entry by entry, through two commands, so the memory is
+  that of the entries. The checkout runs inside verify.timeout, as the command does. A refusal is no
+  error of the server: nothing is verified, the files are PROPOSED (a model's) or REJECTED (rules'),
+  and the reason says which limit or path.
 * **Tests.** A model's resolution that passes lands, signed, with the command run once (so not in
   the lane); one that fails gives a proposal and the output; without a verify.command it is a
   proposal; a tip that moved gets its new tree verified and lands, with no resolver call; a tip that

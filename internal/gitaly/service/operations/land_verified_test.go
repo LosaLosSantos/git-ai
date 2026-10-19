@@ -664,3 +664,102 @@ func TestUserLand_verifiedModelResolution_aTreeThatPassedIsNotVerifiedAgain(t *t
 	require.Equal(t, 1, verifyRuns(t, vdir), "the command ran once for the tree, not once per round")
 	require.Equal(t, 1, resolverCalls(t, rdir))
 }
+
+// TestUserLand_verifiedModelResolution_aCallerThatGivesUpGetsItsCancellation: a caller that cancels while
+// the land verifies, or whose own deadline passes, gets Canceled or DeadlineExceeded from the server, and
+// not the bare "verification not finished" of the internal error, nor a package: the land is not the
+// deadline of the land (landFinalPass), which belongs to the land and not to the caller.
+func TestUserLand_verifiedModelResolution_aCallerThatGivesUpGetsItsCancellation(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		code codes.Code
+		ctx  func(parent context.Context) (context.Context, context.CancelFunc, func())
+	}{
+		"cancelled": {codes.Canceled, func(parent context.Context) (context.Context, context.CancelFunc, func()) {
+			ctx, cancel := context.WithCancel(parent)
+			return ctx, cancel, cancel
+		}},
+		"its own deadline": {codes.DeadlineExceeded, func(parent context.Context) (context.Context, context.CancelFunc, func()) {
+			ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+			return ctx, cancel, func() {}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rdir, rargv := resolverScript(t, "")
+			writeAnswer(t, rdir, modelAnswer())
+			vdir, vargv := countingVerify(t, `echo $$ > "$DIR/pid"
+sleep 60`)
+			rcfg := withVerify(enabledResolver(rargv), vargv, "1m")
+			rcfg.Timeout = "1m"
+			fx := newResolveFixture(t, rcfg)
+			s := fx.server(t, rcfg)
+			s.locator = config.NewLocator(fx.cfg)
+
+			ctx, cancelAll, giveUp := tc.ctx(fx.ctx)
+			defer cancelAll()
+			done := make(chan error, 1)
+			go func() {
+				_, err := s.landResolving(ctx, fx.request("Land"), fx.committer())
+				done <- err
+			}()
+			require.Eventually(t, func() bool {
+				_, err := os.Stat(filepath.Join(vdir, "pid"))
+				return err == nil
+			}, 30*time.Second, 10*time.Millisecond, "the verification never started")
+			giveUp()
+
+			select {
+			case err := <-done:
+				require.Error(t, err)
+				require.Equal(t, tc.code, status.Code(err), "%v", err)
+				require.Nil(t, landConflictDetail(err), "no package for a caller that is gone")
+			case <-time.After(60 * time.Second):
+				require.FailNow(t, "the land did not end")
+			}
+		})
+	}
+}
+
+// TestUserLand_finalPass_aLostRaceStillEndsWithThePackage: the lane hands the land back after the pass
+// pre-resolved it (the branch moved to a tip where a file has no verdict): the next pass ends with the
+// package, the file that changed NOT_ATTEMPTED with the reason and the other one with its verdict. It
+// is not a merge conflict without a package.
+func TestUserLand_finalPass_aLostRaceStillEndsWithThePackage(t *testing.T) {
+	t.Parallel()
+
+	rdir, rargv := resolverScript(t, "")
+	writeAnswer(t, rdir, validAnswer())
+	rcfg := enabledResolver(rargv)
+	var s *Server
+	operationServerHooks.Store(t.Name(), func(served *Server) { s = served })
+	fx := newResolveFixture(t, rcfg)
+	require.NotNil(t, s, "the service's own Server")
+
+	// The rules' verdicts of a and b, at the tip of the fixture.
+	pre := newLandPreResolution()
+	require.NoError(t, s.landPreResolve(fx.ctx, fx.request("Land"), fx.committer(), pre))
+	require.Len(t, pre.verdicts, 2)
+
+	var passes []int
+	s.landFinalPassHook = func(pass int) {
+		passes = append(passes, pass)
+		if pass != 1 {
+			return
+		}
+		// Another land changes a on the branch while this one ends.
+		gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.tip), gittest.WithBranch("main"),
+			gittest.WithTreeEntries(entries("a", "ours changed\n", "b", "ours\n", "c", "c\n")...))
+	}
+	_, err := s.landFinalPass(fx.ctx, fx.request("Land"), fx.committer(), pre, "the time ran out")
+	requireMergeConflict(t, err)
+	pkg := landConflictDetail(err)
+	require.NotNil(t, pkg, "the package, not a bare merge conflict")
+	require.Equal(t, []int{1}, passes, "the second pass pre-resolves and ends with the package")
+	a := packageFile(t, pkg, "a")
+	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, a.GetOutcome())
+	require.Equal(t, "the time ran out", a.GetReason())
+	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, pkg, "b").GetOutcome())
+}

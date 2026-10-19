@@ -2,8 +2,10 @@ package operations
 
 import (
 	"bufio"
-	"bytes"
 	"context"
+	"crypto/sha1" //nolint:gosec // the hash git names its objects with
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,11 +15,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
@@ -64,12 +68,23 @@ func (s *Server) landVerify(ctx context.Context, repo *localrepo.Repo, tree git.
 		}
 	}
 
-	if err := landCheckoutTree(ctx, repo, tree, checkout); err != nil {
-		return fmt.Errorf("checking out the merged tree: %w", err)
-	}
-
+	// The timeout bounds the checkout and the command together: a tree that takes the whole of it to
+	// write is a verification that did not finish.
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	limits := landCheckoutLimits{entries: v.MaxTreeEntriesOrDefault(), bytes: v.MaxTreeBytesOrDefault()}
+	if err := landCheckoutTree(runCtx, repo, tree, checkout, limits); err != nil {
+		var refusal *landCheckoutRefusal
+		switch {
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+			return &landVerifyError{reason: fmt.Sprintf("the checkout of the tree and the command did not finish within %s", timeout)}
+		case errors.As(err, &refusal):
+			return &landVerifyError{reason: "nothing was verified, the merged tree is not checked out: " + refusal.reason}
+		}
+		return fmt.Errorf("checking out the merged tree: %w", err)
+	}
 	var output landBoundedBuffer
 	output.limit = landVerifyOutputBytes
 	cmd, err := command.New(runCtx, s.logger, v.Command,
@@ -154,13 +169,16 @@ func (s *Server) landVerifyTrailer() string {
 
 // landTreeEntry is one entry of a tree as git-ls-tree(1) -r lists it: a file, a symbolic link or a
 // gitlink (a submodule), by path. size and target are filled when it is written: the length of the
-// file, the target of the link.
+// file, the target of the link. sized and listed are the size that the listing gave (ls-tree -l), when
+// it did.
 type landTreeEntry struct {
 	mode   uint32
 	oid    git.ObjectID
 	path   string
 	size   int64
 	target string
+	sized  bool
+	listed int64
 }
 
 const (
@@ -170,70 +188,121 @@ const (
 	landTreeModeGitlink  = 0o160000
 	// landMaxLinkTarget bounds the target of a symbolic link, which is read into memory.
 	landMaxLinkTarget = 64 << 10
+	// landMaxTreePath bounds a path of the tree, and with it the record that is read of the listing.
+	landMaxTreePath = 4096
 )
 
 func (e landTreeEntry) isGitlink() bool { return e.mode&landTreeModeTypeMask == landTreeModeGitlink }
 func (e landTreeEntry) isSymlink() bool { return e.mode&landTreeModeTypeMask == landTreeModeSymlink }
 func (e landTreeEntry) isRegular() bool { return e.mode&landTreeModeTypeMask == landTreeModeRegular }
 
+// landCheckoutLimits bound a checkout; a zero field is no limit (the server always sets them, from
+// verify.max_tree_entries and verify.max_tree_bytes).
+type landCheckoutLimits struct {
+	entries int
+	bytes   int64
+}
+
+// landCheckoutRefusal is a tree that the checkout refuses to write, closed: it holds more than the
+// limits allow, or a path that is not safe to write under a directory. It is no failure of the
+// server: the command does not run, and the reason goes to the agent in the conflict package.
+type landCheckoutRefusal struct {
+	reason string
+}
+
+func (e *landCheckoutRefusal) Error() string { return e.reason }
+
+func landRefuse(format string, args ...any) error {
+	return &landCheckoutRefusal{reason: fmt.Sprintf(format, args...)}
+}
+
 // landCheckoutTree writes the tree under dir byte for byte: the entries of git-ls-tree(1) -r and the
 // contents of git-cat-file(1) --batch, which apply no attribute (no export-ignore, export-subst,
 // eol, filter or smudge), with the modes (a file is executable or not), the symbolic links as links,
 // and the gitlinks as empty directories. It then reads the directory back and compares it with the
-// listing: a difference fails the checkout, closed, since the operator's command would otherwise
+// listing, the content of every file included (the blob hash of what was written must be the OID of
+// the tree): a difference fails the checkout, closed, since the operator's command would otherwise
 // verify a tree that is not the one that lands.
-func landCheckoutTree(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string) error {
-	return landCheckoutTreeThen(ctx, repo, tree, dir, nil)
+//
+// The listing and the blobs are streamed, one entry at a time, so the memory it takes is that of the
+// entries (which limits bounds) and not of the tree. A tree beyond the limits, or with a path that is
+// not safe to write, is a *landCheckoutRefusal.
+func landCheckoutTree(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, limits landCheckoutLimits) error {
+	return landCheckoutTreeThen(ctx, repo, tree, dir, limits, nil)
 }
 
 // landCheckoutTreeThen is landCheckoutTree with a function that runs between the writing and the
 // check; only tests give one, to damage the checkout and see that the check notices.
-func landCheckoutTreeThen(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, afterWrite func()) error {
-	var listing bytes.Buffer
-	var stderr landBoundedBuffer
-	stderr.limit = landVerifyOutputBytes
-	if err := repo.ExecAndWait(ctx,
-		gitcmd.Command{Name: "ls-tree", Flags: []gitcmd.Option{gitcmd.Flag{Name: "-r"}, gitcmd.Flag{Name: "-z"}, gitcmd.Flag{Name: "--full-tree"}}, Args: []string{tree.String()}},
-		gitcmd.WithStdout(&listing),
-		gitcmd.WithStderr(&stderr),
-	); err != nil {
-		return fmt.Errorf("listing the tree: %w, stderr: %q", err, stderr.String())
-	}
-	entries, err := landParseTreeListing(listing.Bytes())
-	if err != nil {
-		return err
-	}
+func landCheckoutTreeThen(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, limits landCheckoutLimits, afterWrite func()) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// The contents come in the order of the listing, one blob after the other: the files and the links.
-	var input bytes.Buffer
-	for _, e := range entries {
-		if !e.isGitlink() {
-			input.WriteString(e.oid.String() + "\n")
-		}
-	}
-	stderr = landBoundedBuffer{limit: landVerifyOutputBytes}
-	cmd, err := repo.Exec(ctx,
-		gitcmd.Command{Name: "cat-file", Flags: []gitcmd.Option{gitcmd.Flag{Name: "--batch"}}},
-		gitcmd.WithStdin(&input),
+	var lsStderr, catStderr landBoundedBuffer
+	lsStderr.limit, catStderr.limit = landVerifyOutputBytes, landVerifyOutputBytes
+	ls, err := repo.Exec(ctx,
+		gitcmd.Command{Name: "ls-tree", Flags: []gitcmd.Option{gitcmd.Flag{Name: "-r"}, gitcmd.Flag{Name: "-z"}, gitcmd.Flag{Name: "-l"}, gitcmd.Flag{Name: "--full-tree"}}, Args: []string{tree.String()}},
 		gitcmd.WithSetupStdout(),
-		gitcmd.WithStderr(&stderr),
+		gitcmd.WithStderr(&lsStderr),
 	)
 	if err != nil {
+		return fmt.Errorf("listing the tree: %w", err)
+	}
+	// The blobs are asked for through a pipe, as the listing is read: the contents come in the order
+	// of the listing, one blob after the other, files and links, gitlinks left out.
+	pipeR, pipeW := io.Pipe()
+	cat, err := repo.Exec(ctx,
+		gitcmd.Command{Name: "cat-file", Flags: []gitcmd.Option{gitcmd.Flag{Name: "--batch"}}},
+		gitcmd.WithStdin(pipeR),
+		gitcmd.WithSetupStdout(),
+		gitcmd.WithStderr(&catStderr),
+	)
+	if err != nil {
+		cancel()
+		_ = ls.Wait()
 		return fmt.Errorf("reading the blobs of the tree: %w", err)
 	}
-	batch := bufio.NewReaderSize(cmd, 1<<20)
-	writeErr := landMaterialize(entries, batch, dir)
-	if writeErr == nil {
+
+	listed := make(chan landTreeEntry, 256)
+	fed := make(chan error, 1)
+	go func() {
+		err := landFeed(ctx, bufio.NewReaderSize(ls, 1<<20), pipeW, listed)
+		close(listed)
+		_ = pipeW.CloseWithError(err) // nil: the end of the input, and cat-file ends
+		fed <- err
+	}()
+
+	var entries []landTreeEntry
+	m := newLandMaterializer(dir, limits)
+	batch := bufio.NewReaderSize(cat, 1<<20)
+	var writeErr error
+	for e := range listed {
+		entries = append(entries, e)
+		if writeErr = m.add(&entries[len(entries)-1], batch); writeErr != nil {
+			break
+		}
+	}
+	if writeErr != nil {
+		// Let the feeder and the commands go: none of them is needed any more.
+		cancel()
+		_ = pipeR.Close()
+	}
+	feedErr := <-fed
+	if writeErr == nil && feedErr == nil {
 		// Nothing else may follow the last blob.
 		if _, err := batch.ReadByte(); !errors.Is(err, io.EOF) {
 			writeErr = fmt.Errorf("git-cat-file(1) answered more than the blobs asked for: %v", err)
 		}
 	}
-	if waitErr := cmd.Wait(); waitErr != nil && writeErr == nil {
-		return fmt.Errorf("reading the blobs of the tree: %w, stderr: %q", waitErr, stderr.String())
-	}
-	if writeErr != nil {
+	lsWait, catWait := ls.Wait(), cat.Wait()
+	switch {
+	case writeErr != nil:
 		return writeErr
+	case feedErr != nil:
+		return feedErr
+	case lsWait != nil:
+		return fmt.Errorf("listing the tree: %w, stderr: %q", lsWait, lsStderr.String())
+	case catWait != nil:
+		return fmt.Errorf("reading the blobs of the tree: %w, stderr: %q", catWait, catStderr.String())
 	}
 	if afterWrite != nil {
 		afterWrite()
@@ -241,32 +310,117 @@ func landCheckoutTreeThen(ctx context.Context, repo *localrepo.Repo, tree git.Ob
 	return landCheckMaterialized(entries, dir)
 }
 
+// landFeed reads the entries of the listing (ls-tree -r -z -l), asks cat-file for the blob of each
+// that is not a gitlink, one line per object ID, and hands the entries on, in order.
+func landFeed(ctx context.Context, listing *bufio.Reader, oids io.Writer, out chan<- landTreeEntry) error {
+	for {
+		record, err := landReadRecord(listing)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		e, err := landParseTreeRecord(record)
+		if err != nil {
+			return err
+		}
+		if !e.isGitlink() {
+			if _, err := io.WriteString(oids, e.oid.String()+"\n"); err != nil {
+				return fmt.Errorf("asking for the blobs of the tree: %w", err)
+			}
+		}
+		select {
+		case out <- e:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// landReadRecord reads one NUL-ended record, of at most landMaxTreePath plus the bytes of its
+// mode, type, object ID and size. io.EOF means the listing ended between two records.
+func landReadRecord(r *bufio.Reader) (string, error) {
+	var record []byte
+	for {
+		chunk, err := r.ReadSlice(0)
+		record = append(record, chunk...)
+		if len(record) > landMaxTreePath+256 {
+			return "", landRefuse("the tree has a path longer than %d bytes", landMaxTreePath)
+		}
+		switch {
+		case err == nil:
+			return string(record[:len(record)-1]), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF) && len(record) == 0:
+			return "", io.EOF
+		case errors.Is(err, io.EOF):
+			return "", fmt.Errorf("the listing of the tree ends in the middle of an entry: %w", io.ErrUnexpectedEOF)
+		}
+		return "", fmt.Errorf("reading the listing of the tree: %w", err)
+	}
+}
+
 // landParseTreeListing parses the output of git-ls-tree(1) -r -z: "<mode> <type> <object>\t<path>"
-// entries ended by NUL. A tree holds files, links and gitlinks once listed recursively.
+// entries ended by NUL (with -l, "<mode> <type> <object> <size>\t<path>"). A tree holds files, links
+// and gitlinks once listed recursively.
 func landParseTreeListing(raw []byte) ([]landTreeEntry, error) {
 	var entries []landTreeEntry
 	for _, record := range strings.Split(string(raw), "\x00") {
 		if record == "" {
 			continue
 		}
-		meta, name, ok := strings.Cut(record, "\t")
-		fields := strings.Fields(meta)
-		if !ok || len(fields) != 3 {
-			return nil, fmt.Errorf("unexpected entry in the listing of the tree: %q", record)
-		}
-		mode, err := strconv.ParseUint(fields[0], 8, 32)
+		e, err := landParseTreeRecord(record)
 		if err != nil {
-			return nil, fmt.Errorf("unexpected mode in the listing of the tree: %q", record)
-		}
-		e := landTreeEntry{mode: uint32(mode), oid: git.ObjectID(fields[2]), path: name}
-		switch {
-		case e.isRegular() && fields[1] == "blob", e.isSymlink() && fields[1] == "blob", e.isGitlink() && fields[1] == "commit":
-		default:
-			return nil, fmt.Errorf("entry %q has the mode %s and the type %s, which a checkout does not write", name, fields[0], fields[1])
+			return nil, err
 		}
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// landParseTreeRecord parses one entry of the listing.
+func landParseTreeRecord(record string) (landTreeEntry, error) {
+	meta, name, ok := strings.Cut(record, "\t")
+	fields := strings.Fields(meta)
+	if !ok || (len(fields) != 3 && len(fields) != 4) {
+		return landTreeEntry{}, fmt.Errorf("unexpected entry in the listing of the tree: %q", record)
+	}
+	mode, err := strconv.ParseUint(fields[0], 8, 32)
+	if err != nil {
+		return landTreeEntry{}, fmt.Errorf("unexpected mode in the listing of the tree: %q", record)
+	}
+	if !landObjectIDValid(fields[2]) {
+		return landTreeEntry{}, fmt.Errorf("unexpected object ID in the listing of the tree: %q", record)
+	}
+	e := landTreeEntry{mode: uint32(mode), oid: git.ObjectID(fields[2]), path: name}
+	if len(fields) == 4 && fields[3] != "-" {
+		size, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil || size < 0 {
+			return landTreeEntry{}, fmt.Errorf("unexpected size in the listing of the tree: %q", record)
+		}
+		e.sized, e.listed = true, size
+	}
+	switch {
+	case e.isRegular() && fields[1] == "blob", e.isSymlink() && fields[1] == "blob", e.isGitlink() && fields[1] == "commit":
+	default:
+		return landTreeEntry{}, fmt.Errorf("entry %q has the mode %s and the type %s, which a checkout does not write", name, fields[0], fields[1])
+	}
+	return e, nil
+}
+
+// landObjectIDValid reports whether s is an object ID: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits.
+func landObjectIDValid(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // landTreePathValid reports whether the path of a tree entry may be written under a directory: a
@@ -276,75 +430,176 @@ func landTreePathValid(name string) bool {
 		!strings.ContainsRune(name, 0)
 }
 
+// landFolded is what a case-insensitive file system sees at a path: its first spelling, and whether
+// that is a symbolic link.
+type landFolded struct {
+	spelling string
+	link     bool
+}
+
+// landMaterializer writes the entries of a tree under dir, one at a time.
+type landMaterializer struct {
+	dir    string
+	limits landCheckoutLimits
+	links  map[string]bool       // the paths of the symbolic links written
+	dirs   map[string]bool       // the directories made
+	folded map[string]landFolded // the paths as a case-insensitive file system sees them
+	count  int                   // entries written
+	bytes  int64                 // bytes of files and links written
+}
+
+func newLandMaterializer(dir string, limits landCheckoutLimits) *landMaterializer {
+	return &landMaterializer{dir: dir, limits: limits, links: map[string]bool{}, dirs: map[string]bool{}, folded: map[string]landFolded{}}
+}
+
 // landMaterialize writes the entries under dir, reading the contents of the files and links from batch
 // in their order (the answer of git-cat-file(1) --batch to the blobs of the listing, gitlinks left
-// out). It refuses a path that would leave dir or lie under a symbolic link it wrote: a link is
-// written as a link and never followed. It sets size and target of the entries.
+// out). See landMaterializer.add for what it refuses. It sets size and target of the entries.
 func landMaterialize(entries []landTreeEntry, batch *bufio.Reader, dir string) error {
-	links := map[string]bool{}
+	m := newLandMaterializer(dir, landCheckoutLimits{})
 	for i := range entries {
-		e := &entries[i]
-		if !landTreePathValid(e.path) {
-			return fmt.Errorf("unsafe path %q in the tree", e.path)
-		}
-		for p := path.Dir(e.path); p != "."; p = path.Dir(p) {
-			if links[p] {
-				return fmt.Errorf("entry %q lies under the symbolic link %q", e.path, p)
-			}
-		}
-		target := filepath.Join(dir, filepath.FromSlash(e.path))
-		if e.isGitlink() {
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-			continue
-		}
-
-		size, err := landReadBatchHeader(batch, e.oid)
-		if err != nil {
-			return fmt.Errorf("%q: %w", e.path, err)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if err := m.add(&entries[i], batch); err != nil {
 			return err
 		}
-		if e.isSymlink() {
-			if size > landMaxLinkTarget {
-				return fmt.Errorf("the symbolic link %q has a target of %d bytes", e.path, size)
-			}
-			content := make([]byte, size)
-			if _, err := io.ReadFull(batch, content); err != nil {
-				return fmt.Errorf("%q: %w", e.path, err)
-			}
-			if err := os.Symlink(string(content), target); err != nil {
-				return err
-			}
-			e.target, e.size = string(content), size
-			links[e.path] = true
-		} else {
-			perm := os.FileMode(0o644)
-			if e.mode&0o111 != 0 {
-				perm = 0o755
-			}
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
-			if err != nil {
-				return err
-			}
-			if _, err := io.CopyN(f, batch, size); err != nil {
-				_ = f.Close()
-				return fmt.Errorf("%q: %w", e.path, err)
-			}
-			if err := f.Close(); err != nil {
-				return err
-			}
-			// The mode is the tree's, whatever the umask of the process.
-			if err := os.Chmod(target, perm); err != nil {
-				return err
-			}
-			e.size = size
+	}
+	return nil
+}
+
+// add writes one entry. It refuses, with a *landCheckoutRefusal:
+//   - a path that is not clean, or leaves dir;
+//   - a path longer than landMaxTreePath, more entries or more bytes than the limits allow;
+//   - a component that names .git on some file system (resolver.IsGitDirName): the operator's
+//     command may run git in the checkout, and a .git of the tree would be its repository, whose
+//     configuration and hooks run;
+//   - an entry under a symbolic link that was written, also when a case-insensitive file system
+//     would see the same name (a link "A" and an entry "a/x");
+//   - a parent that is not a directory.
+//
+// Each directory is made one component at a time and looked at with Lstat, never with MkdirAll,
+// which would follow a link; a file is created with O_EXCL and O_NOFOLLOW; a link is written as a
+// link and never followed.
+func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
+	if !landTreePathValid(e.path) {
+		return landRefuse("unsafe path %q in the tree", e.path)
+	}
+	if len(e.path) > landMaxTreePath {
+		return landRefuse("the tree has a path longer than %d bytes", landMaxTreePath)
+	}
+	if m.count++; m.limits.entries > 0 && m.count > m.limits.entries {
+		return landRefuse("the tree has more than %d entries (verify.max_tree_entries)", m.limits.entries)
+	}
+	if e.sized && !e.isGitlink() && m.limits.bytes > 0 && m.bytes+e.listed > m.limits.bytes {
+		return landRefuse("the tree has more than %d bytes of files (verify.max_tree_bytes)", m.limits.bytes)
+	}
+
+	parts := strings.Split(e.path, "/")
+	for _, c := range parts {
+		if resolver.IsGitDirName(c) {
+			return landRefuse("the path %q has a component that names .git, which a checkout does not write", e.path)
 		}
-		if b, err := batch.ReadByte(); err != nil || b != '\n' {
-			return fmt.Errorf("%q: the blob is not followed by a line feed", e.path)
+	}
+	for p := path.Dir(e.path); p != "."; p = path.Dir(p) {
+		if m.links[p] {
+			return landRefuse("entry %q lies under the symbolic link %q", e.path, p)
 		}
+	}
+	for i := range parts {
+		prefix := strings.Join(parts[:i+1], "/")
+		link := i == len(parts)-1 && e.isSymlink()
+		f := resolver.FoldGitName(prefix)
+		prev, seen := m.folded[f]
+		switch {
+		case !seen:
+			m.folded[f] = landFolded{spelling: prefix, link: link}
+		case prev.spelling != prefix && (prev.link || link):
+			return landRefuse("%q and %q are one name on a case-insensitive file system, and one is a symbolic link", e.path, prev.spelling)
+		}
+	}
+
+	if e.isGitlink() {
+		return m.mkdirAll(parts)
+	}
+	if m.dirs[e.path] {
+		return landRefuse("the entry %q is also a directory of the tree", e.path)
+	}
+	size, err := landReadBatchHeader(batch, e.oid)
+	if err != nil {
+		return fmt.Errorf("%q: %w", e.path, err)
+	}
+	if e.sized && e.listed != size {
+		return fmt.Errorf("%q: the listing says %d bytes and git-cat-file(1) %d", e.path, e.listed, size)
+	}
+	if m.bytes += size; m.limits.bytes > 0 && m.bytes > m.limits.bytes {
+		return landRefuse("the tree has more than %d bytes of files (verify.max_tree_bytes)", m.limits.bytes)
+	}
+	if err := m.mkdirAll(parts[:len(parts)-1]); err != nil {
+		return err
+	}
+	target := filepath.Join(m.dir, filepath.FromSlash(e.path))
+	if e.isSymlink() {
+		if size > landMaxLinkTarget {
+			return landRefuse("the symbolic link %q has a target of %d bytes", e.path, size)
+		}
+		content := make([]byte, size)
+		if _, err := io.ReadFull(batch, content); err != nil {
+			return fmt.Errorf("%q: %w", e.path, err)
+		}
+		if err := os.Symlink(string(content), target); err != nil {
+			return err
+		}
+		e.target, e.size = string(content), size
+		m.links[e.path] = true
+	} else {
+		perm := os.FileMode(0o644)
+		if e.mode&0o111 != 0 {
+			perm = 0o755
+		}
+		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
+		if err != nil {
+			return err
+		}
+		if _, err := io.CopyN(f, batch, size); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("%q: %w", e.path, err)
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		// The mode is the tree's, whatever the umask of the process.
+		if err := os.Chmod(target, perm); err != nil {
+			return err
+		}
+		e.size = size
+	}
+	if b, err := batch.ReadByte(); err != nil || b != '\n' {
+		return fmt.Errorf("%q: the blob is not followed by a line feed", e.path)
+	}
+	return nil
+}
+
+// mkdirAll makes the directory of the given components under dir, one at a time. A component that
+// exists must be a directory by Lstat, which does not follow a link: a link, or a file, in the way
+// is a refusal.
+func (m *landMaterializer) mkdirAll(parts []string) error {
+	current := m.dir
+	for i, c := range parts {
+		current = filepath.Join(current, c)
+		key := strings.Join(parts[:i+1], "/")
+		if m.dirs[key] {
+			continue
+		}
+		info, err := os.Lstat(current)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		case !info.IsDir():
+			return landRefuse("%q is in the way of a directory of the tree, and is not a directory", key)
+		}
+		m.dirs[key] = true
 	}
 	return nil
 }
@@ -367,8 +622,23 @@ func landReadBatchHeader(batch *bufio.Reader, want git.ObjectID) (int64, error) 
 	return size, nil
 }
 
+// landBlobOID is the object ID that git gives the blob that r holds, size bytes long: the hash of
+// "blob <size>\0" and the content, with the hash of the repository (SHA-256 for an ID of 64 digits).
+func landBlobOID(r io.Reader, size int64, like git.ObjectID) (git.ObjectID, error) {
+	h := sha1.New() //nolint:gosec // the hash git names its objects with
+	if len(like) == 64 {
+		h = sha256.New()
+	}
+	fmt.Fprintf(h, "blob %d\x00", size)
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	return git.ObjectID(hex.EncodeToString(h.Sum(nil))), nil
+}
+
 // landCheckMaterialized reads dir back and compares it with the entries that were written: every entry
-// is there with its type, its executable bit, the length of its file or the target of its link; a
+// is there with its type, its executable bit, the length of its file or the target of its link; the
+// content of every file and every link hashes, as a git blob, to the object ID of the tree; a
 // gitlink is an empty directory; and nothing else is there but the directories that hold the
 // entries. A difference is an error.
 func landCheckMaterialized(entries []landTreeEntry, dir string) error {
@@ -409,9 +679,21 @@ func landCheckMaterialized(entries []landTreeEntry, dir string) error {
 			if err != nil || info.Mode()&os.ModeSymlink == 0 || got != e.target {
 				return fmt.Errorf("the symbolic link %q does not point to %q", name, e.target)
 			}
+			if oid, err := landBlobOID(strings.NewReader(got), int64(len(got)), e.oid); err != nil || oid != e.oid {
+				return fmt.Errorf("the symbolic link %q is not the blob %s of the tree", name, e.oid)
+			}
 		case isEntry && e.isRegular():
 			if !info.Mode().IsRegular() || info.Size() != e.size || (info.Mode().Perm()&0o111 != 0) != (e.mode&0o111 != 0) {
 				return fmt.Errorf("the file %q is not the file of the tree (size %d, executable %v)", name, e.size, e.mode&0o111 != 0)
+			}
+			f, err := os.Open(full)
+			if err != nil {
+				return err
+			}
+			oid, err := landBlobOID(f, e.size, e.oid)
+			_ = f.Close()
+			if err != nil || oid != e.oid {
+				return fmt.Errorf("the content of the file %q is not the blob %s of the tree", name, e.oid)
 			}
 		case isEntry:
 			return fmt.Errorf("unexpected entry %q", name)

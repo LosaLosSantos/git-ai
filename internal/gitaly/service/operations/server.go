@@ -44,6 +44,9 @@ type Server struct {
 	// landResolveHook, when set, runs in every resolver call while it holds its resolve slot; only
 	// tests set it.
 	landResolveHook func()
+	// landFinalPassHook, when set, runs in every pass of the final pass of a land between its
+	// pre-resolution and its lane, with the number of the pass; only tests set it.
+	landFinalPassHook func(pass int)
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
 	// or when the configured resolver cannot be built: then resolverErr says why, and every land
 	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).

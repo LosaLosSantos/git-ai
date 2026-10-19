@@ -234,6 +234,19 @@ start from), and a separate unprivileged user. The post-merge test command of
 `graft-verify` ([VERIFY](VERIFY.md)) runs the same kind of code on the tip and
 has the same advice. Without a `verify.command` nothing of a model's lands.
 
+Three things that the container does not close:
+
+- `--network=none` closes the network, not the output. Up to 4 KiB of what the command prints goes back
+  to the agent in the reason of the conflict package, so a command that prints a secret hands it
+  out. Print nothing that is not for the agent, and keep secrets out of the checkout's environment
+  and file system.
+- Symbolic links of the tree are written as links and can point anywhere on the host. Inside a
+  container with the checkout as the only mount they point at nothing; outside one, a command that
+  follows them reads what the gitaly user can read. The checkout never writes through a link.
+- The tree may hold files that other tools read: `graft-resolve`'s own check commands (`[[check]]`)
+  also run on a model's output, with the same advice. The checkout itself refuses a `.git`
+  anywhere in the tree, and a tree over `verify.max_tree_entries` or `verify.max_tree_bytes`.
+
 What counts as a model's answer is fail-safe on both sides. The server treats any
 file that is not marked `origin: "rule"` as a model's. `graft-resolve` marks as a
 rule only the strategies that say so (trivial, union, rerere, and a `command`

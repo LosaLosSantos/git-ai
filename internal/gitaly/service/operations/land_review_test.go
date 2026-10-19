@@ -155,9 +155,16 @@ func TestLandKeptMoving(t *testing.T) {
 
 	in := &gitalypb.UserLandRequest{Branch: []byte("main"), CommitId: strings.Repeat("c", 40)}
 	conflict := landConflict{reference: "refs/heads/main", oldOID: git.ObjectID(strings.Repeat("1", 40)), newOID: git.ObjectID(strings.Repeat("2", 40))}
-	model := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}}}}
-	rules := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule}}}}
-	unmarked := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a"}}}}
+	current := map[landFileKey]bool{{path: "a"}: true}
+	model := &landPreResolution{current: current, verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}}}}
+	rules := &landPreResolution{current: current, verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule}}}}
+	unmarked := &landPreResolution{current: current, verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a"}}}}
+	// A model's verdict for a file as it was (another key), while the land's file is a rule's: stale.
+	stale := &landPreResolution{current: current, verdicts: landVerdicts{
+		{path: "a"}:                      {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule}},
+		{path: "a", oursOID: "old"}:      {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}},
+		{path: "gone", theirsOID: "old"}: {file: resolver.ResponseFile{Path: "gone", Origin: resolver.OriginModel}},
+	}}
 
 	for name, pre := range map[string]*landPreResolution{"a model's verdict": model, "a verdict that says nothing": unmarked} {
 		var need *landNeedsResolution
@@ -166,7 +173,7 @@ func TestLandKeptMoving(t *testing.T) {
 		require.Equal(t, strings.Repeat("c", 40), need.commit.String(), name)
 		require.Equal(t, "could not verify before the branch moved again", landStoppedReason(need, time.Minute), name)
 	}
-	for name, pre := range map[string]*landPreResolution{"rules only": rules, "no pre-resolution": nil, "no verdict": {}} {
+	for name, pre := range map[string]*landPreResolution{"rules only": rules, "stale model verdicts": stale, "no pre-resolution": nil, "no verdict": {}, "no current files": {verdicts: model.verdicts}} {
 		err := landKeptMoving(in, pre, conflict, 20)
 		var need *landNeedsResolution
 		require.False(t, errors.As(err, &need), name)
@@ -204,6 +211,7 @@ func TestLandLostRace(t *testing.T) {
 	conflict := landConflict{reference: "refs/heads/main", oldOID: git.ObjectID(strings.Repeat("1", 40)), newOID: git.ObjectID(strings.Repeat("2", 40))}
 	model := &landPreResolution{
 		verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}}},
+		current:  map[landFileKey]bool{{path: "a"}: true},
 	}
 
 	ctx := context.Background()

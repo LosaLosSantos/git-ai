@@ -53,12 +53,18 @@ func TestGraftResolverValidateVerify(t *testing.T) {
 	d, err := GraftResolverVerify{}.TimeoutOrDefault()
 	require.NoError(t, err)
 	require.Equal(t, "5m0s", d.String())
+	require.Equal(t, 200000, GraftResolverVerify{}.MaxTreeEntriesOrDefault())
+	require.Equal(t, int64(2<<30), GraftResolverVerify{}.MaxTreeBytesOrDefault())
+	require.Equal(t, 7, GraftResolverVerify{MaxTreeEntries: 7}.MaxTreeEntriesOrDefault())
+	require.Equal(t, int64(9), GraftResolverVerify{MaxTreeBytes: 9}.MaxTreeBytesOrDefault())
 
 	for name, v := range map[string]GraftResolverVerify{
-		"no command":    {Enabled: true},
-		"empty program": {Enabled: true, Command: []string{""}},
-		"bad timeout":   {Enabled: true, Command: []string{"x"}, Timeout: "soon"},
-		"zero timeout":  {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
+		"no command":       {Enabled: true},
+		"empty program":    {Enabled: true, Command: []string{""}},
+		"bad timeout":      {Enabled: true, Command: []string{"x"}, Timeout: "soon"},
+		"zero timeout":     {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
+		"negative entries": {MaxTreeEntries: -1},
+		"negative bytes":   {MaxTreeBytes: -1},
 	} {
 		require.Error(t, GraftResolver{Verify: v}.validate(), name)
 	}
