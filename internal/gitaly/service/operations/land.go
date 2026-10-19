@@ -72,11 +72,20 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 		return nil, structerr.NewInvalidArgument("%w", err)
 	}
 
-	if s.landBatchable(ctx, in) {
-		return s.userLandBatched(ctx, in, committer)
+	// The check of an agent's resolution runs an external process: it runs here, before the land
+	// enters its lane, so that no branch is held while it runs (landPrecheckResolution).
+	var precheck *landPrecheck
+	if in.GetResolution() != nil {
+		if precheck, err = s.landPrecheckResolution(ctx, in, s.localRepoFactory.Build(in.GetRepository())); err != nil {
+			return nil, err
+		}
 	}
 
-	resp, err := s.landWithRetries(ctx, in, committer)
+	if s.landBatchable(ctx, in) {
+		return s.userLandBatched(ctx, in, committer, precheck)
+	}
+
+	resp, err := s.landWithRetries(ctx, in, committer, precheck)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +103,7 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 // On MVCC repositories, the attempt runs against a snapshot that is pinned for the whole RPC.
 // Retrying within the RPC would read the same tip again, so the conflict is reported to the
 // client instead and the client has to retry the landing.
-func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
+func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck) (*gitalypb.UserLandResponse, error) {
 	snapshotPinned := mvcc.CacheFromContext(ctx) != nil
 
 	maxAttempts := int(in.GetMaxAttempts())
@@ -103,7 +112,7 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 	}
 
 	for attempt := 1; ; attempt++ {
-		resp, err := s.landAttempt(ctx, in, committer)
+		resp, err := s.landAttempt(ctx, in, committer, precheck)
 		if err == nil {
 			resp.Attempts = int32(attempt)
 			return resp, nil
@@ -167,7 +176,7 @@ func (s *Server) landAncestry(ctx context.Context, quarantineRepo *localrepo.Rep
 
 // landAttempt performs a single compare-and-swap attempt of UserLand. It returns a landConflict
 // if the branch was moved by a concurrent writer, in which case the caller retries.
-func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
+func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck) (*gitalypb.UserLandResponse, error) {
 	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), landPublishLoose, ignoreLandPhase)
 	if err != nil {
 		return nil, err
@@ -182,7 +191,7 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 
 	// The request is decided as a member of a batch is (landingAttempt.decide). The policy is not
 	// evaluated here: the update runs with the identity of the request, so the hooks judge it.
-	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in)}
+	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in), precheck: precheck}
 	step, err := attempt.decide(ctx, tip, req)
 	if err != nil {
 		return nil, err

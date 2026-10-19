@@ -119,7 +119,7 @@ func (s *Server) resolveLandConflicts(
 		return landResolution{}, notAttempted(fmt.Sprintf("%d conflicting files exceed max_files %d", len(conflicts), maxFiles))
 	}
 
-	if err := s.landClassify(ctx, repo, files, base, tip, commitID); err != nil {
+	if err := s.landClassify(ctx, repo, files, base, tip, commitID, newLandClassifyCache(files)); err != nil {
 		return landResolution{}, err
 	}
 
@@ -475,9 +475,10 @@ func (s *Server) landClassify(
 	repo *localrepo.Repo,
 	files []*landFileState,
 	base, tip, commitID git.ObjectID,
+	cache *landClassifyCache,
 ) error {
 	rules := s.conflictResolver.SendRules()
-	listings := map[git.ObjectID]map[git.ObjectID][]string{}
+	listings := cache.listings
 	for _, f := range files {
 		c := f.conflict
 		switch {
@@ -556,7 +557,7 @@ func (s *Server) landClassify(
 			candidates = append(candidates, f.conflict.path)
 		}
 	}
-	generated, err := landGeneratedPaths(ctx, repo, tip, candidates)
+	generated, err := cache.generatedPaths(ctx, repo, tip, candidates)
 	if err != nil {
 		return err
 	}
@@ -569,6 +570,40 @@ func (s *Server) landClassify(
 		}
 	}
 	return nil
+}
+
+// landClassifyCache holds what landClassify reads from the trees, for every call of one land: the
+// listings of the trees (by revision) and the linguist-generated attribute of the paths, read once
+// for all the paths of the land.
+type landClassifyCache struct {
+	listings  map[git.ObjectID]map[git.ObjectID][]string
+	paths     []string
+	generated map[string]bool
+}
+
+// newLandClassifyCache returns the cache of the land of files.
+func newLandClassifyCache(files []*landFileState) *landClassifyCache {
+	c := &landClassifyCache{listings: map[git.ObjectID]map[git.ObjectID][]string{}}
+	for _, f := range files {
+		c.paths = append(c.paths, f.conflict.path)
+	}
+	return c
+}
+
+// generatedPaths returns the linguist-generated attribute of the paths (all of them paths of the
+// land), read at rev with one git check-attr for every path of the land, on first use.
+func (c *landClassifyCache) generatedPaths(ctx context.Context, repo *localrepo.Repo, rev git.ObjectID, paths []string) (map[string]bool, error) {
+	if len(paths) == 0 {
+		return map[string]bool{}, nil
+	}
+	if c.generated == nil {
+		generated, err := landGeneratedPaths(ctx, repo, rev, c.paths)
+		if err != nil {
+			return nil, err
+		}
+		c.generated = generated
+	}
+	return c.generated, nil
 }
 
 // landShapeReason returns why the shape of the sides keeps a conflict from the resolver, or "". A

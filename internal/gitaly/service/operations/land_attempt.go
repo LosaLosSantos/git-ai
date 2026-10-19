@@ -200,7 +200,7 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 	// A resolution from the caller lands as a merge commit of the tip and the change, when it was
 	// made against this tip; it replaces the server's attempt to merge or rebase.
 	if in.GetResolution() != nil {
-		res, err := a.server.landWithResolution(ctx, in, a.repo, tip, commitID, req.committer)
+		res, err := a.server.landWithResolution(ctx, in, a.repo, tip, commitID, req.committer, req.precheck)
 		if err != nil {
 			var unresolved *landUnresolvedError
 			if errors.As(err, &unresolved) {

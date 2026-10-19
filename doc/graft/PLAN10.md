@@ -582,3 +582,19 @@ way.
     names follow git's rules, the hashed 8.3 forms included; only the last paragraph of a message
     is its trailer block, and the server's trailers are always that paragraph (documented,
     tested).
+* **Second re-review of 38d8bb1** (PM: fix before R1).
+  * The check of an agent's resolution runs before the land enters its lane (landPrecheckResolution
+    in UserLand), against resolution.tip: the only tip the land accepts the resolution at, so no
+    re-check is needed. In the lane the land applies the verdicts when the tip and the commit are
+    those the check ran on, and fails closed otherwise; if the branch moved, the resolution is
+    refused with a fresh package before any verdict is used. No branch is held while the external
+    process runs. The whole check has one deadline (the resolver's timeout); each request uses what
+    remains, and expiry fails closed, the files checked before keeping their verdicts.
+  * Check requests carry no commit message; their file data is bounded by resolver.CheckBatchBytes
+    with a per-file allowance for paths, and max_file_bytes is refused at startup above
+    resolver.MaxCheckFileBytes (about 12 MiB), so that one file always fits one request.
+  * The listings of the trees and the attributes are read once per land, not per batch.
+  * The CLI never falls back to one side: when it cannot merge a file, the file to edit is one diff3
+    conflict holding every side (pointer lines for binary sides, the text of text sides, notes for
+    deleted and unavailable ones). --resolved refuses a pointer line, and a path that is a file on
+    none of its sides can only be deleted.

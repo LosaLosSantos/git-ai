@@ -177,8 +177,8 @@ func TestCLILandConflictsWithAnUnavailableSide(t *testing.T) {
 	require.Equal(t, "added by theirs\n", string(theirs))
 	edit, err := os.ReadFile(filepath.Join(conflicts, "files", "c.txt"))
 	require.NoError(t, err)
-	require.Equal(t, "<<<<<<< ours (the branch tip): unavailable, see conflict.json\n=======\nadded by theirs\n>>>>>>> theirs (the change)\n", string(edit),
-		"the side there is against a note on the other, between markers")
+	require.Contains(t, string(edit), "<<<<<<< ours (the branch tip): unavailable, ", "the unavailable side is said so")
+	require.Contains(t, string(edit), "=======\nadded by theirs\n>>>>>>> theirs (the change)\n", "the side there is, between markers")
 
 	// Landed unedited, the file is refused by the marker rule: the tip's side is never dropped.
 	code, _, stderr = runCLI(t, "land", "-C", dir, "-author", "Dev <dev@example.com>", "-resolved", conflicts)

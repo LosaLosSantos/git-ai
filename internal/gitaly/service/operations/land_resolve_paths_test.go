@@ -95,7 +95,7 @@ func TestLandClassify_absentFromBothSides(t *testing.T) {
 	s := fx.server(t, rcfg)
 
 	f := &landFileState{conflict: landFileConflict{path: "x~" + fx.tip.String()}}
-	require.NoError(t, s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.tip, fx.commit))
+	require.NoError(t, s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.tip, fx.commit, newLandClassifyCache([]*landFileState{f})))
 	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, f.outcome)
 	require.Equal(t, landNotSentNoSide, f.reason)
 }

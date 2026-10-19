@@ -81,18 +81,26 @@ A client asks for resolution per call:
   with a side, another path's side or the package. A side the package gives no
   object ID (see `unavailable` below), or that the server cannot return, is
   left out and reported; it fails neither its file nor the directory, and it is
-  never dropped silently. Without the base, the file to edit is the two-way
-  merge of the sides, with markers where they differ. Without ours or theirs,
-  it is a conflict between markers: the side there is (named by its file under
-  `sides/` when it is binary) against a note that the other is unavailable, so
-  that the marker rule refuses it until the agent resolves it. `DIR` must not
+  never dropped silently. When the CLI can merge the file (ours and theirs
+  text, the base text or absent, and a diff within bound), the file to edit is
+  the merge with diff3 markers. Otherwise (a binary side, a side that is deleted
+  or unavailable, a diff too large) it is one conflict between diff3 markers
+  that holds every side: the text of each text side, and for a binary side a
+  `graft-conflict-pointer:` line naming its file under `sides/`, with a note on
+  the marker line of a side that is binary, deleted or unavailable. The marker
+  rule of the server refuses it until the agent resolves it, and
+  `graft land --resolved` refuses a file that still holds a pointer line, so
+  that a pointer can never land in place of a binary side. `DIR` must not
   hold a conflicts directory yet: one being edited is never overwritten. A
   path that cannot be a file under `DIR` on this system (a backslash, on
   Windows a colon or a name the system reserves) is an error, and so are two paths that
   the file system takes for one file (names that differ only in case on a
   case-insensitive file system). Edit the files under `DIR/files`, then
-  `graft land --resolved DIR` lands them: a present file is written (with the
-  tip side's mode), an absent one is deleted.
+  `graft land --resolved DIR` lands them: a present file is written, with the
+  file mode of the tip's side, else of the landed commit's, else of the base's;
+  an absent one is deleted. A path that is a file on none of its sides (a
+  submodule) can only be deleted, by removing its file, or resolved outside
+  graft.
 - RPC: `UserLandRequest.resolve_conflicts` (field 10). The response carries
   `resolved_paths` (field 7) and `resolver` (field 8). The re-land is
   `UserLandRequest.resolution` (field 11).
@@ -412,12 +420,20 @@ content) or `delete`. The server accepts it only when:
 - when a resolver is configured, the files that may be sent to it pass its
   `check`: the syntax check and the configured checks, as an `llm` answer.
   A check that cannot run fails the land, with the reason in the package.
-  The files go to the check in requests of at most 32 MiB of file data each
-  (about 43 MiB encoded, within the 64 MiB a check request may take and the
-  128 MiB graft-resolve reads by default), checked one after the other, so
-  that neither side holds more than one such request at a time. A single file
-  larger than that is a request of its own: raise graft-resolve's
-  `--max-request-bytes` with `max_file_bytes`.
+  The check runs before the land enters the branch's lane, against the tip
+  the resolution was made against, so that no branch is held while an
+  external process runs; the lane only applies its verdicts (if the branch
+  moved meanwhile, the resolution is refused with a fresh package, as it would
+  be anyway). The whole check has one deadline, the resolver's `timeout`:
+  every check request uses what remains of it, and its expiry fails the check
+  closed. The files go to the check in requests of at most 48 MiB of file data
+  each (sides and resolutions, within the 64 MiB a check request may take
+  once encoded, and the 128 MiB graft-resolve reads by default), checked one
+  after the other, so that neither side holds more than one such request at a
+  time; the requests carry no commit message. One file, its three sides and
+  its resolution, must fit one request, so the server refuses at startup a
+  `max_file_bytes` over about 12 MiB. When a check request fails, the files
+  checked before keep their verdict and the others are not attempted.
   A file with a `syntax: unchecked` verdict lands, and is counted in
   `graft_land_resolution_syntax_unchecked_total`, once, when the land
   succeeds, and in the server log.

@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -346,35 +348,141 @@ func TestUserLand_reland(t *testing.T) {
 	t.Run("the check goes in bounded requests, one batch at a time", func(t *testing.T) {
 		t.Parallel()
 
-		// A bound of one byte: every file is a check request of its own, answered in turn.
-		dir, argv := resolverScript(t, `cp "$DIR/answer-$N.json" "$DIR/answer.json"`)
-		for n, p := range []string{"a", "b"} {
-			raw, err := json.Marshal(resolver.CheckResponse{
-				Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: "graft-resolve",
-				Files: []resolver.CheckFile{{Path: p, OK: true, Syntax: resolver.SyntaxUnchecked}},
-			})
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("answer-%d.json", n+1)), raw, 0o600))
-		}
-		fx := newResolveFixture(t, config.GraftResolver{})
-		s := fx.server(t, enabledResolver(argv))
-		s.checkBatchBytes = 1
-		req := fx.request("Land")
-		req.ResolveConflicts = false
-		req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+		// A bound of one byte: every file is larger than the bound, so each is a check request of
+		// its own, answered in turn.
+		dir, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", true, ""), checkAnswer("graft-resolve", "b", true, ""))
+		fx, s, req := batchedReland(t, argv)
 
-		res, err := s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer())
+		pre, err := s.landPrecheckResolution(fx.ctx, req, fx.repo)
+		require.NoError(t, err)
+		res, err := s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
 		require.NoError(t, err)
 		require.Equal(t, 2, resolverCalls(t, dir))
 		for n, p := range []string{"a", "b"} {
 			check := resolverRequest(t, dir, n+1)
 			require.Len(t, check.Files, 1)
 			require.Equal(t, p, check.Files[0].Path)
+			require.Empty(t, check.Messages, "the check carries no commit message")
 		}
 		require.Equal(t, 2, res.syntaxUnchecked, "the verdicts of every batch count")
 		commit, err := fx.repo.ReadCommit(fx.ctx, res.commit.Revision())
 		require.NoError(t, err)
 		require.Contains(t, string(commit.GetBody()), "Graft-Checked-By: graft-resolve\n")
+	})
+
+	t.Run("a later batch that rejects keeps the verdict of the earlier one", func(t *testing.T) {
+		t.Parallel()
+
+		_, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", true, ""), checkAnswer("graft-resolve", "b", false, "b is wrong"))
+		fx, s, req := batchedReland(t, argv)
+		pre, err := s.landPrecheckResolution(fx.ctx, req, fx.repo)
+		require.NoError(t, err)
+		_, err = s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
+		pkg := builtUnresolved(t, fx, err)
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, pkg, "a").GetOutcome())
+		b := packageFile(t, pkg, "b")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_REJECTED, b.GetOutcome())
+		require.Equal(t, "b is wrong", b.GetReason())
+	})
+
+	t.Run("a later batch that cannot be checked keeps the earlier verdicts and fails closed", func(t *testing.T) {
+		t.Parallel()
+
+		for name, second := range map[string]string{
+			"an error":                  "",
+			"another checker answering": checkAnswer("other-checker", "b", true, ""),
+		} {
+			_, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", false, "a is wrong"), second)
+			fx, s, req := batchedReland(t, argv)
+			pre, err := s.landPrecheckResolution(fx.ctx, req, fx.repo)
+			require.NoError(t, err, name)
+			_, err = s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
+			pkg := builtUnresolved(t, fx, err)
+			require.Contains(t, pkg.GetReason(), "the resolution could not be checked", name)
+			a := packageFile(t, pkg, "a")
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_REJECTED, a.GetOutcome(), name)
+			require.Equal(t, "a is wrong", a.GetReason(), name)
+			b := packageFile(t, pkg, "b")
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, b.GetOutcome(), name)
+			require.False(t, b.GetSyntaxUnchecked(), name)
+		}
+	})
+
+	t.Run("the whole check has one deadline", func(t *testing.T) {
+		t.Parallel()
+
+		// Each check request takes 0.7 s and the deadline of the whole check is 1 s: the second
+		// request runs out of time, and the check fails closed.
+		_, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", true, ""), checkAnswer("graft-resolve", "b", true, ""))
+		slow := append([]string{"sh", "-c", `sleep 0.7; exec "$0"`}, argv...)
+		fx, s, req := batchedReland(t, slow)
+		s.resolveCfg.Timeout = "1s"
+		client, err := resolver.New(s.resolveCfg)
+		require.NoError(t, err)
+		s.conflictResolver = client
+
+		start := time.Now()
+		pre, err := s.landPrecheckResolution(fx.ctx, req, fx.repo)
+		require.NoError(t, err)
+		require.Less(t, time.Since(start), 2*time.Second, "the check stops at its deadline")
+		_, err = s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
+		pkg := builtUnresolved(t, fx, err)
+		require.Contains(t, pkg.GetReason(), "the resolution could not be checked")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, pkg, "a").GetOutcome())
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, packageFile(t, pkg, "b").GetOutcome())
+	})
+
+	t.Run("without a check for its tip the land fails closed", func(t *testing.T) {
+		t.Parallel()
+
+		_, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", true, ""))
+		fx, s, req := batchedReland(t, argv)
+		_, err := s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), nil)
+		pkg := builtUnresolved(t, fx, err)
+		require.Contains(t, pkg.GetReason(), "it was not checked against tip")
+	})
+
+	t.Run("the check runs outside the lane: another land of the branch is not held", func(t *testing.T) {
+		t.Parallel()
+
+		// The checker takes 3 s; meanwhile a fast-forward of the branch lands at once.
+		dir, argv := resolverScript(t, "sleep 3")
+		writeRawAnswer(t, dir, resolver.CheckResponse{
+			Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: "graft-resolve",
+			Files: []resolver.CheckFile{{Path: "a", OK: true, Syntax: resolver.SyntaxNone}, {Path: "b", OK: true, Syntax: resolver.SyntaxNone}},
+		})
+		fx := newResolveFixture(t, enabledResolver(argv))
+		forward := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.tip), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "ours\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "b", Content: "ours\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "c", Content: "c\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "e", Content: "e\n"},
+		))
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+
+		var wg sync.WaitGroup
+		var relandDone, forwardDone time.Time
+		var relandErr, forwardErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, relandErr = fx.client.UserLand(fx.ctx, req)
+			relandDone = time.Now()
+		}()
+		go func() {
+			defer wg.Done()
+			time.Sleep(300 * time.Millisecond)
+			_, forwardErr = fx.client.UserLand(fx.ctx, landRequest(fx.repoProto, git.DefaultBranch, forward))
+			forwardDone = time.Now()
+		}()
+		wg.Wait()
+		require.NoError(t, forwardErr)
+		require.True(t, forwardDone.Before(relandDone), "the fast-forward landed while the check ran")
+		// The branch moved, so the resolution made for the old tip is refused with a fresh package.
+		requireMergeConflict(t, relandErr)
+		require.Contains(t, landConflictDetail(relandErr).GetReason(), "the branch tip moved")
 	})
 
 	t.Run("a merge with more conflicting files than a package lists is refused", func(t *testing.T) {
@@ -722,6 +830,37 @@ func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, tip)
 	})
 
+	t.Run("a criss-cross history whose base is virtual", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, "")
+		writeAnswer(t, dir, validAnswer())
+		fx := newResolveFixture(t, enabledResolver(argv))
+		// The merge bases x and y disagree on a: merge-tree merges them into a virtual base of its
+		// own, a blob in no tree, which the failed land discards.
+		x := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "x\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		y := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "y\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		tip := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(x, y), gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "tip\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		commit := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(y, x), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "commit\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		fx.tip, fx.commit = tip, commit
+
+		req := fx.request("Land")
+		req.Strategy = gitalypb.UserLandRequest_STRATEGY_MERGE
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		a := packageFile(t, pkg, "a")
+		require.Empty(t, a.GetBase().GetOid(), "the virtual base is not kept")
+		require.Equal(t, landSideUnavailable, a.GetBase().GetUnavailable())
+		require.Empty(t, a.GetHunks())
+		requirePackageOIDsKept(t, fx, pkg)
+	})
+
 	t.Run("an unclean merge without a conflicting file", func(t *testing.T) {
 		t.Parallel()
 
@@ -752,4 +891,46 @@ func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
 		require.True(t, split, "messages %v", pkg.GetMessages())
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 	})
+}
+
+// checkAnswer is the check response of a checker named checker for one file; an empty answer
+// stands for a call that fails.
+func checkAnswer(checker, path string, ok bool, reason string) string {
+	raw, _ := json.Marshal(resolver.CheckResponse{
+		Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: checker,
+		Files: []resolver.CheckFile{{Path: path, OK: ok, Reason: reason, Syntax: resolver.SyntaxUnchecked}},
+	})
+	return string(raw)
+}
+
+// perCallChecker is a resolver script that gives answers[N-1] to its N-th call, and fails a call
+// whose answer is empty.
+func perCallChecker(t *testing.T, answers ...string) (string, []string) {
+	t.Helper()
+	dir, argv := resolverScript(t, `[ -s "$DIR/answer-$N.json" ] || exit 1; cp "$DIR/answer-$N.json" "$DIR/answer.json"`)
+	for n, a := range answers {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("answer-%d.json", n+1)), []byte(a), 0o600))
+	}
+	return dir, argv
+}
+
+// batchedReland is the fixture's re-land of a and b on a server that checks every file in a
+// request of its own.
+func batchedReland(t *testing.T, argv []string) (resolveFixture, *Server, *gitalypb.UserLandRequest) {
+	t.Helper()
+	fx := newResolveFixture(t, config.GraftResolver{})
+	s := fx.server(t, enabledResolver(argv))
+	s.checkBatchBytes = 1
+	req := fx.request("Land")
+	req.ResolveConflicts = false
+	req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+	return fx, s, req
+}
+
+// builtUnresolved returns the package of an unresolved land.
+func builtUnresolved(t *testing.T, fx resolveFixture, err error) *gitalypb.LandConflict {
+	t.Helper()
+	var unresolved *landUnresolvedError
+	require.ErrorAs(t, err, &unresolved)
+	return builtPackage(t, fx.ctx, unresolved)
 }

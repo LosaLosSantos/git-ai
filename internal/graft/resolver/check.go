@@ -12,6 +12,23 @@ import (
 // within this bound.
 const MaxCheckRequestBytes = 64 << 20
 
+// CheckBatchBytes bounds the file data of one check request: the sides and the resolution of its
+// files, plus CheckFileOverheadBytes for each. base64 makes the contents 4/3 larger, and the
+// request's envelope takes at most maxEnvelopeBytes, so the request stays within
+// MaxCheckRequestBytes.
+const CheckBatchBytes = (MaxCheckRequestBytes - maxEnvelopeBytes) * 3 / 4
+
+// MaxCheckFileBytes is the largest max_file_bytes a resolver can have: one file, its three sides
+// and its resolution, must fit one check request.
+const MaxCheckFileBytes = CheckBatchBytes/4 - 4<<10
+
+// CheckFileOverheadBytes is what a file adds to a check request besides its contents: its path,
+// written in the file and in the resolution, escaped in JSON (at most 6 bytes a byte), and the
+// names and values of the other fields.
+func CheckFileOverheadBytes(path string) int64 {
+	return int64(2*6*len(path)) + 1<<10
+}
+
 // ErrCheckUnsupported is returned by Check when the resolver answers a check request with
 // something other than a check response, as a resolver that predates the check operation does.
 var ErrCheckUnsupported = errors.New("the resolver does not support the check operation")

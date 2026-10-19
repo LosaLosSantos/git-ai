@@ -148,6 +148,8 @@ func TestNew_Errors(t *testing.T) {
 		{name: "zero timeout", cfg: config.GraftResolver{Enabled: true, Command: []string{"/bin/true"}, Timeout: "0s"}},
 		{name: "negative max files", cfg: config.GraftResolver{Enabled: true, Command: []string{"/bin/true"}, MaxFiles: -1}},
 		{name: "negative max file bytes", cfg: config.GraftResolver{Enabled: true, Command: []string{"/bin/true"}, MaxFileBytes: -1}},
+		// The three sides and the resolution of a file must fit one check request.
+		{name: "max file bytes over the check bound", cfg: config.GraftResolver{Enabled: true, Command: []string{"/bin/true"}, MaxFileBytes: MaxCheckFileBytes + 1}},
 		{name: "url without scheme", cfg: config.GraftResolver{Enabled: true, URL: "r.example/resolve"}},
 		{name: "url with ftp scheme", cfg: config.GraftResolver{Enabled: true, URL: "ftp://r.example/resolve"}},
 		{name: "url without host", cfg: config.GraftResolver{Enabled: true, URL: "https:///resolve"}},
@@ -443,11 +445,15 @@ func TestCheck_refusesARequestOverItsBound(t *testing.T) {
 
 	marker := filepath.Join(t.TempDir(), "ran")
 	cfg := commandConfig([]string{writeScript(t, fmt.Sprintf("touch '%s'\ncat > /dev/null\n", marker))})
-	cfg.MaxFileBytes = MaxCheckRequestBytes
+	cfg.MaxFileBytes = MaxCheckFileBytes
 	client := newClient(t, cfg)
 
+	// Five sides of max_file_bytes each, over the bound once encoded.
 	req := sampleRequest()
-	req.Files[0].Ours.Content = make([]byte, MaxCheckRequestBytes*3/4+1)
+	big := make([]byte, MaxCheckFileBytes)
+	for _, side := range []*Side{req.Files[0].Base, req.Files[0].Ours, req.Files[0].Theirs, req.Files[1].Base, req.Files[1].Theirs} {
+		side.Content = big
+	}
 	req.Resolution = validResponse("merged\n").Files
 	_, err := client.Check(testhelper.Context(t), req)
 	require.ErrorContains(t, err, "is over the bound")

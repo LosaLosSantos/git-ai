@@ -130,6 +130,11 @@ func New(cfg config.GraftResolver) (*Client, error) {
 	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 {
 		return nil, errors.New("graft land resolver: max_files and max_file_bytes must not be negative")
 	}
+	// The check of an agent's resolution sends a file's three sides and its resolution in one
+	// request, which must fit its bound.
+	if mfb := cfg.MaxFileBytesOrDefault(); mfb > MaxCheckFileBytes {
+		return nil, fmt.Errorf("graft land resolver: max_file_bytes %d is too large: the check of a resolution sends a file's three sides and its resolution in one request of at most %d bytes, so max_file_bytes can be at most %d", mfb, MaxCheckRequestBytes, MaxCheckFileBytes)
+	}
 
 	rules, err := NewSendRules(cfg)
 	if err != nil {

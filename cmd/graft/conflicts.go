@@ -44,10 +44,6 @@ const (
 // conflictSides are the sides of a conflicting file, in the order of the package.
 var conflictSides = []string{"base", "ours", "theirs"}
 
-// conflictsUnreadable is the content of the file to edit when no side of the file can be read: a
-// conflict that the marker rule of the server rejects until the agent writes the resolution.
-const conflictsUnreadable = "<<<<<<< ours (the branch tip): cannot be read, see conflict.json\n=======\n>>>>>>> theirs (the change): cannot be read, see conflict.json\n"
-
 // printConflict describes a conflict package: the reason the server gave, each file with its
 // outcome and what it lacks, and the merge's messages. The paths, reasons and messages come from
 // the server and are escaped with displayText.
@@ -118,7 +114,6 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 			return err
 		}
 		var contents [3][]byte
-		readable := true
 		for i, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
 			if s == nil {
 				continue
@@ -126,10 +121,8 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 			b, ok := blobs[s.GetOid()]
 			switch {
 			case s.GetOid() == "":
-				readable = false
 				continue
 			case !ok:
-				readable = false
 				fmt.Fprintf(out, "  %s: the %s side %s cannot be read: %s\n", displayText(p), conflictSides[i], shortOID(s.GetOid()), displayText(missing[s.GetOid()]))
 				continue
 			}
@@ -145,10 +138,7 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 				return err
 			}
 		}
-		content := conflictFileContent(contents)
-		if !readable {
-			content = conflictFileWithout(f, contents)
-		}
+		content := conflictFileFor(f, contents)
 		if err := create(target, p, content); err != nil {
 			return err
 		}
@@ -195,51 +185,6 @@ func (w conflictsWriter) create(target, p string, data []byte) error {
 	return f.Close()
 }
 
-// conflictFileWithout is the file to edit when a present side cannot be read. Without the base it
-// is the two-way merge of the sides. Without ours or theirs it is a conflict the marker rule of the
-// server refuses until the agent resolves it: the side that can be read (named by its file under
-// sides/ when it is binary) against a note that the other is unavailable. A side is never dropped
-// silently.
-func conflictFileWithout(f *gitalypb.LandConflictFile, sides [3][]byte) []byte {
-	ours, theirs := sides[1], sides[2]
-	oursPresent, theirsPresent := f.GetOurs() != nil, f.GetTheirs() != nil
-	switch {
-	case ours != nil && theirs != nil:
-		return conflictFileContent([3][]byte{nil, ours, theirs})
-	case ours == nil && theirs == nil:
-		return []byte(conflictsUnreadable)
-	}
-	const unavailable = "unavailable, see conflict.json"
-	body := func(name string, b []byte) []byte {
-		if isBinaryContent(b) {
-			return []byte(fmt.Sprintf("(binary: see sides/%s/%s)\n", name, string(f.GetPath())))
-		}
-		if len(b) > 0 && b[len(b)-1] != '\n' {
-			return append(append([]byte{}, b...), '\n')
-		}
-		return b
-	}
-	var out bytes.Buffer
-	switch {
-	case ours == nil && oursPresent:
-		out.WriteString("<<<<<<< ours (the branch tip): " + unavailable + "\n=======\n")
-		out.Write(body("theirs", theirs))
-		out.WriteString(">>>>>>> theirs (the change)\n")
-	case theirs == nil && theirsPresent:
-		out.WriteString("<<<<<<< ours (the branch tip)\n")
-		out.Write(body("ours", ours))
-		out.WriteString("=======\n>>>>>>> theirs (the change): " + unavailable + "\n")
-	default:
-		// The side that is missing is absent (a deletion), and the one there is cannot be read
-		// apart from the base: the side there is, as for any deletion conflict.
-		if ours != nil {
-			return ours
-		}
-		return theirs
-	}
-	return out.Bytes()
-}
-
 // fetchSides reads the sides of the package that have an object ID, all at once. When the server
 // cannot return them all, it reads them one by one, so that a side it cannot return costs only that
 // side: missing gives the error of each side that could not be read.
@@ -279,20 +224,60 @@ func fetchSides(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandCo
 	return blobs, missing
 }
 
-// conflictFileContent is the file an agent edits: the merge with markers when both sides are text,
-// otherwise the tip's side (or the landed commit's when the tip deleted the file).
-func conflictFileContent(sides [3][]byte) []byte {
-	base, ours, theirs := sides[0], sides[1], sides[2]
-	text := ours != nil && theirs != nil && !isBinaryContent(base) && !isBinaryContent(ours) && !isBinaryContent(theirs)
-	if text {
-		if r, ok := merge3.Merge(base, ours, theirs); ok {
+// conflictPointerPrefix starts the line that stands in the file to edit for a binary side, which
+// the file cannot embed. graft land --resolved refuses a file that still holds such a line.
+const conflictPointerPrefix = "graft-conflict-pointer: "
+
+// conflictFileFor is the file an agent edits for a conflicting file of the package, given the
+// contents of the sides that could be read (nil for an absent side or one that cannot be read).
+// When the CLI can merge the file (ours and theirs text, the base text or absent, and a diff
+// within merge3's bound) it is the merge with git's diff3 markers around each conflict. Otherwise
+// it is one conflict between diff3 markers holding every side: the text of a text side, a pointer
+// line to the file of a binary side under sides/, and on the marker line a note on a side that is
+// binary, absent or unavailable. The marker rule of the server refuses it until the agent resolves
+// it, and --resolved refuses a pointer line: a side is never dropped silently.
+func conflictFileFor(f *gitalypb.LandConflictFile, sides [3][]byte) []byte {
+	present := [3]*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()}
+	text := func(i int) bool { return sides[i] != nil && !isBinaryContent(sides[i]) }
+	if text(1) && text(2) && (present[0] == nil || text(0)) {
+		if r, ok := merge3.Merge(sides[0], sides[1], sides[2]); ok {
 			return r.WithMarkers(merge3.Labels{Ours: "ours (the branch tip)", Base: "base", Theirs: "theirs (the change)"})
 		}
 	}
-	if ours != nil {
-		return ours
+
+	side := func(i int) (note string, body []byte) {
+		switch {
+		case present[i] == nil && i == 0:
+			return ": none, both sides added the file", nil
+		case present[i] == nil:
+			return ": deleted", nil
+		case sides[i] == nil:
+			reason := present[i].GetUnavailable()
+			if reason == "" {
+				reason = "the server did not return it"
+			}
+			return ": unavailable, " + reason, nil
+		case isBinaryContent(sides[i]):
+			return ": binary", []byte(fmt.Sprintf("%sthe binary %s side is sides/%s/%s\n", conflictPointerPrefix, conflictSides[i], conflictSides[i], string(f.GetPath())))
+		}
+		body = sides[i]
+		if len(body) > 0 && body[len(body)-1] != '\n' {
+			body = append(append([]byte{}, body...), '\n')
+		}
+		return "", body
 	}
-	return theirs
+	oursNote, oursBody := side(1)
+	baseNote, baseBody := side(0)
+	theirsNote, theirsBody := side(2)
+	var out bytes.Buffer
+	out.WriteString("<<<<<<< ours (the branch tip)" + oursNote + "\n")
+	out.Write(oursBody)
+	out.WriteString("||||||| base" + baseNote + "\n")
+	out.Write(baseBody)
+	out.WriteString("=======\n")
+	out.Write(theirsBody)
+	out.WriteString(">>>>>>> theirs (the change)" + theirsNote + "\n")
+	return out.Bytes()
 }
 
 func isBinaryContent(b []byte) bool {
@@ -300,8 +285,10 @@ func isBinaryContent(b []byte) bool {
 }
 
 // readResolution reads the resolution of a conflicts directory: the package's tip and commit, and
-// for every conflicting path its file under DIR/files, or a deletion when the file is absent. The mode is the
-// tip's side's, else the landed commit's.
+// for every conflicting path its file under DIR/files, or a deletion when the file is absent. The
+// mode is the file mode of the tip's side, else of the landed commit's, else of the base's: a side
+// that is a submodule (a gitlink) or absent gives none, and a path none of whose sides is a file
+// can only be deleted. A file that still holds the pointer line of a binary side is refused.
 func readResolution(dir string) (*workspace.Resolution, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, conflictsPackage))
 	if err != nil {
@@ -326,12 +313,22 @@ func readResolution(dir string) (*workspace.Resolution, error) {
 		if err != nil {
 			return nil, err
 		}
-		mode := f.GetOurs().GetMode()
-		if mode == "" {
-			mode = f.GetTheirs().GetMode()
+		for _, line := range bytes.Split(content, []byte("\n")) {
+			if bytes.HasPrefix(line, []byte(conflictPointerPrefix)) {
+				return nil, fmt.Errorf("%s still holds the pointer to a binary side: copy the side you want over it from %s, or remove it to delete the path", target, filepath.Join(dir, conflictsSidesDir))
+			}
+		}
+		mode := ""
+		for _, side := range []*gitalypb.LandConflictSide{f.GetOurs(), f.GetTheirs(), f.GetBase()} {
+			switch side.GetMode() {
+			case "100644", "100755", "120000":
+				if mode == "" {
+					mode = side.GetMode()
+				}
+			}
 		}
 		if mode == "" {
-			mode = "100644"
+			return nil, fmt.Errorf("conflicting path %q is a file on none of its sides (a submodule, say): it can only be deleted, by removing %s, or resolved outside graft", p, target)
 		}
 		res.Files = append(res.Files, workspace.ResolvedFile{Path: p, Mode: mode, Content: content})
 	}

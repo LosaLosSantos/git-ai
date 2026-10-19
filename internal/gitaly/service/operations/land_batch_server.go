@@ -78,7 +78,7 @@ func (s *Server) landBatchable(ctx context.Context, in *gitalypb.UserLandRequest
 
 // userLandBatched lands the request through its lane. The response is built from the outcome of
 // the batch that executed the request.
-func (s *Server) userLandBatched(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
+func (s *Server) userLandBatched(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck) (*gitalypb.UserLandResponse, error) {
 	repo := in.GetRepository()
 	key := landlane.Key{
 		Storage:      repo.GetStorageName(),
@@ -91,6 +91,7 @@ func (s *Server) userLandBatched(ctx context.Context, in *gitalypb.UserLandReque
 		in:        in,
 		committer: committer,
 		actor:     landBatchActor(ctx, in),
+		precheck:  precheck,
 	}
 
 	resp, err := s.landLanes.Submit(ctx, key, req)
@@ -141,7 +142,7 @@ func (s *Server) executeLandBatch(ctx context.Context, _ landlane.Key, reqs []*l
 			return stepper, cleanup, nil
 		},
 		fallback: func(req *landBatchRequest) (*gitalypb.UserLandResponse, error) {
-			return s.landWithRetries(req.ctx, req.in, req.committer)
+			return s.landWithRetries(req.ctx, req.in, req.committer, req.precheck)
 		},
 		giveUp: landBatchGiveUp,
 		backoff: func(ctx context.Context, attempt int) error {

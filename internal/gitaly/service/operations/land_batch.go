@@ -29,6 +29,8 @@ type landBatchRequest struct {
 	// request, or its GitLab user ID. The standalone access policy is evaluated for the actor before the
 	// request changes the running tip of the batch, and the changelog records it for the member.
 	actor string
+	// precheck is the check of the request's resolution, run before the request entered its lane.
+	precheck *landPrecheck
 }
 
 // reference returns the branch the request lands on.
