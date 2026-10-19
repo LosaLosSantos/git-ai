@@ -270,8 +270,19 @@ type UpdaterOpt func(*updaterConfig)
 type updaterConfig struct {
 	disableTransactions bool
 	noDeref             bool
+	deferredDurability  bool
 	refBackend          *git.ReferenceBackend
 	refURI              string
+}
+
+// WithDeferredReferenceDurability makes git write the references without fsync. Only the
+// storage core's authoritative mode may set it: its database commit is the durable point of
+// the transaction, and it makes the local references durable itself (doc/graft/PLAN7.md,
+// LOCAL REFERENCE WRITES RULE). Objects stay durable as for every other write.
+func WithDeferredReferenceDurability() UpdaterOpt {
+	return func(cfg *updaterConfig) {
+		cfg.deferredDurability = true
+	}
 }
 
 // WithDisabledTransactions disables hooks such that no reference-transactions
@@ -336,6 +347,9 @@ func New(ctx context.Context, repo gitcmd.RepositoryExecutor, opts ...UpdaterOpt
 	}
 	if cfg.refURI != "" {
 		cmdOpts = append(cmdOpts, gitcmd.WithEnv("GIT_REFERENCE_BACKEND="+cfg.refURI))
+	}
+	if cfg.deferredDurability {
+		cmdOpts = append(cmdOpts, gitcmd.WithConfig(gitcmd.ConfigPair{Key: "core.fsync", Value: gitcmd.FsyncComponentsWithoutReferences}))
 	}
 
 	cmd, err := repo.Exec(

@@ -7,7 +7,10 @@ node can rebuild. It is configured in the `[graft.storage]` section (see
 
 This page covers the architecture, the modes, the configuration, the operations
 (import, verify, switching modes), the benchmark and the limits. The binding
-design is [PLAN6.md](PLAN6.md).
+designs are [PLAN6.md](PLAN6.md) (the storage core: modes, write path,
+catch-up, import) and [PLAN7.md](PLAN7.md) (milestone 3: local reference
+writes, checkpoints, garbage collection, review roots, background
+maintenance). Where they differ, PLAN7.md is the later decision.
 
 ## Architecture
 
@@ -27,7 +30,7 @@ design is [PLAN6.md](PLAN6.md).
        +-----------+  +--------------------------+
        | database  |  | object storage (bucket)  |
        | SQLite or |  | repos/<id>/packs/        |
-       | Postgres  |  |   <sha256>.pack          |
+       | Postgres  |  |   <sha256>-<nonce>.pack  |
        +-----------+  +--------------------------+
 ```
 
@@ -37,9 +40,21 @@ design is [PLAN6.md](PLAN6.md).
   in `graft_refs`, `HEAD` included (a symbolic reference is stored as
   `ref:<target>`).
 - **Packs.** The new objects of a changeset are uploaded **before** the
-  changeset is committed, as one content-addressed, immutable pack
-  (`repos/<repo_id>/packs/<sha256>.pack`). A changeset never references a pack
-  that is not completely uploaded.
+  changeset is committed, as one immutable pack under a key of its own,
+  `repos/<repo_id>/packs/<sha256>-<nonce>.pack`: the SHA-256 of its bytes,
+  checked on every write and read, and a random nonce drawn for that upload.
+  A pack object belongs to exactly one changeset: two writes with byte-identical
+  packs store two objects, and a write never relies on an object it did not
+  upload. Objects are created only if their key is absent, atomically: on S3,
+  GCS and Azure by a conditional request (untested here); on file buckets by
+  link(2), because gocloud's file driver does not make its own create-only write
+  atomic (it checks that the key is absent, then renames onto it, so two writers
+  of one key would both succeed). A file bucket therefore needs a filesystem
+  with hard links. A changeset never references a pack that is not completely
+  uploaded. Changesets written by v0.1.0 keep their keys
+  (`repos/<repo_id>/packs/<sha256>.pack`, shared by identical packs), which
+  stay readable; the database refuses such a key in a new changeset, so every
+  node must run the same version.
 - **Write path (the voter).** Gitaly runs the reference-transaction hook for
   every reference update. In the Preparing phase, before git locks the
   references, the voter builds the pack of the new objects and uploads it: the
@@ -78,6 +93,33 @@ design is [PLAN6.md](PLAN6.md).
   (`ChangesetService`, `graft log`, `graft watch`) is written in the same
   database transaction as the reference change, and reviews are stored in the
   database. A watcher on another node sees new entries by polling every 250 ms.
+- **Review commits are kept by references.** `CreateReview` and `UpdateReview`
+  write a hidden reference `refs/keep-around/review/<commit>` for the head and base of
+  the review before they record it, so an open review keeps its commits alive
+  after their branch is deleted: on every node (housekeeping keeps what
+  references reach), in checkpoints and through garbage collection. A review of
+  a commit that only the serving node has works: the reference write uploads it.
+  Closing a review deletes the references that no other open review uses; a
+  closed or landed review keeps nothing. The open reviews of a repository are
+  bounded by `[graft.review] max_open_reviews` (default 1000, see
+  [REVIEW.md](REVIEW.md)). Clients never see these references over
+  the git protocols and cannot push or delete them. In authoritative mode the
+  database enforces the rule: a review write requires the references, and no
+  write (`DeleteRefs`, `WriteRef`, `UpdateReferences`, a push) can delete or
+  move one that an open review uses. In off and shadow mode the references are
+  written as well (housekeeping keeps the commits), but nothing enforces them:
+  the review files are the source of truth there. Each review creation and each
+  head move costs one reference transaction, so one changeset and no changelog
+  entry. GitLab's own `refs/keep-around/<commit>` references are never touched.
+  The daily housekeeping of every repository (on by default) also writes the
+  references that open reviews lack and deletes those no open review uses,
+  before it prunes objects. In authoritative mode every checkpoint build does
+  the same first, so a checkpoint, and the garbage collection behind it, never
+  goes without the commits of an open review (a build whose backfill fails
+  records no checkpoint); watch `graft_review_roots_sweep_failures_total` and
+  `graft_review_roots_missing_total`. A review written by an older version
+  whose commit was lost since can still be read and closed, but `UpdateReview`
+  refuses it with `FailedPrecondition` naming the review and the commit.
 - **Repository IDs.** A repository is identified by its storage name and
   relative path, and gets an ID that is never reused: a repository removed and
   created again is a new repository, and the old caches are recognized as
@@ -93,7 +135,7 @@ repository's object hash, and every pack against the SHA-256 in its key.
 
 | Mode | Source of truth | What the storage core does |
 |---|---|---|
-| `off` (default, also empty) | local git | Nothing. No database or bucket is opened. |
+| `off` (default, also empty) | local git | No database or bucket is opened. What milestone 3 adds outside the storage core still applies: open reviews keep their commits by `refs/keep-around/review/<commit>` references (bounded by `[graft.review] max_open_reviews`, see [REVIEW.md](REVIEW.md)), and the daily housekeeping backfills and sweeps them. |
 | `shadow` | local git | Every reference transaction of an imported repository is also committed to the database, with its pack. The database never rejects a write: a compare-and-swap mismatch is recorded as a forced changeset and counted as a divergence. Any storage core error, timeout or panic is logged and counted, and the git write proceeds. Reads, the file changelog and the file review store are unchanged. Works with or without Praefect. |
 | `authoritative` | database | A reference transaction commits only if its database compare-and-swap succeeds. Every request first catches the local repository up. The changelog and the reviews are served from the database. Requires `[graft] standalone = true`. |
 
@@ -105,6 +147,21 @@ git write that shadow mode did not record (a counted shadow error, or a write
 that landed while the repository's import was not complete) shows up as a
 divergence until a later write records the reference as a forced changeset;
 its objects are uploaded with the pack of the next write that builds on them.
+
+Shadow mode never fails or noticeably delays a git write: the storage-core work
+of one reference transaction (building and uploading its pack, then recording
+it in the database) runs under `shadow_timeout`. A transaction whose work takes
+longer is **not recorded**: the failure is counted in
+`graft_storage_shadow_errors_total` and logged at error level, and the git write
+proceeds. The database misses that write until the next write of the same
+reference, which is recorded as a forced changeset (counted in
+`graft_storage_shadow_divergences_total`); until then `graft storage verify`
+reports the reference as diverging. Recording every write is therefore
+guaranteed only while the shadow work of every transaction fits the budget; on a
+heavily loaded machine some writes may not fit. Switch to authoritative mode only
+when those counters and `graft_storage_untracked_writes_total` are at zero and
+`graft storage verify --connectivity` is consistent on every repository (see
+[Switching](#switching-from-shadow-to-authoritative)).
 
 Authoritative mode serves reftable repositories only. Repositories created
 through `CreateRepository` are created with the reftable backend, and the syncer
@@ -148,8 +205,16 @@ mode = "authoritative"                          # off | shadow | authoritative
 database = "sqlite:///var/opt/graft/meta.db"    # or postgres://graft@db.internal:5432/graft?sslmode=verify-full
 bucket = "file:///var/opt/graft/objects"        # gocloud URL: file://, s3://, gs://, azblob://
 node_id = "node-a"                              # default: the host name
-sync_timeout = "10s"                            # catch-up budget per request
+sync_timeout = "10s"                            # budget of one sync round per request
 shadow_timeout = "5s"                           # shadow work budget per transaction
+gc_grace = "1h"                                 # age before a dead pack is deleted
+gc_margin = "5m"                                # writers' deadline is gc_grace - gc_margin
+checkpoints = "auto"                            # auto (default in authoritative mode) | off
+gc = "auto"                                     # off (default) | auto: background garbage collection
+maintenance_interval = "1h"
+checkpoint_changesets = 1000                    # 0 = never by count
+checkpoint_pack_bytes = 268435456               # 0 = never by size
+lease_ttl = "10m"
 ```
 
 Every key is described in [CONFIGURATION.md](CONFIGURATION.md#graftstorage).
@@ -158,15 +223,41 @@ environment variables and `.pgpass`, and buckets use the standard environment
 of their cloud SDK (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_*`).
 
 All nodes of a deployment use the same `database` and `bucket` and different
-`node_id` values. SQLite works for one node, or for several nodes on one host
-(the tests run several servers on one SQLite file); a deployment with nodes on
-several hosts needs Postgres and a shared bucket. The database schema is
+`node_id` values. SQLite is for one node (the tests also run several servers
+on one SQLite file, at the cost described in [Limits](#limits)); a deployment
+with more than one node needs Postgres and a shared bucket. The database schema is
 created and migrated at startup.
 
 Startup fails when the mode is unknown, authoritative mode is set without
 `standalone = true`, the database URL is missing or neither `sqlite:///` nor
 `postgres://` (`postgresql://`), the bucket is missing or not a URL, `node_id`
-contains spaces or slashes, or a timeout is not a positive Go duration.
+contains spaces or slashes, a duration is not a positive Go duration,
+`gc_grace` is not greater than `sync_timeout + gc_margin`, or `checkpoints` or
+`gc` is `"auto"` outside authoritative mode. In authoritative mode the
+background checkpoints run by default and the background garbage collection
+does not:
+- A checkpoint deletes nothing (it adds one pack and its rows), and it is what
+  keeps a hydration short. Without one, a node that joins replays every
+  changeset of the repository.
+- Garbage collection deletes packs, so it is turned on deliberately
+  (`gc = "auto"`), or run with `graft storage gc`. Until it runs, the bucket
+  only grows.
+- Space cost with the defaults (checkpoints on, `gc` off). The bucket holds
+  every changeset pack (it grows with the history), plus the checkpoints at or
+  above `C_gc`: the newest checkpoint at least `gc_grace` old and the newer
+  ones. The background checkpoints drop the older ones, under the same rule as
+  garbage collection (a checkpoint below `C_gc` has no reader), so a repository
+  keeps about one or two checkpoints, not one per `checkpoint_changesets`.
+- A checkpoint is a whole copy of the repository: one pack of every object
+  reachable from its references, about the size of a fresh clone.
+- With `gc = "auto"` the changeset packs that a checkpoint `C_gc` covers go
+  too, and the bucket holds about one or two checkpoints plus the packs of the
+  changesets after `C_gc`.
+- Orphan packs stay until garbage collection runs: those of failed writes, and
+  of a drop interrupted between the row and the pack.
+
+The metrics are `graft_storage_maintenance_*` (runs, checkpoints, packs and
+bytes deleted, skipped repositories, failed steps).
 
 ## Operations
 
@@ -240,9 +331,10 @@ the node ID. It does not catch up, so it shows a node that is behind.
 `graft storage verify` compares every local reference with the database and
 lists the divergences. With `--connectivity` it also runs `git fsck
 --connectivity-only` on the local copy and checks the bucket: it indexes the
-pack of every changeset into an empty repository in the storage's temporary
-directory (a dry hydration: it downloads every pack of the repository) and
-checks that every object the database references reach is there. A failure of
+pack of the newest checkpoint, if there is one, and the pack of every changeset
+after it into an empty repository in the storage's temporary directory (a dry
+hydration: it downloads what a hydration would) and checks that every object
+the database references reach is there. A failure of
 either check is reported as a connectivity error; a bucket problem starts with
 `storage core objects:`. In authoritative mode it catches the local copy up
 first, so a divergence means a real inconsistency. In shadow mode it compares
@@ -258,7 +350,117 @@ AND relative_path = '<relative path>'`; its changesets, references, changelog
 and reviews go with it) and run `graft storage import` again. The new
 registration gets a new repository ID and a full pack, and takes the changelog
 and the reviews from the files again, so do this before switching to
-authoritative mode.
+authoritative mode. The deletion records the tombstone of the old ID (a
+database trigger, whoever deletes the row), so garbage collection deletes the
+old objects `gc_grace` later. Rows deleted this way before this release left
+their objects in the bucket; garbage collection finds them and records their
+tombstones (see `gc --removed` below).
+
+### Checkpoints and garbage collection
+
+How it stays safe:
+- Every write uploads its pack under a new key of its own, and commits the
+  database row that references it within `gc_grace - gc_margin` of a database
+  read that found the repository. A write that misses that deadline fails, and
+  its pack is an orphan.
+- Garbage collection deletes a pack only when:
+  - no row references it, and the collector itself observed that at least
+    `gc_grace` earlier;
+  - or it is covered by a checkpoint created at least `gc_grace` ago.
+- Every "how old" decision uses the database clock: Postgres's `now()`; with
+  SQLite, the host clock, since SQLite serves one host. The clocks of the
+  nodes never decide.
+- The writer's deadline is checked on the database clock, in the commit's own
+  transaction. The deadline is the database time of the record read that
+  preceded the upload plus `gc_grace − gc_margin`. Garbage collection observes
+  a pack it may delete on the same clock, and only after that read. So a
+  committed row never references a deleted pack, however long the writer
+  stopped: a suspended host, a paused VM, a long garbage-collection pause of
+  the process.
+  - The writer also stops its upload early on its own monotonic clock. That
+    only saves work; it is not what makes it safe.
+  - The one assumption left is that the database clock does not step backward
+    by more than `gc_margin` (5 minutes by default). A forward step is safe:
+    it makes the commit check refuse earlier.
+- `gc_grace` must also be greater than `sync_timeout + gc_margin`, so that a
+  sync that started from an older checkpoint never meets a pack deleted under
+  it.
+
+```sh
+graft storage checkpoint -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--json]
+graft storage gc         -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--dry-run] [--json]
+graft storage gc --removed -address unix:/var/opt/graft/gitaly.sock [-storage default] [--dry-run] [--json]
+```
+
+- `checkpoint` (authoritative mode) consolidates the repository at its current
+  database head: one pack of every object reachable from its references, and
+  the reference snapshot. A fresh node then hydrates from the checkpoint
+  instead of replaying every changeset, and garbage collection can delete the
+  packs the checkpoint covers. A checkpoint that exists at the head is
+  reported, not built again.
+- `gc` deletes the packs of one repository that no reader needs any more:
+  - the changeset packs covered by a checkpoint at least `gc_grace` old, and
+    the checkpoints that one supersedes;
+  - the objects no database row references, once garbage collection observed
+    them unreferenced at least `gc_grace` earlier (the packs of writes that
+    died before their database commit). The first run only observes them.
+
+  It runs in shadow mode too (orphans only: there are no checkpoints). It holds
+  the repository's maintenance lease while it runs, renewed like the background
+  maintenance's, and fails with `FailedPrecondition` when another maintenance
+  of the repository (the background one, another node) holds it, or `Aborted`
+  when the lease is lost during the collection.
+- `gc --removed` deletes every object of the repositories of the storage that
+  were removed at least `gc_grace` ago. It first reconciles the bucket: a
+  repository ID allocated at least `gc_grace − gc_margin` ago that has objects
+  in the bucket and neither a row nor a tombstone (a row deleted by hand before
+  this release) gets a tombstone, so its objects go `gc_grace` later. A run
+  examines at most 256 IDs, from where the previous run stopped, and reads at
+  most one object of each; it prints what it found. Objects of IDs above the
+  database's allocator (a database restored from an older backup) are reported
+  with a warning and never touched: the database will hand those IDs out again.
+  The background maintenance does the same with `gc = "auto"`.
+- `--dry-run` reports what would be deleted and changes nothing. It is a usage
+  error on the subcommands that do not read it, like `--connectivity` outside
+  `verify` and `--removed` outside `gc`.
+
+These commands are for operators: they need the shared token. A per-agent token
+can never call the storage core service, whatever `agent_rpcs` says.
+
+### Upgrades
+
+Upgrading from v0.2.x to this release changes the storage core's database
+(migrations `20261018000000_graft_storage_gc` and
+`20261019000000_graft_storage_reconcile`: the tombstone trigger and the state
+of the bucket reconciliation) and the keys of the packs in the
+bucket (owned keys, see Packs). A node of the old version cannot work next to
+a node of the new one:
+- **It cannot start.** A v0.2.x node that restarts after the migration
+  refuses the database, with an error about the unknown migrations.
+- **It cannot read.** A v0.2.x node still running reads only the old 64-hex
+  pack keys, so its reads of a repository that a new node wrote fail with
+  "invalid pack key".
+- **It cannot write.** Its writes carry old keys, and the database refuses
+  them ("the pack key is not an owned key; every node must run the same
+  version").
+
+So upgrade the whole deployment at once:
+1. Stop `gitaly serve` on every node.
+2. Install the new binaries on every node.
+3. Start the nodes. The first one migrates the database; the others find it
+   migrated.
+
+**Downgrade is not supported past this migration.** The database keeps the
+data of the new version (checkpoints, tombstones, owned keys) that a v0.2.x
+binary cannot read, and there is no down migration that would make the
+bucket's owned keys readable to it. Going back means restoring the database and
+the bucket from a backup taken before the upgrade.
+
+A binary that finds a database migrated by a newer version refuses to start:
+"the database was migrated by a newer version of the storage core (unknown
+migrations ...): this binary cannot run on it; every node must run the same
+version, so upgrade this node". This is how a node left on the older release
+shows up after the next upgrade, too.
 
 ### Switching from shadow to authoritative
 
@@ -370,7 +572,8 @@ or re-import the repository from scratch (see
   is logged and counted.
 - **A node dies after uploading a pack and before the database commit.** The
   pack is an orphan: no changeset references it, no node serves it, and the
-  write can be retried. Orphan packs are not collected yet (see limits).
+  write can be retried. Garbage collection deletes an orphan `gc_grace` after
+  a collection first observed it (see [Garbage collection](#garbage-collection)).
 - **A node dies after the database commit and before git committed.** The
   database has the write, other nodes serve it, and the node's own copy is
   behind until its next request catches it up. The counter
@@ -381,6 +584,116 @@ or re-import the repository from scratch (see
 - **A repository removed on another node.** The local copy has a watermark
   whose key the database no longer has; it is moved into the storage's
   temporary directory, and the repository is reported missing on that node too.
+
+- **Local reference writes and unclean shutdowns (authoritative mode).** In
+  authoritative mode the database commit is the durable point of a reference
+  update. A node therefore writes its local references without fsync, and makes
+  them durable in a background step a second after a repository goes idle
+  (`doc/graft/PLAN7.md`, LOCAL REFERENCE WRITES RULE). Until then the
+  repository has a dirty marker in `<storage>/+gitaly/graft-ref-durability/`,
+  which holds the kernel's boot identity.
+  - *Process crash or restart* (same kernel boot): nothing is lost, because the
+    page cache kept every write. The restarted node settles the markers.
+  - *Kernel crash or power loss*: the references written since the last durable
+    step may be lost or torn, and git reads a torn reftable stack as an empty
+    repository without an error. At startup, before it opens any listener,
+    `gitaly serve` moves aside every repository that was dirty under the
+    previous boot, and the first request hydrates it again from the database and
+    the bucket. This hydration starts from the newest checkpoint when there is
+    one, so its cost is bounded by how recent the checkpoints are (the
+    background maintenance creates them, see `checkpoints`; with checkpoints
+    off, by the full history).
+    Nothing acknowledged is lost. Cost after a power
+    loss: one hydration per repository that had a write in the second before the
+    loss, or that was still being written. On a busy node that can be every
+    active repository. A repository is only moved when the database holds it
+    with changesets; other markers are dropped.
+  - *A write the kernel reports as failed* (a writeback error, same boot): the
+    durable step's fsync fails, the repository is moved aside at once and logged,
+    and the next request hydrates it. The kernel reports such a failure once, so
+    from then on the repository is untrusted. Every request for it fails with
+    `Unavailable`, and its marker is never removed, until it is moved aside.
+    "Every request" means from the next one on. Each request checks once, in
+    its sync round, so a request already past its round when the failure was
+    found completes on what it read. `graft storage import` refuses an
+    untrusted repository too. If
+    the move fails, it is retried every second. A repository that is not a
+    cache of the storage core (the database cannot rebuild it) stays in place,
+    untrusted and not served, for an operator. Other errors of the step (a file
+    that cannot be opened for a moment) are retried every second and counted.
+  - *Process restart*: a marker found is kept while the repository's reftable
+    directory holds a git lock or a table being written (a git process of the
+    previous process may still be finishing), and for 2 s at least after the
+    restart and after the last such file seen. A repository the previous
+    process had found untrusted is moved aside.
+  - A marker stays while a git process of the node that writes without fsync
+    is running, even when its repository was moved aside meanwhile: the
+    process names the repository by its path, so a hydrated copy there would
+    get its writes.
+  - **Kept copies.** A repository moved aside that may hold shadow-mode history
+    not imported yet goes to `<storage>/+gitaly/graft-untrusted/<stale-*>/repo.git`
+    and stays there. That is history written in shadow mode (file changelog
+    entries, file reviews) that the database does not have yet, or history
+    files that cannot be read. The repository itself is hydrated from the
+    database by its next request.
+    `graft_storage_kept_untrusted_repositories` and
+    `graft_storage_kept_untrusted_bytes` report the kept copies per storage. No
+    request can name a path under `+gitaly/`: the gate and the storage core
+    RPCs reject it with `InvalidArgument`.
+
+    To import what a kept copy holds:
+    1. Take the node out of service: no client traffic to it during the
+       procedure. `gitaly serve` keeps running.
+    2. Move the repository's current copy at `<storage>/<relative path>` out of
+       the storage, then move the kept `repo.git` to `<storage>/<relative path>`.
+    3. `graft storage import -address <node> -storage <storage> -repo <relative path>`.
+       It imports the file changelog entries and the reviews the database does
+       not have, without touching the references.
+    4. Remove the copy at `<storage>/<relative path>` again: its references are
+       not trusted. The next request hydrates the repository from the database.
+       `graft storage verify -repo <relative path>` must then report
+       `consistent`.
+    5. Remove the kept directory, and put the node back in service.
+
+    A kept copy whose history files cannot be read cannot be imported: repair
+    them, or extract what is readable by hand. Removing a kept copy loses only
+    its history that was not imported.
+  - *Downgrade*: not supported past this release's storage migration (see
+    [Upgrades](#upgrades)). A v0.2.x binary would also ignore the markers.
+  - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
+    repository durable and removes its marker, so a clean reboot hydrates
+    nothing.
+  - *Graceful upgrade* (`GITALY_UPGRADES_ENABLED`): the new process serves while
+    the old one drains. One process per storage owns the deferred durability, by
+    an exclusive lock on `<storage>/+gitaly/graft-ref-durability/owner.lock`.
+    Until the old process exits, the new one writes references with fsync, as
+    in the other modes; then it takes over (`graft_storage_ref_durability_owner`).
+    During the overlap two processes also open an SQLite database, and their
+    writes meet in SQLite's own lock wait, see Limits; Postgres is not affected.
+  - Offline tools that read a repository from disk (`gitaly git -C <repo>`,
+    `gitaly-debug simulate-http-clone`) must not be pointed at a repository of
+    a node after an unclean shutdown before `gitaly serve` has started once:
+    they would read the torn stack.
+  - Scope: Linux only (the boot identity is `/proc/sys/kernel/random/boot_id`).
+    Elsewhere, and in off and shadow modes, git makes every reference write
+    durable as before.
+  - The node's reference writers (hook transactions and catch-up) wait for the
+    repository's reference lock in arrival order instead of git's polling.
+- **A corrupt dirty marker** stops `gitaly serve` at startup with the marker's
+  path: the repository it named cannot be identified. Check the storage, then
+  remove the marker; the repository's next request hydrates it if it is stale.
+
+Milestone 3 is proved by `internal/graft/e2e/storage_gc_test.go` and
+`storage_localrefs_test.go`, on SQLite and Postgres:
+- a repository written on two nodes is checkpointed on one; the other collects
+  the covered packs once the checkpoint is `gc_grace` old;
+- a node that joins afterwards hydrates from the checkpoint and serves every
+  write, and writes go on after the collection;
+- orphan packs and removed repositories are collected;
+- with the real `gitaly` binary: the deferred reference durability across
+  process kills, a simulated power loss and a graceful upgrade; the background
+  maintenance; and the daily housekeeping that backfills the keep-around
+  references of a review from before the REVIEW ROOTS RULE.
 
 These behaviours are proved by the end-to-end tests
 `internal/graft/e2e/storage_*_test.go`, with several real servers sharing one
@@ -404,9 +717,33 @@ without a single divergence.
 | `graft_storage_untracked_writes_total` | Shadow mode writes of repositories that are not imported. |
 | `graft_storage_mvcc_skipped_total` | Shadow mode transactions of MVCC repositories, skipped. Authoritative mode rejects every repository that is not reftable (MVCC included) with `FailedPrecondition` and does not count it here. |
 | `graft_storage_local_commit_failures_total` | Transactions committed to the database that git then aborted. |
-| `graft_storage_sync_total{result}` | Catch-ups before a request; results `fresh`, `caught_up`, `hydrated`, `error`. |
+| `graft_storage_sync_total{result}` | Sync rounds before a request; results `fresh`, `caught_up`, `hydrated`, `partial` (the round ran out of its budget before the head; the request fails with `Unavailable` and the next round goes on from there), `seeding` (the round ended while the repository was being seeded from its checkpoint in the background), `error`. |
 | `graft_storage_sync_seconds` | Duration of the catch-up before a request. |
 | `graft_storage_sync_changesets_total`, `graft_storage_sync_bytes_total` | Changesets applied and pack bytes downloaded by catch-up and hydration. |
+| `graft_storage_sync_checkpoint_seeds_total` | Hydrations that started from a checkpoint instead of changeset 1. |
+| `graft_storage_build_cleanup_failures_total` | Build directories of hydrations (`+gitaly/tmp/hydrate-*`) that the startup cleanup could not check or remove; they are kept and logged. |
+| `graft_storage_maintenance_runs_total{result}` | Runs of the background maintenance; `ok`, or `error` when at least one step failed. |
+| `graft_storage_maintenance_checkpoints_total` | Checkpoints created by the background maintenance. |
+| `graft_storage_maintenance_packs_deleted_total`, `graft_storage_maintenance_bytes_reclaimed_total` | Bucket objects, and their bytes, deleted by the background garbage collection. |
+| `graft_storage_maintenance_skipped_total{reason}` | Repositories the background maintenance skipped: `no_local_copy`, `nothing_due` (no checkpoint due, no superseded checkpoint, no collection; decided without the lease), `lease_held`. |
+| `graft_storage_maintenance_failures_total{step}` | Failed steps of the background maintenance: `reconcile`, `collect_removed`, `list`, `lease`, `checkpoint`, `collect`. |
+| `graft_storage_maintenance_leaks_found_total`, `graft_storage_maintenance_leaks_tombstoned_total` | Repository IDs with objects in the bucket and neither a row nor a tombstone, found by the reconciliation, and the tombstones it recorded for them. |
+| `graft_storage_maintenance_ids_ahead_of_allocator` | Repository IDs above the database's allocator with objects in the bucket at the last reconciliation (a database restored from an older backup); never touched. Alert on a value above 0. |
+| `graft_review_roots_backfilled_total` | Keep-around references of open-review commits written by the backfill (daily housekeeping and before every checkpoint). |
+| `graft_review_roots_deleted_total` | Keep-around references deleted because no open review uses them. |
+| `graft_review_roots_missing_total` | Open-review commits the backfill found missing from the repository; the review can only be closed. |
+| `graft_review_roots_sweep_failures_total{trigger}` | Failed sweeps of review keep-around references: `close`, `housekeeping`. |
+| `graft_storage_ref_admission_wait_seconds{writer}` | Wait of a local reference writer (`hook`, `syncer`) for its turn at the repository's reference lock. |
+| `graft_storage_ref_admission_waiting` | Writers waiting for their turn, all repositories. |
+| `graft_storage_ref_admission_bypassed_total{writer}` | Writers that went on to git's lock without their turn after `reftable.lockTimeout` (10 s). |
+| `graft_storage_ref_admission_expired_total` | Turns ended by the 10 s bound instead of their release (a git process that died between its phases). |
+| `graft_storage_ref_dirty_repositories` | Repositories with reference writes not yet made durable. |
+| `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written, and removed (the writes are durable, or the repository was moved aside, and no git process can still write it). |
+| `graft_storage_ref_writes_inflight` | git processes of this node that write references without fsync and have not exited; their repositories keep their markers. |
+| `graft_storage_ref_durability_owner` | 1 when this process owns the deferred durability of its storages, 0 while another process (the old one of a graceful upgrade) does. |
+| `graft_storage_ref_durable_step_errors_total` | Durable steps that failed with a transient error (not a failed fsync); retried every second. |
+| `graft_storage_ref_untrusted_total{reason}` | Repositories moved aside to be hydrated again: `reboot` (dirty at a kernel restart), `sync_failed` (the durable step's fsync failed). |
+| `graft_storage_kept_untrusted_repositories{storage}`, `graft_storage_kept_untrusted_bytes{storage}` | Untrusted copies kept in `+gitaly/graft-untrusted/` for an operator (see Kept copies), and their size. Read at every scrape. |
 
 ## Benchmark
 
@@ -490,24 +827,64 @@ show:
 - **Git still needs a local repository.** "Stateless" means that the local
   repository of a node is a cache that the node can rebuild from the database
   and the bucket, not that nodes keep no local state. Every request runs git
-  on a local copy, a node's first request for a repository downloads all of its
-  packs, and there is no virtual filesystem.
-- **No garbage collection of packs yet.** Packs are never deleted: neither the
-  orphans of writes that died before the database commit nor the packs of
-  removed repositories. There is no checkpoint compaction either: hydration
-  replays every changeset from 1. Both are planned after the first release.
+  on a local copy, a node's first request for a repository downloads the pack
+  of its newest checkpoint and every changeset pack after it, and there is no
+  virtual filesystem.
+- **Pack garbage collection runs in the background only with `gc = "auto"`**
+  (authoritative mode; off by default). Otherwise changeset packs, orphans and
+  the objects of removed repositories are deleted only when an operator runs
+  `graft storage gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)).
+  The background maintenance still drops superseded checkpoints and their
+  packs with `gc = "off"`. The background checkpoints are on by default.
+  With `checkpoints = "off"` and no `graft storage checkpoint`, a hydration
+  replays every changeset of the repository from 1. Its rounds resume, but that
+  takes many requests on a long history.
+- **A sync round is bounded by `sync_timeout`.** A hydration or catch-up that
+  needs more than one round answers `Unavailable` until it reaches the head;
+  each round keeps what it did. The checkpoint pack, a whole copy of the
+  repository, is not bound to a round. A node that rebuilds a repository from
+  its checkpoint downloads and indexes that pack in the background, for up to
+  `gc_grace − gc_margin`, and answers `Unavailable` ("being seeded") until it is
+  done. A changeset pack that cannot be downloaded and indexed within one
+  round never completes. Measured (2026-10-19, Postgres,
+  file bucket, small changesets of the land benchmark): about 4 ms per
+  changeset, so at the default `sync_timeout` of 10 s (7.5 s of fetch per
+  round) one round covers about 1800–2000 changesets after the newest
+  checkpoint. A copy that is further behind needs several requests. With the
+  default checkpoints (every 1000 changesets) a repository stays within one
+  round. Before the concurrent fetch, the same repository took about 40 ms per
+  changeset and never finished at 10 s.
 - **Praefect is not supported in authoritative mode.** Configuration validation
   requires `[graft] standalone = true` for authoritative mode. Shadow mode
   works with or without Praefect.
 - **S3, GCS and Azure are untested here.** The bucket is any gocloud URL, but
   the test suite and the benchmark use `file://` and `mem://` buckets only;
   the S3 tests run only when `GRAFT_TEST_S3_URL` points at a test bucket.
+- **File buckets need a filesystem with hard links** (every local Linux or
+  macOS filesystem, and NFS): objects are published with link(2), see Packs. On
+  a filesystem without hard links every write fails with an error that says so.
 - **Concurrent writes to one repository share one lock** in authoritative
-  mode: reftable has one reference lock per repository. The voter holds it only
-  for the expected values and the database commit (the pack is uploaded before
-  the lock is taken), and git waits up to 10 s for it, so concurrent writes
-  queue instead of failing; a write that waits longer than 10 s still fails with
-  "reference is already locked". See [Benchmark](#benchmark).
+  mode: reftable has one reference lock per repository. Writers take it in
+  arrival order, and the hold is the voter's expected values and database commit
+  plus a git write without fsync, about 15 ms with SQLite. The pack is uploaded
+  before the lock, and the references are made durable later, see
+  [Failures](#failures). So concurrent writes queue: about 125–190 ms of queue
+  at 50 and 100 agents on one repository, measured. A write whose turn does not
+  come within 10 s goes on to git's own wait, and fails with "reference is
+  already locked" if that also passes 10 s. See [Benchmark](#benchmark).
+- **A repository that is never idle for a second keeps its dirty marker**, so
+  after a power loss it is always hydrated again, even though its references
+  were made durable less than a second earlier: the marker does not record which
+  writes are already durable.
+- **SQLite serves one node.** Only `gitaly serve` opens the database: the
+  `graft` CLI and the other tools go through the server. SQLite has a single
+  write lock. The writes of one gitaly process take it in the order they
+  arrive, but several processes on one SQLite file (several nodes on one host,
+  or the old and the new process during a graceful upgrade) meet in SQLite's
+  own lock wait,
+  which keeps no queue: under steady contention an unlucky write can wait past
+  the 10 s busy timeout and fail. A deployment with more than one node uses
+  Postgres; SQLite is for one node, or for tests.
 - **Some mutators are refused in authoritative mode**, see
   [RPCs in authoritative mode](#rpcs-in-authoritative-mode).
 - **Switching back from authoritative mode** has no export of the changelog

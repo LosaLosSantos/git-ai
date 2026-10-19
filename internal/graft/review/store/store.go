@@ -25,8 +25,13 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// ErrNotFound is returned when a review does not exist.
-var ErrNotFound = errors.New("review not found")
+var (
+	// ErrNotFound is returned when a review does not exist.
+	ErrNotFound = errors.New("review not found")
+	// ErrTooManyOpenReviews is returned by Create, and nothing is written, for
+	// an open review beyond the limit of the store (WithMaxOpen).
+	ErrTooManyOpenReviews = errors.New("too many open reviews")
+)
 
 const (
 	reviewsDirRel = "graft/reviews"
@@ -39,11 +44,24 @@ const (
 // Open does not touch the disk.
 type Store struct {
 	repoPath string
+	// maxOpen, when positive, bounds the open reviews that Create may reach.
+	maxOpen int
 }
 
 // Open returns a Store for the repository at repoPath (its git directory).
 func Open(repoPath string) *Store {
 	return &Store{repoPath: repoPath}
+}
+
+// WithMaxOpen returns a store whose Create refuses an open review with
+// ErrTooManyOpenReviews, and writes nothing, when the repository has limit
+// open reviews already. Create counts them under the lock that serialises
+// every mutation, so concurrent creates cannot pass the limit. A limit of zero
+// or less means no limit.
+func (s *Store) WithMaxOpen(limit int) *Store {
+	bounded := *s
+	bounded.maxOpen = limit
+	return &bounded
 }
 
 // dir returns the reviews directory.
@@ -59,6 +77,18 @@ func (s *Store) Create(r *gitalypb.Review) (*gitalypb.Review, error) {
 		return nil, err
 	}
 	defer unlock()
+
+	if s.maxOpen > 0 && r.GetState() == gitalypb.Review_STATE_OPEN_UNSPECIFIED {
+		// List reads every review file, closed ones included: the files keep
+		// no index of the open ones.
+		open, err := s.List("", false, 0)
+		if err != nil {
+			return nil, fmt.Errorf("count open reviews: %w", err)
+		}
+		if len(open) >= s.maxOpen {
+			return nil, fmt.Errorf("%w: the repository has %d open reviews, the limit is %d", ErrTooManyOpenReviews, len(open), s.maxOpen)
+		}
+	}
 
 	dir := s.dir()
 	nextID, err := readNextID(dir)

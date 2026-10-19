@@ -85,7 +85,7 @@ func TestImportHistory(t *testing.T) {
 
 		inserted, err := s.InsertReview(ctx, repo.ID, func(id string) (*gitalypb.Review, error) {
 			return newReview("next", "main", gitalypb.Review_STATE_OPEN_UNSPECIFIED), nil
-		})
+		}, corestore.ReviewInsert{})
 		require.NoError(t, err)
 		require.Equal(t, "8", inserted.GetId(), "the next review ID follows the largest imported one")
 
@@ -140,7 +140,7 @@ func TestImportHistoryReplacesReviewsChangedInShadowMode(t *testing.T) {
 
 		// Review 2 was changed in the database after the file (authoritative mode).
 		dbChanged := review("2", "changed in the database", 0, 2*time.Hour)
-		require.NoError(t, s.UpdateReview(ctx, repo.ID, "2", 1, dbChanged))
+		require.NoError(t, s.UpdateReview(ctx, repo.ID, "2", 1, dbChanged, false))
 
 		closed := review("1", "closed in shadow mode", 0, time.Hour)
 		closed.State = gitalypb.Review_STATE_CLOSED
@@ -183,7 +183,7 @@ func TestImportHistoryReplacesReviewsChangedInShadowMode(t *testing.T) {
 		require.Equal(t, []string{"5", "4", "3", "2"}, openIDs)
 
 		// An update based on the version before the import re-reads the review.
-		require.ErrorIs(t, s.UpdateReview(ctx, repo.ID, "1", 1, review("1", "stale", 0, 4*time.Hour)), corestore.ErrReviewVersionConflict)
+		require.ErrorIs(t, s.UpdateReview(ctx, repo.ID, "1", 1, review("1", "stale", 0, 4*time.Hour), false), corestore.ErrReviewVersionConflict)
 
 		// Idempotent: the same file reviews write nothing new.
 		_, reviews, err = s.ImportHistory(ctx, repo.ID, nil, []*gitalypb.Review{closed, review("5", "created in shadow mode", 3*time.Hour, 3*time.Hour)})

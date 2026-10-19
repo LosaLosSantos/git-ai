@@ -36,8 +36,13 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
 	"github.com/feder-cr/git-ai/internal/gitlab"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/checkpoint"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gate"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gc"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
+	storagemaintenance "github.com/feder-cr/git-ai/internal/graft/corestore/maintenance"
 	corestoreopen "github.com/feder-cr/git-ai/internal/graft/corestore/open"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	corestoresyncer "github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/voter"
 	"github.com/feder-cr/git-ai/internal/graft/derived"
@@ -604,6 +609,9 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		return fmt.Errorf("graft storage core: %w", err)
 	}
 	defer func() { _ = storageCore.Close() }()
+	// The review roots are written and swept in every mode, also without the
+	// storage core.
+	prometheus.MustRegister(reviewroots.DefaultSweeper)
 
 	hookManagerOpts := []hook.ManagerOption{hook.WithEagerObserver(eagerObserver)}
 	var (
@@ -611,6 +619,12 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		storageGate   *gate.Gate
 	)
 	if storageCore.Enabled() {
+		if storageCore.Authoritative() {
+			if err := openLocalReferenceWrites(storageCore, locator, logger); err != nil {
+				return err
+			}
+		}
+
 		syncer := corestoresyncer.New(storageCore, logger, locator, localrepoFactory, gitCmdFactory)
 		prometheus.MustRegister(syncer)
 		storageSyncer = syncer
@@ -620,6 +634,37 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		hookManagerOpts = append(hookManagerOpts, hook.WithStorageVoter(storageVoter))
 
 		if storageCore.Authoritative() {
+			// Before any listener opens: a repository whose references may be torn
+			// by a kernel restart is moved aside, so nothing reads it before it is
+			// hydrated again (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
+			storageNames := make([]string, 0, len(cfg.Storages))
+			for _, s := range cfg.Storages {
+				storageNames = append(storageNames, s.Name)
+			}
+			// The build directories of hydrations of a process that died are
+			// removed; those of a process that runs (the old one of a graceful
+			// upgrade) hold their lock and are kept. A failure is logged and
+			// counted: it never stops the server.
+			syncer.CleanBuilds(ctx, storageNames)
+			stopLocalReferences, err := syncer.StartLocalReferences(ctx, storageNames)
+			if err != nil {
+				return err
+			}
+			// Deferred here, so it runs after the servers stopped: a last durable step
+			// settles every repository whose writes ended.
+			defer stopLocalReferences()
+			// Runs before it (deferred later): the seeds in the background end
+			// before the last durable step.
+			defer syncer.StopSeeds()
+
+			if cfg.Graft.Storage.MaintenanceAuto() {
+				stopMaintenance, err := startStorageMaintenance(ctx, cfg, storageCore, syncer, locator, localrepoFactory, logger, storageNames)
+				if err != nil {
+					return err
+				}
+				defer stopMaintenance()
+			}
+
 			storageGate = gate.New(storageCore, syncer, logger, locator, localrepoFactory, protoregistry.GitalyProtoPreregistered)
 		}
 
@@ -839,7 +884,16 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			ctx,
 			logger,
 			maintenance.DailyOptimizationWorker(cfg, maintenance.OptimizerFunc(func(ctx context.Context, logger log.Logger, repo storage.Repository) error {
-				return housekeepingManager.OptimizeRepository(ctx, localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo))
+				local := localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
+				// Graft: the backstop of the review roots, in every mode, before the
+				// housekeeping that prunes unreferenced objects (doc/graft/PLAN7.md,
+				// REVIEW ROOTS RULE): the commits of an open review written without
+				// its keep-around references are referenced before a prune could
+				// take them.
+				if err := housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo); err != nil {
+					return err
+				}
+				return housekeepingManager.OptimizeRepository(ctx, local)
 			})),
 		)
 		if err != nil {
@@ -879,6 +933,91 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	gitalyServerFactory.Stop()
 
 	return waitErr
+}
+
+// housekeepReviewRoots runs the backstop of the review roots before the daily
+// housekeeping of a repository: it writes the keep-around references that
+// open reviews lack and deletes those no open review uses (in authoritative
+// mode after catching the repository up). Open reviews whose commits are lost
+// are logged with their IDs and commits; the counts are metrics of
+// reviewroots.DefaultSweeper.
+func housekeepReviewRoots(ctx context.Context, logger log.Logger, core *corestore.Core, fresh corestore.Freshener, local *localrepo.Repo, repo storage.Repository) error {
+	backfill, sweep, err := reviewroots.DefaultSweeper.Housekeep(ctx, core, fresh, local, repo)
+	for _, missing := range backfill.Missing {
+		logger.WithFields(log.Fields{
+			"review_id": missing.ReviewID,
+			"commit_id": missing.Commit,
+		}).Warn("review roots: a commit of an open review is not in the repository; the review can only be closed")
+	}
+	if backfill.Protected > 0 || sweep.Deleted > 0 {
+		logger.WithFields(log.Fields{
+			"backfilled": backfill.Protected,
+			"deleted":    sweep.Deleted,
+		}).Info("review roots: housekeeping")
+	}
+	if err != nil {
+		return fmt.Errorf("review roots: %w", err)
+	}
+	return nil
+}
+
+// openLocalReferenceWrites sets up the admission and the deferred durability
+// of the local reference writes of the storage core in authoritative mode
+// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). Without the kernel's boot
+// identity (not Linux) the durability is not deferred: every reference write
+// is made durable by git, as in the other modes.
+func openLocalReferenceWrites(core *corestore.Core, locator storage.Locator, logger log.Logger) error {
+	lockTimeout := gitcmd.ReftableLockTimeoutMilliseconds * time.Millisecond
+	core.RefAdmission = localrefs.NewAdmission(lockTimeout, lockTimeout)
+	prometheus.MustRegister(core.RefAdmission)
+
+	durability, err := localrefs.NewDurability(locator, localrefs.DurableStepIdle)
+	if err != nil {
+		return fmt.Errorf("graft storage core: %w", err)
+	}
+	if durability == nil {
+		logger.Info("graft storage core: the kernel exposes no boot identity, every reference write is made durable by git")
+		return nil
+	}
+	core.RefDurability = durability
+	prometheus.MustRegister(durability)
+	return nil
+}
+
+// startStorageMaintenance starts the background checkpoints and garbage
+// collection of the storage core ([graft.storage] checkpoints, on by default,
+// and gc, opt-in; authoritative mode only; doc/graft/PLAN7.md, "Background
+// maintenance").
+func startStorageMaintenance(ctx context.Context, cfg config.Cfg, core *corestore.Core, fresh corestore.Freshener, locator storage.Locator, repoFactory localrepo.Factory, logger log.Logger, storageNames []string) (func(), error) {
+	interval, err := cfg.Graft.Storage.MaintenanceIntervalOrDefault()
+	if err != nil {
+		return nil, err
+	}
+	leaseTTL, err := cfg.Graft.Storage.LeaseTTLOrDefault()
+	if err != nil {
+		return nil, err
+	}
+
+	runner := storagemaintenance.New(core,
+		checkpoint.New(core, logger, locator, repoFactory, fresh),
+		gc.New(core, logger),
+		fresh, logger,
+		storagemaintenance.Config{
+			Interval:             interval,
+			Checkpoints:          cfg.Graft.Storage.CheckpointsAuto(),
+			CheckpointChangesets: cfg.Graft.Storage.CheckpointChangesetsOrDefault(),
+			CheckpointPackBytes:  cfg.Graft.Storage.CheckpointPackBytesOrDefault(),
+			Collect:              cfg.Graft.Storage.GCAuto(),
+			LeaseTTL:             leaseTTL,
+		},
+		storageNames,
+	)
+	prometheus.MustRegister(runner)
+	logger.WithField("interval", interval.String()).
+		WithField("checkpoints", cfg.Graft.Storage.CheckpointsAuto()).
+		WithField("gc", cfg.Graft.Storage.GCAuto()).
+		Info("graft storage core: background maintenance enabled")
+	return runner.Start(ctx), nil
 }
 
 // newPackObjectsAdaptiveLimit builds the adaptive limit backing a pack objects limiter. The limit

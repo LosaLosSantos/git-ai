@@ -43,8 +43,11 @@ const (
 	chaosSeed = 1
 	// chaosSeedEnv names the environment variable that overrides chaosSeed.
 	chaosSeedEnv = "GRAFT_CHAOS_SEED"
-	// chaosBudget bounds the time the lands and the external writer run.
-	chaosBudget = 60 * time.Second
+	// chaosDeadlock bounds the time the lands and the external writer run. It
+	// only turns a deadlock into a failure: every assertion of the scenario
+	// holds however long the lands take, so it is far above what they need
+	// (about a minute on a loaded host).
+	chaosDeadlock = 5 * time.Minute
 	// chaosOutsider is the agent that the protected branches deny.
 	chaosOutsider = "outsider-chaos"
 	// chaosExternalBranch is the branch the external writer moves.
@@ -58,7 +61,9 @@ const (
 	// chaosWriterWins is the number of updates that win the compare-and-swap
 	// before the external writer stops. A bounded count leaves the lanes free
 	// for most of the run: an unbounded writer moves the branch faster than a
-	// batch attempt can land, so the lanes give up with "kept moving".
+	// batch attempt can land, so the lanes give up with "kept moving". It is
+	// below the rebuilds of a batch (landBatchMaxRebuilds), so the writer
+	// alone never makes a land of the open branch give up.
 	chaosWriterWins = 3
 )
 
@@ -243,14 +248,16 @@ func runChaosRequest(ctx context.Context, repo *sdk.Repo, req chaosRequest) (*sd
 }
 
 // chaosExternalWriter moves chaosExternalBranch with UserUpdateBranch until it
-// has won chaosWriterWins updates or done is closed. The first update comes at
-// once, the next ones after a pause drawn from rnd. Each update points the
-// branch at a commit with the same tree as the tip, so the files of the lands
-// are unaffected. It returns the number of updates that won the
-// compare-and-swap. A lost race only ends that attempt. Any other error, a
-// denial included, fails the test: the policy admits the writer to every
-// branch.
-func chaosExternalWriter(t *testing.T, s gitalyStack, done <-chan struct{}, rnd *rand.Rand) int {
+// has won chaosWriterWins updates. It starts with the lands, so its first
+// updates race them; it does not stop when they are done, so it wins its
+// updates whatever the schedule (once the lands are done, nothing else moves
+// the branch). The first update comes at once, the next ones after a pause
+// drawn from rnd. Each update points the branch at a commit with the same tree
+// as the tip, so the files of the lands are unaffected. It returns the number
+// of updates that won the compare-and-swap. A lost race only ends that
+// attempt. Any other error, a denial included, fails the test: the policy
+// admits the writer to every branch. ctx ends it only as a deadlock.
+func chaosExternalWriter(ctx context.Context, t *testing.T, s gitalyStack, rnd *rand.Rand) int {
 	t.Helper()
 
 	client := gitalypb.NewOperationServiceClient(s.dialAgent(t, sharedTestToken))
@@ -261,8 +268,8 @@ func chaosExternalWriter(t *testing.T, s gitalyStack, done <-chan struct{}, rnd 
 	var pause time.Duration
 	for n := 0; won < chaosWriterWins; n++ {
 		select {
-		case <-done:
-			return won
+		case <-ctx.Done():
+			require.FailNow(t, "the external writer did not win its updates", "%d of %d won: %v", won, chaosWriterWins, ctx.Err())
 		case <-time.After(pause):
 		}
 		pause = chaosWriterGap + time.Duration(rnd.Int63n(int64(3*chaosWriterGap)))
@@ -575,9 +582,9 @@ func TestChaosLanding(t *testing.T) {
 		reqs[i].blob = s.git(t, "rev-parse", reqs[i].commit+":"+reqs[i].path)
 	}
 
-	// The budget bounds the lands. A land that outlives it fails with a
-	// deadline error, which the invariants reject.
-	landCtx, cancelLands := context.WithTimeout(ctx, chaosBudget)
+	// Only a deadlock ends the lands: a land fails with a deadline error only
+	// past chaosDeadlock, which the invariants then reject.
+	landCtx, cancelLands := context.WithTimeout(ctx, chaosDeadlock)
 	defer cancelLands()
 
 	results := make([]chaosResult, len(reqs))
@@ -604,7 +611,7 @@ func TestChaosLanding(t *testing.T) {
 
 	// The external writer runs here, in the test goroutine, until it has won its
 	// updates. The lands may outlive it, so the results are read after done.
-	externalWins := chaosExternalWriter(t, s, done, rand.New(rand.NewSource(seed+1)))
+	externalWins := chaosExternalWriter(landCtx, t, s, rand.New(rand.NewSource(seed+1)))
 	t.Logf("the external writer won %d updates of %s", externalWins, chaosExternalBranch)
 	<-done
 
@@ -625,11 +632,17 @@ func TestChaosLanding(t *testing.T) {
 		}
 	}
 	t.Logf("%d lands succeeded, %d on %s, %d conflicted, and %d paths were resolved", successes, openSuccesses, chaosExternalBranch, conflicts, resolutions)
+	// These hold under any schedule. The first four requests change the hot
+	// file of the open branch and are never cancelled (planChaos): whichever
+	// lands first, one of the first two conflicts and one of the last two is
+	// resolved, so at least two land on the open branch. The branch moves under
+	// them only by the external writer, chaosWriterWins times, fewer than the
+	// rebuilds of a batch, so none of them gives up.
 	require.Positive(t, successes, "some lands succeed")
 	require.Positive(t, openSuccesses, "some lands succeed on %s, the branch the external writer moves", chaosExternalBranch)
 	require.Positive(t, conflicts, "some overlapping lands conflict")
 	require.Positive(t, resolutions, "the resolver resolves some overlapping lands")
-	require.Positive(t, externalWins, "the external writer wins an update of %s", chaosExternalBranch)
+	require.Equal(t, chaosWriterWins, externalWins, "the external writer wins its updates of %s", chaosExternalBranch)
 
 	view := chaosViewOf(t, s, s.repoAs(t, tokens[workerName(0)]), base)
 	require.Empty(t, checkChaosInvariants(reqs, results, view), "the chaos invariants hold")

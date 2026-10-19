@@ -41,12 +41,13 @@ func unmarshalReview(body string) (*gitalypb.Review, error) {
 }
 
 // InsertReview implements corestore.MetaStore.
-func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error)) (*gitalypb.Review, error) {
+func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), opts corestore.ReviewInsert) (*gitalypb.Review, error) {
 	var stored *gitalypb.Review
 
 	err := s.withTx(ctx, nil, func(tx *sql.Tx) error {
 		stored = nil
 
+		// LOCK ORDER (doc/graft/PLAN7.md): the repository row first.
 		repo, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true)
 		if err != nil {
 			return err
@@ -62,6 +63,23 @@ func (s *Store) InsertReview(ctx context.Context, repoID int64, build func(id st
 		}
 
 		r := prepareReview(built, fmt.Sprintf("%d", id))
+		if opts.MaxOpen > 0 && r.GetState() == gitalypb.Review_STATE_OPEN_UNSPECIFIED {
+			// Under the repository row lock, which every insert takes: the count
+			// cannot change before the commit.
+			var open int
+			if err := tx.QueryRowContext(ctx, s.bind("SELECT COUNT(*) FROM graft_reviews WHERE repo_id = ? AND closed = ?"),
+				repoID, false).Scan(&open); err != nil {
+				return fmt.Errorf("count open reviews: %w", err)
+			}
+			if open >= opts.MaxOpen {
+				return fmt.Errorf("%w: the repository has %d open reviews, the limit is %d", corestore.ErrTooManyOpenReviews, open, opts.MaxOpen)
+			}
+		}
+		if opts.RequireRoots {
+			if err := s.requireReviewRoots(ctx, tx, repoID, r); err != nil {
+				return err
+			}
+		}
 		body, err := marshalReview(r)
 		if err != nil {
 			return err
@@ -164,13 +182,26 @@ func (s *Store) ListReviews(ctx context.Context, repoID int64, targetBranch stri
 }
 
 // UpdateReview implements corestore.MetaStore.
-func (s *Store) UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review) error {
+func (s *Store) UpdateReview(ctx context.Context, repoID int64, id string, version int64, r *gitalypb.Review, requireRoots bool) error {
 	reviewID, ok := parseReviewID(id)
 	if !ok {
 		return corestore.ErrReviewNotFound
 	}
 
 	return s.withTx(ctx, nil, func(tx *sql.Tx) error {
+		// An update that may move the review's head serializes with the
+		// changesets that could delete its keep-around references: LOCK ORDER,
+		// the repository row first. The others touch only the review row and
+		// never lock the repository row.
+		if requireRoots {
+			if _, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true); err != nil {
+				return err
+			}
+			if err := s.requireReviewRoots(ctx, tx, repoID, r); err != nil {
+				return err
+			}
+		}
+
 		var current int64
 		err := tx.QueryRowContext(ctx, s.bind("SELECT version FROM graft_reviews WHERE repo_id = ? AND review_id = ?"),
 			repoID, reviewID).Scan(&current)

@@ -19,15 +19,51 @@ import (
 type fakeStorageCore struct {
 	gitalypb.UnimplementedStorageCoreServiceServer
 
-	importResp *gitalypb.ImportRepositoryResponse
-	stateResp  *gitalypb.GetStorageStateResponse
-	verifyResp *gitalypb.VerifyRepositoryResponse
-	err        error
+	importResp     *gitalypb.ImportRepositoryResponse
+	stateResp      *gitalypb.GetStorageStateResponse
+	verifyResp     *gitalypb.VerifyRepositoryResponse
+	checkpointResp *gitalypb.CreateCheckpointResponse
+	gcResp         *gitalypb.CollectGarbageResponse
+	removedResp    *gitalypb.CollectRemovedRepositoriesResponse
+	err            error
 
-	mu         sync.Mutex
-	importReqs []*gitalypb.ImportRepositoryRequest
-	stateReqs  []*gitalypb.GetStorageStateRequest
-	verifyReqs []*gitalypb.VerifyRepositoryRequest
+	mu             sync.Mutex
+	importReqs     []*gitalypb.ImportRepositoryRequest
+	stateReqs      []*gitalypb.GetStorageStateRequest
+	verifyReqs     []*gitalypb.VerifyRepositoryRequest
+	checkpointReqs []*gitalypb.CreateCheckpointRequest
+	gcReqs         []*gitalypb.CollectGarbageRequest
+	removedReqs    []*gitalypb.CollectRemovedRepositoriesRequest
+}
+
+func (f *fakeStorageCore) CreateCheckpoint(_ context.Context, req *gitalypb.CreateCheckpointRequest) (*gitalypb.CreateCheckpointResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checkpointReqs = append(f.checkpointReqs, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.checkpointResp, nil
+}
+
+func (f *fakeStorageCore) CollectGarbage(_ context.Context, req *gitalypb.CollectGarbageRequest) (*gitalypb.CollectGarbageResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gcReqs = append(f.gcReqs, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.gcResp, nil
+}
+
+func (f *fakeStorageCore) CollectRemovedRepositories(_ context.Context, req *gitalypb.CollectRemovedRepositoriesRequest) (*gitalypb.CollectRemovedRepositoriesResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedReqs = append(f.removedReqs, req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.removedResp, nil
 }
 
 func (f *fakeStorageCore) ImportRepository(_ context.Context, req *gitalypb.ImportRepositoryRequest) (*gitalypb.ImportRepositoryResponse, error) {
@@ -68,6 +104,94 @@ func storageRepo(t *testing.T, fake *fakeStorageCore) *sdk.Repo {
 		gitalypb.RegisterStorageCoreServiceServer(srv, fake)
 	}, sdk.WithStorage("default"))
 	return client.Repo("@hashed/ab/cd/repo.git")
+}
+
+func TestStorageCheckpoint(t *testing.T) {
+	fake := &fakeStorageCore{checkpointResp: &gitalypb.CreateCheckpointResponse{
+		CheckpointSequence: 42,
+		Created:            true,
+		PackBytes:          8192,
+		References:         5,
+	}}
+	repo := storageRepo(t, fake)
+
+	res, err := repo.StorageCheckpoint(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, &sdk.StorageCheckpoint{Sequence: 42, Created: true, PackBytes: 8192, References: 5}, res)
+	require.Len(t, fake.checkpointReqs, 1)
+	require.Equal(t, "@hashed/ab/cd/repo.git", fake.checkpointReqs[0].GetRepository().GetRelativePath())
+}
+
+func TestStorageGC(t *testing.T) {
+	fake := &fakeStorageCore{gcResp: &gitalypb.CollectGarbageResponse{
+		Boundary:           7,
+		CoveredDeleted:     3,
+		CheckpointsDropped: 1,
+		OrphansDeleted:     2,
+		OrphansObserved:    4,
+		OrphansInGrace:     5,
+		PacksDeleted:       6,
+		BytesReclaimed:     1 << 20,
+		DryRun:             true,
+	}}
+	repo := storageRepo(t, fake)
+
+	res, err := repo.StorageGC(t.Context(), true)
+	require.NoError(t, err)
+	require.Equal(t, &sdk.StorageGC{
+		Boundary:           7,
+		CoveredDeleted:     3,
+		CheckpointsDropped: 1,
+		OrphansDeleted:     2,
+		OrphansObserved:    4,
+		OrphansInGrace:     5,
+		PacksDeleted:       6,
+		BytesReclaimed:     1 << 20,
+		DryRun:             true,
+	}, res)
+	require.Len(t, fake.gcReqs, 1)
+	require.True(t, fake.gcReqs[0].GetDryRun())
+	require.Equal(t, "default", fake.gcReqs[0].GetRepository().GetStorageName())
+}
+
+func TestStorageGCRemoved(t *testing.T) {
+	fake := &fakeStorageCore{removedResp: &gitalypb.CollectRemovedRepositoriesResponse{
+		Repositories:        2,
+		PacksDeleted:        9,
+		BytesReclaimed:      4096,
+		LeaksFound:          3,
+		LeaksTombstoned:     2,
+		IdsAheadOfAllocator: 1,
+	}}
+	client := dialFake(t, func(srv *grpc.Server) {
+		gitalypb.RegisterStorageCoreServiceServer(srv, fake)
+	}, sdk.WithStorage("default"))
+
+	res, err := client.StorageGCRemoved(t.Context(), "", false)
+	require.NoError(t, err)
+	require.Equal(t, &sdk.StorageGCRemoved{
+		Repositories: 2, PacksDeleted: 9, BytesReclaimed: 4096,
+		LeaksFound: 3, LeaksTombstoned: 2, IDsAheadOfAllocator: 1,
+	}, res)
+
+	_, err = client.StorageGCRemoved(t.Context(), "other", true)
+	require.NoError(t, err)
+
+	require.Len(t, fake.removedReqs, 2)
+	require.Equal(t, "default", fake.removedReqs[0].GetStorageName(), "the client's storage by default")
+	require.False(t, fake.removedReqs[0].GetDryRun())
+	require.Equal(t, "other", fake.removedReqs[1].GetStorageName())
+	require.True(t, fake.removedReqs[1].GetDryRun())
+}
+
+func TestStorageMaintenanceErrorsAreReturned(t *testing.T) {
+	fake := &fakeStorageCore{err: status.Error(codes.FailedPrecondition, "the storage core is off")}
+	repo := storageRepo(t, fake)
+
+	_, err := repo.StorageCheckpoint(t.Context())
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	_, err = repo.StorageGC(t.Context(), false)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 func TestStorageImport(t *testing.T) {

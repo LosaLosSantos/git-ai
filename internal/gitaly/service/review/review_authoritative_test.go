@@ -11,6 +11,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	hookservice "github.com/feder-cr/git-ai/internal/gitaly/service/hook"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
 	"github.com/feder-cr/git-ai/internal/grpc/client"
@@ -25,17 +26,34 @@ import (
 )
 
 // setupWithStorageCore runs a ReviewService whose storage core is in the given
-// mode, on the SQLite database of the test.
-func setupWithStorageCore(t *testing.T, mode corestore.Mode) (context.Context, config.Cfg, *corestore.Core, gitalypb.ReviewServiceClient) {
+// mode, on the SQLite database of the test. configure, when given, adjusts the
+// server before it serves.
+func setupWithStorageCore(t *testing.T, mode corestore.Mode, configure ...func(*server)) (context.Context, config.Cfg, *corestore.Core, gitalypb.ReviewServiceClient) {
+	t.Helper()
+	return setupWithConfig(t, mode, func(*config.Cfg) {}, configure...)
+}
+
+// setupWithConfig is setupWithStorageCore with adjust applied to the
+// configuration before the server starts.
+func setupWithConfig(t *testing.T, mode corestore.Mode, adjust func(*config.Cfg), configure ...func(*server)) (context.Context, config.Cfg, *corestore.Core, gitalypb.ReviewServiceClient) {
 	t.Helper()
 
 	ctx := testhelper.Context(t)
 	cfg := testcfg.Build(t)
 	cfg.Graft.Standalone = true
+	adjust(&cfg)
+	// The service writes keep-around references through the
+	// reference-transaction hook.
+	testcfg.BuildGitalyHooks(t, cfg)
 	core := coretest.Open(t, coretest.Options{Mode: mode})
 
 	cfg.SocketPath = testserver.RunGitalyServer(t, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
-		gitalypb.RegisterReviewServiceServer(srv, newServer(deps))
+		s := newServer(deps)
+		for _, c := range configure {
+			c(s)
+		}
+		gitalypb.RegisterReviewServiceServer(srv, s)
+		gitalypb.RegisterHookServiceServer(srv, hookservice.NewServer(deps))
 	}, testserver.WithGraftStorage(core))
 
 	conn, err := client.New(ctx, cfg.SocketPath)

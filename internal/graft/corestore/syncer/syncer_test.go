@@ -185,12 +185,13 @@ func (e *env) changeset(t *testing.T, id int64, src source, updates []corestore.
 		NodeID:    "node-a",
 	}
 	if !pack.Empty() {
-		key = corestore.PackKey(id, pack.SHA256)
+		key = corestore.NewPackKey(id, pack.SHA256)
 		rc, err := pack.Open()
 		require.NoError(t, err)
 		require.NoError(t, e.core.Blobs.Put(e.ctx, key, rc))
 		require.NoError(t, rc.Close())
 		in.PackKey = key
+		in.PackDeadline = time.Now().Add(time.Hour)
 		in.PackBytes = pack.Size
 	}
 

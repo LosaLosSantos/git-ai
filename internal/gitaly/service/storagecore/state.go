@@ -15,8 +15,8 @@ import (
 // that this node has no local copy of (another node may have it).
 func (s *server) GetStorageState(ctx context.Context, req *gitalypb.GetStorageStateRequest) (*gitalypb.GetStorageStateResponse, error) {
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
+		return nil, err
 	}
 
 	core := s.deps.GetGraftStorage()

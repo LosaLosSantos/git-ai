@@ -37,6 +37,12 @@ type Store struct {
 	ctx    context.Context
 	meta   corestore.MetaStore
 	repoID int64
+	// requireRoots makes Create and Update require the keep-around references of
+	// the review's commits (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	requireRoots bool
+	// maxOpen, when positive, bounds the open reviews of the repository that
+	// Create may reach (WithMaxOpen).
+	maxOpen int
 }
 
 var _ store.ReviewStore = (*Store)(nil)
@@ -45,6 +51,27 @@ var _ store.ReviewStore = (*Store)(nil)
 // the database calls of the store.
 func New(ctx context.Context, meta corestore.MetaStore, repoID int64) store.ReviewStore {
 	return &Store{ctx: ctx, meta: meta, repoID: repoID}
+}
+
+// WithRequiredRoots returns a store whose Create and Update write a review only
+// when the keep-around references of its head and base commits exist in the
+// database, else they fail with corestore.ErrReviewRootsMissing and write
+// nothing. It is the store of the writes that may record new commits.
+func (s *Store) WithRequiredRoots() store.ReviewStore {
+	required := *s
+	required.requireRoots = true
+	return &required
+}
+
+// WithMaxOpen returns a store whose Create refuses an open review with
+// store.ErrTooManyOpenReviews, and writes nothing, when the repository has
+// limit open reviews already. The count and the insert are one transaction
+// under the repository row lock, so concurrent creates on any node cannot
+// pass the limit. A limit of zero or less means no limit.
+func (s *Store) WithMaxOpen(limit int) *Store {
+	bounded := *s
+	bounded.maxOpen = limit
+	return &bounded
 }
 
 // Create stores a new review. It assigns the id, created_at and updated_at.
@@ -59,7 +86,7 @@ func (s *Store) Create(r *gitalypb.Review) (*gitalypb.Review, error) {
 		review.Requirements = nil
 		review.Approved = false
 		return review, nil
-	})
+	}, corestore.ReviewInsert{RequireRoots: s.requireRoots, MaxOpen: s.maxOpen})
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -111,7 +138,7 @@ func (s *Store) Update(id string, fn func(*gitalypb.Review) error) (*gitalypb.Re
 		stored.Requirements = nil
 		stored.Approved = false
 
-		err = s.meta.UpdateReview(s.ctx, s.repoID, id, version, stored)
+		err = s.meta.UpdateReview(s.ctx, s.repoID, id, version, stored, s.requireRoots)
 		if err == nil {
 			return proto.Clone(r).(*gitalypb.Review), nil
 		}
@@ -154,8 +181,11 @@ func (s *Store) backoff(attempt int) error {
 // mapErr translates the storage core errors into the errors of the review
 // store.
 func mapErr(err error) error {
-	if errors.Is(err, corestore.ErrReviewNotFound) {
+	switch {
+	case errors.Is(err, corestore.ErrReviewNotFound):
 		return store.ErrNotFound
+	case errors.Is(err, corestore.ErrTooManyOpenReviews):
+		return fmt.Errorf("%w: %w", store.ErrTooManyOpenReviews, err)
 	}
 	return err
 }

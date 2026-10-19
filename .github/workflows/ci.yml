@@ -2,14 +2,97 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
+  # The whole test suite of the main module, on pushes (main and ci/**), split
+  # into groups that run in parallel. Every group builds the same binaries and
+  # runs `make test-go`, the test entry point of the Makefile (build tags,
+  # ldflags and the test PATH). Pull requests run the quick job below.
   test:
+    name: test (${{ matrix.group }})
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [git, gitaly-service, gitaly-other, graft, other]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      GRAFT_TEST_POSTGRES_DSN: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
+      # Praefect's tests connect through the libpq environment variables.
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libcurl4-openssl-dev libexpat1-dev gettext libssl-dev zlib1g-dev libpcre2-dev
+          # The bundled Git is built with Meson and Ninja; the packaged Meson can be too old.
+          python3 -m venv "$RUNNER_TEMP/buildtools"
+          "$RUNNER_TEMP/buildtools/bin/pip" install --quiet "meson>=1.12" ninja
+          echo "$RUNNER_TEMP/buildtools/bin" >> "$GITHUB_PATH"
+
+      - name: Cache the built dependencies (bundled Git)
+        uses: actions/cache@v4
+        with:
+          path: _build/deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Makefile') }}
+
+      - name: Build
+        run: make build
+
+      - name: Vet
+        if: matrix.group == 'graft'
+        run: go vet ./internal/graft/... ./internal/gitaly/service/storagecore/... ./internal/gitaly/config/... ./cmd/graft/... ./sdk/...
+
+      - name: Prepare tests
+        run: make prepare-tests
+
+      - name: Test
+        run: |
+          case "${{ matrix.group }}" in
+            git)            pkgs=$(go list ./internal/git/...) ;;
+            gitaly-service) pkgs=$(go list ./internal/gitaly/service/...) ;;
+            gitaly-other)   pkgs=$(go list ./internal/gitaly/... | grep -v '/internal/gitaly/service/') ;;
+            graft)          pkgs=$(go list ./internal/graft/... ./cmd/... ./sdk/...) ;;
+            other)          pkgs=$(go list ./... | grep -v -E '/internal/(git|gitaly|graft)(/|$)|/cmd/|/sdk(/|$)') ;;
+          esac
+          # RewriteHistory runs git-filter-repo from PATH, as in production.
+          # prepare-tests builds the pinned version into _build/bin; expose
+          # only that tool, not every built binary.
+          mkdir -p "$RUNNER_TEMP/testpath"
+          ln -s "$PWD/_build/bin/git-filter-repo" "$RUNNER_TEMP/testpath/git-filter-repo"
+          export PATH="$RUNNER_TEMP/testpath:$PATH"
+          make test-go TEST_PACKAGES="$(echo $pkgs)"
+
+  # Pull requests: the storage core, configuration, CLI and SDK, and the
+  # storage end-to-end tests. The full suite runs once the change is on main.
+  quick:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     services:
@@ -37,10 +120,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libcurl4-openssl-dev libexpat1-dev gettext libssl-dev zlib1g-dev libpcre2-dev
-          # The bundled Git is built with Meson and Ninja; the packaged Meson can be too old.
           python3 -m venv "$RUNNER_TEMP/buildtools"
           "$RUNNER_TEMP/buildtools/bin/pip" install --quiet "meson>=1.12" ninja
           echo "$RUNNER_TEMP/buildtools/bin" >> "$GITHUB_PATH"
+
+      - name: Cache the built dependencies (bundled Git)
+        uses: actions/cache@v4
+        with:
+          path: _build/deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Makefile') }}
 
       - name: Build
         run: make build
@@ -56,6 +144,16 @@ jobs:
 
       - name: Test (storage end to end)
         run: go test -count=1 -run '^TestStorage' ./internal/graft/e2e
+
+  graft-agents:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/graft-agents/go.mod
 
       - name: Test (graft-agents module)
         run: go -C tools/graft-agents test ./...

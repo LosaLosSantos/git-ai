@@ -68,6 +68,9 @@ type Store struct {
 	// of db take. On Postgres it is db.
 	readDB  *sql.DB
 	dialect Dialect
+	// writers queues the write transactions on SQLite (nil on Postgres, whose
+	// row locks queue their waiters themselves); see writeQueue.
+	writers *writeQueue
 }
 
 var _ corestore.MetaStore = (*Store)(nil)
@@ -113,6 +116,13 @@ func ParseDSN(dsn string) (Dialect, string, error) {
 // the lock is acquired in slices of sqliteBusySlice, never longer than the
 // context's deadline.
 func Open(ctx context.Context, dsn string) (*Store, error) {
+	return open(ctx, dsn, 0)
+}
+
+// open is Open applying only the first migrations of the schema when
+// migrations is greater than 0 (tests build a database as an earlier version
+// left it), every migration otherwise.
+func open(ctx context.Context, dsn string, migrations int) (*Store, error) {
 	dialect, target, err := ParseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -141,7 +151,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("ping %s database: %w", dialect, err)
 	}
 
-	if err := applyMigrations(ctx, db, dialect); err != nil {
+	if err := applyMigrations(ctx, db, dialect, migrations); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply migrations: %w", err)
 	}
@@ -162,7 +172,11 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		}
 	}
 
-	return &Store{db: db, readDB: readDB, dialect: dialect}, nil
+	s := &Store{db: db, readDB: readDB, dialect: dialect}
+	if dialect == SQLite {
+		s.writers = &writeQueue{}
+	}
+	return s, nil
 }
 
 // ping checks the connection to the database. On SQLite, the first
@@ -186,10 +200,11 @@ func ping(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	}
 }
 
-// applyMigrations brings the schema of the dialect up to date. Postgres
-// processes are serialized with an advisory lock held on a dedicated
-// connection; SQLite processes that race on a new database retry.
-func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
+// applyMigrations brings the schema of the dialect up to date, or up to its
+// first limit migrations when limit is greater than 0. Postgres processes are
+// serialized with an advisory lock held on a dedicated connection; SQLite
+// processes that race on a new database retry.
+func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect, limit int) error {
 	migrations := sqliteMigrations
 	name := "sqlite3"
 	attempts := maxMigrationAttempts
@@ -197,7 +212,12 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		migrations = postgresMigrations
 		name = "postgres"
 		attempts = 1
+	}
+	if limit > 0 {
+		migrations = migrations[:min(limit, len(migrations))]
+	}
 
+	if dialect == Postgres {
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			return fmt.Errorf("get migration connection: %w", err)
@@ -215,6 +235,10 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	set := migrate.MigrationSet{TableName: migrationTable}
 	source := &migrate.MemoryMigrationSource{Migrations: migrations}
 
+	if err := refuseUnknownMigrations(set, db, name, dialect); err != nil {
+		return err
+	}
+
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if _, err = set.Exec(db, name, source, migrate.Up); err == nil {
@@ -228,6 +252,41 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	}
 
 	return err
+}
+
+// ErrUnknownMigrations is returned by Open when the database holds migrations
+// that this binary does not know: a newer version migrated it. This version
+// cannot run on it: its writes and its reads of the newer data are not
+// compatible (doc/graft/STORAGE.md, Upgrades).
+var ErrUnknownMigrations = errors.New("storage core: the database was migrated by a newer version of the storage core")
+
+// refuseUnknownMigrations returns ErrUnknownMigrations, naming the migrations,
+// when the database records a migration that is not among the migrations of
+// this binary for the dialect (all of them, whatever limit applies).
+func refuseUnknownMigrations(set migrate.MigrationSet, db *sql.DB, name string, dialect Dialect) error {
+	records, err := set.GetMigrationRecords(db, name)
+	if err != nil {
+		return fmt.Errorf("read the applied migrations: %w", err)
+	}
+	all := sqliteMigrations
+	if dialect == Postgres {
+		all = postgresMigrations
+	}
+	known := make(map[string]struct{}, len(all))
+	for _, m := range all {
+		known[m.Id] = struct{}{}
+	}
+	var unknown []string
+	for _, r := range records {
+		if _, ok := known[r.Id]; !ok {
+			unknown = append(unknown, r.Id)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("%w (unknown migrations %s): this binary cannot run on it; every node must run the same version, so upgrade this node (doc/graft/STORAGE.md, Upgrades)",
+			ErrUnknownMigrations, strings.Join(unknown, ", "))
+	}
+	return nil
 }
 
 // Dialect returns the dialect of the store.
@@ -332,12 +391,20 @@ func (s *Store) withReadTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return s.retryTx(ctx, s.readDB, s.readTxOptions(), fn)
 }
 
+// retryHook, when set by a test, is called with the error of every transaction
+// that is retried, so that a test can assert which kind of conflict occurred
+// (doc/graft/PLAN7.md, LOCK ORDER: no deadlock). It is nil in production.
+var retryHook func(err error)
+
 func (s *Store) retryTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn func(*sql.Tx) error) error {
 	var err error
 	for attempt := 0; ; attempt++ {
 		err = s.runTx(ctx, db, opts, fn)
 		if err == nil || attempt >= maxTxRetries || !isRetryable(err) || ctx.Err() != nil {
 			return err
+		}
+		if retryHook != nil {
+			retryHook(err)
 		}
 		if serr := sleep(ctx, attempt); serr != nil {
 			return err
@@ -362,6 +429,22 @@ func (s *Store) runTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn f
 	}
 	defer func() { _ = conn.Close() }()
 	defer restoreBusyTimeout(conn)
+
+	// A write transaction waits for its turn among the writers of this Store
+	// before it asks SQLite for the write lock (writeQueue). The admission covers
+	// one attempt: it is taken right before BEGIN IMMEDIATE and released when the
+	// attempt has committed or rolled back, so a writer never holds it while
+	// retryTx sleeps before the next attempt, and the writers behind it are never
+	// kept waiting for a lock nobody uses. No transaction function starts another
+	// write transaction, and the admission is always taken before the SQLite
+	// lock, so the two can never wait for each other. Read transactions run on
+	// readDB and need no admission.
+	if db == s.db && s.writers != nil {
+		if err := s.writers.acquire(ctx); err != nil {
+			return fmt.Errorf("wait for the write admission: %w", err)
+		}
+		defer s.writers.release()
+	}
 
 	tx, err := beginSQLite(ctx, conn, opts)
 	if err != nil {

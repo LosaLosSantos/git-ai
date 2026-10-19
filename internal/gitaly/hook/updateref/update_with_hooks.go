@@ -140,6 +140,23 @@ func (e Error) Proto() *gitalypb.ReferenceUpdateError {
 	}
 }
 
+// deferredDurability is implemented by a hook manager whose storage core writes the references
+// of the transactions it commits without fsync (hook.GitLabHookManager).
+type deferredDurability interface {
+	DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool)
+}
+
+// deferReferenceWrites decides whether the update-ref process about to start for repo with
+// hookManager writes its references without fsync: only when its storage voter says so. When
+// ok, end is called once the process has exited.
+func deferReferenceWrites(ctx context.Context, hookManager hook.Manager, repo *gitalypb.Repository) (end func(), ok bool) {
+	d, isDeferring := hookManager.(deferredDurability)
+	if !isDeferring {
+		return nil, false
+	}
+	return d.DeferReferenceWrites(ctx, repo)
+}
+
 // NewUpdaterWithHooks creates a new instance of a struct that will update a Git reference.
 func NewUpdaterWithHooks(
 	cfg config.Cfg,
@@ -257,7 +274,16 @@ func (u *UpdaterWithHooks) UpdateReference(
 	// is packed, which is obviously a bad thing as Gitaly nodes may be differently packed. We
 	// thus continue to manually drive the reference-transaction hook here, which doesn't have
 	// this problem.
-	updater, err := updateref.New(ctx, repo, updateref.WithDisabledTransactions())
+	updaterOpts := []updateref.UpdaterOpt{updateref.WithDisabledTransactions()}
+	// The storage core's authoritative mode makes the references durable itself: its database
+	// commit in the prepared phase is the durable point of the transaction. It counts the
+	// update-ref process as writing without fsync until the process has exited (end runs after
+	// updater.Close, which waits for it).
+	if end, ok := deferReferenceWrites(ctx, u.hookManager, repoProto); ok {
+		defer end()
+		updaterOpts = append(updaterOpts, updateref.WithDeferredReferenceDurability())
+	}
+	updater, err := updateref.New(ctx, repo, updaterOpts...)
 	if err != nil {
 		return fmt.Errorf("creating updater: %w", err)
 	}

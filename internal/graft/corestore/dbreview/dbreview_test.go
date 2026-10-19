@@ -3,6 +3,7 @@ package dbreview_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -155,6 +156,70 @@ func TestUpdate(t *testing.T) {
 	})
 }
 
+// withMaxOpen returns rs bounded to limit open reviews.
+func withMaxOpen(t *testing.T, rs store.ReviewStore, limit int) store.ReviewStore {
+	switch s := rs.(type) {
+	case *store.Store:
+		return s.WithMaxOpen(limit)
+	case *dbreview.Store:
+		return s.WithMaxOpen(limit)
+	}
+	require.FailNow(t, "unknown review store", "%T", rs)
+	return nil
+}
+
+// TestCreateIsBoundedByTheOpenReviews: concurrent creates on two handles (two
+// nodes) never pass the limit of open reviews; reviews that are not open do
+// not count and are not refused, and closing one makes room for one.
+func TestCreateIsBoundedByTheOpenReviews(t *testing.T) {
+	eachBackend(t, func(t *testing.T, rs store.ReviewStore, other store.ReviewStore) {
+		const limit, creates = 3, 12
+		handles := []store.ReviewStore{withMaxOpen(t, rs, limit), withMaxOpen(t, other, limit)}
+
+		landed, err := handles[0].Create(&gitalypb.Review{TargetBranch: []byte("main"), State: gitalypb.Review_STATE_LANDED})
+		require.NoError(t, err, "a review that is not open is not bounded")
+
+		start := make(chan struct{})
+		errs := make(chan error, creates)
+		for i := 0; i < creates; i++ {
+			go func() {
+				<-start
+				_, err := handles[i%2].Create(&gitalypb.Review{TargetBranch: []byte("main")})
+				errs <- err
+			}()
+		}
+		close(start)
+		created := 0
+		for i := 0; i < creates; i++ {
+			err := <-errs
+			if err == nil {
+				created++
+				continue
+			}
+			require.ErrorIs(t, err, store.ErrTooManyOpenReviews)
+		}
+		require.Equal(t, limit, created, "exactly the limit is created")
+
+		open, err := rs.List("", false, 0)
+		require.NoError(t, err)
+		require.Len(t, open, limit)
+		all, err := rs.List("", true, 0)
+		require.NoError(t, err)
+		require.Len(t, all, limit+1, "a refused create writes nothing")
+		require.Contains(t, ids(all), landed.GetId())
+
+		_, err = handles[1].Create(&gitalypb.Review{TargetBranch: []byte("main")})
+		require.ErrorIs(t, err, store.ErrTooManyOpenReviews)
+		_, err = rs.Update(open[0].GetId(), func(r *gitalypb.Review) error {
+			r.State = gitalypb.Review_STATE_CLOSED
+			return nil
+		})
+		require.NoError(t, err)
+		_, err = handles[1].Create(&gitalypb.Review{TargetBranch: []byte("main")})
+		require.NoError(t, err, "closing a review makes room")
+	})
+}
+
 func TestCreateTimestampsAreNow(t *testing.T) {
 	eachBackend(t, func(t *testing.T, rs store.ReviewStore, _ store.ReviewStore) {
 		before := time.Now().Add(-time.Second)
@@ -207,6 +272,10 @@ type conflictingMeta struct {
 	corestore.MetaStore
 	gets, updates int
 	updateErr     error
+	// requireRoots are the requireRoots arguments of the writes, in order.
+	requireRoots []bool
+	// maxOpen are the open-review limits of the inserts, in order.
+	maxOpen []int
 }
 
 func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.Review, int64, error) {
@@ -214,9 +283,76 @@ func (m *conflictingMeta) GetReview(context.Context, int64, string) (*gitalypb.R
 	return &gitalypb.Review{Id: "1", TargetBranch: []byte("main")}, int64(m.gets), nil
 }
 
-func (m *conflictingMeta) UpdateReview(context.Context, int64, string, int64, *gitalypb.Review) error {
+func (m *conflictingMeta) UpdateReview(_ context.Context, _ int64, _ string, _ int64, _ *gitalypb.Review, requireRoots bool) error {
 	m.updates++
+	m.requireRoots = append(m.requireRoots, requireRoots)
 	return m.updateErr
+}
+
+func (m *conflictingMeta) InsertReview(_ context.Context, _ int64, build func(string) (*gitalypb.Review, error), opts corestore.ReviewInsert) (*gitalypb.Review, error) {
+	m.requireRoots = append(m.requireRoots, opts.RequireRoots)
+	m.maxOpen = append(m.maxOpen, opts.MaxOpen)
+	return build("1")
+}
+
+// TestRequiredRootsReachTheDatabase: the writes of WithRequiredRoots require
+// the review's roots, those of New's store do not. A missing root is returned
+// at once: retrying the same write without writing the reference again could
+// not succeed.
+func TestRequiredRootsReachTheDatabase(t *testing.T) {
+	ctx := testhelper.Context(t)
+	meta := &conflictingMeta{}
+	plain := dbreview.New(ctx, meta, 1)
+
+	_, err := plain.Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = plain.Update("1", func(*gitalypb.Review) error { return nil })
+	require.NoError(t, err)
+
+	required := plain.(*dbreview.Store).WithRequiredRoots()
+	_, err = required.Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = required.Update("1", func(*gitalypb.Review) error { return nil })
+	require.NoError(t, err)
+	require.Equal(t, []bool{false, false, true, true}, meta.requireRoots)
+
+	meta.updateErr = corestore.ErrReviewRootsMissing
+	meta.updates = 0
+	_, err = required.Update("1", func(*gitalypb.Review) error { return nil })
+	require.ErrorIs(t, err, corestore.ErrReviewRootsMissing)
+	require.Equal(t, 1, meta.updates)
+}
+
+// TestMaxOpenReachesTheDatabase: the open-review limit of WithMaxOpen goes to
+// the insert, also through WithRequiredRoots, and the database's refusal is
+// the store's ErrTooManyOpenReviews.
+func TestMaxOpenReachesTheDatabase(t *testing.T) {
+	ctx := testhelper.Context(t)
+	meta := &conflictingMeta{}
+	plain := dbreview.New(ctx, meta, 1).(*dbreview.Store)
+
+	_, err := plain.Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = plain.WithMaxOpen(5).Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	_, err = plain.WithMaxOpen(7).WithRequiredRoots().Create(&gitalypb.Review{})
+	require.NoError(t, err)
+	require.Equal(t, []int{0, 5, 7}, meta.maxOpen)
+	require.Equal(t, []bool{false, false, true}, meta.requireRoots)
+
+	refusing := &refusingMeta{}
+	_, err = dbreview.New(ctx, refusing, 1).(*dbreview.Store).WithMaxOpen(1).Create(&gitalypb.Review{})
+	require.ErrorIs(t, err, store.ErrTooManyOpenReviews)
+	require.ErrorContains(t, err, "the limit is 1")
+}
+
+// refusingMeta refuses every insert as beyond the open-review limit.
+type refusingMeta struct {
+	corestore.MetaStore
+}
+
+func (refusingMeta) InsertReview(_ context.Context, _ int64, _ func(string) (*gitalypb.Review, error), opts corestore.ReviewInsert) (*gitalypb.Review, error) {
+	return nil, fmt.Errorf("%w: the repository has %d open reviews, the limit is %d", corestore.ErrTooManyOpenReviews, opts.MaxOpen, opts.MaxOpen)
 }
 
 func TestUpdateGivesUpAfterTenConflicts(t *testing.T) {

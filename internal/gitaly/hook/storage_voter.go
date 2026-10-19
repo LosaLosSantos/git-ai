@@ -5,6 +5,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // StorageVoter is the write path of the Graft storage core
@@ -25,6 +26,24 @@ type StorageVoter interface {
 	// Authoritative reports whether the storage core's database replaces the
 	// file changelog.
 	Authoritative() bool
+	// DeferReferenceWrites decides whether the git process the caller is about
+	// to start for repo writes its references without fsync: the database
+	// commit is their durable point, and the storage core makes the local
+	// references durable later (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
+	// When ok, the caller calls end once that process has exited.
+	DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool)
+}
+
+// DeferReferenceWrites decides whether the git process that the manager's
+// caller (UpdateWithHooks) is about to start writes its references without
+// fsync; when ok, end is called once that process has exited. It is false
+// without a storage voter, so only the storage core's authoritative mode ever
+// turns the fsync of references off.
+func (m *GitLabHookManager) DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool) {
+	if m.storageVoter == nil {
+		return nil, false
+	}
+	return m.storageVoter.DeferReferenceWrites(ctx, repo)
 }
 
 // WithStorageVoter makes the manager commit every reference transaction to

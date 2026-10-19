@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 
 	"github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
@@ -369,30 +370,49 @@ func TestPhase4AdaptiveSizingVisible(t *testing.T) {
 	require.LessOrEqual(t, grown, float64(maxSize), "the size never exceeds the maximum")
 }
 
+// gatedUpdateHookScript is a pre-receive hook that holds the update until the
+// file release exists. It gives up after five minutes, so that a test that
+// never releases it fails instead of hanging; that bound only detects a
+// deadlock, nothing waits for it.
+func gatedUpdateHookScript(release string) string {
+	return fmt.Sprintf(`#!/bin/sh
+while read old new ref; do :; done
+i=0
+while [ ! -f '%s' ]; do
+	i=$((i + 1))
+	[ "$i" -lt 6000 ] || exit 1
+	sleep 0.05
+done
+exit 0
+`, release)
+}
+
 // TestPhase4EarlyCompletionPolicyDenied checks that a policy-denied request
-// which shares a batch with landing members returns before the slow update of
-// that batch, while the members wait for the update. The denial is final before
+// which shares a batch with landing members returns before the update of that
+// batch, while the members wait for the update. The denial is final before
 // the update, so it does not wait for it.
+//
+// The order is forced, not timed: the batch takes exactly the workers and the
+// outsider (MaxSize is their number, the window is long, the size does not
+// adapt), so they are in one batch whatever the scheduling; and the batch's
+// update is held by its pre-receive hook until the test has seen the denial
+// with no worker done.
 func TestPhase4EarlyCompletionPolicyDenied(t *testing.T) {
 	t.Parallel()
 
-	const (
-		workers  = 10
-		slowHook = 3 * time.Second
-	)
+	const workers = 10
 
 	graft, tokens := protectedGraft(workers)
-	graft.Land.Batch.Window = "300ms"
+	graft.Land.Batch.Window = "10m"
+	graft.Land.Batch.MaxSize = workers + 1
+	graft.Land.Batch.TargetLatency = "0s"
 	s := startGitaly(t, graft, sharedTestToken)
 	ctx := s.ctx
 
 	base := writeMain(t, s, map[string]string{sharedLogPath: sharedLogHeader})
-	marker := filepath.Join(t.TempDir(), "slow")
-	gittest.WriteCustomHook(t, s.repoPath, "pre-receive", []byte(slowUpdateHookScript(marker, slowHook)))
-	require.NoError(t, os.WriteFile(marker, nil, 0o600))
 
-	// The workers and the outsider, which the policy denies on main, all land
-	// at once, so that they share the batch window.
+	// The workers and the outsider, which the policy denies on main, all land:
+	// the batch starts once all of them are queued.
 	names := make([]string, 0, workers+1)
 	for i := 0; i < workers; i++ {
 		names = append(names, workerName(i))
@@ -409,45 +429,47 @@ func TestPhase4EarlyCompletionPolicyDenied(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	// The hook holds every reference update from now on, the setup commits
+	// above being done.
+	release := filepath.Join(t.TempDir(), "release")
+	gittest.WriteCustomHook(t, s.repoPath, "pre-receive", []byte(gatedUpdateHookScript(release)))
+
 	type outcome struct {
-		res     *sdk.LandResult
-		elapsed time.Duration
+		agent int
+		res   *sdk.LandResult
+		err   error
 	}
-	outcomes := make([]outcome, len(names))
-	tally := runLoad(len(names), func(agent int) error {
-		start := time.Now()
-		res, err := landOn(ctx, repos[agent], "main", commits[agent], false)
-		outcomes[agent] = outcome{res: res, elapsed: time.Since(start)}
-		return err
-	})
-	require.Equal(t, loadTally{Landed: workers, Denied: 1}, tally, "the workers land and the outsider is denied")
-
-	denied := outcomes[workers]
-	require.Less(t, denied.elapsed, slowHook/2, "the denied request returns before the slow update of its batch")
-
-	// The batch size counts every request of the batch, the denied one included,
-	// so the workers of a batch of size s that holds the denial are s-1 landed
-	// members. Their count n then satisfies n+1 = 0 mod s, which a batch of
-	// landed members alone never does for s > 1.
-	var shared int
-	sizes := map[int32]int{}
-	for i := 0; i < workers; i++ {
-		require.NotNil(t, outcomes[i].res, "worker %d landed", i)
-		require.GreaterOrEqual(t, outcomes[i].elapsed, slowHook, "worker %d waits for the batch update", i)
-		if size := outcomes[i].res.Batch.Size; size > 1 {
-			shared++
-			sizes[size]++
-		}
+	deniedDone := make(chan outcome, 1)
+	workersDone := make(chan outcome, workers)
+	for agent := range names {
+		go func() {
+			res, err := landOn(ctx, repos[agent], "main", commits[agent], false)
+			if agent == workers {
+				deniedDone <- outcome{agent: agent, res: res, err: err}
+				return
+			}
+			workersDone <- outcome{agent: agent, res: res, err: err}
+		}()
 	}
-	require.Positive(t, shared, "the workers share batches")
 
-	var withDenial bool
-	for size, n := range sizes {
-		if (n+1)%int(size) == 0 {
-			withDenial = true
-		}
+	// The denial comes back while the batch's update is held: no worker is
+	// done.
+	denied := <-deniedDone
+	require.Equal(t, codes.PermissionDenied, sdk.Code(denied.err), "the outsider is denied: %v", denied.err)
+	select {
+	case w := <-workersDone:
+		t.Fatalf("worker %d returned before the update of its batch: %v", w.agent, w.err)
+	default:
 	}
-	require.True(t, withDenial, "the denied request is in a batch with the landing workers, sizes %v", sizes)
+
+	require.NoError(t, os.WriteFile(release, nil, 0o600))
+	for range workers {
+		w := <-workersDone
+		require.NoError(t, w.err, "worker %d lands", w.agent)
+		// The batch size counts every request of the batch, the denied one
+		// included: one batch of the workers and the outsider.
+		require.EqualValues(t, workers+1, w.res.Batch.Size, "worker %d is in the batch of the denied request", w.agent)
+	}
 
 	files := strings.Split(s.git(t, "ls-tree", "-r", "--name-only", "main", "early"), "\n")
 	require.Len(t, files, workers, "every worker change is on main")

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -62,6 +63,13 @@ type storageCluster struct {
 	// logger, when set, is the logger of every node, so that a test can read
 	// what the storage core logged.
 	logger log.Logger
+	// shadowTimeout, when set, is the shadow budget of every node instead of
+	// the default.
+	shadowTimeout time.Duration
+	// adjust, when set, may change each node's core before its server starts
+	// (wrap its database or bucket); the core is never changed afterwards, while
+	// the server reads it.
+	adjust func(*corestore.Core)
 	nodes  []storageNode
 }
 
@@ -97,12 +105,16 @@ func (c *storageCluster) addNode(t *testing.T) storageNode {
 
 	name := fmt.Sprintf("node-%c", 'a'+len(c.nodes))
 	core := coretest.Open(t, coretest.Options{
-		Mode:        c.mode,
-		Dialect:     c.dialect,
-		DatabaseURL: c.databaseURL,
-		BucketURL:   c.bucketURL,
-		NodeID:      name,
+		Mode:          c.mode,
+		Dialect:       c.dialect,
+		DatabaseURL:   c.databaseURL,
+		BucketURL:     c.bucketURL,
+		NodeID:        name,
+		ShadowTimeout: c.shadowTimeout,
 	})
+	if c.adjust != nil {
+		c.adjust(core)
+	}
 
 	cfg := testcfg.Build(t)
 	cfg.Auth.Token = sharedTestToken

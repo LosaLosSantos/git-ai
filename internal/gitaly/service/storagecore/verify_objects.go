@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -23,10 +24,20 @@ import (
 const verifyChangesetBatch = 500
 
 // checkStoredObjects checks that the object storage can rebuild the database
-// state of the repository: it indexes the pack of every changeset up to
-// headSeq into a new empty repository in the storage's temporary directory (a
-// dry hydration, nothing is installed) and checks that every object reachable
-// from the object IDs of dbRefs is there (`git rev-list --objects --quiet`).
+// state of the repository the way a hydration does: into a new empty
+// repository in the storage's temporary directory (a dry hydration, nothing is
+// installed) it indexes the pack of the newest checkpoint, if any, and the pack
+// of every changeset after it up to the head, then checks that every object
+// reachable from the object IDs of the database references is there (`git
+// rev-list --objects --quiet`). The keep-around references of the open reviews
+// are among them, so their commits are checked too (doc/graft/PLAN7.md, "Verify
+// after compaction").
+//
+// The checkpoint is read before the references, so the head they belong to is
+// at or above it. The check runs under a deadline of W (WriteDeadline) from its
+// start: a checkpoint newer than the one it read can become C_gc, and so let
+// garbage collection delete the packs this check reads, only gc_grace after its
+// creation, which is after the start of the check.
 //
 // The local connectivity check cannot see this: a git write that shadow mode
 // did not record leaves objects that are in the local repository but in no
@@ -34,7 +45,14 @@ const verifyChangesetBatch = 500
 // references of git and of the database agree while a hydration on another
 // node fails. It returns whether the check passed and, when it did not, what
 // is missing; an error only when the check could not run.
-func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, repo *gitalypb.Repository, record corestore.Repository, dbRefs map[string]corestore.Target, headSeq uint64) (bool, string, error) {
+func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, repo *gitalypb.Repository, record corestore.Repository) (bool, string, error) {
+	deadline := core.WriteDeadline()
+	if deadline <= 0 {
+		return false, "", structerr.NewFailedPrecondition("storage core: invalid write deadline %s", deadline)
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
 	storageName := repo.GetStorageName()
 	storagePath, err := s.deps.GetLocator().GetStorageByName(ctx, storageName)
 	if err != nil {
@@ -63,11 +81,32 @@ func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, r
 	}
 	stored := s.localRepo(&gitalypb.Repository{StorageName: storageName, RelativePath: rel})
 
-	for after := uint64(0); after < headSeq; {
+	cp, seeded, err := core.Meta.NewestCheckpoint(ctx, record.ID)
+	if err != nil {
+		return false, "", deadlineOr(ctx, deadline, structerr.NewUnavailable("storage core: newest checkpoint: %w", err))
+	}
+	dbRefs, headSeq, err := core.Meta.Refs(ctx, record.ID)
+	if err != nil {
+		return false, "", deadlineOr(ctx, deadline, structerr.NewUnavailable("storage core: references: %w", err))
+	}
+
+	after := uint64(0)
+	if seeded {
+		if id, _, ok := corestore.ParsePackKey(cp.PackKey); !ok || id != record.ID {
+			return false, fmt.Sprintf("checkpoint %d references %q, which is not a pack of the repository", cp.Seq, cp.PackKey), nil
+		}
+		problem, err := indexStoredPack(ctx, core, stored, cp.PackKey, fmt.Sprintf("checkpoint %d", cp.Seq))
+		if err != nil || problem != "" {
+			return false, problem, deadlineOr(ctx, deadline, err)
+		}
+		after = cp.Seq
+	}
+
+	for after < headSeq {
 		upTo := min(after+verifyChangesetBatch, headSeq)
 		changesets, err := core.Meta.ListChangesets(ctx, record.ID, after, upTo)
 		if err != nil {
-			return false, "", structerr.NewUnavailable("storage core: list changesets: %w", err)
+			return false, "", deadlineOr(ctx, deadline, structerr.NewUnavailable("storage core: list changesets: %w", err))
 		}
 		if len(changesets) == 0 {
 			return false, fmt.Sprintf("the database has no changesets after %d up to %d", after, upTo), nil
@@ -82,9 +121,9 @@ func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, r
 				return false, fmt.Sprintf("changeset %d references %q, which is not a pack of the repository", cs.Seq, cs.PackKey), nil
 			}
 
-			problem, err := indexStoredPack(ctx, core, stored, cs)
+			problem, err := indexStoredPack(ctx, core, stored, cs.PackKey, fmt.Sprintf("changeset %d", cs.Seq))
 			if err != nil || problem != "" {
-				return false, problem, err
+				return false, problem, deadlineOr(ctx, deadline, err)
 			}
 		}
 	}
@@ -114,7 +153,7 @@ func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, r
 		return true, "", nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, "", structerr.NewUnavailable("stored objects check: %w", ctxErr)
+		return false, "", deadlineOr(ctx, deadline, structerr.NewUnavailable("stored objects check: %w", ctxErr))
 	}
 	if _, exited := command.ExitStatus(err); !exited {
 		return false, "", structerr.NewInternal("stored objects check: %w", err)
@@ -127,13 +166,14 @@ func (s *server) checkStoredObjects(ctx context.Context, core *corestore.Core, r
 	return false, "the packs of the database do not hold every object of its references: " + msg, nil
 }
 
-// indexStoredPack downloads the pack of cs (whose key was checked) and indexes
-// it into repo. It returns a description of a missing or corrupt pack, or an
-// error when the check could not run.
-func indexStoredPack(ctx context.Context, core *corestore.Core, repo *localrepo.Repo, cs corestore.Changeset) (string, error) {
-	rc, err := core.Blobs.Get(ctx, cs.PackKey)
+// indexStoredPack downloads the pack of key (which was checked), the pack of
+// owner ("checkpoint 4", "changeset 7"), and indexes it into repo. It returns a
+// description of a missing or corrupt pack, or an error when the check could
+// not run.
+func indexStoredPack(ctx context.Context, core *corestore.Core, repo *localrepo.Repo, key, owner string) (string, error) {
+	rc, err := core.Blobs.Get(ctx, key)
 	if errors.Is(err, corestore.ErrBlobNotFound) {
-		return fmt.Sprintf("the pack %q of changeset %d is missing from the object storage", cs.PackKey, cs.Seq), nil
+		return fmt.Sprintf("the pack %q of %s is missing from the object storage", key, owner), nil
 	}
 	if err != nil {
 		return "", structerr.NewUnavailable("storage core: download pack: %w", err)
@@ -144,7 +184,16 @@ func indexStoredPack(ctx context.Context, core *corestore.Core, repo *localrepo.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", structerr.NewUnavailable("stored objects check: %w", ctxErr)
 		}
-		return fmt.Sprintf("the pack %q of changeset %d cannot be indexed: %v", cs.PackKey, cs.Seq, err), nil
+		return fmt.Sprintf("the pack %q of %s cannot be indexed: %v", key, owner, err), nil
 	}
 	return "", nil
+}
+
+// deadlineOr returns the error of a check that ran out of its deadline when
+// ctx's deadline has passed, and err otherwise.
+func deadlineOr(ctx context.Context, deadline time.Duration, err error) error {
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return structerr.NewUnavailable("storage core: the stored objects check did not finish within the write deadline %s: %w", deadline, err)
+	}
+	return err
 }

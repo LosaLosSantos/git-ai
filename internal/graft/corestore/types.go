@@ -16,6 +16,7 @@
 package corestore
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -130,6 +131,12 @@ type Repository struct {
 	// LogSeq is the sequence of the last changelog entry, 0 when there is none.
 	LogSeq    uint64
 	CreatedAt time.Time
+	// ReadAt is the database time of the read that returned the record (set by
+	// GetRepository), at or before the read. A pack uploaded after the read is
+	// first observable by garbage collection after ReadAt, so a row that
+	// references it is committed before ReadAt + Core.WriteDeadline() on the
+	// database clock (PackUpload.DBDeadline, checked in the commit).
+	ReadAt time.Time
 }
 
 // Changeset is one recorded changeset of the write-ahead log.
@@ -149,6 +156,65 @@ type Changeset struct {
 	CreatedAt time.Time
 	// Updates are the effective reference changes, in order.
 	Updates []AppliedUpdate
+}
+
+// Checkpoint is a consolidated state of a repository at a changeset sequence:
+// one pack with every object reachable from the references at Seq (among them
+// the keep-around references of the open reviews), plus the reference snapshot
+// at Seq (MetaStore.CheckpointRefs). Hydration starts from the newest checkpoint
+// and replays only the changesets after it (doc/graft/PLAN7.md).
+type Checkpoint struct {
+	RepoID    int64
+	Seq       uint64
+	PackKey   string
+	PackBytes int64
+	// CreatedAt is a database time (doc/graft/PLAN7.md, CLOCK RULE).
+	CreatedAt time.Time
+}
+
+// RemovedRepository is the tombstone of a removed repository whose objects
+// are still to be deleted from the bucket.
+type RemovedRepository struct {
+	RepoID int64
+	// Key is empty for a tombstone that the reconciliation recorded: the row
+	// was deleted without one, and its key with it.
+	Key RepoKey
+	// RemovedAt is a database time (doc/graft/PLAN7.md, CLOCK RULE).
+	RemovedAt time.Time
+}
+
+// AllocatorView is an observation of the repository ID allocator by the
+// reconciliation of the bucket (MetaStore.ObserveAllocator).
+type AllocatorView struct {
+	// Now is the database time of the observation.
+	Now time.Time
+	// Position is the greatest repository ID allocated, 0 for none. On
+	// Postgres it counts the allocations of creations whose row is not
+	// committed yet, or never will be; on SQLite only committed ones.
+	Position int64
+	// Bound is the greatest position observed at least minAge before Now, 0
+	// when there is none: every ID at or below it was allocated at least
+	// minAge ago.
+	Bound int64
+	// DoneThrough is the reconciliation cursor: every ID at or below it is
+	// reconciled.
+	DoneThrough int64
+}
+
+// GCState is what garbage collection decides on for one repository, read in
+// one database snapshot (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 5).
+type GCState struct {
+	// Now is the database time of the snapshot: every row committed before it is
+	// part of the snapshot.
+	Now time.Time
+	// Packs maps every changeset pack key to the greatest sequence of the
+	// changesets that reference it (a legacy key can be shared by several).
+	Packs map[string]uint64
+	// Checkpoints are the checkpoints, ascending by sequence.
+	Checkpoints []Checkpoint
+	// Orphans maps the keys observed unreferenced to the database time they were
+	// first observed.
+	Orphans map[string]time.Time
 }
 
 // RefConflict is one reference whose current value did not satisfy its
@@ -181,47 +247,124 @@ var (
 	ErrRepositoryExists = errors.New("storage core: repository already exists")
 	// ErrBlobNotFound is returned by BlobStore.Get for a missing key.
 	ErrBlobNotFound = errors.New("storage core: blob not found")
+	// ErrBlobExists is returned by BlobStore.Put for a key that exists already:
+	// objects are never overwritten nor shared between writers.
+	ErrBlobExists = errors.New("storage core: blob already exists")
+	// ErrCheckpointNotFound is returned for a checkpoint sequence the
+	// repository has no checkpoint at.
+	ErrCheckpointNotFound = errors.New("storage core: checkpoint not found")
+	// ErrReviewRootsMissing is returned by MetaStore.InsertReview and
+	// UpdateReview, when they require the review's roots, for a head or base
+	// commit that has no keep-around reference (KeepAroundRef): the caller writes
+	// the reference again and retries (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	ErrReviewRootsMissing = errors.New("storage core: a commit of the review has no keep-around reference")
+	// ErrReviewRootInUse is returned by MetaStore.CommitChangeset for a changeset
+	// that deletes or moves the keep-around reference of a commit that an open
+	// review uses; nothing is written (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
+	ErrReviewRootInUse = errors.New("storage core: the keep-around reference is the root of an open review")
+	// ErrPackDeadline is returned when a pack upload, or the commit of the row
+	// that references it, would end after the write deadline: garbage collection
+	// may then already treat the pack as an orphan (doc/graft/PLAN7.md, PACK
+	// OWNERSHIP RULE 4). The write fails like any storage failure.
+	ErrPackDeadline = errors.New("storage core: the pack upload is older than the write deadline")
 	// ErrBlobCorrupt is returned by the reader of BlobStore.Get when the content
 	// does not hash to its key.
 	ErrBlobCorrupt = errors.New("storage core: blob content does not match its key")
 )
 
-// PackKey returns the bucket key of a pack of the repository with the given
-// SHA-256 of its bytes: "repos/<repo_id>/packs/<hex sha256>.pack".
-func PackKey(repoID int64, sha256 [32]byte) string {
-	return fmt.Sprintf("repos/%d/packs/%x.pack", repoID, sha256)
+// packNonceSize is the number of random bytes that make a pack key unique.
+const packNonceSize = 16
+
+// NewPackKey returns a new owned bucket key for a pack of the repository whose
+// bytes have the given SHA-256: "repos/<repo_id>/packs/<hex sha256>-<hex
+// nonce>.pack", with a random nonce drawn for this one upload. Every upload uses a
+// new key, so a pack object is never shared between two rows and a write never
+// relies on an object it did not write (doc/graft/PLAN7.md, PACK OWNERSHIP RULE).
+func NewPackKey(repoID int64, sum [32]byte) string {
+	var nonce [packNonceSize]byte
+	// crypto/rand.Read never fails: it aborts the program instead.
+	_, _ = rand.Read(nonce[:])
+	return ownedPackKey(repoID, sum, nonce)
 }
 
-// ParsePackKey returns the repository ID and the SHA-256 encoded in a key
-// made by PackKey, and false when key is not exactly such a key.
+func ownedPackKey(repoID int64, sum [32]byte, nonce [packNonceSize]byte) string {
+	return fmt.Sprintf("repos/%d/packs/%x-%x.pack", repoID, sum, nonce)
+}
+
+func legacyPackKey(repoID int64, sum [32]byte) string {
+	return fmt.Sprintf("repos/%d/packs/%x.pack", repoID, sum)
+}
+
+// ParsePackKey returns the repository ID and the SHA-256 encoded in an owned
+// pack key (NewPackKey) or in a legacy one, "repos/<repo_id>/packs/<hex
+// sha256>.pack", written by v0.1.0 and still referenced by its changesets. It
+// returns false for anything else, including non-canonical spellings (uppercase
+// hex, leading zeros).
 func ParsePackKey(key string) (repoID int64, sum [32]byte, ok bool) {
+	repoID, sum, _, ok = parsePackKey(key)
+	return repoID, sum, ok
+}
+
+// IsOwnedPackKey reports whether key is an owned pack key, the only kind a
+// writer may produce.
+func IsOwnedPackKey(key string) bool {
+	_, _, owned, ok := parsePackKey(key)
+	return ok && owned
+}
+
+func parsePackKey(key string) (repoID int64, sum [32]byte, owned, ok bool) {
 	rest, found := strings.CutPrefix(key, "repos/")
 	if !found {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
 	idPart, rest, found := strings.Cut(rest, "/packs/")
 	if !found {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
-	hexSum, found := strings.CutSuffix(rest, ".pack")
-	if !found || len(hexSum) != 64 {
-		return 0, sum, false
+	name, found := strings.CutSuffix(rest, ".pack")
+	if !found {
+		return 0, sum, false, false
 	}
+	hexSum, hexNonce, owned := strings.Cut(name, "-")
+	if len(hexSum) != 2*len(sum) || (owned && len(hexNonce) != 2*packNonceSize) {
+		return 0, sum, false, false
+	}
+
 	id, err := strconv.ParseInt(idPart, 10, 64)
 	if err != nil || id <= 0 {
-		return 0, sum, false
+		return 0, sum, false, false
 	}
-	decoded, err := hex.DecodeString(hexSum)
-	if err != nil {
-		return 0, sum, false
+	if _, err := hex.Decode(sum[:], []byte(hexSum)); err != nil {
+		return 0, [32]byte{}, false, false
 	}
-	copy(sum[:], decoded)
+
 	// Only the canonical spelling is a pack key (lowercase hex, no leading zeros).
-	if PackKey(id, sum) != key {
-		return 0, [32]byte{}, false
+	canonical := legacyPackKey(id, sum)
+	if owned {
+		var nonce [packNonceSize]byte
+		if _, err := hex.Decode(nonce[:], []byte(hexNonce)); err != nil {
+			return 0, [32]byte{}, false, false
+		}
+		canonical = ownedPackKey(id, sum, nonce)
 	}
-	return id, sum, true
+	if canonical != key {
+		return 0, [32]byte{}, false, false
+	}
+	return id, sum, owned, true
 }
+
+// KeepAroundPrefix is the prefix of the references that keep the commits of
+// open reviews alive (doc/graft/PLAN7.md, REVIEW ROOTS RULE). It is under
+// refs/keep-around/, which Gitaly hides from clients (neither advertised nor
+// writable over the git protocols) and which housekeeping and garbage
+// collection respect like every reference. It is a namespace of its own:
+// GitLab writes refs/keep-around/<oid> for its own purposes, and the sweeps of
+// the review roots must never delete those.
+const KeepAroundPrefix = "refs/keep-around/review/"
+
+// KeepAroundRef returns the keep-around reference of a commit; its target is
+// the commit itself.
+func KeepAroundRef(oid string) string { return KeepAroundPrefix + oid }
 
 // IsChangelogRef reports whether updates of the reference are recorded in the
 // Graft changelog: branches and tags, as changelog.ParseUpdates does.

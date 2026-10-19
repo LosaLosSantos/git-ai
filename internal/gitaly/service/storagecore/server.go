@@ -13,6 +13,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -35,6 +36,20 @@ func (s *server) enabledCore() (*corestore.Core, error) {
 		return nil, structerr.NewFailedPrecondition("the storage core is off")
 	}
 	return core, nil
+}
+
+// validateRepository validates the repository of a request: the locator's
+// checks (InvalidArgument), and a relative path outside Gitaly's data
+// directory of the storage (corestore.CheckRelativePath). The gate does not see
+// the storage core's RPCs, so they check it themselves.
+func (s *server) validateRepository(ctx context.Context, repo *gitalypb.Repository, opts ...storage.ValidateRepositoryOption) error {
+	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, opts...); err != nil {
+		return structerr.NewInvalidArgument("%w", err)
+	}
+	if err := corestore.CheckRelativePath(repo.GetRelativePath()); err != nil {
+		return structerr.NewInvalidArgument("%w", err)
+	}
+	return nil
 }
 
 // localRepo returns the local repository of a request.

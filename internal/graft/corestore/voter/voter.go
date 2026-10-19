@@ -41,6 +41,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -107,23 +108,26 @@ type committedEntry struct {
 	seq    uint64
 }
 
-// uploadedPack is a changeset pack in the bucket. An empty key means that the
-// transaction brings no new objects.
-type uploadedPack struct {
-	key   string
-	bytes int64
-}
-
 // preparedPack is the outcome of the Preparing phase of a transaction.
 type preparedPack struct {
 	// ok tells that pack was built and uploaded for the repository repoID.
 	// When it is false, Preparing failed and Prepared does the work itself.
 	ok     bool
 	repoID int64
-	pack   uploadedPack
+	// pack is the uploaded pack, with an empty key when the transaction brings
+	// no new objects.
+	pack corestore.PackUpload
 	// spent is the time Preparing took. In shadow mode it counts against the
 	// shadow timeout, which is the budget of the whole transaction.
 	spent time.Duration
+}
+
+// usable reports whether Prepared may commit the pack of the Preparing phase:
+// its write deadline has not passed (doc/graft/PLAN7.md, PACK OWNERSHIP RULE
+// 4). A pack whose deadline passed may be an orphan that garbage collection
+// deletes, so Prepared uploads a new one instead.
+func (p preparedPack) usable(now time.Time) bool {
+	return p.pack.Key == "" || now.Before(p.pack.Deadline)
 }
 
 // New returns the voter of core. applier is told about local commits (it may
@@ -171,6 +175,10 @@ func (v *Voter) Preparing(ctx context.Context, payload gitcmd.HooksPayload, chan
 	if v == nil || !v.core.Enabled() || payload.Repo == nil {
 		return
 	}
+
+	// Deferred first, so that it runs last: the admission is waited for after
+	// the pack work, when git is about to take the reference lock.
+	defer v.admit(ctx, payload, changes)
 
 	start := time.Now()
 	defer func() { v.metrics.preparing.Observe(time.Since(start).Seconds()) }()
@@ -237,6 +245,9 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 		return nil, nil
 	}
 
+	// The write deadline of the pack starts before this read of the record
+	// (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	readAt := time.Now()
 	record, err := v.core.Meta.GetRepository(ctx, corestore.KeyOf(payload.Repo))
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return nil, nil
@@ -248,7 +259,7 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 		return nil, nil
 	}
 
-	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, updates)
+	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -392,6 +403,9 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		return nil
 	}
 
+	// The write deadline of a pack uploaded here starts before this read of the
+	// record (doc/graft/PLAN7.md, PACK OWNERSHIP RULE 4).
+	readAt := time.Now()
 	record, err := v.core.Meta.GetRepository(ctx, corestore.KeyOf(payload.Repo))
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		if shadow {
@@ -400,6 +414,11 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 			return nil
 		}
 		return structerr.NewFailedPrecondition("storage core: repository is not imported into the storage core")
+	}
+	if errors.Is(err, corestore.ErrReviewRootInUse) {
+		// Only non-forced (authoritative) changesets are refused.
+		result = resultConflict
+		return structerr.NewFailedPrecondition("%w", err)
 	}
 	if err != nil {
 		return v.unavailable(err)
@@ -431,28 +450,29 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 	}
 
 	// The pack prepared before git took the locks is used when it was uploaded
-	// for this repository (not for a removed one that had the same path).
-	// Otherwise it is built and uploaded now, as before the LOCK AND HISTORY
-	// RULE.
-	var pack uploadedPack
-	if prepared != nil && prepared.ok && prepared.repoID == record.ID {
+	// for this repository (not for a removed one that had the same path) and its
+	// write deadline has not passed. Otherwise it is built and uploaded now, as
+	// before the LOCK AND HISTORY RULE.
+	var pack corestore.PackUpload
+	if prepared != nil && prepared.ok && prepared.repoID == record.ID && prepared.usable(time.Now()) {
 		pack = prepared.pack
 	} else {
-		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, updates)
+		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
 		if err != nil {
 			return v.unavailable(err)
 		}
 	}
 
 	in := corestore.ChangesetInput{
-		RepoID:    record.ID,
-		Updates:   refUpdates,
-		Operation: meta.Operation,
-		Actor:     meta.Actor,
-		NodeID:    v.core.NodeID,
-		Force:     shadow,
-		PackKey:   pack.key,
-		PackBytes: pack.bytes,
+		RepoID:       record.ID,
+		Updates:      refUpdates,
+		Operation:    meta.Operation,
+		Actor:        meta.Actor,
+		NodeID:       v.core.NodeID,
+		Force:        shadow,
+		PackKey:      pack.Key,
+		PackBytes:    pack.Bytes,
+		PackDeadline: pack.DBDeadline,
 	}
 
 	if err := v.fault(faultAfterUpload); err != nil {
@@ -464,7 +484,15 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		in.Changelog = &metaCopy
 	}
 
-	res, err := v.core.Meta.CommitChangeset(ctx, in)
+	// The changeset that references the pack commits before the pack's write
+	// deadline, or not at all.
+	commitCtx, cancel, err := pack.CommitContext(ctx)
+	if err != nil {
+		return v.unavailable(err)
+	}
+	defer cancel()
+
+	res, err := v.core.Meta.CommitChangeset(commitCtx, in)
 
 	var conflict *corestore.ErrRefConflict
 	if errors.As(err, &conflict) {
@@ -498,6 +526,10 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 	}
 
 	if res.NoOp {
+		// git still writes the values the database already holds.
+		if err := v.deferDurability(ctx, payload, changes, shadow); err != nil {
+			return v.unavailable(err)
+		}
 		result = resultNoOp
 		return nil
 	}
@@ -512,6 +544,13 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 		repoID: record.ID,
 		seq:    res.Seq,
 	}, time.Now())
+
+	// After the entry, so that a failure here counts as a local failure in the
+	// Aborted phase: the database holds the changeset, catch-up repairs the
+	// local repository.
+	if err := v.deferDurability(ctx, payload, changes, shadow); err != nil {
+		return v.unavailable(err)
+	}
 
 	if err := v.fault(faultAfterCommit); err != nil {
 		return fmt.Errorf("storage core: %w", err)
@@ -631,27 +670,30 @@ func newTips(updates []inputUpdate) []git.ObjectID {
 }
 
 // buildAndUpload builds the pack of the objects reachable from the new tips of
-// updates and not from what is already in the bucket, and uploads it under the
-// pack key of repoID. An empty pack is not uploaded.
+// updates and not from what is already in the bucket, and uploads it under a
+// new owned key of repoID with the write deadline that starts at readAt, the
+// time taken before the read of the repository record (Core.UploadPack). An
+// empty pack is not uploaded.
 //
 // What is already in the bucket: in authoritative mode, everything any current
 // local reference reaches (invariant I1, gitops.BuildPack); in shadow mode,
 // everything that the values the database records reach (buildPackAgainst),
 // because local references can hold values the storage core never recorded.
-func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, repoID int64, updates []inputUpdate) (uploadedPack, error) {
+func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, record corestore.Repository, readAt time.Time, updates []inputUpdate) (corestore.PackUpload, error) {
+	repoID := record.ID
 	tips := newTips(updates)
 	if len(tips) == 0 {
-		return uploadedPack{}, nil
+		return corestore.PackUpload{}, nil
 	}
 
 	tmpDir, err := v.locator.TempDir(storageName)
 	if err != nil {
-		return uploadedPack{}, err
+		return corestore.PackUpload{}, err
 	}
 	// The server creates the temporary directory when it starts, but it may have
 	// been cleaned up since.
 	if err := os.MkdirAll(tmpDir, mode.Directory); err != nil {
-		return uploadedPack{}, fmt.Errorf("creating the temporary directory: %w", err)
+		return corestore.PackUpload{}, fmt.Errorf("creating the temporary directory: %w", err)
 	}
 
 	var pack gitops.Pack
@@ -661,37 +703,32 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 		var known map[string]corestore.Target
 		known, _, err = v.core.Meta.Refs(ctx, repoID)
 		if err != nil {
-			return uploadedPack{}, fmt.Errorf("reading the database references: %w", err)
+			return corestore.PackUpload{}, fmt.Errorf("reading the database references: %w", err)
 		}
 		pack, err = buildPackAgainst(ctx, repo, tips, known, tmpDir)
 	}
 	if err != nil {
-		return uploadedPack{}, err
+		return corestore.PackUpload{}, err
 	}
 	defer func() { _ = pack.Remove() }()
 
 	if pack.Empty() {
-		return uploadedPack{}, nil
+		return corestore.PackUpload{}, nil
 	}
 
-	key := corestore.PackKey(repoID, pack.SHA256)
-	if err := v.uploadPack(ctx, key, pack); err != nil {
-		return uploadedPack{}, err
-	}
-	v.metrics.packBytes.Add(float64(pack.Size))
-
-	return uploadedPack{key: key, bytes: pack.Size}, nil
-}
-
-// uploadPack stores the pack under key, see BlobStore.Put.
-func (v *Voter) uploadPack(ctx context.Context, key string, pack gitops.Pack) error {
 	r, err := pack.Open()
 	if err != nil {
-		return err
+		return corestore.PackUpload{}, err
 	}
 	defer func() { _ = r.Close() }()
 
-	return v.core.Blobs.Put(ctx, key, r)
+	upload, err := v.core.UploadPack(ctx, record, readAt, pack.SHA256, pack.Size, r)
+	if err != nil {
+		return corestore.PackUpload{}, err
+	}
+	v.metrics.packBytes.Add(float64(pack.Size))
+
+	return upload, nil
 }
 
 // fault calls FaultHook and exits the process when CrashEnv selects the point.
@@ -722,23 +759,110 @@ func (v *Voter) Committed(ctx context.Context, payload gitcmd.HooksPayload, chan
 		return
 	}
 
-	entry, ok := v.pending.take(pendingKey(payload.Repo, changes), time.Now())
-	if !ok || v.applier == nil {
+	key := pendingKey(payload.Repo, changes)
+	entry, ok := v.pending.take(key, time.Now())
+	if !v.localRefs() && (!ok || v.applier == nil) {
 		return
 	}
 
-	// The path is built from the storage and the relative path only, so that a
-	// quarantine of the hooks payload does not end up in it.
-	repoPath, err := v.locator.GetRepoPath(ctx, &gitalypb.Repository{
-		StorageName:  payload.Repo.GetStorageName(),
-		RelativePath: payload.Repo.GetRelativePath(),
-	}, storage.WithRepositoryVerificationSkipped())
+	repoPath, err := v.repoPath(ctx, payload)
 	if err != nil {
 		v.logger.WithError(err).ErrorContext(ctx, "storage core: resolving the repository path after a commit")
 		return
 	}
 
+	// git finished the transaction, its auto-compaction included, and released
+	// the reference lock.
+	v.core.RefAdmission.Release(repoPath, localrefs.Key(key))
+
+	if !ok || v.applier == nil {
+		return
+	}
 	v.applier.NoteCommitted(ctx, repoPath, entry.repoID, entry.seq)
+}
+
+// repoPath returns the path of the repository of the transaction. It is built
+// from the storage and the relative path only, so that a quarantine of the
+// hooks payload does not end up in it.
+func (v *Voter) repoPath(ctx context.Context, payload gitcmd.HooksPayload) (string, error) {
+	return v.locator.GetRepoPath(ctx, &gitalypb.Repository{
+		StorageName:  payload.Repo.GetStorageName(),
+		RelativePath: payload.Repo.GetRelativePath(),
+	}, storage.WithRepositoryVerificationSkipped())
+}
+
+// localRefs reports whether the local reference writes of the node are
+// admitted or their durability deferred (authoritative mode).
+func (v *Voter) localRefs() bool {
+	return v.core.Authoritative() && (v.core.RefAdmission != nil || v.core.RefDurability.Enabled())
+}
+
+// DeferredReferenceDurability reports whether the reference writes of the
+// transactions this voter commits may run without fsync: authoritative mode,
+// and this process owns the deferred durability of the node (doc/graft/PLAN7.md,
+// LOCAL REFERENCE WRITES RULE). It goes from false to true at most once in a
+// process.
+func (v *Voter) DeferredReferenceDurability() bool {
+	return v != nil && v.core.Authoritative() && v.core.RefDurability.Deferring()
+}
+
+// DeferReferenceWrites decides whether the git process that the caller is about
+// to start for repo (UpdateWithHooks' update-ref) writes its references without
+// fsync. When ok, the process counts as live for the repository's deferred
+// durability, and the caller calls end once it has exited: until then it may
+// write a table or compact the stack, whichever hooks git runs or skips.
+func (v *Voter) DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool) {
+	if !v.DeferredReferenceDurability() {
+		return nil, false
+	}
+
+	repoPath, err := v.locator.GetRepoPath(ctx, &gitalypb.Repository{
+		StorageName:  repo.GetStorageName(),
+		RelativePath: repo.GetRelativePath(),
+	}, storage.WithRepositoryVerificationSkipped())
+	if err != nil {
+		v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path of a reference write; it is made durable by git")
+		return nil, false
+	}
+	return v.core.RefDurability.Begin(repoPath), true
+}
+
+// admit waits for the admission of the transaction to the reference lock of
+// its repository (authoritative mode). Committed or Aborted releases it. It
+// never fails the transaction: without an admission git waits for its lock as
+// before.
+func (v *Voter) admit(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if !v.core.Authoritative() || v.core.RefAdmission == nil {
+		return
+	}
+
+	repoPath, err := v.repoPath(ctx, payload)
+	if err != nil {
+		v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path for the admission, the transaction goes on without it")
+		return
+	}
+	v.core.RefAdmission.Acquire(ctx, repoPath, localrefs.Key(pendingKey(payload.Repo, changes)), localrefs.WriterHook)
+}
+
+// deferDurability lets git write the references of a transaction that the
+// database committed without fsync (authoritative mode, and this process owns
+// the deferred durability): the repository gets its durable dirty marker
+// first. A git process that writes without fsync counts as live from before it
+// started until it exited (DeferReferenceWrites), so the durable step keeps the
+// marker meanwhile. It runs in the Prepared phase, under git's reference lock
+// and before git writes anything. A transaction whose git process writes with
+// fsync (a push) gets a marker too, which only delays its removal.
+func (v *Voter) deferDurability(ctx context.Context, payload gitcmd.HooksPayload, changes []byte, shadow bool) error {
+	if shadow || !v.DeferredReferenceDurability() {
+		return nil
+	}
+
+	repoPath, err := v.repoPath(ctx, payload)
+	if err != nil {
+		return err
+	}
+	repoKey := corestore.KeyOf(payload.Repo)
+	return v.core.RefDurability.MarkDirty(ctx, localrefs.RepoRef{Storage: repoKey.Storage, RelativePath: repoKey.RelativePath}, repoPath)
 }
 
 // Aborted tells the voter that git aborted the transaction.
@@ -759,6 +883,14 @@ func (v *Voter) Aborted(ctx context.Context, payload gitcmd.HooksPayload, change
 	}
 
 	key := pendingKey(payload.Repo, changes)
+
+	if v.localRefs() {
+		if repoPath, err := v.repoPath(ctx, payload); err != nil {
+			v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path after an abort, the admission ends at its bound")
+		} else {
+			v.core.RefAdmission.Release(repoPath, localrefs.Key(key))
+		}
+	}
 
 	// A transaction aborted before its Prepared phase (git did not get the
 	// locks) leaves the pack of its Preparing phase unused: an orphan in the
