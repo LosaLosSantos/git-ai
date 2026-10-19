@@ -190,8 +190,13 @@ func (s *Server) landPreResolve(ctx context.Context, in *gitalypb.UserLandReques
 	l, _, err := s.landResolveAt(ctx, in, repo, tip, commitID, committer, pre)
 	var unfinished *landVerifyUnfinishedError
 	var needs *landNeedsResolution
+	var moved *landTipMovedError
 	switch {
 	case err == nil, errors.Is(err, errLandNoConflicts):
+		return nil
+	case errors.As(err, &moved):
+		// The branch moved while the verification waited for its turn: the verdicts are kept, and the
+		// lane hands the land back with the tree of the new tip to be verified (nothing stale was).
 		return nil
 	case errors.As(err, &unfinished), errors.As(err, &needs):
 		// Not the land's failure: UserLand decides what a verification that ran out of time, or a
@@ -313,17 +318,18 @@ func landStoppedReason(need *landNeedsResolution, timeout time.Duration) string 
 }
 
 // landFinalPasses bounds the passes of landFinalPass: each is cheap, as it calls no resolver and runs
-// no verification of a model's resolution, so that losing the branch to another land four times in a
-// row is a branch that moves by the millisecond. (A land of rules only may run verify.command once
-// in the lane, in the pass that lands; that is the lane's verification, which is not repeated.)
+// no verification, so that losing the branch to another land four times in a row is a branch that
+// moves by the millisecond. Nothing is verified in the lane either (15.9): a land that reaches it
+// without a verified tree is handed back, and the pass ends it with the package.
 const landFinalPasses = 4
 
 // landFinalPass ends a land that could not go on (landResolving): the agent gets the package, not
 // a deadline. A verified AI land is opportunistic, and losing the race is harmless. It pre-resolves
 // once more with the request's context, in a new quarantine, verifying nothing and calling no
 // resolver: the verdicts that are kept give the proposals (a model's files PROPOSED with the reason,
-// the rules' files RESOLVED), the files without a verdict are NOT_ATTEMPTED with the reason, and the
-// land fails with the package. That is every ending of a land that had a conflict: the package is
+// the rules' files RESOLVED, or NOT_ATTEMPTED with the reason when a verification is configured and
+// their tree could not be verified), the files without a verdict are NOT_ATTEMPTED with the reason, and
+// the land fails with the package. That is every ending of a land that had a conflict: the package is
 // what landPreResolve returns, and nothing else comes out of it but the refusal of the policy or an
 // error of the server. When there is nothing to report as a conflict after all (the change landed,
 // the merge is clean, or every file has a verdict a rule made), the lane answers, and lands.

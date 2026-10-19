@@ -928,7 +928,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
    |-- conflicts, every conflicting file has a verdict with its key, and the lane's
    |   classification of the file agrees with the verdict's
-   |       decideLand (15.4) on the tree the lane would write: with a verify.command configured, any
+   |       decideLand (15.4) on the tree the lane would write: with verify.enabled set, any
    |                     resolution (a rule's, a model's) LANDS only if that tree is the tree
    |                     verify.command passed on (tree object IDs), and a model's on no other tree,
    |                     configured or not. The lane runs no verification of any resolution. Merge
@@ -941,9 +941,10 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
            -> NEEDS VERIFICATION, out of the lane: rebuild the tree from the same verdicts (the
               resolver is called only for files that changed), VERIFY it, enter the lane again
  The rounds are bounded by the deadline of the land (the resolver's timeout, plus verify.timeout when
- a verify.command is configured) and by resolve_rounds (default 32, a safety cap, no contract). At
+ verify.enabled is set) and by resolve_rounds (default 32, a safety cap, no contract). At
  the deadline: the final pass (15.9): the merge conflict with its PACKAGE, the model's files PROPOSED
- ("could not verify before the branch moved again"), the rules' files RESOLVED, the files that changed
+ ("could not verify before the branch moved again"), the rules' files RESOLVED (NOT_ATTEMPTED with the
+ reason when verify.enabled is set and their tree could not be verified), the files that changed
  under the land NOT_ATTEMPTED with the reason (a verified AI land is opportunistic: losing the race
  is harmless, the agent gets the proposal).
  The resolver is never called inside the lane, and neither is the verification of a model's resolution.
@@ -998,7 +999,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
    v
- verify.command configured? --no--> stays a PROPOSAL: the agent decides ("no verify.command")
+ verify.enabled set? --no--> stays a PROPOSAL: the agent decides ("no verify.command")
    | yes: the exact tree that would land is verified, out of the lane (15.9)
    |-- fails ------------------------------------------------> stays a PROPOSAL (+ the verify output)
    |-- not verified before the branch moved again -----------> stays a PROPOSAL (+ the reason)
@@ -1033,7 +1034,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 ```
  decideLand(answer, files, tree, verified): the pre-resolution calls it with the tree it verified,
  the lane with the tree it would write
-   every file resolved by an operator rule ...... LAND, and with a verify.command configured only if it ran
+   every file resolved by an operator rule ...... LAND, and with verify.enabled set only if it ran
                                                   and passed on THIS tree (tree object ID equality)
    a file a model resolved ...................... LAND only if verify.command ran and passed on THIS
                                                   tree: tree object ID equality, not the tip
@@ -1057,7 +1058,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | the tree that would land | `landResolvedTree` | operations/land_resolve.go |
 | VERIFY, the one box, out of the lane, for every resolution | `landVerifyOutOfLane`, `landVerify`, `landPrecheckVerify` (an agent's), `VerifyPool.Acquire` | operations/land_verify.go, land_reland.go; graft/resolver/check.go |
 | verdicts applied in the lane | `landApplyVerdicts`, `landNeedsResolution` | operations/land_resolve.go, land_preresolve.go |
-| unverified in time: proposals | `landUnverified`, `landNotVerifiedReason` | operations/land_preresolve.go |
+| unverified in time: proposals | `landAnnotateUnverified`, `landStoppedReason`, `landFinalPass` | operations/land_resolve.go, land_preresolve.go |
 | resolver call, bounded slots | `Client.AcquireResolveSlot`, `ResolveSlot.Resolve` | graft/resolver/check.go |
 | policy before resolving | `hook.CheckAgentPolicy`, `landPolicyDeniedError` | operations/land_resolve.go, land_proposals.go |
 | classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
@@ -1191,9 +1192,11 @@ The resolution is bound to the files instead (the PM's correction):
   today (binding agents' resolutions to the files too is a possible later extension, not now).
 * **Landable: applied in the lane, file by file.** The lane merges its own tip and the change. When
   every conflicting file has a landable verdict with its key, and the lane's classification of the
-  file agrees, the lane writes the verdicts into the merge commit (and runs verify.command); the
-  resolver is not called. In a batch, a member's verdicts hold whenever their keys match, so
-  members chain.
+  file agrees, the lane writes the verdicts into the merge commit and runs no command (15.9); the
+  resolver is not called. In a batch, a member's verdicts hold whenever their keys match; without
+  verify.enabled the members chain, one on the other's tip. With it a member lands only on a tree
+  that passed, so a member whose tree is not the verified one (the batch changed the tip under it) goes
+  back out to be verified, and lands alone.
 * **Needs resolution.** When a conflicting file has no verdict with its key (it is new, or a side
   changed), the lane returns the attempt with those files, without resolving. UserLand
   pre-resolves only them against the new tip, out of the lane, keeps every other verdict, and
@@ -1270,12 +1273,13 @@ and the tree it verifies depends on the tip.
   an agent's resolution gets "could not verify before the deadline of <t>" with its package); an
   agent's resolution is verified in its precheck, at the only tip the lane accepts it at. The
   per-process worst case of a verification, so that the operator can size it: inodes and disk at
-  most verify_concurrency x (verify.max_tree_entries inodes, verify.max_tree_bytes of files), heap
-  at most verify_concurrency x (the paths kept, 128 MiB by the charge of the materializer; the
-  entries and the target of no link), and a TMPDIR on tmpfs turns that disk into memory: point it
-  at a disk, or lower the limits.
+  most verify_concurrency x (verify.max_tree_entries inodes, verify.max_tree_bytes of files), and
+  that is the checkout alone: what the command itself writes (a build directory, a cache) is the
+  operator's to bound, and counts against the same disk; heap at most verify_concurrency x (the
+  paths kept, 128 MiB by the charge of the materializer; the entries and the target of no link);
+  and a TMPDIR on tmpfs turns that disk into memory: point it at a disk, or lower the limits.
 * **Verification out of the lane, on the exact tree.** For an answer that holds a model's
-  resolution (or any answer, with a verify.command), and when nothing else keeps the land from landing (every file resolved or proposed),
+  resolution (or any answer, with verify.enabled set), and when nothing else keeps the land from landing (every file resolved or proposed),
   the pre-resolution builds the tree that would land (`landResolvedTree`: the merged tree of the
   tip and the change, the answer's files written in) and runs verify.command on it, in the
   quarantine, with a slot of the verify pool (`verify_concurrency`, default 2, a pool of its own:
@@ -1300,7 +1304,7 @@ and the tree it verifies depends on the tip.
   the whole pool, and the deadline of the land. A land that waits for its repository's turn holds
   nothing of the pool, and a wait that outlasts the deadline ends in proposals like the rest.
 * **Deadline: a proposal, not a failure.** The deadline of the land is the resolver's timeout plus
-  verify.timeout when a verify.command is configured. A verified AI land is opportunistic: when the
+  verify.timeout when verify.enabled is set. A verified AI land is opportunistic: when the
   deadline ends before a tree could be verified and landed, the land does not fail for the agent. The
   model's files become PROPOSED with the reason "could not verify before the branch moved again" (or
   "before the deadline of <t>" when the verification itself was cut), the proposals are kept (14), and
@@ -1309,8 +1313,8 @@ and the tree it verifies depends on the tip.
   fell (the listing, the tree, the resolution, the verification), the cap on the rounds, and a land that
   the lane or its batch kept handing back (a model's resolution whose batch ran out of rebuilds is
   handed back as a land that needs its new tree verified, not failed with "kept moving"). The files
-  that have a verdict are reported with it (a model's PROPOSED, a rule's RESOLVED, their proposals
-  kept); the files that changed under the land and have none are NOT_ATTEMPTED, with the reason. With
+  that have a verdict are reported with it (a model's PROPOSED, a rule's RESOLVED, or NOT_ATTEMPTED with
+  the reason when verify.enabled is set and its tree could not be verified; their proposals kept); the files that changed under the land and have none are NOT_ATTEMPTED, with the reason. With
   nothing known yet it is the merge conflict with its package and no proposals, with the reason. A
   land that had a conflict never returns a bare deadline to the agent: only a caller that gives up
   gets its cancellation.

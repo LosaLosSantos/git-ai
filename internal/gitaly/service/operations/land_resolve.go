@@ -247,7 +247,14 @@ func (s *Server) landResolveAt(
 				break
 			}
 			var verifyErr *landVerifyError
-			switch err := s.landVerifyOutOfLane(ctx, in.GetRepository(), repo, tree); {
+			current := func(ctx context.Context) (bool, error) {
+				now, err := repo.ResolveRevision(ctx, git.NewReferenceNameFromBranchName(string(in.GetBranch())).Revision())
+				if errors.Is(err, git.ErrReferenceNotFound) {
+					return false, nil
+				}
+				return now == tip, err
+			}
+			switch err := s.landVerifyOutOfLane(ctx, in.GetRepository(), repo, tree, current); {
 			case err == nil:
 				verified = tree
 				pre.markVerified(tree)
@@ -548,7 +555,7 @@ func (s *Server) landApplyVerdicts(
 	if verified != "" {
 		checkedBy = s.landVerifyTrailer()
 	}
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, checkedBy, tree, verified != "")
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, checkedBy, tree, verified)
 	return res, err
 }
 
@@ -743,8 +750,9 @@ func landUnresolvedCause(files []*landFileState) string {
 // tree and commits it with parents [tip, commitID]; checkedBy names what checked it, if anything
 // did. The commit message carries the trailers. built is the resolved tree when the caller already
 // built it (landResolvedTree). verified says that verify.command passed on that very tree, out of
-// the lane (15.9). The lane runs no verification: when one is configured and the tree is not the
-// one it passed on, the resolution is refused here, closed, whatever the caller did.
+// the lane (15.9), and is the tree itself, so that a caller cannot vouch with a bool. The lane runs no
+// verification: when one is configured and the tree is not the one it passed on, the resolution is
+// refused here, closed, whatever the caller did.
 func (s *Server) landWriteResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -755,7 +763,7 @@ func (s *Server) landWriteResolution(
 	resp *resolver.Response,
 	checkedBy string,
 	built git.ObjectID,
-	verified bool,
+	verified git.ObjectID,
 ) (landResolution, error) {
 	paths := make([]string, 0, len(resp.Files))
 	for _, f := range resp.Files {
@@ -776,7 +784,7 @@ func (s *Server) landWriteResolution(
 	}
 	// The verification ran out of the lane, on this very tree, before it got here (15.9): no
 	// resolution lands on a tree it did not pass on, and no code path verifies in the lane.
-	if s.resolveCfg.Verify.Enabled && !verified {
+	if s.resolveCfg.Verify.Enabled && (verified == "" || verified != treeID) {
 		return landResolution{}, errors.New("a resolution reached the lane without the verification of its tree")
 	}
 

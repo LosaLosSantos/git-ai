@@ -157,6 +157,14 @@ func (s *Server) landVerify(ctx context.Context, repo *localrepo.Repo, tree git.
 	return nil
 }
 
+// landTipMovedError says that the branch moved while a verification waited for its turn: the tree
+// was not verified, because it is not the tree the land would write any more.
+type landTipMovedError struct{}
+
+func (*landTipMovedError) Error() string {
+	return "the branch moved while the verification waited for its turn"
+}
+
 // landVerifyUnfinishedError is a verification that could not be completed, because its context ended
 // (the deadline of the land, or the caller) while it waited for a slot or ran: not a verdict.
 type landVerifyUnfinishedError struct {
@@ -178,7 +186,7 @@ func landVerifyRepoKey(repository *gitalypb.Repository) string {
 // with a slot of the verify pool. It returns a *landVerifyError when the command fails or times
 // out, a *landVerifyUnfinishedError when ctx ended first, and another error when the verification
 // could not be run.
-func (s *Server) landVerifyOutOfLane(ctx context.Context, repository *gitalypb.Repository, repo *localrepo.Repo, tree git.ObjectID) error {
+func (s *Server) landVerifyOutOfLane(ctx context.Context, repository *gitalypb.Repository, repo *localrepo.Repo, tree git.ObjectID, current func(context.Context) (bool, error)) error {
 	slot, err := s.verifyPool.Acquire(ctx, landVerifyRepoKey(repository))
 	if err != nil {
 		if ctx.Err() != nil {
@@ -187,6 +195,19 @@ func (s *Server) landVerifyOutOfLane(ctx context.Context, repository *gitalypb.R
 		return err
 	}
 	defer slot.Release()
+	// The wait for a slot can take as long as the verification before it: the tree was built from a
+	// tip that the branch may have left meanwhile. Nothing is verified that is not current.
+	if current != nil {
+		ok, err := current(ctx)
+		switch {
+		case err != nil && ctx.Err() != nil:
+			return &landVerifyUnfinishedError{err: err}
+		case err != nil:
+			return err
+		case !ok:
+			return &landTipMovedError{}
+		}
+	}
 
 	err = s.landVerify(ctx, repo, tree)
 	var verifyErr *landVerifyError
@@ -546,7 +567,7 @@ func (m *landMaterializer) osError(err error) error {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		switch errno {
-		case syscall.EEXIST, syscall.ENAMETOOLONG, syscall.EILSEQ, syscall.ELOOP, syscall.ENOTDIR, syscall.EISDIR, syscall.ENOTEMPTY, syscall.EINVAL:
+		case syscall.EEXIST, syscall.ENAMETOOLONG, syscall.EILSEQ, syscall.ELOOP, syscall.ENOTDIR, syscall.EISDIR, syscall.ENOTEMPTY, syscall.EINVAL, syscall.EMLINK:
 			return landRefuse("the tree cannot be written on this file system: %s", m.describe(err, errno))
 		}
 	}
@@ -614,6 +635,9 @@ func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
 	}
 	if e.sized && !e.isGitlink() && m.limits.bytes > 0 && m.bytes+e.listed > m.limits.bytes {
 		return landRefuse("the tree has more than %d bytes of files (verify.max_tree_bytes)", m.limits.bytes)
+	}
+	if e.isSymlink() && e.sized && e.listed == 0 {
+		return landRefuse("the symbolic link %q has an empty target, which no file system takes", e.path)
 	}
 	if e.isSymlink() && e.sized && e.listed > landMaxLinkTarget {
 		return landRefuse("the symbolic link %q has a target of %d bytes, more than the %d that Linux takes", e.path, e.listed, landMaxLinkTarget)
@@ -706,6 +730,9 @@ func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
 	enter()
 	target := filepath.Join(m.dir, filepath.FromSlash(e.path))
 	if e.isSymlink() {
+		if size == 0 {
+			return landRefuse("the symbolic link %q has an empty target, which no file system takes", e.path)
+		}
 		if size > landMaxLinkTarget {
 			return landRefuse("the symbolic link %q has a target of %d bytes, more than the %d that Linux takes", e.path, size, landMaxLinkTarget)
 		}

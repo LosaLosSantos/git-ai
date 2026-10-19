@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -168,10 +169,13 @@ type landPrecheck struct {
 //
 // The check runs in the quarantine repo, which the caller discards: the merge it computes leaves no
 // object behind. A resolution for a tip the branch has left, or for a change that already landed,
-// is not checked (skipped): the lane refuses or answers it. It returns nil when no resolver is
-// configured. A failure to check is the result's failure, with its cause, which the lane reports.
+// is not checked (skipped): the lane refuses or answers it. It returns nil when there is neither a
+// resolver nor a verification (verify.enabled) to run, and when the configured resolver cannot be
+// built (the lane refuses the resolution with that reason before anything is verified). A failure to
+// check is the result's failure, with its cause, which the lane reports. The whole precheck has one
+// deadline: the resolver's timeout, plus the verification's when verify.enabled is set.
 func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLandRequest, repo *localrepo.Repo) (*landPrecheck, error) {
-	if s.conflictResolver == nil && !s.resolveCfg.Verify.Enabled {
+	if s.conflictResolver == nil && (s.resolverErr != nil || !s.resolveCfg.Verify.Enabled) {
 		return nil, nil
 	}
 	objectHash, err := repo.ObjectHash(ctx)
@@ -218,19 +222,31 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("listing the conflicts: %v", err), failureErr: err}}, nil
 	}
 
+	timeout, err := s.resolveCfg.TimeoutOrDefault()
+	if err != nil {
+		return nil, structerr.NewInternal("resolver timeout: %w", err)
+	}
+	// One budget for the whole precheck: the check takes the resolver's timeout at most, and the
+	// verification what the budget has left, so that the deadline is the one the docs say.
+	budget := timeout
+	if s.resolveCfg.Verify.Enabled {
+		verifyTimeout, err := s.resolveCfg.Verify.TimeoutOrDefault()
+		if err != nil {
+			return nil, structerr.NewInternal("verify timeout: %w", err)
+		}
+		budget += verifyTimeout
+	}
+	budgetCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
 	var result landCheckResult
 	if s.conflictResolver != nil {
-		timeout, err := s.resolveCfg.TimeoutOrDefault()
-		if err != nil {
-			return nil, structerr.NewInternal("resolver timeout: %w", err)
-		}
-		checkCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
+		checkCtx, cancelCheck := context.WithTimeout(budgetCtx, timeout)
+		defer cancelCheck()
 		result = s.landCheckResolution(checkCtx, in, repo, review.listing, review.actor, review.resolved)
 	}
 	pc := &landPrecheck{tip: tip, commit: commitID, result: result}
 	if s.resolveCfg.Verify.Enabled && result.failure == "" && !landCheckRejects(result) {
-		if err := s.landPrecheckVerify(ctx, in, repo, review, pc); err != nil {
+		if err := s.landPrecheckVerify(ctx, budgetCtx, budget, in, repo, review, pc); err != nil {
 			return nil, err
 		}
 	}
@@ -259,40 +275,48 @@ func landAgentResponse(review landReview) *resolver.Response {
 }
 
 // landPrecheckVerify verifies the tree of the agent's resolution out of the lane (15.9), with a slot
-// of the verify pool, before the land enters its lane, and records the outcome in pc. The deadline is
-// the resolver's timeout plus the verification's; a verification that the deadline cut is recorded
-// as unfinished, and one that the caller cut is the caller's cancellation. The resolution was made
-// against the tip the branch is at, which the lane insists on, so the tree it would write there is
-// the tree verified here.
-func (s *Server) landPrecheckVerify(ctx context.Context, in *gitalypb.UserLandRequest, repo *localrepo.Repo, review landReview, pc *landPrecheck) error {
-	timeout, err := s.resolveCfg.TimeoutOrDefault()
+// of the verify pool, before the land enters its lane, and records the outcome in pc. caller is the
+// request's context and budgetCtx the one of the precheck's budget (the resolver's timeout plus the
+// verification's); a verification that the budget cut is recorded as unfinished, and one that the
+// caller cut is the caller's cancellation. The resolution was made against the tip the branch is at,
+// which the lane insists on, so the tree it would write there is the tree verified here; the branch
+// is read again once the slot is taken, and a tree of a tip the branch has left is not verified.
+func (s *Server) landPrecheckVerify(caller, budgetCtx context.Context, budget time.Duration, in *gitalypb.UserLandRequest, repo *localrepo.Repo, review landReview, pc *landPrecheck) error {
+	tree, err := s.landResolvedTree(budgetCtx, repo, review.listing.mergedTree, landAgentResponse(review))
 	if err != nil {
-		return structerr.NewInternal("resolver timeout: %w", err)
-	}
-	verifyTimeout, err := s.resolveCfg.Verify.TimeoutOrDefault()
-	if err != nil {
-		return structerr.NewInternal("verify timeout: %w", err)
-	}
-	tree, err := s.landResolvedTree(ctx, repo, review.listing.mergedTree, landAgentResponse(review))
-	if err != nil {
+		if caller.Err() != nil {
+			return landCallerGaveUp(caller, err)
+		}
+		if budgetCtx.Err() != nil {
+			pc.verifyErr = fmt.Errorf("could not verify before the deadline of %s", budget)
+			return nil
+		}
 		return structerr.NewInternal("building the tree to verify: %w", err)
 	}
-	vctx, cancel := context.WithTimeout(ctx, timeout+verifyTimeout)
-	defer cancel()
+	current := func(ctx context.Context) (bool, error) {
+		now, err := repo.ResolveRevision(ctx, git.NewReferenceNameFromBranchName(string(in.GetBranch())).Revision())
+		if errors.Is(err, git.ErrReferenceNotFound) {
+			return false, nil
+		}
+		return now == pc.tip, err
+	}
 	var verifyErr *landVerifyError
-	switch err := s.landVerifyOutOfLane(vctx, in.GetRepository(), repo, tree); {
+	var moved *landTipMovedError
+	switch err := s.landVerifyOutOfLane(budgetCtx, in.GetRepository(), repo, tree, current); {
 	case err == nil:
 		pc.verified = tree
 	case errors.As(err, &verifyErr):
 		pc.verifyErr = err
+	case errors.As(err, &moved):
+		pc.verifyErr = err
 	default:
 		var unfinished *landVerifyUnfinishedError
-		if errors.As(err, &unfinished) && ctx.Err() == nil {
-			pc.verifyErr = fmt.Errorf("could not verify before the deadline of %s", timeout+verifyTimeout)
+		if errors.As(err, &unfinished) && caller.Err() == nil {
+			pc.verifyErr = fmt.Errorf("could not verify before the deadline of %s", budget)
 			return nil
 		}
-		if ctx.Err() != nil {
-			return landCallerGaveUp(ctx, err)
+		if caller.Err() != nil {
+			return landCallerGaveUp(caller, err)
 		}
 		return err
 	}
@@ -383,8 +407,7 @@ func (s *Server) landWithResolution(
 	resp := landAgentResponse(review)
 	// The verification ran out of the lane (15.9): the lane compares the tree it would write with
 	// the one that passed, and writes nothing that did not.
-	var built git.ObjectID
-	verified := false
+	var built, verified git.ObjectID
 	if s.resolveCfg.Verify.Enabled {
 		switch reason := landPrecheckUnusable(precheck, tip, commitID); {
 		case reason != "":
@@ -400,10 +423,13 @@ func (s *Server) landWithResolution(
 		if err != nil {
 			return landResolution{}, err
 		}
-		if precheck.verified == "" || precheck.verified != tree {
+		switch {
+		case precheck.verified == "":
+			return landResolution{}, l.notAttempted("the resolution could not be verified: the precheck did not verify it", nil)
+		case precheck.verified != tree:
 			return landResolution{}, l.notAttempted("the resolution could not be verified: the tree to land is not the tree that was verified", nil)
 		}
-		built, verified = tree, true
+		built, verified = tree, precheck.verified
 	}
 	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, review.actor, resp, checkedBy, built, verified)
 	res.syntaxUnchecked = syntaxUnchecked

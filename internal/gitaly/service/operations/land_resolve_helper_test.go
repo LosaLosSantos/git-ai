@@ -26,5 +26,9 @@ func (s *Server) resolveLandConflicts(ctx context.Context, in *gitalypb.UserLand
 			return landResolution{}, err
 		}
 	}
-	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "", tree, pre.isVerified(tree))
+	var verified git.ObjectID
+	if pre.isVerified(tree) {
+		verified = tree
+	}
+	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "", tree, verified)
 }
