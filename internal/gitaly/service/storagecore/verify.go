@@ -33,8 +33,8 @@ func (s *server) VerifyRepository(ctx context.Context, req *gitalypb.VerifyRepos
 	}
 
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
+		return nil, err
 	}
 
 	if core.Authoritative() {
@@ -95,7 +95,7 @@ func (s *server) VerifyRepository(ctx context.Context, req *gitalypb.VerifyRepos
 
 		// Equal references are not enough: the object storage must also hold
 		// every object they reach, or a hydration on another node fails.
-		storedOK, storedMsg, err := s.checkStoredObjects(ctx, core, repo, record, dbRefs, headSeq)
+		storedOK, storedMsg, err := s.checkStoredObjects(ctx, core, repo, record)
 		if err != nil {
 			return nil, err
 		}

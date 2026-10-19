@@ -416,6 +416,466 @@ func (x *VerifyRepositoryResponse) GetConnectivityError() string {
 	return ""
 }
 
+// CreateCheckpointRequest is the request of CreateCheckpoint.
+type CreateCheckpointRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// repository is the repository to checkpoint.
+	Repository    *Repository `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateCheckpointRequest) Reset() {
+	*x = CreateCheckpointRequest{}
+	mi := &file_storage_core_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateCheckpointRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateCheckpointRequest) ProtoMessage() {}
+
+func (x *CreateCheckpointRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateCheckpointRequest.ProtoReflect.Descriptor instead.
+func (*CreateCheckpointRequest) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *CreateCheckpointRequest) GetRepository() *Repository {
+	if x != nil {
+		return x.Repository
+	}
+	return nil
+}
+
+// CreateCheckpointResponse is the response of CreateCheckpoint.
+type CreateCheckpointResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// checkpoint_sequence is the changeset sequence the checkpoint is at; 0 when
+	// the repository has no object to consolidate (every reference is symbolic).
+	CheckpointSequence uint64 `protobuf:"varint,1,opt,name=checkpoint_sequence,json=checkpointSequence,proto3" json:"checkpoint_sequence,omitempty"`
+	// created is false when a checkpoint at the head existed already.
+	Created bool `protobuf:"varint,2,opt,name=created,proto3" json:"created,omitempty"`
+	// pack_bytes is the size of the checkpoint's pack.
+	PackBytes int64 `protobuf:"varint,3,opt,name=pack_bytes,json=packBytes,proto3" json:"pack_bytes,omitempty"`
+	// references is the number of references in the checkpoint's snapshot.
+	References    uint32 `protobuf:"varint,4,opt,name=references,proto3" json:"references,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateCheckpointResponse) Reset() {
+	*x = CreateCheckpointResponse{}
+	mi := &file_storage_core_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateCheckpointResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateCheckpointResponse) ProtoMessage() {}
+
+func (x *CreateCheckpointResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateCheckpointResponse.ProtoReflect.Descriptor instead.
+func (*CreateCheckpointResponse) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *CreateCheckpointResponse) GetCheckpointSequence() uint64 {
+	if x != nil {
+		return x.CheckpointSequence
+	}
+	return 0
+}
+
+func (x *CreateCheckpointResponse) GetCreated() bool {
+	if x != nil {
+		return x.Created
+	}
+	return false
+}
+
+func (x *CreateCheckpointResponse) GetPackBytes() int64 {
+	if x != nil {
+		return x.PackBytes
+	}
+	return 0
+}
+
+func (x *CreateCheckpointResponse) GetReferences() uint32 {
+	if x != nil {
+		return x.References
+	}
+	return 0
+}
+
+// CollectGarbageRequest is the request of CollectGarbage.
+type CollectGarbageRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// repository is the repository whose packs are collected.
+	Repository *Repository `protobuf:"bytes,1,opt,name=repository,proto3" json:"repository,omitempty"`
+	// dry_run reports what would be deleted and changes nothing.
+	DryRun        bool `protobuf:"varint,2,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CollectGarbageRequest) Reset() {
+	*x = CollectGarbageRequest{}
+	mi := &file_storage_core_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectGarbageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectGarbageRequest) ProtoMessage() {}
+
+func (x *CollectGarbageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectGarbageRequest.ProtoReflect.Descriptor instead.
+func (*CollectGarbageRequest) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *CollectGarbageRequest) GetRepository() *Repository {
+	if x != nil {
+		return x.Repository
+	}
+	return nil
+}
+
+func (x *CollectGarbageRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// CollectGarbageResponse is the response of CollectGarbage.
+type CollectGarbageResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// boundary is the sequence of the newest checkpoint at least gc_grace old;
+	// 0 when there is none.
+	Boundary uint64 `protobuf:"varint,1,opt,name=boundary,proto3" json:"boundary,omitempty"`
+	// covered_deleted is the number of changeset packs covered by the boundary.
+	CoveredDeleted uint32 `protobuf:"varint,2,opt,name=covered_deleted,json=coveredDeleted,proto3" json:"covered_deleted,omitempty"`
+	// checkpoints_dropped is the number of checkpoints superseded by the boundary.
+	CheckpointsDropped uint32 `protobuf:"varint,3,opt,name=checkpoints_dropped,json=checkpointsDropped,proto3" json:"checkpoints_dropped,omitempty"`
+	// orphans_deleted is the number of unreferenced objects observed at least
+	// gc_grace ago.
+	OrphansDeleted uint32 `protobuf:"varint,4,opt,name=orphans_deleted,json=orphansDeleted,proto3" json:"orphans_deleted,omitempty"`
+	// orphans_observed is the number of unreferenced objects seen for the first
+	// time.
+	OrphansObserved uint32 `protobuf:"varint,5,opt,name=orphans_observed,json=orphansObserved,proto3" json:"orphans_observed,omitempty"`
+	// orphans_in_grace is the number of unreferenced objects observed less than
+	// gc_grace ago.
+	OrphansInGrace uint32 `protobuf:"varint,6,opt,name=orphans_in_grace,json=orphansInGrace,proto3" json:"orphans_in_grace,omitempty"`
+	// packs_deleted is the number of objects deleted (to delete in a dry run).
+	PacksDeleted uint32 `protobuf:"varint,7,opt,name=packs_deleted,json=packsDeleted,proto3" json:"packs_deleted,omitempty"`
+	// bytes_reclaimed is the size of those objects.
+	BytesReclaimed int64 `protobuf:"varint,8,opt,name=bytes_reclaimed,json=bytesReclaimed,proto3" json:"bytes_reclaimed,omitempty"`
+	// dry_run tells that nothing was deleted or recorded.
+	DryRun        bool `protobuf:"varint,9,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CollectGarbageResponse) Reset() {
+	*x = CollectGarbageResponse{}
+	mi := &file_storage_core_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectGarbageResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectGarbageResponse) ProtoMessage() {}
+
+func (x *CollectGarbageResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectGarbageResponse.ProtoReflect.Descriptor instead.
+func (*CollectGarbageResponse) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *CollectGarbageResponse) GetBoundary() uint64 {
+	if x != nil {
+		return x.Boundary
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetCoveredDeleted() uint32 {
+	if x != nil {
+		return x.CoveredDeleted
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetCheckpointsDropped() uint32 {
+	if x != nil {
+		return x.CheckpointsDropped
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetOrphansDeleted() uint32 {
+	if x != nil {
+		return x.OrphansDeleted
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetOrphansObserved() uint32 {
+	if x != nil {
+		return x.OrphansObserved
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetOrphansInGrace() uint32 {
+	if x != nil {
+		return x.OrphansInGrace
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetPacksDeleted() uint32 {
+	if x != nil {
+		return x.PacksDeleted
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetBytesReclaimed() int64 {
+	if x != nil {
+		return x.BytesReclaimed
+	}
+	return 0
+}
+
+func (x *CollectGarbageResponse) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// CollectRemovedRepositoriesRequest is the request of
+// CollectRemovedRepositories.
+type CollectRemovedRepositoriesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// storage_name is the storage whose removed repositories are collected.
+	StorageName string `protobuf:"bytes,1,opt,name=storage_name,json=storageName,proto3" json:"storage_name,omitempty"`
+	// dry_run reports what would be deleted and changes nothing.
+	DryRun        bool `protobuf:"varint,2,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CollectRemovedRepositoriesRequest) Reset() {
+	*x = CollectRemovedRepositoriesRequest{}
+	mi := &file_storage_core_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectRemovedRepositoriesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectRemovedRepositoriesRequest) ProtoMessage() {}
+
+func (x *CollectRemovedRepositoriesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectRemovedRepositoriesRequest.ProtoReflect.Descriptor instead.
+func (*CollectRemovedRepositoriesRequest) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *CollectRemovedRepositoriesRequest) GetStorageName() string {
+	if x != nil {
+		return x.StorageName
+	}
+	return ""
+}
+
+func (x *CollectRemovedRepositoriesRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+// CollectRemovedRepositoriesResponse is the response of
+// CollectRemovedRepositories.
+type CollectRemovedRepositoriesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// repositories is the number of removed repositories whose objects were
+	// deleted (to delete in a dry run).
+	Repositories uint32 `protobuf:"varint,1,opt,name=repositories,proto3" json:"repositories,omitempty"`
+	// packs_deleted is the number of objects deleted.
+	PacksDeleted uint32 `protobuf:"varint,2,opt,name=packs_deleted,json=packsDeleted,proto3" json:"packs_deleted,omitempty"`
+	// bytes_reclaimed is the size of those objects.
+	BytesReclaimed int64 `protobuf:"varint,3,opt,name=bytes_reclaimed,json=bytesReclaimed,proto3" json:"bytes_reclaimed,omitempty"`
+	// dry_run tells that nothing was deleted or recorded.
+	DryRun bool `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	// leaks_found is the number of repository IDs the reconciliation found with
+	// objects in the bucket and neither a row nor a tombstone (a row deleted
+	// without one).
+	LeaksFound uint32 `protobuf:"varint,5,opt,name=leaks_found,json=leaksFound,proto3" json:"leaks_found,omitempty"`
+	// leaks_tombstoned is the number of tombstones the reconciliation recorded
+	// for them; their objects are deleted once the tombstone is gc_grace old.
+	LeaksTombstoned uint32 `protobuf:"varint,6,opt,name=leaks_tombstoned,json=leaksTombstoned,proto3" json:"leaks_tombstoned,omitempty"`
+	// ids_ahead_of_allocator is the number of repository IDs above the
+	// database's allocator that have objects in the bucket (a database restored
+	// from an older backup). They are never touched.
+	IdsAheadOfAllocator uint32 `protobuf:"varint,7,opt,name=ids_ahead_of_allocator,json=idsAheadOfAllocator,proto3" json:"ids_ahead_of_allocator,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *CollectRemovedRepositoriesResponse) Reset() {
+	*x = CollectRemovedRepositoriesResponse{}
+	mi := &file_storage_core_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CollectRemovedRepositoriesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CollectRemovedRepositoriesResponse) ProtoMessage() {}
+
+func (x *CollectRemovedRepositoriesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_storage_core_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CollectRemovedRepositoriesResponse.ProtoReflect.Descriptor instead.
+func (*CollectRemovedRepositoriesResponse) Descriptor() ([]byte, []int) {
+	return file_storage_core_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetRepositories() uint32 {
+	if x != nil {
+		return x.Repositories
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetPacksDeleted() uint32 {
+	if x != nil {
+		return x.PacksDeleted
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetBytesReclaimed() int64 {
+	if x != nil {
+		return x.BytesReclaimed
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetLeaksFound() uint32 {
+	if x != nil {
+		return x.LeaksFound
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetLeaksTombstoned() uint32 {
+	if x != nil {
+		return x.LeaksTombstoned
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetIdsAheadOfAllocator() uint32 {
+	if x != nil {
+		return x.IdsAheadOfAllocator
+	}
+	return 0
+}
+
 // ReferenceDivergence is a reference whose local value differs from the
 // database.
 type VerifyRepositoryResponse_ReferenceDivergence struct {
@@ -433,7 +893,7 @@ type VerifyRepositoryResponse_ReferenceDivergence struct {
 
 func (x *VerifyRepositoryResponse_ReferenceDivergence) Reset() {
 	*x = VerifyRepositoryResponse_ReferenceDivergence{}
-	mi := &file_storage_core_proto_msgTypes[6]
+	mi := &file_storage_core_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -445,7 +905,7 @@ func (x *VerifyRepositoryResponse_ReferenceDivergence) String() string {
 func (*VerifyRepositoryResponse_ReferenceDivergence) ProtoMessage() {}
 
 func (x *VerifyRepositoryResponse_ReferenceDivergence) ProtoReflect() protoreflect.Message {
-	mi := &file_storage_core_proto_msgTypes[6]
+	mi := &file_storage_core_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -525,11 +985,53 @@ const file_storage_core_proto_rawDesc = "" +
 	"\x13ReferenceDivergence\x12\x1c\n" +
 	"\treference\x18\x01 \x01(\fR\treference\x12!\n" +
 	"\flocal_target\x18\x02 \x01(\tR\vlocalTarget\x12'\n" +
-	"\x0fdatabase_target\x18\x03 \x01(\tR\x0edatabaseTarget2\xae\x02\n" +
+	"\x0fdatabase_target\x18\x03 \x01(\tR\x0edatabaseTarget\"S\n" +
+	"\x17CreateCheckpointRequest\x128\n" +
+	"\n" +
+	"repository\x18\x01 \x01(\v2\x12.gitaly.RepositoryB\x04\x98\xc6,\x01R\n" +
+	"repository\"\xa4\x01\n" +
+	"\x18CreateCheckpointResponse\x12/\n" +
+	"\x13checkpoint_sequence\x18\x01 \x01(\x04R\x12checkpointSequence\x12\x18\n" +
+	"\acreated\x18\x02 \x01(\bR\acreated\x12\x1d\n" +
+	"\n" +
+	"pack_bytes\x18\x03 \x01(\x03R\tpackBytes\x12\x1e\n" +
+	"\n" +
+	"references\x18\x04 \x01(\rR\n" +
+	"references\"j\n" +
+	"\x15CollectGarbageRequest\x128\n" +
+	"\n" +
+	"repository\x18\x01 \x01(\v2\x12.gitaly.RepositoryB\x04\x98\xc6,\x01R\n" +
+	"repository\x12\x17\n" +
+	"\adry_run\x18\x02 \x01(\bR\x06dryRun\"\xf3\x02\n" +
+	"\x16CollectGarbageResponse\x12\x1a\n" +
+	"\bboundary\x18\x01 \x01(\x04R\bboundary\x12'\n" +
+	"\x0fcovered_deleted\x18\x02 \x01(\rR\x0ecoveredDeleted\x12/\n" +
+	"\x13checkpoints_dropped\x18\x03 \x01(\rR\x12checkpointsDropped\x12'\n" +
+	"\x0forphans_deleted\x18\x04 \x01(\rR\x0eorphansDeleted\x12)\n" +
+	"\x10orphans_observed\x18\x05 \x01(\rR\x0forphansObserved\x12(\n" +
+	"\x10orphans_in_grace\x18\x06 \x01(\rR\x0eorphansInGrace\x12#\n" +
+	"\rpacks_deleted\x18\a \x01(\rR\fpacksDeleted\x12'\n" +
+	"\x0fbytes_reclaimed\x18\b \x01(\x03R\x0ebytesReclaimed\x12\x17\n" +
+	"\adry_run\x18\t \x01(\bR\x06dryRun\"e\n" +
+	"!CollectRemovedRepositoriesRequest\x12'\n" +
+	"\fstorage_name\x18\x01 \x01(\tB\x04\x88\xc6,\x01R\vstorageName\x12\x17\n" +
+	"\adry_run\x18\x02 \x01(\bR\x06dryRun\"\xb0\x02\n" +
+	"\"CollectRemovedRepositoriesResponse\x12\"\n" +
+	"\frepositories\x18\x01 \x01(\rR\frepositories\x12#\n" +
+	"\rpacks_deleted\x18\x02 \x01(\rR\fpacksDeleted\x12'\n" +
+	"\x0fbytes_reclaimed\x18\x03 \x01(\x03R\x0ebytesReclaimed\x12\x17\n" +
+	"\adry_run\x18\x04 \x01(\bR\x06dryRun\x12\x1f\n" +
+	"\vleaks_found\x18\x05 \x01(\rR\n" +
+	"leaksFound\x12)\n" +
+	"\x10leaks_tombstoned\x18\x06 \x01(\rR\x0fleaksTombstoned\x123\n" +
+	"\x16ids_ahead_of_allocator\x18\a \x01(\rR\x13idsAheadOfAllocator2\xe5\x04\n" +
 	"\x12StorageCoreService\x12]\n" +
 	"\x10ImportRepository\x12\x1f.gitaly.ImportRepositoryRequest\x1a .gitaly.ImportRepositoryResponse\"\x06\xfa\x97(\x02\b\x01\x12Z\n" +
 	"\x0fGetStorageState\x12\x1e.gitaly.GetStorageStateRequest\x1a\x1f.gitaly.GetStorageStateResponse\"\x06\xfa\x97(\x02\b\x02\x12]\n" +
-	"\x10VerifyRepository\x12\x1f.gitaly.VerifyRepositoryRequest\x1a .gitaly.VerifyRepositoryResponse\"\x06\xfa\x97(\x02\b\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
+	"\x10VerifyRepository\x12\x1f.gitaly.VerifyRepositoryRequest\x1a .gitaly.VerifyRepositoryResponse\"\x06\xfa\x97(\x02\b\x02\x12]\n" +
+	"\x10CreateCheckpoint\x12\x1f.gitaly.CreateCheckpointRequest\x1a .gitaly.CreateCheckpointResponse\"\x06\xfa\x97(\x02\b\x01\x12W\n" +
+	"\x0eCollectGarbage\x12\x1d.gitaly.CollectGarbageRequest\x1a\x1e.gitaly.CollectGarbageResponse\"\x06\xfa\x97(\x02\b\x01\x12}\n" +
+	"\x1aCollectRemovedRepositories\x12).gitaly.CollectRemovedRepositoriesRequest\x1a*.gitaly.CollectRemovedRepositoriesResponse\"\b\xfa\x97(\x04\b\x01\x10\x02B.Z,github.com/feder-cr/git-ai/proto/go/gitalypbb\x06proto3"
 
 var (
 	file_storage_core_proto_rawDescOnce sync.Once
@@ -543,7 +1045,7 @@ func file_storage_core_proto_rawDescGZIP() []byte {
 	return file_storage_core_proto_rawDescData
 }
 
-var file_storage_core_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_storage_core_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_storage_core_proto_goTypes = []any{
 	(*ImportRepositoryRequest)(nil),                      // 0: gitaly.ImportRepositoryRequest
 	(*ImportRepositoryResponse)(nil),                     // 1: gitaly.ImportRepositoryResponse
@@ -551,25 +1053,39 @@ var file_storage_core_proto_goTypes = []any{
 	(*GetStorageStateResponse)(nil),                      // 3: gitaly.GetStorageStateResponse
 	(*VerifyRepositoryRequest)(nil),                      // 4: gitaly.VerifyRepositoryRequest
 	(*VerifyRepositoryResponse)(nil),                     // 5: gitaly.VerifyRepositoryResponse
-	(*VerifyRepositoryResponse_ReferenceDivergence)(nil), // 6: gitaly.VerifyRepositoryResponse.ReferenceDivergence
-	(*Repository)(nil),                                   // 7: gitaly.Repository
+	(*CreateCheckpointRequest)(nil),                      // 6: gitaly.CreateCheckpointRequest
+	(*CreateCheckpointResponse)(nil),                     // 7: gitaly.CreateCheckpointResponse
+	(*CollectGarbageRequest)(nil),                        // 8: gitaly.CollectGarbageRequest
+	(*CollectGarbageResponse)(nil),                       // 9: gitaly.CollectGarbageResponse
+	(*CollectRemovedRepositoriesRequest)(nil),            // 10: gitaly.CollectRemovedRepositoriesRequest
+	(*CollectRemovedRepositoriesResponse)(nil),           // 11: gitaly.CollectRemovedRepositoriesResponse
+	(*VerifyRepositoryResponse_ReferenceDivergence)(nil), // 12: gitaly.VerifyRepositoryResponse.ReferenceDivergence
+	(*Repository)(nil),                                   // 13: gitaly.Repository
 }
 var file_storage_core_proto_depIdxs = []int32{
-	7, // 0: gitaly.ImportRepositoryRequest.repository:type_name -> gitaly.Repository
-	7, // 1: gitaly.GetStorageStateRequest.repository:type_name -> gitaly.Repository
-	7, // 2: gitaly.VerifyRepositoryRequest.repository:type_name -> gitaly.Repository
-	6, // 3: gitaly.VerifyRepositoryResponse.divergences:type_name -> gitaly.VerifyRepositoryResponse.ReferenceDivergence
-	0, // 4: gitaly.StorageCoreService.ImportRepository:input_type -> gitaly.ImportRepositoryRequest
-	2, // 5: gitaly.StorageCoreService.GetStorageState:input_type -> gitaly.GetStorageStateRequest
-	4, // 6: gitaly.StorageCoreService.VerifyRepository:input_type -> gitaly.VerifyRepositoryRequest
-	1, // 7: gitaly.StorageCoreService.ImportRepository:output_type -> gitaly.ImportRepositoryResponse
-	3, // 8: gitaly.StorageCoreService.GetStorageState:output_type -> gitaly.GetStorageStateResponse
-	5, // 9: gitaly.StorageCoreService.VerifyRepository:output_type -> gitaly.VerifyRepositoryResponse
-	7, // [7:10] is the sub-list for method output_type
-	4, // [4:7] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	13, // 0: gitaly.ImportRepositoryRequest.repository:type_name -> gitaly.Repository
+	13, // 1: gitaly.GetStorageStateRequest.repository:type_name -> gitaly.Repository
+	13, // 2: gitaly.VerifyRepositoryRequest.repository:type_name -> gitaly.Repository
+	12, // 3: gitaly.VerifyRepositoryResponse.divergences:type_name -> gitaly.VerifyRepositoryResponse.ReferenceDivergence
+	13, // 4: gitaly.CreateCheckpointRequest.repository:type_name -> gitaly.Repository
+	13, // 5: gitaly.CollectGarbageRequest.repository:type_name -> gitaly.Repository
+	0,  // 6: gitaly.StorageCoreService.ImportRepository:input_type -> gitaly.ImportRepositoryRequest
+	2,  // 7: gitaly.StorageCoreService.GetStorageState:input_type -> gitaly.GetStorageStateRequest
+	4,  // 8: gitaly.StorageCoreService.VerifyRepository:input_type -> gitaly.VerifyRepositoryRequest
+	6,  // 9: gitaly.StorageCoreService.CreateCheckpoint:input_type -> gitaly.CreateCheckpointRequest
+	8,  // 10: gitaly.StorageCoreService.CollectGarbage:input_type -> gitaly.CollectGarbageRequest
+	10, // 11: gitaly.StorageCoreService.CollectRemovedRepositories:input_type -> gitaly.CollectRemovedRepositoriesRequest
+	1,  // 12: gitaly.StorageCoreService.ImportRepository:output_type -> gitaly.ImportRepositoryResponse
+	3,  // 13: gitaly.StorageCoreService.GetStorageState:output_type -> gitaly.GetStorageStateResponse
+	5,  // 14: gitaly.StorageCoreService.VerifyRepository:output_type -> gitaly.VerifyRepositoryResponse
+	7,  // 15: gitaly.StorageCoreService.CreateCheckpoint:output_type -> gitaly.CreateCheckpointResponse
+	9,  // 16: gitaly.StorageCoreService.CollectGarbage:output_type -> gitaly.CollectGarbageResponse
+	11, // 17: gitaly.StorageCoreService.CollectRemovedRepositories:output_type -> gitaly.CollectRemovedRepositoriesResponse
+	12, // [12:18] is the sub-list for method output_type
+	6,  // [6:12] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_storage_core_proto_init() }
@@ -585,7 +1101,7 @@ func file_storage_core_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_storage_core_proto_rawDesc), len(file_storage_core_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   7,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

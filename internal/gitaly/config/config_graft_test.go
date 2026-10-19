@@ -237,3 +237,17 @@ func TestGraft_ObjectServiceDefaults(t *testing.T) {
 	require.Equal(t, 5, custom.MaxObjectsOrDefault())
 	require.Equal(t, 64, custom.ChunkSizeOrDefault())
 }
+
+func TestGraft_MaxOpenReviews(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, DefaultGraftMaxOpenReviews, GraftReview{}.MaxOpenReviewsOrDefault())
+	require.Equal(t, 7, GraftReview{MaxOpenReviews: 7}.MaxOpenReviewsOrDefault())
+
+	cfg := graftTestCfg(t)
+	cfg.Graft.Standalone = true
+	cfg.Graft.Review.MaxOpenReviews = -1
+	for _, err := range []error{cfg.Graft.Validate(), cfg.Validate(), cfg.ValidateV2()} {
+		require.ErrorContains(t, err, "max_open_reviews must not be negative")
+	}
+}

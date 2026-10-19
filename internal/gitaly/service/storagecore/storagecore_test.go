@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -17,6 +18,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/gitaly/service/hook"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
@@ -67,9 +69,15 @@ func setup(t *testing.T, mode corestore.Mode, dialect sqlstore.Dialect, adjust .
 	if mode == corestore.ModeAuthoritative {
 		cfg.Graft.Standalone = true
 	}
+	// The server's own reference writes (the review roots that a checkpoint
+	// backfills) go through the reference-transaction hook and its HookService,
+	// as in production: without the hook binary git would skip it and write
+	// past the database.
+	testcfg.BuildGitalyHooks(t, cfg)
 
 	cfg.SocketPath = testserver.RunGitalyServer(t, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
 		gitalypb.RegisterStorageCoreServiceServer(srv, NewServer(deps))
+		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 	}, testserver.WithGraftStorage(core))
 
 	conn, err := client.New(ctx, cfg.SocketPath)
@@ -182,7 +190,7 @@ func (h *harness) commitElsewhere(repoID int64, ref string) git.ObjectID {
 	pack, err := gitops.BuildPack(h.ctx, localrepo.NewTestRepo(h.t, h.cfg, otherProto), []git.ObjectID{oid}, h.t.TempDir())
 	require.NoError(h.t, err)
 	require.False(h.t, pack.Empty())
-	key := corestore.PackKey(repoID, pack.SHA256)
+	key := corestore.NewPackKey(repoID, pack.SHA256)
 	f, err := pack.Open()
 	require.NoError(h.t, err)
 	require.NoError(h.t, h.core.Blobs.Put(h.ctx, key, f))
@@ -198,7 +206,7 @@ func (h *harness) commitElsewhere(repoID int64, ref string) git.ObjectID {
 		Operation: "test",
 		Actor:     "other-node",
 		NodeID:    "node-b",
-		PackKey:   key,
+		PackKey:   key, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: pack.Size,
 	})
 	require.NoError(h.t, err)

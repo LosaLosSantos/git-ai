@@ -272,7 +272,7 @@ commands:
   cat REV:PATH           print a file at a revision
   search QUERY           search file contents (--regex, -i, --path, --context, -n, --rev, --json)
   review SUBCOMMAND      create, show, list, comment, approve, request-changes, update, close (--branch, --title, --json)
-  storage SUBCOMMAND     import, state, verify a repository in the storage core (--connectivity, --json)
+  storage SUBCOMMAND     import, state, verify, checkpoint, gc a repository in the storage core; gc --removed for a storage (--connectivity, --dry-run, --json)
 
 environment: GRAFT_ADDRESS, GRAFT_TOKEN, GRAFT_STORAGE, GRAFT_USER, GRAFT_AUTHOR
 

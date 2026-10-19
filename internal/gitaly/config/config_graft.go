@@ -110,6 +110,24 @@ type GraftReview struct {
 	// that applies to at least one file has enough current approvals. When
 	// Rules is empty, DefaultGraftReviewRules apply.
 	Rules []GraftReviewRule `json:"rules" toml:"rule,omitempty"`
+	// MaxOpenReviews bounds the open reviews of one repository: CreateReview
+	// refuses a review beyond it with ResourceExhausted. Every open review
+	// keeps its head and base commits by references, in every mode, so the
+	// bound also bounds those references. Zero means
+	// DefaultGraftMaxOpenReviews.
+	MaxOpenReviews int `json:"max_open_reviews" toml:"max_open_reviews,omitempty"`
+}
+
+// DefaultGraftMaxOpenReviews is the bound on the open reviews of a repository
+// when max_open_reviews is not set.
+const DefaultGraftMaxOpenReviews = 1000
+
+// MaxOpenReviewsOrDefault returns MaxOpenReviews or DefaultGraftMaxOpenReviews.
+func (r GraftReview) MaxOpenReviewsOrDefault() int {
+	if r.MaxOpenReviews > 0 {
+		return r.MaxOpenReviews
+	}
+	return DefaultGraftMaxOpenReviews
 }
 
 // GraftReviewRule is one approval rule.
@@ -151,6 +169,9 @@ func (r GraftReview) RulesOrDefault() []GraftReviewRule {
 }
 
 func (r GraftReview) validate() error {
+	if r.MaxOpenReviews < 0 {
+		return fmt.Errorf("graft review: max_open_reviews must not be negative (0 means the default, %d)", DefaultGraftMaxOpenReviews)
+	}
 	for i, rule := range r.Rules {
 		if rule.Name == "" {
 			return fmt.Errorf("graft review rule %d: name is required", i+1)

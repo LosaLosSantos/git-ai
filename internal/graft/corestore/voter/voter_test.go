@@ -90,6 +90,9 @@ type fixtureOptions struct {
 	// files makes the repository use the files reference backend instead of
 	// the package's default, reftable (see TestMain).
 	files bool
+	// localRefs gives the core the admission and the deferred durability of
+	// the local reference writes (coretest.EnableLocalRefs).
+	localRefs bool
 }
 
 func newFixture(t *testing.T, opts fixtureOptions) *fixture {
@@ -104,7 +107,12 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 	if opts.files {
 		useFilesBackend(t, cfg, repoPath)
 	}
-	core := coretest.Open(t, coretest.Options{Mode: opts.mode, Dialect: opts.dialect})
+	// The shadow budget is not binding here: these tests check what a shadow
+	// write records, which the budget can legitimately prevent under load
+	// (doc/graft/PLAN7.md, SHADOW BUDGET requirement). The budget itself is
+	// tested with short budgets set explicitly (TestShadowBudgetOverrunInPrepared,
+	// TestPreparingShadowTimeoutCoversBothPhases, TestShadowTimeoutNeverFails).
+	core := coretest.Open(t, coretest.Options{Mode: opts.mode, Dialect: opts.dialect, ShadowTimeout: time.Minute})
 
 	var repoID int64
 	var base uint64
@@ -125,6 +133,9 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 
 	logger := testhelper.NewLogger(t)
 	locator := config.NewLocator(cfg)
+	if opts.localRefs {
+		coretest.EnableLocalRefs(t, core, cfg)
+	}
 	cache := catfile.NewCache(cfg)
 	t.Cleanup(cache.Stop)
 	factory := localrepo.NewFactory(logger, locator, gittest.NewCommandFactory(t, cfg), cache)

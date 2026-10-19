@@ -37,6 +37,16 @@ const (
 	// Rate limiter is immediately allocated the maxBurstToken value. Burst is the maximum number of tokens
 	// that can be consumed in a single call
 	maxBurstToken = 40
+
+	// FsyncComponents are the components git makes durable on every write (`core.fsync`).
+	FsyncComponents = "objects,derived-metadata,reference"
+	// FsyncComponentsWithoutReferences is FsyncComponents without the references, for the
+	// reference writes whose durability the storage core makes itself
+	// (updateref.WithDeferredReferenceDurability).
+	FsyncComponentsWithoutReferences = "objects,derived-metadata"
+	// ReftableLockTimeoutMilliseconds is how long git waits for the reference lock of a reftable
+	// repository (`reftable.lockTimeout`).
+	ReftableLockTimeoutMilliseconds = 10000
 )
 
 // CommandFactory is designed to create and run git commands in a protected and fully managed manner.
@@ -737,7 +747,7 @@ func (cf *ExecCommandFactory) GlobalConfiguration(ctx context.Context) ([]Config
 		// We configure for what data should be fsynced and how that should happen.
 		// Synchronize object files, packed-refs and loose refs to disk to lessen the
 		// likelihood of repository corruption in case the server crashes.
-		ConfigPair{Key: "core.fsync", Value: "objects,derived-metadata,reference"},
+		ConfigPair{Key: "core.fsync", Value: FsyncComponents},
 		ConfigPair{Key: "core.fsyncMethod", Value: "fsync"},
 
 		// When deleting references, Git needs to rewrite the `packed-refs` file to evict
@@ -758,7 +768,7 @@ func (cf *ExecCommandFactory) GlobalConfiguration(ctx context.Context) ([]Config
 		// reference transaction, so it is a shared resource like the `packed-refs` lock
 		// above and gets the same timeout instead of Git's default of 100 milliseconds.
 		// Context cancellation still ends the wait early.
-		ConfigPair{Key: "reftable.lockTimeout", Value: "10000"},
+		ConfigPair{Key: "reftable.lockTimeout", Value: fmt.Sprint(ReftableLockTimeoutMilliseconds)},
 		// Similarly, for loose references we bump the limit from 100 milliseconds to 1 second. We aim for a
 		// lower limit here as the locking for loose references is typically a lot more fine-grained. We have
 		// still observed lock contention around them though, but mostly in cases where the host system was

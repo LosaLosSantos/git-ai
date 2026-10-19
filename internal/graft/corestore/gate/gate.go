@@ -267,7 +267,9 @@ func targetRepo(mi protoregistry.MethodInfo, msg any) *gitalypb.Repository {
 // (corestore.KeyOf), while the locator resolves every spelling of a path to
 // the same directory: without this check "grp//proj.git" and "grp/proj.git"
 // would be two repositories in the database sharing one local copy. An empty
-// path is left to the handler, which rejects it itself.
+// path is left to the handler, which rejects it itself. A path inside Gitaly's
+// data directory is rejected too (corestore.CheckRelativePath): the stale-cache
+// rule must never act on a copy the storage core keeps there.
 func checkCanonical(repo *gitalypb.Repository) error {
 	rel := repo.GetRelativePath()
 	if rel == "" {
@@ -275,6 +277,9 @@ func checkCanonical(repo *gitalypb.Repository) error {
 	}
 	if clean := filepath.Clean(rel); clean != rel {
 		return structerr.NewInvalidArgument("relative path %q is not canonical in authoritative storage mode, use %q", rel, clean)
+	}
+	if err := corestore.CheckRelativePath(rel); err != nil {
+		return structerr.NewInvalidArgument("%w", err)
 	}
 	return nil
 }

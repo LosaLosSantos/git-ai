@@ -109,6 +109,12 @@ var transactionRPCs = map[string]transactionsCondition{
 	// The Graft storage core keeps its state in its own database, not in Git references. Its
 	// authoritative mode is not supported behind Praefect (see doc/graft/STORAGE.md).
 	"/gitaly.StorageCoreService/ImportRepository": transactionsDisabled,
+	// The storage core's operator RPCs write its database and its bucket, never the references
+	// or objects of a Gitaly replica, so there is nothing for the replicas to vote on:
+	// CreateCheckpoint records a pack and a row (authoritative mode only, which is refused
+	// behind Praefect); CollectGarbage deletes bucket objects and rows (also in shadow mode).
+	"/gitaly.StorageCoreService/CreateCheckpoint": transactionsDisabled,
+	"/gitaly.StorageCoreService/CollectGarbage":   transactionsDisabled,
 }
 
 // forcePrimaryRoutingRPCs tracks RPCs which need to always get routed to the primary. This should

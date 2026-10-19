@@ -34,6 +34,14 @@ func Open(ctx context.Context, cfg config.GraftStorage) (*corestore.Core, error)
 	if err != nil {
 		return nil, err
 	}
+	gcGrace, err := cfg.GCGraceOrDefault()
+	if err != nil {
+		return nil, err
+	}
+	gcMargin, err := cfg.GCMarginOrDefault()
+	if err != nil {
+		return nil, err
+	}
 
 	nodeID := cfg.NodeID
 	if nodeID == "" {
@@ -60,5 +68,7 @@ func Open(ctx context.Context, cfg config.GraftStorage) (*corestore.Core, error)
 		Blobs:         blobs,
 		SyncTimeout:   syncTimeout,
 		ShadowTimeout: shadowTimeout,
+		GCGrace:       gcGrace,
+		GCMargin:      gcMargin,
 	}, nil
 }

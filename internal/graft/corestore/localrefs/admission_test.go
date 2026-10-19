@@ -1,0 +1,177 @@
+package localrefs
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+
+	"github.com/feder-cr/git-ai/internal/testhelper"
+)
+
+func TestMain(m *testing.M) {
+	testhelper.Run(m)
+}
+
+func key(i byte) Key { return Key{i} }
+
+// queued returns an admission whose onWait reports every queued writer.
+func queued(waitBound, holdBound time.Duration) (*Admission, <-chan string) {
+	a := NewAdmission(waitBound, holdBound)
+	waiting := make(chan string, 16)
+	a.onWait = func(path string) { waiting <- path }
+	return a, waiting
+}
+
+// acquireAsync starts Acquire in the background, waits until the writer is
+// queued, and returns the channel of its result.
+func acquireAsync(ctx context.Context, t *testing.T, a *Admission, waiting <-chan string, path string, k Key) <-chan bool {
+	t.Helper()
+	result := make(chan bool, 1)
+	go func() { result <- a.Acquire(ctx, path, k, WriterHook) }()
+	require.Equal(t, path, <-waiting)
+	return result
+}
+
+func TestAdmissionAdmitsInArrivalOrder(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a, waiting := queued(time.Hour, time.Hour)
+
+	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	results := []<-chan bool{
+		acquireAsync(ctx, t, a, waiting, "repo", key(1)),
+		acquireAsync(ctx, t, a, waiting, "repo", key(2)),
+		acquireAsync(ctx, t, a, waiting, "repo", key(3)),
+	}
+	require.Equal(t, 3.0, testutil.ToFloat64(a.waiting))
+
+	// Another repository is not ordered behind them.
+	require.True(t, a.Acquire(ctx, "other", key(9), WriterHook))
+
+	for i, result := range results {
+		select {
+		case <-result:
+			t.Fatalf("writer %d admitted before the release of writer %d", i+1, i)
+		default:
+		}
+		a.Release("repo", key(byte(i)))
+		require.True(t, <-result, "writer %d", i+1)
+	}
+	a.Release("repo", key(3))
+	a.Release("other", key(9))
+
+	require.Empty(t, a.queues)
+	require.Equal(t, 0.0, testutil.ToFloat64(a.waiting))
+}
+
+func TestAdmissionCancelledWriterLeavesTheQueue(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a, waiting := queued(time.Hour, time.Hour)
+
+	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelled := acquireAsync(cancelCtx, t, a, waiting, "repo", key(1))
+	next := acquireAsync(ctx, t, a, waiting, "repo", key(2))
+
+	cancel()
+	require.False(t, <-cancelled)
+
+	a.Release("repo", key(0))
+	require.True(t, <-next)
+	a.Release("repo", key(2))
+	require.Empty(t, a.queues)
+	require.Equal(t, 0.0, testutil.ToFloat64(a.bypassed.WithLabelValues(WriterHook)))
+}
+
+func TestAdmissionWaitBoundFallsBackToGitsLock(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a := NewAdmission(20*time.Millisecond, time.Hour)
+
+	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	require.False(t, a.Acquire(ctx, "repo", key(1), WriterSyncer))
+	require.Equal(t, 1.0, testutil.ToFloat64(a.bypassed.WithLabelValues(WriterSyncer)))
+
+	// The writer that went on without an admission releases nothing.
+	a.Release("repo", key(1))
+	require.Equal(t, key(0), a.queues["repo"].holder.key)
+
+	a.Release("repo", key(0))
+	require.Empty(t, a.queues)
+}
+
+func TestAdmissionHoldBoundEndsALostAdmission(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a, waiting := queued(time.Hour, time.Hour)
+
+	// Writer 0 never releases (git died between its phases); the hold bound
+	// ends its admission, which is what its timer calls.
+	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	second := acquireAsync(ctx, t, a, waiting, "repo", key(1))
+	a.mu.Lock()
+	lost := a.queues["repo"].holder
+	a.mu.Unlock()
+	a.expire("repo", lost)
+	require.True(t, <-second)
+	require.Equal(t, 1.0, testutil.ToFloat64(a.expired))
+
+	// The late release of writer 0 does not end the admission of writer 1, and
+	// a second expiry of the lost admission does nothing.
+	a.Release("repo", key(0))
+	a.expire("repo", lost)
+	a.mu.Lock()
+	require.Equal(t, key(1), a.queues["repo"].holder.key)
+	a.mu.Unlock()
+	require.Equal(t, 1.0, testutil.ToFloat64(a.expired))
+
+	a.Release("repo", key(1))
+	require.Empty(t, a.queues)
+}
+
+func TestAdmissionHoldBoundTimer(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a := NewAdmission(time.Hour, 20*time.Millisecond)
+
+	// The first writer never releases: only the hold bound ends its admission.
+	// The bound may pass before the second writer queues (it is then admitted
+	// at once) or while it waits (it is then handed the admission): either way
+	// it is admitted, by the expiry, and long before its own wait bound.
+	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	require.True(t, a.Acquire(ctx, "repo", key(1), WriterHook))
+	require.Equal(t, 1.0, testutil.ToFloat64(a.expired))
+}
+
+func TestAdmissionUniqueKeysAreOrdered(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	a, waiting := queued(time.Hour, time.Hour)
+
+	release := a.AcquireUnique(ctx, "repo", WriterSyncer)
+	require.NotNil(t, release)
+
+	second := make(chan func(), 1)
+	go func() { second <- a.AcquireUnique(ctx, "repo", WriterSyncer) }()
+	require.Equal(t, "repo", <-waiting)
+
+	release()
+	releaseSecond := <-second
+	require.NotNil(t, releaseSecond)
+	releaseSecond()
+	require.Empty(t, a.queues)
+}
+
+func TestNilAdmissionAdmitsNothing(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+
+	var a *Admission
+	require.False(t, a.Acquire(ctx, "repo", key(0), WriterHook))
+	require.Nil(t, a.AcquireUnique(ctx, "repo", WriterSyncer))
+	a.Release("repo", key(0))
+}

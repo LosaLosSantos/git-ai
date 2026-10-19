@@ -26,12 +26,16 @@ import (
 //   - CleanupService and PartitionService are administrative: they rewrite and
 //     clean up repositories and partitions outside the reference policy.
 //   - InternalGitaly serves the internal calls between Gitaly nodes.
+//   - StorageCoreService is the storage core's administration: imports,
+//     checkpoints and garbage collection, which deletes packs of the bucket.
+//     It is reserved for operators (doc/graft/STORAGE.md).
 var agentNeverAllowedServices = []string{
 	gitalypb.HookService_ServiceDesc.ServiceName,
 	gitalypb.ObjectPoolService_ServiceDesc.ServiceName,
 	gitalypb.CleanupService_ServiceDesc.ServiceName,
 	gitalypb.PartitionService_ServiceDesc.ServiceName,
 	gitalypb.InternalGitaly_ServiceDesc.ServiceName,
+	gitalypb.StorageCoreService_ServiceDesc.ServiceName,
 }
 
 // agentNeverAllowedMethods are RPCs that no caller authenticated with a
@@ -94,10 +98,13 @@ var agentNeverAllowedMethods = map[string]struct{}{
 //   - ObjectService, ChangesetService and DerivedDataService: every RPC. They
 //     read objects, changesets and derived data.
 //   - SearchService (`graft search`): every RPC. It only reads a commit.
-//   - ReviewService (`graft review`): every RPC. Its mutators only write the
-//     review store of the repository, never references, and record the
-//     authenticated identity as the actor, so an agent cannot approve its own
-//     change on behalf of another agent.
+//   - ReviewService (`graft review`): every RPC. Its mutators write the review
+//     store of the repository and the keep-around references of the review's
+//     head and base commits (refs/keep-around/review/<commit>, REVIEW ROOTS
+//     RULE): the name is derived from a commit that must already be in the
+//     repository, so they cannot write a branch, a tag or any other name, nor
+//     add an object. They record the authenticated identity as the actor, so
+//     an agent cannot approve its own change on behalf of another agent.
 //   - The Find, List and Get RPCs of CommitService, RefService, BlobService and
 //     DiffService, which are read-only accessors.
 //   - CommitService.TreeEntry, which the SDK reads trees with.

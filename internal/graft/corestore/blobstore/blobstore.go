@@ -1,31 +1,49 @@
 // Package blobstore implements corestore.BlobStore on a gocloud bucket. Owned
 // by WP52 (doc/graft/PLAN6.md).
 //
-// Conditional writes. Put writes with blob.WriterOptions{IfNotExist: true}.
-// This was probed experimentally with gocloud.dev v0.46.0: the memblob and
-// fileblob drivers support IfNotExist, and an existing key is reported by
-// Close as gcerrors.FailedPrecondition. (The gocloud documentation names
-// gcerrors.PreconditionFailed, which these drivers do not return.) Put treats
-// FailedPrecondition as success, and it checks Exists first, so an existing
-// key never reads the content. No plain-write fallback is implemented for a
-// driver that reports gcerrors.Unimplemented: no registered driver does so
-// (checked against gocloud.dev v0.46.0: s3blob, gcsblob, azureblob, memblob and
-// fileblob all implement IfNotExist), and by the time Close reports it the
-// reader is consumed, so a fallback would need a second copy of the content.
-// Such an error is returned instead.
+// Create-only writes. Every upload uses a new owned key (corestore.NewPackKey),
+// so an object is never shared between two writers, and Put never succeeds on a
+// key that exists: it returns corestore.ErrBlobExists and leaves the stored
+// object as it is (doc/graft/PLAN7.md, PACK OWNERSHIP RULE). Put writes with
+// blob.WriterOptions{IfNotExist: true}; the drivers report an existing key from
+// the writer's Close as gcerrors.FailedPrecondition (the gocloud documentation
+// names gcerrors.PreconditionFailed, which they do not return). Every registered
+// driver implements IfNotExist (checked against gocloud.dev v0.46.0: s3blob,
+// gcsblob, azureblob, memblob and fileblob), so no plain-write fallback exists.
+//
+// Exactly one of concurrent Puts of a key wins. memblob checks and inserts
+// under its bucket-wide mutex, and S3, GCS and Azure use conditional requests
+// that the server decides. fileblob does not: its writer's Close stats the key
+// and then renames the temporary file onto it, under a mutex created per writer
+// (gocloud.dev v0.46.0, fileblob.go 764 and 789), so two writers of one key both
+// succeed and the second rename overwrites the first, in one process or across
+// processes and hosts sharing the bucket. For file buckets Put therefore
+// publishes the object itself with link(2) (publishFile), which the filesystem
+// makes atomic and create-only for every writer: fileblob's writer creates the
+// temporary file (<path>.<hex nanos>.tmp, so the key-to-path mapping stays
+// fileblob's) and receives the content, the link gives it the key's name, and
+// the writer is then discarded, which only removes the temporary name. File
+// buckets therefore need a filesystem with hard links; one without them fails
+// every Put with a clear error. No .attrs sidecar is bypassed: file buckets are
+// opened with MetadataDontWrite.
 //
 // Atomic objects. gocloud writers commit the object on Close and discard it
 // when the writer's context is cancelled before Close (probed: a cancelled
 // writer leaves no object). Put cancels before Close on every failure, so a
 // reader never sees a partial object.
 //
-// Durability of file buckets. The fileblob driver renames its temporary file
-// into place on Close without any fsync. A changeset row in the database
-// (synchronous=FULL) can therefore outlive a pack whose data never reached the
-// disk, and because Put skips existing keys, such a pack would never be
-// repaired. For file buckets Put fsyncs the content before Close, and fsyncs
-// the directories that hold the new entry (up to the bucket root) after Close.
-// The mem and remote drivers commit their objects durably themselves.
+// Durability of file buckets. Neither fileblob's writer nor a link fsyncs
+// anything, and a changeset row in the database (synchronous=FULL) could
+// outlive a pack whose data never reached the disk. For file buckets Put fsyncs
+// the content before the link publishes it, and fsyncs the directories that
+// hold the new entry (up to the bucket root) after it. The mem and remote
+// drivers commit their objects durably themselves.
+//
+// Listing. List reports objects only. fileblob also reports a writer's
+// temporary file (<key>.<nanos>.tmp, in the key's directory because file
+// buckets are opened with NoTempDir) while the write is in flight, and one that
+// a crashed writer left behind. Callers that act on a listing (the garbage
+// collector) must treat keys they did not write accordingly.
 //
 // Integrity. Pack keys (corestore.ParsePackKey) are verified: Put hashes the
 // content while writing and refuses content that does not match its key, and
@@ -43,9 +61,11 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
@@ -152,14 +172,6 @@ func withS3DefaultChecksumCalculation(parsed *url.URL) string {
 
 // Put implements corestore.BlobStore.
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
-	exists, err := s.bucket.Exists(ctx, key)
-	if err != nil {
-		return fmt.Errorf("blobstore: check %q: %w", key, err)
-	}
-	if exists {
-		return nil
-	}
-
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -207,28 +219,91 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 	}
 
 	if file != nil {
-		// Close renames the file into place. The content must reach the disk
+		// The link below publishes the file. The content must reach the disk
 		// first: a database row may reference this object after a power loss.
 		if err := syncFile(file); err != nil {
 			return abort(fmt.Errorf("blobstore: sync %q: %w", key, err))
 		}
 	}
 
-	closeErr := w.Close()
-	if closeErr != nil && gcerrors.Code(closeErr) != gcerrors.FailedPrecondition {
-		return fmt.Errorf("blobstore: close writer %q: %w", key, closeErr)
-	}
-
-	// The rename (or, with FailedPrecondition, the key that another writer
-	// created first, whose content is the same) is durable only once its
-	// directory is synced.
 	if file != nil {
+		// fileblob's own Close is not a create-only publish (see the package doc):
+		// the content is published by a link, and the writer is then discarded
+		// (abort), which only removes the temporary name.
+		if err := publishFile(file.Name()); err != nil {
+			return abort(fmt.Errorf("blobstore: put %q: %w", key, err))
+		}
+		_ = abort(nil)
+
+		// The new name is durable only once its directory is synced.
 		if err := s.syncDirs(filepath.Dir(file.Name())); err != nil {
 			return fmt.Errorf("blobstore: sync directories of %q: %w", key, err)
 		}
+		return nil
 	}
 
+	closeErr := w.Close()
+	if gcerrors.Code(closeErr) == gcerrors.FailedPrecondition {
+		// The writer's Close discarded its content: the stored object is untouched.
+		return fmt.Errorf("blobstore: put %q: %w", key, corestore.ErrBlobExists)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("blobstore: close writer %q: %w", key, closeErr)
+	}
 	return nil
+}
+
+// publishFile gives tmp, the temporary file of a fileblob writer, the name of
+// its key, create-only and atomically: link(2) fails with EEXIST when the name
+// exists, for every writer of the filesystem, other hosts of a network
+// filesystem included. A network filesystem can also report EEXIST for a link
+// that succeeded but whose reply was lost and retransmitted: when the name is
+// then the same file as tmp, the link was this writer's and the publish
+// succeeded. A conflict is corestore.ErrBlobExists.
+func publishFile(tmp string) error {
+	final, ok := finalPath(tmp)
+	if !ok {
+		return fmt.Errorf("unexpected temporary file name %q", tmp)
+	}
+
+	err := os.Link(tmp, final)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("link %q (file buckets need a filesystem with hard links): %w", final, err)
+	}
+
+	tmpInfo, statErr := os.Stat(tmp)
+	if statErr != nil {
+		return fmt.Errorf("stat %q after a link conflict: %w", tmp, statErr)
+	}
+	finalInfo, statErr := os.Stat(final)
+	if statErr != nil {
+		return fmt.Errorf("stat %q after a link conflict: %w", final, statErr)
+	}
+	if os.SameFile(tmpInfo, finalInfo) {
+		return nil
+	}
+	return corestore.ErrBlobExists
+}
+
+// finalPath returns the path of the object whose temporary file fileblob named
+// tmp: "<path>.<hex nanoseconds>.tmp" in the object's directory (file buckets
+// are opened with NoTempDir).
+func finalPath(tmp string) (string, bool) {
+	rest, ok := strings.CutSuffix(tmp, ".tmp")
+	if !ok {
+		return "", false
+	}
+	i := strings.LastIndex(rest, ".")
+	if i <= 0 || i == len(rest)-1 {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(rest[i+1:], 16, 64); err != nil {
+		return "", false
+	}
+	return rest[:i], true
 }
 
 // syncFile fsyncs the temporary file of a file bucket writer.
@@ -242,8 +317,8 @@ func syncFile(f *os.File) error {
 }
 
 // syncDirs fsyncs dir and, when dir is inside the bucket root, each of its
-// ancestors up to the root: the directories that Put or the driver may have
-// created, and the entry that the rename created.
+// ancestors up to the root: the directories that the driver may have created,
+// and the entry that the link created.
 func (s *Store) syncDirs(dir string) error {
 	inside := dir == s.root || strings.HasPrefix(dir, s.root+string(filepath.Separator))
 	for d := dir; ; d = filepath.Dir(d) {
@@ -304,6 +379,100 @@ func (s *Store) Exists(ctx context.Context, key string) (bool, error) {
 		return false, fmt.Errorf("blobstore: exists %q: %w", key, err)
 	}
 	return exists, nil
+}
+
+// List implements corestore.BlobStore. An object deleted while the listing
+// runs is either listed or not, never an error: garbage collection deletes
+// objects while other runs list them.
+func (s *Store) List(ctx context.Context, prefix string, fn func(corestore.BlobInfo) error) error {
+	if s.root != "" {
+		return s.listFiles(ctx, prefix, fn)
+	}
+
+	it := s.bucket.List(&blob.ListOptions{Prefix: prefix})
+	for {
+		obj, err := it.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("blobstore: list %q: %w", prefix, err)
+		}
+		if obj.IsDir {
+			continue
+		}
+		if err := fn(corestore.BlobInfo{Key: obj.Key, Size: obj.Size}); err != nil {
+			return err
+		}
+	}
+}
+
+// listFiles lists a file bucket by walking its directory. fileblob's own
+// listing reads a directory and then stats each entry, and fails with NotFound
+// when an entry was deleted in between; here such an entry is an object that is
+// gone and is not listed. Keys are the slash-separated paths below the root
+// (the storage core writes no key that fileblob would escape); directories are
+// not objects.
+func (s *Store) listFiles(ctx context.Context, prefix string, fn func(corestore.BlobInfo) error) error {
+	start := s.root
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
+		start = filepath.Join(s.root, filepath.FromSlash(prefix[:i]))
+	}
+
+	// The error of fn is returned as it is (the BlobStore contract).
+	var fnErr error
+	err := filepath.WalkDir(start, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// The directory, or the entry, is gone: nothing to list there.
+				return nil
+			}
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(s.root, path)
+		if err != nil {
+			return err
+		}
+		key := filepath.ToSlash(rel)
+		if !strings.HasPrefix(key, prefix) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := fn(corestore.BlobInfo{Key: key, Size: info.Size()}); err != nil {
+			fnErr = err
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if fnErr != nil {
+		return fnErr
+	}
+	if err != nil {
+		return fmt.Errorf("blobstore: list %q: %w", prefix, err)
+	}
+	return nil
+}
+
+// Delete implements corestore.BlobStore.
+func (s *Store) Delete(ctx context.Context, key string) error {
+	if err := s.bucket.Delete(ctx, key); err != nil && gcerrors.Code(err) != gcerrors.NotFound {
+		return fmt.Errorf("blobstore: delete %q: %w", key, err)
+	}
+	return nil
 }
 
 // Close implements corestore.BlobStore.

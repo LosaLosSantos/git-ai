@@ -2,20 +2,32 @@ package corestore
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"path"
 	"strings"
 	"time"
 
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 )
 
-// BlobStore is the object storage of the storage core. Keys are
-// content-addressed (see PackKey), so objects are immutable: Put never
-// overwrites. Implementations: blobstore (any gocloud bucket URL).
+// BlobStore is the object storage of the storage core. Objects are immutable
+// and every pack object belongs to exactly one database row: each upload uses a
+// new owned key (NewPackKey), and Put never overwrites nor shares an object
+// (doc/graft/PLAN7.md, PACK OWNERSHIP RULE). Implementations: blobstore (any
+// gocloud bucket URL).
 type BlobStore interface {
-	// Put stores the content under key if the key does not exist yet. An
-	// existing key is success: its content is the same by construction.
+	// Put stores the content under key, which must not exist: an existing key is
+	// ErrBlobExists and the stored object is left unchanged. Of concurrent Puts
+	// of one key exactly one succeeds. For a pack key (see ParsePackKey) the
+	// content must hash to the key's SHA-256, else ErrBlobCorrupt. A Put whose
+	// context ends before it commits stores nothing. After any error the caller
+	// must not reference the key: an object a failed Put may have left (its
+	// commit succeeded but making it durable failed) is an orphan that garbage
+	// collection reclaims, never an object another writer relies on.
 	Put(ctx context.Context, key string, r io.Reader) error
 	// Get returns the content, or ErrBlobNotFound. For a pack key (see
 	// ParsePackKey) the reader returns ErrBlobCorrupt instead of io.EOF when
@@ -23,8 +35,24 @@ type BlobStore interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	// Exists reports whether the key exists.
 	Exists(ctx context.Context, key string) (bool, error)
+	// List calls fn for every object whose key starts with prefix, in no
+	// defined order. Directories are not objects. An error returned by fn stops
+	// the iteration and is returned as it is. An object deleted while the
+	// listing runs is listed or not, never an error (collections overlap).
+	List(ctx context.Context, prefix string, fn func(BlobInfo) error) error
+	// Delete removes the object. A key that does not exist is success, so a
+	// collection that is run again never fails on an object it deleted before.
+	Delete(ctx context.Context, key string) error
 	// Close releases the bucket.
 	Close() error
+}
+
+// BlobInfo describes a stored object. It has no modification time on purpose:
+// garbage collection never decides on bucket clocks (doc/graft/PLAN7.md, CLOCK
+// RULE).
+type BlobInfo struct {
+	Key  string
+	Size int64
 }
 
 // Watermark is how far the local cache of a repository is: every changeset
@@ -65,6 +93,95 @@ type Core struct {
 	// one reference transaction.
 	SyncTimeout   time.Duration
 	ShadowTimeout time.Duration
+	// GCGrace is how long garbage collection waits before it deletes a pack it
+	// observed unreferenced, and how old a checkpoint must be before the packs it
+	// covers are deleted. GCMargin is the safety margin of the writers' deadline,
+	// WriteDeadline() = GCGrace - GCMargin (doc/graft/PLAN7.md, PACK OWNERSHIP
+	// RULE 4). Both are set whenever the storage core is on: garbage collection
+	// runs in shadow mode too.
+	GCGrace  time.Duration
+	GCMargin time.Duration
+	// RefAdmission orders the local reference writers of the node and
+	// RefDurability defers the durability of their writes to a durable step
+	// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). Both are set in
+	// authoritative mode only; nil admits nothing and keeps every reference write
+	// durable by itself.
+	RefAdmission  *localrefs.Admission
+	RefDurability *localrefs.Durability
+}
+
+// WriteDeadline is W of doc/graft/PLAN7.md: a writer uploads a pack and
+// commits the row that references it within W of a read of the repository
+// record that found the repository.
+func (c *Core) WriteDeadline() time.Duration { return c.GCGrace - c.GCMargin }
+
+// PackUpload is a pack uploaded under a new owned key (NewPackKey) and the
+// deadline before which a row may reference it.
+type PackUpload struct {
+	// Key is the owned key, empty when there was nothing to upload (the
+	// transaction brings no new objects).
+	Key   string
+	Bytes int64
+	// Deadline is the time of the repository-record read that preceded the
+	// upload plus WriteDeadline(). It keeps the monotonic clock reading of that
+	// read, so that it is compared on the monotonic clock.
+	Deadline time.Time
+	// DBDeadline is the same deadline on the database clock: the record's
+	// ReadAt plus WriteDeadline(). The commit of the row that references the
+	// pack checks it in its transaction (ChangesetInput.PackDeadline,
+	// CheckpointInput.PackDeadline): the monotonic clock stops while the host
+	// is suspended or the VM paused, the database clock does not.
+	DBDeadline time.Time
+}
+
+// UploadPack uploads the pack read from r (size bytes whose SHA-256 is sum)
+// under a new owned key of the repository. record was returned by a read of the
+// repository record that found the repository (GetRepository: its ReadAt is
+// the database time of that read), and readAt is the time taken before that
+// read; the upload must end before readAt + WriteDeadline(), else it is
+// cancelled (nothing is stored) and the error wraps ErrPackDeadline. It is the
+// only way the storage core uploads a pack (doc/graft/PLAN7.md, RULE 26).
+func (c *Core) UploadPack(ctx context.Context, record Repository, readAt time.Time, sum [32]byte, size int64, r io.Reader) (PackUpload, error) {
+	if c.GCGrace <= 0 || c.GCMargin <= 0 || c.WriteDeadline() <= 0 {
+		return PackUpload{}, fmt.Errorf("storage core: invalid write deadline: gc_grace %s, gc_margin %s", c.GCGrace, c.GCMargin)
+	}
+	if record.ReadAt.IsZero() {
+		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: the record carries no database read time", record.ID)
+	}
+
+	deadline := readAt.Add(c.WriteDeadline())
+	if !time.Now().Before(deadline) {
+		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: %w", record.ID, ErrPackDeadline)
+	}
+
+	putCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	key := NewPackKey(record.ID, sum)
+	if err := c.Blobs.Put(putCtx, key, r); err != nil {
+		if ctx.Err() == nil && errors.Is(putCtx.Err(), context.DeadlineExceeded) {
+			return PackUpload{}, fmt.Errorf("storage core: upload %q: %w: %w", key, ErrPackDeadline, err)
+		}
+		return PackUpload{}, fmt.Errorf("storage core: upload %q: %w", key, err)
+	}
+
+	return PackUpload{Key: key, Bytes: size, Deadline: deadline, DBDeadline: record.ReadAt.Add(c.WriteDeadline())}, nil
+}
+
+// CommitContext returns ctx bounded by the upload's deadline, for the commit of
+// the row that references the pack. When the deadline has passed it returns
+// ErrPackDeadline: the caller must not start the commit and must not reference
+// the key. An upload without a key (nothing uploaded) has no deadline.
+func (u PackUpload) CommitContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if u.Key == "" {
+		ctx, cancel := context.WithCancel(ctx)
+		return ctx, cancel, nil
+	}
+	if !time.Now().Before(u.Deadline) {
+		return nil, nil, fmt.Errorf("storage core: commit the changeset of pack %q: %w", u.Key, ErrPackDeadline)
+	}
+	ctx, cancel := context.WithDeadline(ctx, u.Deadline)
+	return ctx, cancel, nil
 }
 
 // Enabled reports whether the storage core is on (shadow or authoritative).
@@ -91,6 +208,23 @@ func (c *Core) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// ErrReservedRelativePath is returned for a repository named inside Gitaly's
+// own data directory of a storage (config.GitalyDataPrefix): the temporary,
+// cache and state directories, the dirty markers, and the untrusted copies the
+// storage core keeps for an operator. A request naming one could make the
+// storage core treat a kept copy as a stale cache and remove it.
+var ErrReservedRelativePath = errors.New("the relative path is inside Gitaly's data directory of the storage, which no request may name")
+
+// CheckRelativePath rejects a relative path that names Gitaly's data directory
+// of the storage or anything in it (ErrReservedRelativePath).
+func CheckRelativePath(relativePath string) error {
+	rel := NormalizeRelativePath(relativePath)
+	if rel == config.GitalyDataPrefix || strings.HasPrefix(rel, config.GitalyDataPrefix+"/") {
+		return fmt.Errorf("%w: %q", ErrReservedRelativePath, relativePath)
+	}
+	return nil
 }
 
 // KeyOf returns the RepoKey of a gitaly repository. The relative path is

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/feder-cr/git-ai/internal/featureflag"
@@ -738,6 +739,14 @@ func TestObjectReader_queue(t *testing.T) {
 	})
 }
 
+// TestObjectReader_logging verifies which failures of a cat-file process are
+// logged at error level. The process fails with "fatal: not a git repository"
+// when its repository is not valid at its startup. Each case makes the
+// repository invalid before the process starts, so that the process fails at its startup
+// whatever the scheduling: removing it while the process starts raced with
+// git's repository setup, and a process that won the race exited cleanly and
+// logged nothing. Each case checks that the process did fail, so that the
+// assertion on the log is never vacuous.
 func TestObjectReader_logging(t *testing.T) {
 	ctx := testhelper.Context(t)
 	cfg := testcfg.Build(t)
@@ -755,13 +764,18 @@ func TestObjectReader_logging(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(cleanup)
 
-		reader, err := newObjectReader(ctx, newRepoExecutor(t, cfg, quarantineDir.QuarantinedRepo()), nil)
-		require.NoError(t, err)
-
+		// The quarantine is migrated, and its object directory removed, before
+		// the process that points at it starts: the evicted cat-file process of
+		// a migrated quarantine.
+		quarantined := quarantineDir.QuarantinedRepo()
 		require.NoError(t, quarantineDir.Migrate(ctx))
+
+		reader, err := newObjectReader(ctx, newRepoExecutor(t, cfg, quarantined), nil)
+		require.NoError(t, err)
 
 		reader.close()
 
+		require.Error(t, reader.cmd.Wait(), "the process failed: its object directory is gone")
 		require.Nil(t, hook.LastEntry())
 	})
 
@@ -773,13 +787,21 @@ func TestObjectReader_logging(t *testing.T) {
 			SkipCreationViaService: true,
 		})
 
+		// A HEAD that is neither a symbolic reference nor an object ID makes git
+		// refuse the directory as a repository at its startup (validate_headref
+		// in git's setup.c). Gitaly's validation before the spawn only checks
+		// that HEAD exists, and the config, which the reader reads for the
+		// object hash, stays.
+		require.NoError(t, os.WriteFile(filepath.Join(repoPath, "HEAD"), []byte("not a reference\n"), 0o644))
+
 		reader, err := newObjectReader(ctx, newRepoExecutor(t, cfg, repoProto), nil)
 		require.NoError(t, err)
 
-		require.NoError(t, os.RemoveAll(repoPath))
-
 		reader.close()
 
-		require.NotNil(t, hook.LastEntry())
+		require.Error(t, reader.cmd.Wait(), "the process failed: its HEAD is not valid")
+		entry := hook.LastEntry()
+		require.NotNil(t, entry)
+		require.Contains(t, entry.Message, "not a git repository")
 	})
 }

@@ -20,8 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/blobstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 	"github.com/stretchr/testify/require"
 )
@@ -135,6 +137,14 @@ type Options struct {
 	BucketURL   string
 	// NodeID is the node name; empty means "node-a".
 	NodeID string
+	// GCGrace and GCMargin are the garbage collection times; zero means the
+	// production defaults (1h and 5m). A test of the writers' deadline sets them
+	// short.
+	GCGrace  time.Duration
+	GCMargin time.Duration
+	// ShadowTimeout is the shadow budget of a transaction; zero means the
+	// production default (5s).
+	ShadowTimeout time.Duration
 }
 
 // Open opens a storage core for the test and closes it when the test ends.
@@ -156,6 +166,15 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 	if opts.NodeID == "" {
 		opts.NodeID = "node-a"
 	}
+	if opts.GCGrace == 0 {
+		opts.GCGrace = time.Hour
+	}
+	if opts.GCMargin == 0 {
+		opts.GCMargin = 5 * time.Minute
+	}
+	if opts.ShadowTimeout == 0 {
+		opts.ShadowTimeout = 5 * time.Second
+	}
 
 	ctx := context.Background()
 
@@ -171,9 +190,52 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 		Meta:          meta,
 		Blobs:         blobs,
 		SyncTimeout:   10 * time.Second,
-		ShadowTimeout: 5 * time.Second,
+		ShadowTimeout: opts.ShadowTimeout,
+		GCGrace:       opts.GCGrace,
+		GCMargin:      opts.GCMargin,
 	}
 	tb.Cleanup(func() { _ = core.Close() })
 
 	return core
 }
+
+// EnableLocalRefs gives the core the admission and the deferred durability of
+// the local reference writes, owning the storages of cfg, as gitaly serve does
+// in authoritative mode (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). The
+// boot identity is a fixed test value and the recovery grace 0 unless opts set
+// others. A deferred
+// durability the core had is closed first, as when its process exits.
+func EnableLocalRefs(tb testing.TB, core *corestore.Core, cfg config.Cfg, opts ...localrefs.DurabilityOption) {
+	tb.Helper()
+
+	if core.RefDurability != nil {
+		require.NoError(tb, core.RefDurability.Close())
+	}
+	core.RefAdmission = localrefs.NewAdmission(10*time.Second, 10*time.Second)
+	durability, err := localrefs.NewDurability(config.NewLocator(cfg), 0, append([]localrefs.DurabilityOption{localrefs.WithBootID(TestBootID), localrefs.WithRecoveryGrace(0)}, opts...)...)
+	require.NoError(tb, err)
+	// A git process forked at the moment a previous durability closed its lock
+	// holds a copy of it until it execs (close-on-exec): the lock can be busy for
+	// that short while.
+	require.Eventually(tb, func() bool {
+		owned, err := durability.TryOwn(context.Background(), StorageNames(cfg))
+		require.NoError(tb, err)
+		return owned
+	}, 10*time.Second, time.Millisecond, "another durability of the test owns the storages")
+	durability.Activate()
+	tb.Cleanup(func() { _ = durability.Close() })
+	core.RefDurability = durability
+}
+
+// StorageNames returns the names of the storages of cfg.
+func StorageNames(cfg config.Cfg) []string {
+	names := make([]string, 0, len(cfg.Storages))
+	for _, s := range cfg.Storages {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+// TestBootID is the boot identity EnableLocalRefs gives the deferred
+// durability by default.
+const TestBootID = "test-boot"

@@ -7,22 +7,26 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"unicode/utf8"
 
+	"github.com/feder-cr/git-ai/internal/graft/workspace"
 	"github.com/feder-cr/git-ai/sdk"
 )
 
 // storageSynopsis is the command line of graft storage.
-const storageSynopsis = "usage: graft storage import|state|verify [-repo R] [--connectivity] [--json]"
+const storageSynopsis = "usage: graft storage import|state|verify|checkpoint|gc [-repo R] [--connectivity] [--dry-run] [--removed] [--json]"
 
 // storageUsage lists the subcommands of graft storage.
-const storageUsage = "storage requires a subcommand: import, state or verify (" + storageSynopsis + ")"
+const storageUsage = "storage requires a subcommand: import, state, verify, checkpoint or gc (" + storageSynopsis + ")"
 
 // storageFlags holds the flags of graft storage. Each subcommand reads only
-// some of them, as its help text says.
+// some of them, as its help text says, and rejects the others (checkUsed).
 type storageFlags struct {
 	repo         string
 	connectivity bool
+	dryRun       bool
+	removed      bool
 }
 
 // storageCommand returns the storage command, the operator's view of the
@@ -37,7 +41,9 @@ func storageCommand() command {
 			}
 			fs.StringVar(&f.repo, "repo", "", "repository path, used without a workspace together with -address and -storage")
 			fs.BoolVar(&f.connectivity, "connectivity", false, "verify: also check the connectivity of the local repository (git fsck --connectivity-only) and that the object storage holds every object of the database references")
-			fs.BoolVar(&o.jsonOut, "json", false, "import, state, verify: print the result as one JSON object")
+			fs.BoolVar(&f.dryRun, "dry-run", false, "gc: report what would be deleted, delete nothing")
+			fs.BoolVar(&f.removed, "removed", false, "gc: collect the removed repositories of the storage (-storage) instead of one repository; takes no -repo")
+			fs.BoolVar(&o.jsonOut, "json", false, "print the result as one JSON object")
 		},
 		run: func(ctx context.Context, out io.Writer, o *options, args []string) error {
 			return cmdStorage(ctx, out, o, f, args)
@@ -52,6 +58,11 @@ func cmdStorage(ctx context.Context, out io.Writer, o *options, f *storageFlags,
 		return usagef("%s", storageUsage)
 	}
 	sub, rest := args[0], args[1:]
+	if used, known := storageSubcommandFlags[sub]; known {
+		if err := f.checkUsed(sub, used); err != nil {
+			return err
+		}
+	}
 	switch sub {
 	case "import":
 		return storageImport(ctx, out, o, f, rest)
@@ -59,8 +70,163 @@ func cmdStorage(ctx context.Context, out io.Writer, o *options, f *storageFlags,
 		return storageState(ctx, out, o, f, rest)
 	case "verify":
 		return storageVerify(ctx, out, o, f, rest)
+	case "checkpoint":
+		return storageCheckpoint(ctx, out, o, f, rest)
+	case "gc":
+		return storageGC(ctx, out, o, f, rest)
 	}
 	return usagef("unknown storage subcommand %q: %s", sub, storageUsage)
+}
+
+// storageSubcommandFlags are the subcommand-specific flags each subcommand
+// reads.
+var storageSubcommandFlags = map[string][]string{
+	"import":     nil,
+	"state":      nil,
+	"verify":     {"connectivity"},
+	"checkpoint": nil,
+	"gc":         {"dry-run", "removed"},
+}
+
+// checkUsed rejects a subcommand-specific flag that the subcommand sub does not
+// read: a flag that does nothing must not look accepted (checkpoint --dry-run
+// would create a checkpoint).
+func (f *storageFlags) checkUsed(sub string, used []string) error {
+	for _, flag := range []struct {
+		name string
+		set  bool
+	}{
+		{"connectivity", f.connectivity},
+		{"dry-run", f.dryRun},
+		{"removed", f.removed},
+	} {
+		if flag.set && !slices.Contains(used, flag.name) {
+			return usagef("storage %s does not take --%s: %s", sub, flag.name, storageSynopsis)
+		}
+	}
+	return nil
+}
+
+func storageCheckpoint(ctx context.Context, out io.Writer, o *options, f *storageFlags, args []string) error {
+	if len(args) != 0 {
+		return usagef("storage checkpoint takes flags only: checkpoint [-repo R] [--json]")
+	}
+	repo, err := openStorage(ctx, o, f)
+	if err != nil {
+		return err
+	}
+	res, err := repo.StorageCheckpoint(ctx)
+	if err != nil {
+		return mapError(err)
+	}
+	if o.jsonOut {
+		return writeStorageJSON(out, res)
+	}
+	switch {
+	case res.Sequence == 0:
+		fmt.Fprintln(out, "no checkpoint: the repository has no object to consolidate")
+	case res.Created:
+		fmt.Fprintf(out, "checkpoint created at changeset %d: %d references, pack %d bytes\n", res.Sequence, res.References, res.PackBytes)
+	default:
+		fmt.Fprintf(out, "checkpoint at changeset %d exists already: %d references, pack %d bytes\n", res.Sequence, res.References, res.PackBytes)
+	}
+	return nil
+}
+
+func storageGC(ctx context.Context, out io.Writer, o *options, f *storageFlags, args []string) error {
+	if len(args) != 0 {
+		return usagef("storage gc takes flags only: gc [-repo R] [--dry-run] [--json], or gc --removed [-storage S] [--dry-run] [--json]")
+	}
+	if f.removed {
+		if f.repo != "" {
+			return usagef("storage gc --removed collects the removed repositories of a storage and takes no -repo")
+		}
+		return storageGCRemoved(ctx, out, o, f)
+	}
+
+	repo, err := openStorage(ctx, o, f)
+	if err != nil {
+		return err
+	}
+	res, err := repo.StorageGC(ctx, f.dryRun)
+	if err != nil {
+		return mapError(err)
+	}
+	if o.jsonOut {
+		return writeStorageJSON(out, res)
+	}
+	verb := "deleted"
+	if res.DryRun {
+		verb = "would delete"
+	}
+	fmt.Fprintf(out, "%s %d objects (%d bytes): %d covered by the checkpoint at changeset %d, %d superseded checkpoints, %d orphans\n",
+		verb, res.PacksDeleted, res.BytesReclaimed, res.CoveredDeleted, res.Boundary, res.CheckpointsDropped, res.OrphansDeleted)
+	fmt.Fprintf(out, "orphans observed now %d, still in their grace period %d\n", res.OrphansObserved, res.OrphansInGrace)
+	return nil
+}
+
+func storageGCRemoved(ctx context.Context, out io.Writer, o *options, f *storageFlags) error {
+	client, err := openStorageClient(ctx, o)
+	if err != nil {
+		return err
+	}
+	res, err := client.StorageGCRemoved(ctx, "", f.dryRun)
+	if err != nil {
+		return mapError(err)
+	}
+	if o.jsonOut {
+		return writeStorageJSON(out, res)
+	}
+	verb := "deleted"
+	if res.DryRun {
+		verb = "would delete"
+	}
+	fmt.Fprintf(out, "%s %d objects (%d bytes) of %d removed repositories of storage %s\n",
+		verb, res.PacksDeleted, res.BytesReclaimed, res.Repositories, displayText(client.Storage()))
+	if res.LeaksFound > 0 {
+		recorded := "recorded"
+		if res.DryRun {
+			recorded = "would record"
+		}
+		fmt.Fprintf(out, "found %d repository IDs with objects and no row or tombstone; %s %d tombstones (their objects are deleted after gc_grace)\n",
+			res.LeaksFound, recorded, res.LeaksTombstoned)
+	}
+	if res.IDsAheadOfAllocator > 0 {
+		fmt.Fprintf(out, "warning: %d repository IDs above the database's allocator have objects in the bucket (a database restored from an older backup?); they are left alone\n",
+			res.IDsAheadOfAllocator)
+	}
+	return nil
+}
+
+// openStorageClient returns the client of a storage-wide command: the server
+// and the storage of the workspace, or without a workspace -address and
+// -storage.
+func openStorageClient(ctx context.Context, o *options) (*sdk.Client, error) {
+	var t target
+	if root, err := workspaceRoot(o); err == nil {
+		if meta, err := workspace.ReadMeta(root); err == nil {
+			t = target{Address: pick(o.address, meta.Address), Token: o.token, Storage: pick(o.storage, meta.Storage), Repo: meta.Repo, User: o.user}
+		}
+	}
+	if t.Address == "" {
+		if o.address == "" {
+			return nil, usagef("storage gc --removed needs a workspace or -address")
+		}
+		t = target{Address: o.address, Token: o.token, Storage: o.storage, User: o.user}
+	}
+
+	// A storage-wide command names no repository, which the workspace backend
+	// requires: the client is dialed with the same options.
+	opts := []sdk.DialOption{sdk.WithStorage(pick(t.Storage, defaultStorage))}
+	if t.Token != "" {
+		opts = append(opts, sdk.WithToken(t.Token))
+	}
+	client, err := sdk.Dial(ctx, t.Address, opts...)
+	if err != nil {
+		return nil, err
+	}
+	registerCloser(ctx, client)
+	return client, nil
 }
 
 func storageImport(ctx context.Context, out io.Writer, o *options, f *storageFlags, args []string) error {

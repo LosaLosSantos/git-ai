@@ -1,0 +1,644 @@
+package maintenance_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+
+	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/checkpoint"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gc"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/maintenance"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+)
+
+func TestMain(m *testing.M) {
+	testhelper.Run(m)
+}
+
+const relPath = "repo.git"
+
+// env is one node with a repository of the storage core: its database record,
+// a source repository its packs are built from, and the node's syncer.
+type env struct {
+	t      *testing.T
+	cfg    config.Cfg
+	core   *corestore.Core
+	sy     *syncer.Syncer
+	cp     *checkpoint.Checkpointer
+	runner *maintenance.Runner
+	repo   corestore.Repository
+	src    *localrepo.Repo
+	srcDir string
+	head   git.ObjectID
+}
+
+func newEnv(t *testing.T, opts coretest.Options, cfg maintenance.Config) *env {
+	t.Helper()
+
+	gcfg := testcfg.Build(t)
+	ctx := testhelper.Context(t)
+	logger := testhelper.NewLogger(t)
+	locator := config.NewLocator(gcfg)
+	gitCmdFactory := gittest.NewCommandFactory(t, gcfg)
+	cache := catfile.NewCache(gcfg)
+	t.Cleanup(cache.Stop)
+	repoFactory := localrepo.NewFactory(logger, locator, gitCmdFactory, cache)
+
+	core := coretest.Open(t, opts)
+	sy := syncer.New(core, logger, locator, repoFactory, gitCmdFactory)
+	cp := checkpoint.New(core, logger, locator, repoFactory, sy)
+	runner := maintenance.New(core, cp, gc.New(core, logger), sy, logger, cfg, []string{gcfg.Storages[0].Name})
+
+	srcPB, srcDir := gittest.CreateRepository(t, ctx, gcfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	e := &env{t: t, cfg: gcfg, core: core, sy: sy, cp: cp, runner: runner, src: localrepo.NewTestRepo(t, gcfg, srcPB), srcDir: srcDir}
+
+	repo, _, err := core.Meta.RegisterRepository(ctx, e.key(), gittest.DefaultObjectHash.Format, corestore.InitialState{})
+	require.NoError(t, err)
+	e.repo = repo
+	e.head = e.commit("c0")
+	e.changeset([]corestore.RefUpdate{
+		{Name: "HEAD", Expect: corestore.ExpectValue, New: corestore.SymbolicTarget("refs/heads/main")},
+		{Name: "refs/heads/main", Expect: corestore.ExpectValue, New: corestore.Target(e.head)},
+	}, e.head)
+	return e
+}
+
+func (e *env) key() corestore.RepoKey { return corestore.KeyOf(e.pbRepo()) }
+
+func (e *env) pbRepo() *gitalypb.Repository {
+	return &gitalypb.Repository{StorageName: e.cfg.Storages[0].Name, RelativePath: relPath}
+}
+
+func (e *env) commit(message string, parents ...git.ObjectID) git.ObjectID {
+	return gittest.WriteCommit(e.t, e.cfg, e.srcDir, gittest.WithMessage(message), gittest.WithParents(parents...))
+}
+
+func (e *env) changeset(updates []corestore.RefUpdate, tips ...git.ObjectID) {
+	e.t.Helper()
+	ctx := testhelper.Context(e.t)
+
+	pack, err := gitops.BuildPack(ctx, e.src, tips, e.t.TempDir())
+	require.NoError(e.t, err)
+	defer func() { require.NoError(e.t, pack.Remove()) }()
+
+	in := corestore.ChangesetInput{RepoID: e.repo.ID, Updates: updates, Operation: "test", Actor: "tester", NodeID: "node-a"}
+	if !pack.Empty() {
+		in.PackKey = corestore.NewPackKey(e.repo.ID, pack.SHA256)
+		in.PackDeadline = time.Now().Add(time.Hour)
+		rc, err := pack.Open()
+		require.NoError(e.t, err)
+		require.NoError(e.t, e.core.Blobs.Put(ctx, in.PackKey, rc))
+		require.NoError(e.t, rc.Close())
+		in.PackBytes = pack.Size
+	}
+	_, err = e.core.Meta.CommitChangeset(ctx, in)
+	require.NoError(e.t, err)
+}
+
+// advance moves main by n commits, one changeset each.
+func (e *env) advance(n int) {
+	e.t.Helper()
+	for i := 0; i < n; i++ {
+		next := e.commit("next", e.head)
+		e.changeset([]corestore.RefUpdate{{Name: "refs/heads/main", Expect: corestore.ExpectValue, Old: corestore.Target(e.head), New: corestore.Target(next)}}, next)
+		e.head = next
+	}
+}
+
+// fresh catches the node's local copy up.
+func (e *env) fresh() {
+	e.t.Helper()
+	require.NoError(e.t, e.sy.EnsureFresh(testhelper.Context(e.t), e.pbRepo()))
+}
+
+func (e *env) newestCheckpoint() (corestore.Checkpoint, bool) {
+	e.t.Helper()
+	cp, ok, err := e.core.Meta.NewestCheckpoint(testhelper.Context(e.t), e.repo.ID)
+	require.NoError(e.t, err)
+	return cp, ok
+}
+
+func (e *env) headSeq() uint64 {
+	e.t.Helper()
+	r, err := e.core.Meta.GetRepository(testhelper.Context(e.t), e.key())
+	require.NoError(e.t, err)
+	return r.HeadSeq
+}
+
+// metric returns the value of the counter name with the label value (when
+// not empty).
+func (e *env) metric(name, label string) float64 {
+	e.t.Helper()
+	reg := prometheus.NewPedanticRegistry()
+	require.NoError(e.t, reg.Register(e.runner))
+	families, err := reg.Gather()
+	require.NoError(e.t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		// A metric is a counter or a gauge; the other value is zero.
+		for _, m := range family.GetMetric() {
+			if label == "" {
+				return m.GetCounter().GetValue() + m.GetGauge().GetValue()
+			}
+			for _, l := range m.GetLabel() {
+				if l.GetValue() == label {
+					return m.GetCounter().GetValue() + m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// exec runs a statement with "?" placeholders on the database of the env.
+func (e *env) exec(query string, args ...any) {
+	e.t.Helper()
+	store := e.core.Meta.(*sqlstore.Store)
+	if store.Dialect() == sqlstore.Postgres {
+		for n := 1; strings.Contains(query, "?"); n++ {
+			query = strings.Replace(query, "?", fmt.Sprintf("$%d", n), 1)
+		}
+	}
+	_, err := store.DB().ExecContext(testhelper.Context(e.t), query, args...)
+	require.NoError(e.t, err)
+}
+
+// past returns the database time value of d before now.
+func (e *env) past(d time.Duration) any {
+	t := time.Now().Add(-d).UTC()
+	if e.core.Meta.(*sqlstore.Store).Dialect() == sqlstore.SQLite {
+		return t.Format(time.RFC3339Nano)
+	}
+	return t
+}
+
+// The tests age rows on the database clock instead of waiting with a short
+// gc_grace: the writers' deadline W is gc_grace - gc_margin, and a checkpoint
+// built under the race detector on a loaded host does not fit in a W of a
+// fraction of a second.
+
+// ageCheckpoints makes every checkpoint of the repository older than
+// gc_grace.
+func (e *env) ageCheckpoints() {
+	e.exec("UPDATE graft_checkpoints SET created_at = ? WHERE repo_id = ?", e.past(e.core.GCGrace+time.Minute), e.repo.ID)
+}
+
+// observedLongAgo records that a collection observed the object unreferenced
+// more than gc_grace ago.
+func (e *env) observedLongAgo(key string) {
+	e.exec("INSERT INTO graft_gc_orphans (repo_id, pack_key, first_seen) VALUES (?, ?, ?)", e.repo.ID, key, e.past(e.core.GCGrace+time.Minute))
+}
+
+// config3 is a configuration with the checkpoints and the garbage collection
+// on, and the given checkpoint thresholds.
+func config3(changesets uint64, packBytes int64) maintenance.Config {
+	return maintenance.Config{Interval: time.Hour, Checkpoints: true, Collect: true, CheckpointChangesets: changesets, CheckpointPackBytes: packBytes, LeaseTTL: time.Minute}
+}
+
+// TestRunOnceDropsSupersededCheckpointsWithGCOff verifies that the default
+// configuration (checkpoints on, garbage collection off) does not keep every
+// checkpoint ever built: once the newest checkpoint is gc_grace old (C_gc), the
+// older ones go, under the same rule as the collection's. The changeset packs
+// stay: they are the collection's. With nothing due, a run takes no lease.
+func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.Collect = false
+	e := newEnv(t, coretest.Options{}, cfg)
+
+	var built []corestore.Checkpoint
+	for i := 0; i < 3; i++ {
+		e.advance(1)
+		e.fresh()
+		require.NoError(t, e.runner.RunOnce(ctx))
+		cp, ok := e.newestCheckpoint()
+		require.True(t, ok)
+		built = append(built, cp)
+	}
+	changesetPacks := e.bucketKeys()
+	for _, cp := range built {
+		delete(changesetPacks, cp.PackKey)
+	}
+
+	newest := built[len(built)-1]
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 3, "no checkpoint is gc_grace old yet")
+	e.ageCheckpoints()
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1, "the superseded checkpoints are dropped")
+	require.Equal(t, newest.Seq, e.checkpoints()[0].Seq)
+
+	keys := e.bucketKeys()
+	for _, cp := range built[:len(built)-1] {
+		require.NotContains(t, keys, cp.PackKey, "the pack of a dropped checkpoint is deleted")
+	}
+	require.Contains(t, keys, newest.PackKey)
+	for key := range changesetPacks {
+		require.Contains(t, keys, key, "garbage collection is off: the changeset packs stay")
+	}
+	require.Len(t, keys, len(changesetPacks)+1)
+
+	// Nothing is due any more: the run decides it without the lease.
+	before := e.metric("graft_storage_maintenance_skipped_total", "nothing_due")
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Equal(t, before+1, e.metric("graft_storage_maintenance_skipped_total", "nothing_due"))
+}
+
+// TestRunOnceDropsALateLowerCheckpoint: a checkpoint of an older sequence
+// recorded after the superseded ones were dropped (a build that committed
+// after a newer one: CreateCheckpoint does not lock the repository) is dropped
+// by the next run, without C_gc moving (final minor 5).
+func TestRunOnceDropsALateLowerCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.Collect = false
+	e := newEnv(t, coretest.Options{}, cfg)
+
+	var built []corestore.Checkpoint
+	for i := 0; i < 2; i++ {
+		e.advance(1)
+		e.fresh()
+		require.NoError(t, e.runner.RunOnce(ctx))
+		cp, ok := e.newestCheckpoint()
+		require.True(t, ok)
+		built = append(built, cp)
+	}
+	e.ageCheckpoints()
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1)
+
+	// The late build: a checkpoint below C_gc, recorded now.
+	late := built[0]
+	content := []byte("the pack of a late build")
+	lateKey := corestore.NewPackKey(e.repo.ID, sha256.Sum256(content))
+	require.NoError(t, e.core.Blobs.Put(ctx, lateKey, bytes.NewReader(content)))
+	e.exec("INSERT INTO graft_checkpoints (repo_id, seq, pack_key, pack_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
+		e.repo.ID, int64(late.Seq), lateKey, len(content), e.past(0))
+	require.Len(t, e.checkpoints(), 2)
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1, "the late checkpoint below C_gc is dropped")
+	require.Equal(t, built[1].Seq, e.checkpoints()[0].Seq)
+	exists, err := e.core.Blobs.Exists(ctx, lateKey)
+	require.NoError(t, err)
+	require.False(t, exists, "and its pack")
+}
+
+// TestRunOnceReconcilesLeaks: with the collection on, a run reconciles the
+// bucket before it collects the removed repositories, and its metrics count
+// the leaks found and tombstoned and the IDs ahead of the allocator.
+func TestRunOnceReconcilesLeaks(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
+	put := func(repoID int64) {
+		content := []byte(fmt.Sprintf("objects of %d", repoID))
+		require.NoError(t, e.core.Blobs.Put(ctx, corestore.NewPackKey(repoID, sha256.Sum256(content)), bytes.NewReader(content)))
+	}
+
+	// A row deleted by hand before the trigger existed: no tombstone.
+	leaked, _, err := e.core.Meta.RegisterRepository(ctx, corestore.RepoKey{Storage: "default", RelativePath: "leaked.git"}, "sha1", corestore.InitialState{})
+	require.NoError(t, err)
+	put(leaked.ID)
+	e.exec("DELETE FROM graft_repositories WHERE repo_id = ?", leaked.ID)
+	e.exec("DELETE FROM graft_gc_removed WHERE repo_id = ?", leaked.ID)
+	put(leaked.ID + 2)
+
+	// The allocator was observed at its position longer than W ago.
+	e.exec("INSERT INTO graft_gc_allocator_marks (observed_at, position) VALUES (?, ?)", e.past(e.core.WriteDeadline()+time.Minute), leaked.ID)
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_leaks_found_total", ""))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_leaks_tombstoned_total", ""))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_ids_ahead_of_allocator", ""))
+	removed, err := e.core.Meta.ListRemovedRepositories(ctx, "", 0)
+	require.NoError(t, err)
+	require.Len(t, removed, 1)
+	require.Equal(t, leaked.ID, removed[0].RepoID)
+}
+
+// leaseExpiry returns the expiry of the repository's maintenance lease, which
+// holder must hold.
+func (e *env) leaseExpiry(holder string) time.Time {
+	e.t.Helper()
+	store := e.core.Meta.(*sqlstore.Store)
+	query := "SELECT holder, expires_at FROM graft_gc_leases WHERE repo_id = ?"
+	if store.Dialect() == sqlstore.Postgres {
+		query = "SELECT holder, expires_at FROM graft_gc_leases WHERE repo_id = $1"
+	}
+	var (
+		got string
+		raw any
+	)
+	require.NoError(e.t, store.DB().QueryRowContext(testhelper.Context(e.t), query, e.repo.ID).Scan(&got, &raw))
+	require.Equal(e.t, holder, got)
+	switch v := raw.(type) {
+	case time.Time:
+		return v
+	case string:
+		expiry, err := time.Parse(time.RFC3339Nano, v)
+		require.NoError(e.t, err)
+		return expiry
+	case []byte:
+		expiry, err := time.Parse(time.RFC3339Nano, string(v))
+		require.NoError(e.t, err)
+		return expiry
+	}
+	require.FailNow(e.t, "unexpected expiry type", "%T", raw)
+	return time.Time{}
+}
+
+// checkpoints returns the checkpoints of the repository.
+func (e *env) checkpoints() []corestore.Checkpoint {
+	e.t.Helper()
+	st, err := e.core.Meta.GCSnapshot(testhelper.Context(e.t), e.repo.ID)
+	require.NoError(e.t, err)
+	return st.Checkpoints
+}
+
+// TestRunOnceDoesOnlyWhatIsOn verifies that the checkpoints and the garbage
+// collection are configured apart: checkpoints alone delete nothing, and the
+// collection alone creates no checkpoint.
+func TestRunOnceDoesOnlyWhatIsOn(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	orphan := func(e *env) string {
+		content := []byte("an orphan pack")
+		key := corestore.NewPackKey(e.repo.ID, sha256.Sum256(content))
+		require.NoError(t, e.core.Blobs.Put(ctx, key, bytes.NewReader(content)))
+		return key
+	}
+	exists := func(e *env, key string) bool {
+		ok, err := e.core.Blobs.Exists(ctx, key)
+		require.NoError(t, err)
+		return ok
+	}
+
+	// An orphan that a collection would delete now: it was observed more than
+	// gc_grace ago.
+	checkpointsOnly := config3(1, 0)
+	checkpointsOnly.Collect = false
+	e := newEnv(t, coretest.Options{}, checkpointsOnly)
+	e.fresh()
+	key := orphan(e)
+	e.observedLongAgo(key)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.True(t, exists(e, key), "checkpoints alone delete nothing")
+	_, ok := e.newestCheckpoint()
+	require.True(t, ok)
+
+	collectOnly := config3(1, 0)
+	collectOnly.Checkpoints = false
+	e = newEnv(t, coretest.Options{}, collectOnly)
+	e.fresh()
+	key = orphan(e)
+	e.observedLongAgo(key)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.False(t, exists(e, key), "the collection deletes it")
+	_, ok = e.newestCheckpoint()
+	require.False(t, ok, "the collection alone creates no checkpoint")
+}
+
+func TestRunOnceCheckpointsAfterEnoughChangesets(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(3, 0))
+	e.fresh()
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	_, ok := e.newestCheckpoint()
+	require.False(t, ok, "one changeset is below the threshold")
+
+	e.advance(2)
+	e.fresh()
+	require.NoError(t, e.runner.RunOnce(ctx))
+	cp, ok := e.newestCheckpoint()
+	require.True(t, ok)
+	require.Equal(t, e.headSeq(), cp.Seq)
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_checkpoints_total", ""))
+
+	// Nothing follows the checkpoint: no new one.
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_checkpoints_total", ""))
+	require.Equal(t, float64(3), e.metric("graft_storage_maintenance_runs_total", "ok"))
+}
+
+func TestRunOnceCheckpointsAfterEnoughPackBytes(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 1))
+	e.fresh()
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	cp, ok := e.newestCheckpoint()
+	require.True(t, ok, "the first changeset's pack is over one byte")
+	require.Equal(t, e.headSeq(), cp.Seq)
+
+	off := newEnv(t, coretest.Options{}, config3(0, 0))
+	off.fresh()
+	require.NoError(t, off.runner.RunOnce(ctx))
+	_, ok = off.newestCheckpoint()
+	require.False(t, ok, "both thresholds 0 never checkpoint")
+}
+
+func TestRunOnceSkipsARepositoryWithoutALocalCopy(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(1, 0))
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	_, ok := e.newestCheckpoint()
+	require.False(t, ok)
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_skipped_total", "no_local_copy"))
+}
+
+func TestRunOnceSkipsARepositoryWhoseLeaseIsHeld(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(1, 0))
+	e.fresh()
+
+	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", time.Hour)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	_, ok := e.newestCheckpoint()
+	require.False(t, ok)
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_skipped_total", "lease_held"))
+
+	require.NoError(t, e.core.Meta.ReleaseMaintenanceLease(ctx, e.repo.ID, "node-b/1"))
+	require.NoError(t, e.runner.RunOnce(ctx))
+	_, ok = e.newestCheckpoint()
+	require.True(t, ok)
+
+	// The run released its lease: another holder takes it at once.
+	acquired, err = e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", time.Hour)
+	require.NoError(t, err)
+	require.True(t, acquired)
+}
+
+// TestRunOnceCollectsAnOrphanPack verifies that the runs collect the
+// repository: an object under its pack prefix that no row references is
+// deleted once a run observed it gc_grace earlier.
+func TestRunOnceCollectsAnOrphanPack(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
+	e.fresh()
+
+	content := []byte("an orphan pack")
+	key := corestore.NewPackKey(e.repo.ID, sha256.Sum256(content))
+	require.NoError(t, e.core.Blobs.Put(ctx, key, bytes.NewReader(content)))
+
+	// The first run observes it; a run gc_grace later deletes it.
+	require.NoError(t, e.runner.RunOnce(ctx))
+	exists, err := e.core.Blobs.Exists(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists, "observed, not yet deleted")
+
+	e.exec("UPDATE graft_gc_orphans SET first_seen = ? WHERE repo_id = ?", e.past(e.core.GCGrace+time.Minute), e.repo.ID)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	exists, err = e.core.Blobs.Exists(ctx, key)
+	require.NoError(t, err)
+	require.False(t, exists, "deleted gc_grace after its observation")
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_packs_deleted_total", ""))
+	require.Equal(t, float64(len(content)), e.metric("graft_storage_maintenance_bytes_reclaimed_total", ""))
+}
+
+// TestRunOnceStopsWhenTheLeaseIsLost blocks a checkpoint build after its
+// upload while another holder takes the lease (it expired, as for a run that
+// stalled): the run is cancelled, the checkpoint is never recorded (its pack is
+// an orphan, as for any failed build), and the run deletes nothing.
+func TestRunOnceStopsWhenTheLeaseIsLost(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.LeaseTTL = 300 * time.Millisecond
+	e := newEnv(t, coretest.Options{}, cfg)
+	e.fresh()
+	holder := fmt.Sprintf("%s/%d", e.core.NodeID, os.Getpid())
+
+	uploaded := make(chan struct{})
+	resume := make(chan struct{})
+	checkpoint.SetFaultHook(e.cp, func(point string) error {
+		if point == checkpoint.PointAfterUpload {
+			close(uploaded)
+			<-resume
+		}
+		return nil
+	})
+	before := e.bucketKeys()
+
+	done := make(chan error, 1)
+	go func() { done <- e.runner.RunOnce(ctx) }()
+	<-uploaded
+
+	// The lease is taken by another node: the run's next renewal finds it gone.
+	require.NoError(t, e.core.Meta.ReleaseMaintenanceLease(ctx, e.repo.ID, holder))
+	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", time.Hour)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.Eventually(t, func() bool { return e.metric("graft_storage_maintenance_failures_total", "lease") == 1 },
+		30*time.Second, 10*time.Millisecond, "the renewal notices the lost lease")
+	close(resume)
+
+	require.ErrorIs(t, <-done, context.Canceled)
+	_, ok := e.newestCheckpoint()
+	require.False(t, ok, "a run that lost its lease records no checkpoint")
+
+	after := e.bucketKeys()
+	for key := range before {
+		require.Contains(t, after, key, "a run that lost its lease deleted %s", key)
+	}
+	require.Len(t, after, len(before)+1, "the uploaded checkpoint pack is an orphan")
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_runs_total", "error"))
+}
+
+// TestHoldLeaseRenewsUntilReleased verifies the lease the background
+// maintenance and the CollectGarbage request hold while they work: the renewal
+// moves its expiry forward, the holder keeps it, and it is free once released.
+// The test waits for the renewal itself (the expiry in the database moving past
+// the one the acquisition set), not for a span of time, so it does not depend
+// on how fast the database writes on the host.
+func TestHoldLeaseRenewsUntilReleased(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
+	const ttl = 900 * time.Millisecond
+	const holder = "node-a/1/request-1"
+
+	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, holder, ttl)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	first := e.leaseExpiry(holder)
+	var lost atomic.Bool
+	leaseCtx, release := maintenance.HoldLease(ctx, e.core, testhelper.NewLogger(t), e.repo.ID, holder, ttl, func() { lost.Store(true) })
+
+	for renewals := 0; renewals < 2; renewals++ {
+		previous := e.leaseExpiry(holder)
+		require.Eventually(t, func() bool { return e.leaseExpiry(holder).After(previous) },
+			30*time.Second, 10*time.Millisecond, "renewal %d moves the expiry forward", renewals+1)
+	}
+	require.True(t, e.leaseExpiry(holder).After(first))
+	require.NoError(t, leaseCtx.Err())
+	require.False(t, lost.Load())
+
+	release()
+	require.ErrorIs(t, leaseCtx.Err(), context.Canceled)
+	acquired, err = e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", ttl)
+	require.NoError(t, err)
+	require.True(t, acquired, "released")
+}
+
+func (e *env) bucketKeys() map[string]bool {
+	e.t.Helper()
+	keys := map[string]bool{}
+	require.NoError(e.t, e.core.Blobs.List(testhelper.Context(e.t), "", func(info corestore.BlobInfo) error {
+		keys[info.Key] = true
+		return nil
+	}))
+	return keys
+}
+
+func TestStartRunsEveryIntervalUntilStopped(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.Interval = 20 * time.Millisecond
+	e := newEnv(t, coretest.Options{}, cfg)
+	e.fresh()
+
+	stop := e.runner.Start(ctx)
+	require.Eventually(t, func() bool {
+		_, ok := e.newestCheckpoint()
+		return ok
+	}, 30*time.Second, 10*time.Millisecond)
+	// stop returns once the loop has ended (a run in progress is cancelled).
+	stop()
+}

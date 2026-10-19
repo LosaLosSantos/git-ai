@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,6 +87,61 @@ func TestNew_refURI(t *testing.T) {
 	require.NoError(t, updater.Start())
 	require.NoError(t, updater.Create("refs/heads/main/conflict", commitID))
 	require.Equal(t, expectedErr, updater.Commit())
+}
+
+// TestNew_deferredReferenceDurability verifies that only WithDeferredReferenceDurability takes the
+// references out of what git makes durable, and that it keeps the objects in.
+func TestNew_deferredReferenceDurability(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	_, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	repo := gittest.NewRepositoryPathExecutor(t, cfg, repoPath)
+	commitID := gittest.WriteCommit(t, cfg, repoPath)
+
+	// effectiveConfig returns the last value of key among the `-c key=value` arguments of a
+	// git command line, which is the one git uses.
+	effectiveConfig := func(args []string, key string) string {
+		var effective string
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "-c" {
+				continue
+			}
+			name, value, _ := strings.Cut(args[i+1], "=")
+			if strings.EqualFold(name, key) {
+				effective = value
+			}
+		}
+		return effective
+	}
+
+	for _, tc := range []struct {
+		desc     string
+		opts     []UpdaterOpt
+		expected string
+	}{
+		{desc: "default", expected: gitcmd.FsyncComponents},
+		{desc: "without transactions", opts: []UpdaterOpt{WithDisabledTransactions()}, expected: gitcmd.FsyncComponents},
+		{desc: "deferred", opts: []UpdaterOpt{WithDisabledTransactions(), WithDeferredReferenceDurability()}, expected: gitcmd.FsyncComponentsWithoutReferences},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			updater, err := New(ctx, repo, tc.opts...)
+			require.NoError(t, err)
+			defer testhelper.MustClose(t, updater)
+
+			require.Equal(t, tc.expected, effectiveConfig(updater.cmd.Args(), "core.fsync"))
+
+			// The writes themselves are unchanged.
+			ref := git.ReferenceName("refs/heads/" + strings.ReplaceAll(tc.desc, " ", "-"))
+			require.NoError(t, updater.Start())
+			require.NoError(t, updater.Create(ref, commitID))
+			require.NoError(t, updater.Commit())
+			require.Equal(t, commitID, gittest.ResolveRevision(t, cfg, repoPath, ref.String()))
+		})
+	}
 }
 
 func TestUpdater_create(t *testing.T) {

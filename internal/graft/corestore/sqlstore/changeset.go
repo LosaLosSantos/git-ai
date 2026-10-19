@@ -70,6 +70,28 @@ func validateChangeset(in corestore.ChangesetInput) error {
 	return nil
 }
 
+// checkPackDeadline refuses, with ErrPackDeadline, the commit of a row that
+// references an uploaded pack once the database clock reached the pack's write
+// deadline (PackUpload.DBDeadline), and the commit of one without a deadline.
+// Garbage collection deletes an unreferenced pack gc_grace after it observed it
+// on the database clock, which is after the record read the deadline starts
+// from: a row committed before the deadline is never a row whose pack is gone,
+// whatever the writer's own clock did meanwhile (a suspended host, a paused
+// VM).
+func (s *Store) checkPackDeadline(ctx context.Context, tx *sql.Tx, deadline time.Time) error {
+	if deadline.IsZero() {
+		return errors.New("storage core: a row that references a pack must carry the pack's write deadline")
+	}
+	now, err := s.wallTime(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !now.Before(deadline) {
+		return fmt.Errorf("storage core: commit at %s, after the pack's write deadline %s: %w", now.Format(time.RFC3339Nano), deadline.UTC().Format(time.RFC3339Nano), corestore.ErrPackDeadline)
+	}
+	return nil
+}
+
 // commitChangeset records a changeset in the open transaction tx, for the
 // locked repository repo, and advances repo to the new sequences. It is shared
 // by CommitChangeset and the initial changeset of RegisterRepository.
@@ -110,6 +132,11 @@ func (s *Store) commitChangeset(ctx context.Context, tx *sql.Tx, repo *repoState
 	if len(conflicts) > 0 && !in.Force {
 		return corestore.CommitResult{}, &corestore.ErrRefConflict{Conflicts: conflicts}
 	}
+	if !in.Force {
+		if err := s.refuseReleasedRoots(ctx, tx, repo.id, effective); err != nil {
+			return corestore.CommitResult{}, err
+		}
+	}
 
 	if len(effective) == 0 {
 		return corestore.CommitResult{NoOp: true, Conflicts: conflicts}, nil
@@ -121,6 +148,9 @@ func (s *Store) commitChangeset(ctx context.Context, tx *sql.Tx, repo *repoState
 
 	var packKey any
 	if in.PackKey != "" {
+		if err := s.checkPackDeadline(ctx, tx, in.PackDeadline); err != nil {
+			return corestore.CommitResult{}, err
+		}
 		packKey = in.PackKey
 	}
 

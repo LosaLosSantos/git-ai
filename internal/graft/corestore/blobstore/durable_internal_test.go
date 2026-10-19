@@ -30,7 +30,7 @@ func openFileStoreForTest(t *testing.T, dir string, hook func(path string, isDir
 func TestPutSyncsFileBeforeCommitAndSyncsDirectories(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("pack content, synced before the commit")
-	key := corestore.PackKey(1, sha256.Sum256(content))
+	key := corestore.NewPackKey(1, sha256.Sum256(content))
 	final := filepath.Join(dir, filepath.FromSlash(key))
 
 	var fileSyncs int
@@ -73,7 +73,7 @@ func TestPutSyncsFileBeforeCommitAndSyncsDirectories(t *testing.T) {
 func TestPutFailedFileSyncLeavesNoObject(t *testing.T) {
 	dir := t.TempDir()
 	content := []byte("pack content whose sync fails")
-	key := corestore.PackKey(1, sha256.Sum256(content))
+	key := corestore.NewPackKey(1, sha256.Sum256(content))
 	final := filepath.Join(dir, filepath.FromSlash(key))
 
 	syncErr := errors.New("disk on fire")
@@ -104,19 +104,83 @@ func TestPutFailedFileSyncLeavesNoObject(t *testing.T) {
 
 func TestPutWithoutFileSyncHookSucceeds(t *testing.T) {
 	// The fsync steps run for real on a file bucket: the write is observable
-	// afterwards and a repeated Put is still a no-op.
+	// afterwards. A second Put of the key is refused and leaves the object as it
+	// is (PLAN7, PACK OWNERSHIP RULE 2: Put is strictly create-only; before phase 7
+	// a repeated Put was a successful no-op).
 	dir := t.TempDir()
 	s := openFileStoreForTest(t, dir, nil)
 	ctx := testhelper.Context(t)
 
 	content := []byte("durable content")
-	key := corestore.PackKey(2, sha256.Sum256(content))
+	key := corestore.NewPackKey(2, sha256.Sum256(content))
 	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
-	require.NoError(t, s.Put(ctx, key, bytes.NewReader(content)))
+	require.ErrorIs(t, s.Put(ctx, key, bytes.NewReader(content)), corestore.ErrBlobExists)
 
-	exists, err := s.Exists(ctx, key)
+	data, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(key)))
 	require.NoError(t, err)
-	require.True(t, exists)
+	require.Equal(t, content, data)
+}
+
+func TestPublishFileIsCreateOnly(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	final := filepath.Join(dir, "k.pack")
+
+	first := write("k.pack.18f3a.tmp", "first")
+	require.NoError(t, publishFile(first))
+	// A network filesystem that lost the reply of a successful link retransmits
+	// it and reports EEXIST: the name is then the same file, and the publish
+	// succeeded.
+	require.NoError(t, publishFile(first))
+
+	second := write("k.pack.18f3b.tmp", "second")
+	require.ErrorIs(t, publishFile(second), corestore.ErrBlobExists)
+
+	data, err := os.ReadFile(final)
+	require.NoError(t, err)
+	require.Equal(t, "first", string(data), "the first publish is kept")
+}
+
+func TestFinalPath(t *testing.T) {
+	for tmp, want := range map[string]string{
+		"/b/repos/1/packs/k.pack.18f3a2b4c.tmp": "/b/repos/1/packs/k.pack",
+		"/b/plain.ff.tmp":                       "/b/plain",
+	} {
+		got, ok := finalPath(tmp)
+		require.True(t, ok, tmp)
+		require.Equal(t, want, got)
+	}
+	for _, tmp := range []string{"/b/k.pack", "/b/k.pack.tmp", "/b/k.pack.xyz.tmp", "/b/k.pack..tmp", ".1.tmp"} {
+		_, ok := finalPath(tmp)
+		require.False(t, ok, tmp)
+	}
+}
+
+func TestPutLeavesOnlyTheObject(t *testing.T) {
+	// The writer's temporary name is removed after the link published the
+	// object: only the object and its directories remain.
+	dir := t.TempDir()
+	s := openFileStoreForTest(t, dir, nil)
+
+	content := []byte("published by a link")
+	key := corestore.NewPackKey(4, sha256.Sum256(content))
+	require.NoError(t, s.Put(testhelper.Context(t), key, bytes.NewReader(content)))
+
+	var files []string
+	require.NoError(t, filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, path)
+		}
+		return nil
+	}))
+	require.Equal(t, []string{filepath.Join(dir, filepath.FromSlash(key))}, files)
 }
 
 func TestPutMemBucketWithoutFileSync(t *testing.T) {
@@ -129,7 +193,7 @@ func TestPutMemBucketWithoutFileSync(t *testing.T) {
 	t.Cleanup(func() { syncHook = nil })
 
 	content := []byte("mem content")
-	key := corestore.PackKey(3, sha256.Sum256(content))
+	key := corestore.NewPackKey(3, sha256.Sum256(content))
 	require.NoError(t, s.Put(testhelper.Context(t), key, bytes.NewReader(content)))
 }
 

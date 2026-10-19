@@ -80,16 +80,41 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 		return nil, structerr.NewInternal("%w", err)
 	}
 
-	stored, err := st.Create(&gitalypb.Review{
-		TargetBranch: []byte(branch),
-		BaseCommitId: base.String(),
-		HeadCommitId: head.String(),
-		Author:       identity.Actor(ctx, anonymousActor),
-		Title:        req.GetTitle(),
-		Description:  req.GetDescription(),
-		State:        gitalypb.Review_STATE_OPEN_UNSPECIFIED,
-		Files:        files,
+	// A repository at its limit refuses here, before the keep-around
+	// references are written. The store refuses again, atomically, a create
+	// that a concurrent one put past the limit.
+	maxOpen := s.deps.GetCfg().Graft.Review.MaxOpenReviewsOrDefault()
+	open, err := st.List("", false, 0)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if len(open) >= maxOpen {
+		return nil, toStatus(fmt.Errorf("%w: the repository has %d open reviews, the limit is %d", store.ErrTooManyOpenReviews, len(open), maxOpen))
+	}
+
+	var stored *gitalypb.Review
+	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
+		if err := protect("", head, base); err != nil {
+			return err
+		}
+
+		var err error
+		stored, err = st.Create(&gitalypb.Review{
+			TargetBranch: []byte(branch),
+			BaseCommitId: base.String(),
+			HeadCommitId: head.String(),
+			Author:       identity.Actor(ctx, anonymousActor),
+			Title:        req.GetTitle(),
+			Description:  req.GetDescription(),
+			State:        gitalypb.Review_STATE_OPEN_UNSPECIFIED,
+			Files:        files,
+		})
+		return err
 	})
+	if errors.Is(err, store.ErrTooManyOpenReviews) {
+		// The references were written for a review that was not recorded.
+		s.releaseRoots(ctx, repo, st, reviewCommits(head, base))
+	}
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -190,64 +215,98 @@ func (s *server) UpdateReview(ctx context.Context, req *gitalypb.UpdateReviewReq
 		return nil, err
 	}
 
-	updated, err := st.Update(req.GetId(), func(r *gitalypb.Review) error {
-		if err := checkAuthor(ctx, r, "update"); err != nil {
-			return err
-		}
-		if err := checkOpen(r); err != nil {
-			return err
-		}
-		if expected := req.GetExpectedHeadCommitId(); expected != "" && expected != r.GetHeadCommitId() {
-			return structerr.NewFailedPrecondition("review head is %s, expected %s", r.GetHeadCommitId(), expected)
-		}
-		if head.String() == r.GetHeadCommitId() {
-			return nil
-		}
-
-		base := git.ObjectID(r.GetBaseCommitId())
-		descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
-		if err != nil {
-			if !errors.As(err, new(localrepo.InvalidCommitError)) {
-				return structerr.NewInternal("%w", err)
-			}
-			descends = false
-		}
-		if !descends {
-			return structerr.NewFailedPrecondition("head %s does not descend from the review base %s", head, base)
-		}
-
-		files, err := changedFiles(ctx, repo, base, head)
-		if err != nil {
-			return structerr.NewInternal("%w", err)
-		}
-
-		// Verdicts on the same commit have the same outcome, so the change
-		// since that commit is computed once per distinct commit.
-		survivesByCommit := map[string]bool{}
-		for _, v := range r.GetVerdicts() {
-			if !v.GetCurrent() {
-				continue
-			}
-			survives, ok := survivesByCommit[v.GetCommitId()]
-			if !ok {
-				survives, err = onlyCommentOrDocs(ctx, repo, git.ObjectID(v.GetCommitId()), head)
-				if err != nil {
-					return structerr.NewInternal("%w", err)
-				}
-				survivesByCommit[v.GetCommitId()] = survives
-			}
-			v.Current = survives
-		}
-
-		r.Files = files
-		r.HeadCommitId = head.String()
-		return nil
+	var updated *gitalypb.Review
+	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
+		var err error
+		updated, err = st.Update(req.GetId(), func(r *gitalypb.Review) error {
+			return moveHead(ctx, repo, req, r, head, protect)
+		})
+		return err
 	})
 	if err != nil {
 		return nil, toStatus(err)
 	}
 
 	return &gitalypb.UpdateReviewResponse{Review: s.withRequirements(updated)}, nil
+}
+
+// moveHead moves the review r to head, for UpdateReview. protect writes the
+// keep-around references of the head and base the review is stored with (the
+// REVIEW ROOTS RULE), also when the head does not move: the review store of
+// authoritative mode requires them for every review it writes here.
+func moveHead(ctx context.Context, repo *localrepo.Repo, req *gitalypb.UpdateReviewRequest, r *gitalypb.Review, head git.ObjectID, protect rootsProtect) error {
+	if err := checkAuthor(ctx, r, "update"); err != nil {
+		return err
+	}
+	if err := checkOpen(r); err != nil {
+		return err
+	}
+	if expected := req.GetExpectedHeadCommitId(); expected != "" && expected != r.GetHeadCommitId() {
+		return structerr.NewFailedPrecondition("review head is %s, expected %s", r.GetHeadCommitId(), expected)
+	}
+
+	base := git.ObjectID(r.GetBaseCommitId())
+	if head.String() == r.GetHeadCommitId() {
+		return protect(r.GetId(), reviewCommits(head, base)...)
+	}
+	// The base is a root of the open review whatever this update does; a base
+	// that is gone is reported as such, not as a head that does not descend.
+	if base != "" {
+		if err := protect(r.GetId(), base); err != nil {
+			return err
+		}
+	}
+
+	descends, err := repo.IsAncestor(ctx, base.Revision(), head.Revision())
+	if err != nil {
+		if !errors.As(err, new(localrepo.InvalidCommitError)) {
+			return structerr.NewInternal("%w", err)
+		}
+		descends = false
+	}
+	if !descends {
+		return structerr.NewFailedPrecondition("head %s does not descend from the review base %s", head, base)
+	}
+
+	files, err := changedFiles(ctx, repo, base, head)
+	if err != nil {
+		return structerr.NewInternal("%w", err)
+	}
+
+	// Verdicts on the same commit have the same outcome, so the change
+	// since that commit is computed once per distinct commit.
+	survivesByCommit := map[string]bool{}
+	for _, v := range r.GetVerdicts() {
+		if !v.GetCurrent() {
+			continue
+		}
+		survives, ok := survivesByCommit[v.GetCommitId()]
+		if !ok {
+			survives, err = onlyCommentOrDocs(ctx, repo, git.ObjectID(v.GetCommitId()), head)
+			if err != nil {
+				return structerr.NewInternal("%w", err)
+			}
+			survivesByCommit[v.GetCommitId()] = survives
+		}
+		v.Current = survives
+	}
+
+	if err := protect(r.GetId(), reviewCommits(head, base)...); err != nil {
+		return err
+	}
+
+	r.Files = files
+	r.HeadCommitId = head.String()
+	return nil
+}
+
+// reviewCommits returns the head and base of a review, leaving out an unset
+// base (reviews imported from the files of an older version may have none).
+func reviewCommits(head, base git.ObjectID) []git.ObjectID {
+	if base == "" {
+		return []git.ObjectID{head}
+	}
+	return []git.ObjectID{head, base}
 }
 
 // onlyCommentOrDocs reports whether every file changed between from and to is
@@ -408,7 +467,7 @@ func (s *server) CloseReview(ctx context.Context, req *gitalypb.CloseReviewReque
 		return nil, structerr.NewInvalidArgument("review id is required")
 	}
 
-	_, st, err := s.openRepo(ctx, req.GetRepository())
+	repo, st, err := s.openRepo(ctx, req.GetRepository())
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +489,9 @@ func (s *server) CloseReview(ctx context.Context, req *gitalypb.CloseReviewReque
 	if err != nil {
 		return nil, toStatus(err)
 	}
+
+	// A closed review is not a root any more (REVIEW ROOTS RULE).
+	s.releaseRoots(ctx, repo, st, reviewCommits(git.ObjectID(updated.GetHeadCommitId()), git.ObjectID(updated.GetBaseCommitId())))
 
 	return &gitalypb.CloseReviewResponse{Review: s.withRequirements(updated)}, nil
 }
@@ -477,6 +539,9 @@ func hasFile(r *gitalypb.Review, path []byte) bool {
 func toStatus(err error) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return structerr.NewNotFound("review not found")
+	}
+	if errors.Is(err, store.ErrTooManyOpenReviews) {
+		return structerr.NewResourceExhausted("%w; close or land an open review first, or raise [graft.review] max_open_reviews", err)
 	}
 	if _, ok := status.FromError(err); ok {
 		return err
