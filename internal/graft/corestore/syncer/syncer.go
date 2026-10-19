@@ -236,16 +236,20 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoF
 // Concurrent calls for one repository share one sync (single flight). The
 // sync runs under its own sync_timeout budget, detached from the cancellation
 // of the caller that started it, so that a caller that goes away does not fail
-// the others; every caller still stops waiting when its own context is done.
+// the others; every caller still stops waiting when its own context is done. A
+// call waits for at most two syncs, the one it joined and one of its own, so at
+// most twice sync_timeout, and a sync that runs out of its budget fails the
+// calls that wait for it with Unavailable.
 func (s *Syncer) EnsureFresh(ctx context.Context, repo storage.Repository) error {
 	if s == nil || !s.core.Authoritative() {
 		return nil
 	}
 
+	// Each sync (flight) runs under its own sync_timeout. The call has no budget of its own: one
+	// set at its arrival would also have to cover the end of a flight it joins and then a whole
+	// flight of its own, so it could give up while its own flight is still within its budget.
+	// It waits at most for both, each bounded by sync_timeout, and stops when its context ends.
 	timeout := s.syncTimeout()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
 	key := corestore.KeyOf(repo)
 	flightCtx := context.WithoutCancel(ctx)
 

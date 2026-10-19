@@ -11,7 +11,8 @@
 //   - GetObjects fetches raw objects by ID, resuming interrupted transfers.
 //   - CommitFiles builds a commit on the server from a list of actions.
 //   - Land lands a commit on a branch, rebasing or merging onto the current
-//     tip and retrying concurrent updates on the server.
+//     tip and retrying concurrent updates on the server. It retries the
+//     calls the server answers with Unavailable (see UnavailableRetry).
 //   - Blame and PathHistory answer history questions from derived data.
 //   - Changesets and WatchChangesets read the repository's changeset log.
 //

@@ -34,6 +34,7 @@ var comparisonMetrics = []comparisonMetric{
 	{"max attempts (all changes)", func(r Result) string { return fmt.Sprint(r.MaxAttempts) }},
 	{"attempts histogram (landed)", func(r Result) string { return formatHistogram(r.AttemptsHistogram) }},
 	{"attempts histogram (failed)", func(r Result) string { return formatHistogram(r.FailedAttemptsHistogram) }},
+	{"unavailable retries", func(r Result) string { return fmt.Sprint(r.UnavailableRetries) }},
 	{"batch size mean", func(r Result) string { return fmt.Sprintf("%.2f", r.BatchSizeMean) }},
 	{"batch size max", func(r Result) string { return fmt.Sprint(r.BatchSizeMax) }},
 	{"batch size histogram", func(r Result) string { return formatHistogram(r.BatchSizeHistogram) }},

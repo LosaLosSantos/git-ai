@@ -245,6 +245,7 @@ Markdown report show the same values.
 | `resolutions` | Conflicting paths the server resolved. |
 | `attempts` | Compare-and-swap attempts the server used, summed over every change, landed or failed. A land that gave up because the branch kept moving counts the attempts it made (the number the server reports in its "giving up after N attempts" error). Other failed lands count none, because the server does not report their attempts. Above `landed` means the branch moved during lands. |
 | `attempts_per_land` | `attempts` divided by `landed`. The attempts wasted on failed changes raise it, so it is the server work per landed change. |
+| `unavailable_retries` | Calls that the server answered with `Unavailable` and the SDK retried (`LandOptions.RetryUnavailable`), summed over the landed changes. Each is a whole land request again, the conflict resolver included. A failed land reports none. |
 | `max_attempts` | The largest number of attempts of any change, landed or failed. |
 | `attempts_histogram` | Landed changes by their number of attempts (`{"1": 95, "2": 5}`: 95 changes landed at the first attempt). Landed changes that report no attempts are left out. |
 | `failed_attempts_histogram` | Failed changes that report attempts, by their number of attempts. A land that gave up after `max_attempts` rounds shows up here. |
