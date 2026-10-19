@@ -71,6 +71,9 @@ type Result struct {
 	// composition report of an accepted answer (PLAN10 15.3).
 	ModelAbstained bool     `json:"model_abstained,omitempty"`
 	Calls          int      `json:"calls,omitempty"`
+	// Providers counts the model calls of the case by the provider that served them, as the endpoint
+	// reports it (a run with routing pinned to a provider shows here that it stayed there).
+	Providers map[string]int `json:"providers,omitempty"`
 	Repairs        int      `json:"repairs,omitempty"`
 	Report         []string `json:"report,omitempty"`
 	// LineEndings are those of the sides of a content conflict (resolve.LLMLineEndings): the llm
@@ -260,6 +263,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	usage := regionStats.Usage()
 	res.InputTokens, res.OutputTokens, res.ReasoningTokens = usage.InputTokens, usage.OutputTokens, usage.ReasoningTokens
 	res.Calls, res.Repairs = regionStats.Calls()
+	res.Providers = regionStats.Providers()
 	if err != nil {
 		var unresolved *resolve.UnresolvedError
 		if !errors.As(err, &unresolved) || len(unresolved.Failures) != 1 {

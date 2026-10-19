@@ -368,7 +368,9 @@ func (p *Provider) body(system, prompt string, maxTokens int, format any) []byte
 }
 
 type chatResponse struct {
-	Model   string `json:"model"`
+	Model string `json:"model"`
+	// Provider is the provider that served the call, as OpenRouter reports it.
+	Provider string `json:"provider"`
 	Choices []struct {
 		Message struct {
 			Content *string `json:"content"`
@@ -415,8 +417,9 @@ func (p *Provider) answer(chat *chatResponse, wantJSON bool) (*llm.Response, err
 		model = p.model
 	}
 	resp := &llm.Response{
-		Text:  text,
-		Model: model,
+		Text:     text,
+		Model:    model,
+		Provider: chat.Provider,
 		Usage: llm.Usage{
 			InputTokens:     chat.Usage.PromptTokens,
 			OutputTokens:    chat.Usage.CompletionTokens,

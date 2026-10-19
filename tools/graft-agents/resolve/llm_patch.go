@@ -620,6 +620,7 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		calls++
 		if stats != nil {
 			stats.RecordUsage(resp.Usage)
+			stats.RecordProvider(resp.Provider)
 		}
 		model = llmModel(resp, p)
 		return resp, nil

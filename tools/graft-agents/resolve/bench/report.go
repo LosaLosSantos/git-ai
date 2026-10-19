@@ -257,6 +257,24 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		fmt.Fprintf(&b, "\nModel calls: %d, of which %d repair rounds driven by deterministic findings; the model abstained on %d cases (the two changes cannot both hold; each reached the agent with its reason).\n",
 			t.Calls, t.Repairs, t.ModelAbstained)
 	}
+	providers := map[string]int{}
+	for _, r := range rep.Results {
+		for name, n := range r.Providers {
+			providers[name] += n
+		}
+	}
+	if len(providers) > 0 {
+		names := make([]string, 0, len(providers))
+		for name := range providers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		parts := make([]string, 0, len(names))
+		for _, name := range names {
+			parts = append(parts, fmt.Sprintf("%s %d", name, providers[name]))
+		}
+		fmt.Fprintf(&b, "\nModel calls by the provider that served them, as the endpoint reports it: %s.\n", strings.Join(parts, ", "))
+	}
 	if t := rep.Total; t.InputTokens+t.OutputTokens > 0 {
 		share := 0.0
 		if t.OutputTokens > 0 {

@@ -794,6 +794,29 @@ func TestProviderSatisfiesInterface(t *testing.T) {
 	var _ llm.Provider = (*Provider)(nil)
 }
 
+// TestCompleteReportsTheServingProvider: OpenRouter says which provider served the call; the response
+// carries it, and is empty when the endpoint does not say.
+func TestCompleteReportsTheServingProvider(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"model":    "served-model",
+		"provider": "Z.AI",
+		"choices": []any{map[string]any{
+			"message":       map[string]any{"role": "assistant", "content": "answer"},
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 1},
+	})
+	f := newFakeServer(t, func(int, recorded) reply { return reply{status: http.StatusOK, body: string(body)} })
+	resp, err := newProvider(t, f).Complete(context.Background(), llm.Request{Prompt: "p"})
+	if err != nil || resp.Provider != "Z.AI" {
+		t.Fatalf("provider %q, err %v", resp.Provider, err)
+	}
+	f = newFakeServer(t, func(int, recorded) reply { return chatOK("answer") })
+	if resp, err = newProvider(t, f).Complete(context.Background(), llm.Request{Prompt: "p"}); err != nil || resp.Provider != "" {
+		t.Fatalf("provider %q, err %v", resp.Provider, err)
+	}
+}
+
 // TestCompleteReportsReasoningTokens: the reasoning tokens of the usage, part of the output, are
 // reported when the endpoint gives them.
 func TestCompleteReportsReasoningTokens(t *testing.T) {

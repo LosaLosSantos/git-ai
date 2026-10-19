@@ -62,6 +62,9 @@ type Response struct {
 	Model string
 	// Usage is the token usage, if known.
 	Usage Usage
+	// Provider is the provider that served the call, when the endpoint says (OpenRouter's "provider"
+	// field of the answer): with routing pinned to a provider it is the proof that the call stayed there.
+	Provider string
 }
 
 // Provider is a language-model backend.

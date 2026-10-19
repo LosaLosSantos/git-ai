@@ -174,6 +174,31 @@ type LLMRegionStats struct {
 	calls, repairs     int
 	abstained          string
 	report             []string
+	providers          map[string]int
+}
+
+// RecordProvider counts a call served by the named provider (empty when the endpoint did not say).
+func (s *LLMRegionStats) RecordProvider(name string) {
+	if name == "" {
+		name = "(not reported)"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.providers == nil {
+		s.providers = map[string]int{}
+	}
+	s.providers[name]++
+}
+
+// Providers returns, by provider, the calls recorded.
+func (s *LLMRegionStats) Providers() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int, len(s.providers))
+	for k, v := range s.providers {
+		out[k] = v
+	}
+	return out
 }
 
 // RecordCalls adds the model calls of a file and those of them that were repair rounds.
