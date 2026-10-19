@@ -11,6 +11,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/updateref"
 	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
@@ -71,6 +72,45 @@ func (repo *Repo) ResolveRevision(ctx context.Context, revision git.Revision) (g
 	}
 
 	return oid, nil
+}
+
+// RequestObjectReader returns the object reader of a request that resolves revisions and reads
+// objects through one `git cat-file --batch-command` process: one process for the whole request,
+// where ResolveRevision starts one per revision (PLAN9, WP96). The returned function must be
+// called on every path once the request is done with the reader.
+func (repo *Repo) RequestObjectReader(ctx context.Context) (catfile.ObjectReader, func(), error) {
+	contentReader, cancel, err := repo.catfileCache.ObjectReader(ctx, repo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating object reader: %w", err)
+	}
+
+	reader, ok := contentReader.(catfile.ObjectReader)
+	if !ok {
+		cancel()
+		return nil, nil, fmt.Errorf("object reader %T cannot read object info", contentReader)
+	}
+
+	return reader, cancel, nil
+}
+
+// ResolveRevisionWithReader is ResolveRevision through reader, the request's object reader: the
+// same object ID, or git.ErrReferenceNotFound when the revision does not resolve. Unlike
+// ResolveRevision it also requires the object to exist, which a revision peeled to an object type
+// (`<rev>^{commit}`) requires anyway: pass only such revisions where ResolveRevision is replaced.
+func (repo *Repo) ResolveRevisionWithReader(ctx context.Context, reader catfile.ObjectInfoReader, revision git.Revision) (git.ObjectID, error) {
+	if revision.String() == "" {
+		return "", errors.New("repository cannot contain empty reference name")
+	}
+
+	info, err := reader.Info(ctx, revision)
+	if err != nil {
+		if errors.As(err, &catfile.NotFoundError{}) {
+			return "", git.ErrReferenceNotFound
+		}
+		return "", err
+	}
+
+	return info.Oid, nil
 }
 
 // GetReference looks up and returns the given reference. Returns a

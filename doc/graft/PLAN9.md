@@ -652,3 +652,149 @@ and commit build (95 to 146 ms), stage 2.
   with the numbers of the window.
 * **Release.** v0.2.0 is main with phase 4b, the skew fix, its performance fix
   (`6aecff1`) and the `UserSquash` fix. The rest of this plan goes to v0.3.0.
+
+## 15. WP96: the git processes of `UserCommitFiles` (design, for approval)
+
+Owner since 2026-10-19: m3 (scion-74), taking over p5w. This replaces the sketch of 3.4.
+
+### 15.1 Where the processes come from (measured and traced)
+
+`TestUserCommitFilesProcessCount` (`operations`, counting command factory) counts the
+git processes of one request that creates one file:
+
+| Case | Processes | By subcommand |
+|---|---|---|
+| existing branch, `file.txt` | 10 | rev-parse 3, hash-object 2, for-each-ref 1, ls-tree, commit-tree, cat-file, update-ref |
+| existing branch, `a/b/file.txt` | 12 | hash-object 4 (1 blob + 3 trees) |
+| new branch (from `start_branch_name`), `file.txt` | 13 | rev-parse 5, for-each-ref 2 |
+| new branch, `a/b/file.txt` | 15 | |
+
+Each one, traced to its call site (all through `localrepo.Repo.Exec`):
+
+| | Process | Count | From | Needed? |
+|---|---|---|---|---|
+| A | `rev-parse --verify refs/heads/<branch>^{commit}` | 1 | `commit_files.go:569` | a read: the request's object reader can answer it |
+| B | `for-each-ref --count=1 refs/heads/` (`HasBranches`) | new branch: 1 | `commit_files.go:799` (issue-3294 workaround) | only when the start branch does not resolve |
+| C | `rev-parse --verify refs/heads/<start>^{commit}` | new branch: 1 | `commit_files.go:829` | a read |
+| D | `rev-parse --verify <oid>^{commit}` (`fetchMissingCommit`) | new branch: 1 | `commit_files.go:843` | redundant: C resolved and peeled it in the same repository |
+| E | `hash-object --stdin -w --path=<path>` | 1 per blob | `commit_files.go:655` | yes: `--path` applies the repository's attributes (clean and eol filters) to the content |
+| F | `rev-parse --verify <parent>^{tree}` | 1 | `commit_files.go:453` | a read |
+| G | `rev-parse --verify <tree>:` | 1 | `tree.go:689` (`ReadTree`) | redundant: its input is a tree ID, which `Info` checks right after |
+| H | `cat-file -Z --batch-command --buffer` | 1 | `tree.go:694` | the request's object reader (a cache miss: the quarantine is per request) |
+| I | `ls-tree -z -r -t <tree>:` | 1 | `tree.go:407` | reads the whole tree recursively; only the trees on the changed paths are needed |
+| J | `hash-object -t tree -w --stdin` | 1 per changed tree (depth + 1) | `tree.go:623` | one process can write every tree |
+| K | `commit-tree` | 1 | `commit.go:203` | yes (see 15.2, item 4) |
+| L | `for-each-ref --count=1 refs/heads/` | 1 | `commit_files.go:732` | only for `RepoCreated`, which A or C already decides |
+| M | `update-ref -z --stdin` | 1 | `update_with_hooks.go:286` | yes |
+
+### 15.2 Design
+
+1. **Reads go through the request's object reader (H).** One `cat-file --batch-command`
+   process, taken once per request and kept for it (with the MVCC backend the catfile
+   cache is off, so the handle must be held, not looked up per read):
+   * A, C and F become `Info("refs/heads/<branch>^{commit}")`,
+     `Info("refs/heads/<start>^{commit}")` and `Info("<parent>^{tree}")`. A missing
+     object answers `missing`, which maps to the same not-found error as the failed
+     `rev-parse` today. Both resolve a name with git's same rules (`get_oid`), so
+     no ambiguity rule of `rev-parse` is lost. Probed on git 2.53: a running `cat-file --batch-command`
+     resolves `refs/heads/x^{commit}` and `^{tree}`, answers `missing` for an absent
+     reference, and sees objects and references written after it started.
+   * D becomes `Info("<parent>^{commit}")` on the same reader (the fetch from the start
+     repository, when it is missing, is unchanged; the reader then sees the fetched pack). G is
+     dropped (F already answered it).
+   * I is replaced by a lazy tree: the root is read with `Object()` and parsed (in
+     `localrepo`, into the entries `ls-tree -r -t` gives: a six-digit mode and the type
+     from the mode's format bits), and a subtree is read only when an action descends into it
+     (create, update, delete, move, chmod and create-dir each address one path).
+     Untouched subtrees keep their ID, so `Write` skips them as today. The cost no
+     longer grows with the size of the repository's tree.
+2. **One process writes every tree.** Today's writer, `git hash-object -t tree -w`, in
+   `--stdin-paths` mode: the request starts it once, writes each tree's content (the
+   same bytes `writeEntries` builds today) to a temporary file of the storage, sends the
+   path and reads the ID back, bottom-up (the `CommitWriter` pattern, for trees). The
+   bytes, the format checks and the absence of an existence check are those of today, by
+   construction. (Amended after the approval: `mktree --batch` was probed. It gives the
+   same IDs on valid trees, but it writes trees with duplicate names and invalid modes,
+   which `hash-object` refuses as malformed, and it refuses entries whose object is
+   missing, which today's writer accepts. Probe:
+   `m3-work/wp96/probe_mktree2.sh`.) A malformed tree makes the process exit, so the
+   request fails as today; the writer is not reused after an error.
+3. **`for-each-ref` only when nothing else decides it.** `RepoCreated` is false when A or
+   C resolved a branch; `HasBranches` runs only when neither did (an orphan commit,
+   possibly into an empty repository). B runs only when the start branch does not
+   resolve, which is where the issue-3294 workaround matters.
+4. **Unchanged:** E, one `hash-object --path` per blob: the attributes of the path decide
+   the bytes of the blob, and a batched writer cannot apply per-path attributes without a
+   `check-attr` process, which costs as much as it saves for one or two files. K, one
+   `commit-tree`: the existing `CommitWriter` costs two processes per request (its `git
+   config` lookup and its writer) unless it outlives the request. M.
+
+Expected, one created file, any depth, existing or new branch: **5 processes**
+(cat-file, hash-object for the blob, hash-object for the trees, commit-tree, update-ref). n files: 4 + n.
+An orphan commit into an empty repository: 6 (`for-each-ref`).
+
+### 15.3 What stays identical
+
+* **Objects:** the same blob bytes (same `--path`), tree bytes (the same writer and the
+  same input; the differential test checks it) and commit (`commit-tree`, unchanged).
+* **Durability:** every write is still a git process built by the command factory, so
+  `core.fsync=objects,derived-metadata,reference` and `core.fsyncMethod=fsync` apply to
+  the tree writer exactly as today. No object is written by Go, and
+  `TestQuarantineWritersKeepTheDurabilityContract` has no new place. The temporary files
+  are the writer's input, not objects.
+* **Errors:** the same codes and messages for a missing branch, a missing start branch, an
+  existing file, a missing file to update, delete or move, and directory conflicts; the
+  existing `UserCommitFiles` tests run unchanged.
+* **Two answers decided differently, in one corner.** With the start branch in the same
+  repository, it is now resolved before `HasBranches`, which runs only if it does not
+  resolve; and `RepoCreated` is false without `for-each-ref` when the target or the start
+  branch resolved. Both rely on "a resolved `refs/heads/<x>` is a branch". `get_oid` also
+  tries `refs/refs/heads/<x>`, `refs/tags/refs/heads/<x>` and `refs/remotes/refs/heads/<x>`
+  when `refs/heads/<x>` is absent, so a repository with no branch but such a ref now
+  starts from that ref, where today it starts an orphan commit (probe:
+  `m3-work/wp96/probe_dwim.sh`; `rev-parse --verify` and `cat-file` resolve it alike). Today the same rules
+  already apply to the target branch and, in a repository with branches, to the start
+  branch.
+* **Kept as today, found by the differential test:** a file created below an existing
+  file (`README/x`) walks into the blob entry, which loses its ID; the tree is then
+  malformed and both writers refuse it (`writing tree: exit status 128`, an internal error
+  rather than an index error). WP96 keeps this; making it an index error is a separate
+  change.
+* **The object reader goes back to the catfile cache** at the end of the request, on every
+  path (a deferred release), as today's `ReadTree` reader does. Its cache key holds the
+  quarantine directory, so no other request reuses it, and the cache's TTL ends it.
+* **Git features:** `hash-object --stdin-paths` (long-standing, already used by
+  `CommitWriter`) and `cat-file --batch-command` (2.36, already used by the object
+  reader). The server already needs newer git
+  (reftable, `merge-tree --stdin`).
+
+### 15.4 Proof
+
+* `TestUserCommitFilesProcessCount` asserts the processes by subcommand: 5 for the four
+  cases above, 7 for three files (4 + n), 6 for the orphan commit into an empty repository.
+  A process that comes back fails it.
+* `TestApplyActionLazyTreeMatchesRecursiveTree` applies seeded random sequences of the six
+  actions to the whole tree with today's writer and to the lazy tree with the tree writer.
+  It asserts the same error for every action, the same tree ID or the same refusal for
+  every sequence, and that every action type succeeds and every index error occurs below
+  the top level. A failure names the seed (`-lazy-tree-seed` replays it). It fails when
+  the lazy read is removed from the walk.
+* `TestTreeWriter_matchesWriteEntries` covers edge names, git's directory order, every
+  mode, missing objects (accepted), and duplicate names, file/directory clashes, invalid
+  modes and empty IDs (refused with today's error). Writes after a refusal fail, and one
+  process writes every tree. `TestReadTreeLazily_matchesReadTree` checks that the walked
+  lazy tree equals `ReadTree`. `TestTreeWriter_quarantine` checks objects that exist only
+  in the quarantine.
+* `TestUserCommitFilesReleasesProcessesAndFiles` runs failing requests (index error,
+  refused tree, missing start branch) and a successful one. After each, evicting the cache
+  leaves no cat-file process and the storage's temporary directory holds no tree object
+  file. It fails without the deferred release, or without the file removal.
+* The existing operations tests.
+* `UserCommitFiles` latency at 50 agents (graft-bench, as in 2.2), before and after,
+  alternated, in a window the PM grants.
+
+### 15.5 Ownership needed
+
+`internal/gitaly/service/operations/commit_files.go`; `internal/git/localrepo/tree.go` (the
+lazy tree and the tree writer) and `refs.go` if a reader-based resolve helper lives
+there; tests in those packages and `gittest/counting_command_factory.go` (`Counts`).
