@@ -2,6 +2,7 @@ package sdk_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -99,7 +100,51 @@ func TestRepo_Land_UnavailableRetriesAreBounded(t *testing.T) {
 			_, err := repo.Land(t.Context(), opts)
 			require.Equal(t, codes.Unavailable, sdk.Code(err), "the last Unavailable is returned")
 			require.Len(t, fakes.operations.landRequests, tc.expectedRequests)
+
+			// The retries are reported with the failure.
+			var retriesErr *sdk.UnavailableRetriesError
+			if tc.expectedRequests == 1 {
+				require.False(t, errors.As(err, &retriesErr), "a land that was not retried returns its error as is")
+				return
+			}
+			require.ErrorAs(t, err, &retriesErr)
+			require.Equal(t, tc.expectedRequests-1, retriesErr.Retries)
+			require.Equal(t, "still syncing", retriesErr.LastUnavailable)
 		})
+	}
+}
+
+func TestRepo_Land_FailureAfterRetriesKeepsItsStatus(t *testing.T) {
+	t.Parallel()
+
+	fakes := newFakeServices()
+	fakes.operations.landErrs = []error{status.Error(codes.Unavailable, "the land lane is closed")}
+	fakes.operations.landErr = status.Error(codes.Aborted, "giving up after 20 attempts")
+	repo := dialFake(t, fakes.register).Repo("repo")
+
+	opts := mergeLand()
+	opts.RetryUnavailable = fastRetry
+	_, err := repo.Land(t.Context(), opts)
+	require.Equal(t, codes.Aborted, sdk.Code(err), "the status of the last error")
+	require.Contains(t, status.Convert(err).Message(), "giving up after 20 attempts")
+	var retriesErr *sdk.UnavailableRetriesError
+	require.ErrorAs(t, err, &retriesErr)
+	require.Equal(t, 1, retriesErr.Retries)
+	require.Equal(t, "the land lane is closed", retriesErr.LastUnavailable)
+}
+
+func TestRepo_Land_NegativeRetriesAreInvalid(t *testing.T) {
+	t.Parallel()
+
+	for _, retry := range []sdk.UnavailableRetry{{MaxRetries: -1}, {Base: -time.Second}, {Cap: -time.Second}} {
+		fakes := newFakeServices()
+		repo := dialFake(t, fakes.register).Repo("repo")
+
+		opts := mergeLand()
+		opts.RetryUnavailable = retry
+		_, err := repo.Land(t.Context(), opts)
+		require.Equal(t, codes.InvalidArgument, sdk.Code(err), "%+v", retry)
+		require.Empty(t, fakes.operations.landRequests)
 	}
 }
 
@@ -140,6 +185,12 @@ func TestRepo_Land_ContextStopsTheRetries(t *testing.T) {
 	_, err := repo.Land(ctx, opts)
 	require.Equal(t, codes.DeadlineExceeded, sdk.Code(err))
 	require.Less(t, len(fakes.operations.landRequests), 6)
+
+	// The error keeps what the server answered last.
+	var retriesErr *sdk.UnavailableRetriesError
+	require.ErrorAs(t, err, &retriesErr)
+	require.Equal(t, "still syncing", retriesErr.LastUnavailable)
+	require.Contains(t, err.Error(), "still syncing")
 }
 
 func TestRepo_Land_RetriedResolveLandReportsItsOutcome(t *testing.T) {

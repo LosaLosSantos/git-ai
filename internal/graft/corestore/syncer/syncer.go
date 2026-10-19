@@ -238,20 +238,28 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoF
 // of the caller that started it, so that a caller that goes away does not fail
 // the others; every caller still stops waiting when its own context is done. A
 // call waits for at most two syncs, the one it joined and one of its own, so at
-// most twice sync_timeout, and a sync that runs out of its budget fails the
-// calls that wait for it with Unavailable.
+// most twice sync_timeout and the report after each, and a sync that runs out of
+// its budget fails the calls that wait for it with Unavailable. A sync that does
+// not end within that bound is a defect; the call then stops waiting with
+// Unavailable, and the error is logged.
 func (s *Syncer) EnsureFresh(ctx context.Context, repo storage.Repository) error {
 	if s == nil || !s.core.Authoritative() {
 		return nil
 	}
 
-	// Each sync (flight) runs under its own sync_timeout. The call has no budget of its own: one
-	// set at its arrival would also have to cover the end of a flight it joins and then a whole
-	// flight of its own, so it could give up while its own flight is still within its budget.
-	// It waits at most for both, each bounded by sync_timeout, and stops when its context ends.
+	// Each sync (flight) runs under its own sync_timeout. The call waits for at most two flights,
+	// the one it joined and one of its own, each bounded by sync_timeout plus the report it makes
+	// after it (detached, at most reportInterval): a budget of one sync_timeout from its arrival
+	// would give up while its own flight is still within its budget. That bound holds as long as
+	// every step of a flight respects its context; the backstop below ends the wait of the call
+	// should a flight not end within it (a stalled file system, a driver that ignores its
+	// context), instead of leaving every caller of the repository waiting for it.
 	timeout := s.syncTimeout()
 	key := corestore.KeyOf(repo)
 	flightCtx := context.WithoutCancel(ctx)
+	backstop := 2 * (timeout + reportInterval)
+	waitCtx, cancel := context.WithTimeout(ctx, backstop)
+	defer cancel()
 
 	// A call must not be answered by a sync that read the database head before
 	// the call arrived: a changeset committed (on another node) between that read
@@ -286,8 +294,14 @@ func (s *Syncer) EnsureFresh(ctx context.Context, repo storage.Repository) error
 				return nil
 			}
 			// The joined sync read the head before this call arrived: sync again.
-		case <-ctx.Done():
-			return structerr.NewUnavailable("storage core: waiting for the sync of %s: %w", key, ctx.Err())
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return structerr.NewUnavailable("storage core: waiting for the sync of %s: %w", key, ctx.Err())
+			}
+			// A flight outlived its budget: a step of it does not respect its context.
+			s.logger.WithField("repository", key.String()).WithField("backstop", backstop).
+				Error("storage core: a sync did not end within its budget; the call stops waiting for it")
+			return structerr.NewUnavailable("storage core: waiting for the sync of %s: no sync ended within %s", key, backstop)
 		}
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
 )
@@ -67,4 +69,36 @@ func TestEnsureFreshWaitsForItsOwnRound(t *testing.T) {
 	require.NoError(t, <-second, "the call gave up while its own round was within its budget")
 	require.Greater(t, time.Since(arrived), syncTimeout, "the call waited longer than one sync_timeout since it arrived")
 	require.Equal(t, int32(2), rounds.Load(), "the second call ran a round of its own")
+}
+
+// TestEnsureFreshBackstop: a sync round that never ends (a step that ignores its
+// context, here the "synced" point held) does not hold its callers forever. A
+// call stops waiting after twice sync_timeout and the report after each round,
+// with Unavailable.
+func TestEnsureFreshBackstop(t *testing.T) {
+	a := newEnv(t, envOptions{})
+	src := a.newSource(t)
+	c1 := a.writeCommit(t, src)
+	a.register(t, a.key(localRelPath), src, c1)
+
+	b := a.secondNode(t, sqlstore.SQLite)
+	const syncTimeout = 200 * time.Millisecond
+	b.core.SyncTimeout = syncTimeout
+
+	release := make(chan struct{})
+	b.sy.SetTestHook(func(point string) {
+		if point == "synced" {
+			<-release
+		}
+	})
+	// The held round ends when the test does, so that nothing outlives it.
+	t.Cleanup(func() { close(release) })
+
+	start := time.Now()
+	err := b.sy.EnsureFresh(b.ctx, b.pbRepo(localRelPath))
+	elapsed := time.Since(start)
+
+	require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+	require.ErrorContains(t, err, "no sync ended within")
+	require.GreaterOrEqual(t, elapsed, 2*syncTimeout, "the call waited for the two rounds it may need")
 }

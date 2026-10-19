@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"time"
@@ -98,6 +99,29 @@ type UnavailableRetry struct {
 	Cap time.Duration
 }
 
+// UnavailableRetriesError is the error of a land that failed after the SDK
+// retried Unavailable answers: the error of the last call, or of the context
+// that ended while Land waited to retry. It carries the status of that error,
+// so Code, LandError and the Is* helpers read it as they read the error itself.
+type UnavailableRetriesError struct {
+	// Retries is the number of Unavailable answers that were retried.
+	Retries int
+	// LastUnavailable is the message of the last of them.
+	LastUnavailable string
+	// Err is the error the land failed with.
+	Err error
+}
+
+func (e *UnavailableRetriesError) Error() string {
+	return fmt.Sprintf("%v (after %d retries of Unavailable, the last: %s)", e.Err, e.Retries, e.LastUnavailable)
+}
+
+// Unwrap returns the error the land failed with.
+func (e *UnavailableRetriesError) Unwrap() error { return e.Err }
+
+// GRPCStatus returns the status of the error the land failed with.
+func (e *UnavailableRetriesError) GRPCStatus() *status.Status { return status.Convert(e.Err) }
+
 // Defaults of UnavailableRetry.
 const (
 	defaultUnavailableRetries = 5
@@ -182,8 +206,9 @@ func oldTip(oid string) string {
 // concurrent updates, so many writers can land changes on the same branch
 // without a merge queue.
 //
-// An Unavailable answer is retried as opts.RetryUnavailable says; when the
-// retries run out, the last Unavailable error is returned.
+// An Unavailable answer is retried as opts.RetryUnavailable says. A land that
+// fails after retries returns an *UnavailableRetriesError, with the retries and
+// the status of the last error.
 //
 // Failures carry structured details: use IsMergeConflict, IsNotAncestor,
 // IsReferenceUpdateConflict, IsRejectedByHook or LandError.
@@ -195,6 +220,8 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		return nil, status.Error(codes.InvalidArgument, "commit is required")
 	case opts.MaxAttempts < 0:
 		return nil, status.Error(codes.InvalidArgument, "max attempts must not be negative")
+	case opts.RetryUnavailable.MaxRetries < 0, opts.RetryUnavailable.Base < 0, opts.RetryUnavailable.Cap < 0:
+		return nil, status.Error(codes.InvalidArgument, "the retries of Unavailable must not be negative")
 	}
 
 	req := &gitalypb.UserLandRequest{
@@ -230,11 +257,14 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, status.FromContextError(ctx.Err()).Err()
+			return nil, &UnavailableRetriesError{Retries: retries, LastUnavailable: lastUnavailable, Err: status.FromContextError(ctx.Err()).Err()}
 		case <-timer.C:
 		}
 	}
 	if err != nil {
+		if retries > 0 {
+			return nil, &UnavailableRetriesError{Retries: retries, LastUnavailable: lastUnavailable, Err: err}
+		}
 		return nil, err
 	}
 

@@ -27,6 +27,7 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -1204,10 +1205,10 @@ func testFetchRemote(t *testing.T, ctx context.Context) {
 			for _, run := range setupData.runs {
 				response, err := client.FetchRemote(ctx, setupData.request)
 				if len(run.expectedErrOneOf) > 0 {
+					// The whole status, its details included, must be one of them.
 					matched := false
 					for _, expected := range run.expectedErrOneOf {
-						matched = matched || (status.Code(err) == status.Code(expected) &&
-							status.Convert(err).Message() == status.Convert(expected).Message())
+						matched = matched || proto.Equal(status.Convert(err).Proto(), status.Convert(expected).Proto())
 					}
 					require.True(t, matched, "%v is none of %v", err, run.expectedErrOneOf)
 				} else {
