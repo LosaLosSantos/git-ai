@@ -52,6 +52,12 @@ func TestSyncerSeedsInTheBackground(t *testing.T) {
 	<-seeding
 	require.Equal(t, float64(3), syncCount(t, b.sy, "seeding"))
 
+	// The short budget is for the rounds while the seed runs. The catch-up after it applies the
+	// changesets since the checkpoint, and a round that cannot finish that within its budget, as
+	// a heavily loaded node may not in 400ms, answers Unavailable every time (the sync_timeout
+	// contract): the catch-up gets the default budget. The seed goroutine reads it only after
+	// close(release).
+	b.core.SyncTimeout = 10 * time.Second
 	close(release)
 	require.Eventually(t, func() bool {
 		return b.sy.EnsureFresh(b.ctx, b.pbRepo(localRelPath)) == nil

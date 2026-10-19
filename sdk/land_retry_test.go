@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -173,18 +174,25 @@ func TestRepo_Land_ContextStopsTheRetries(t *testing.T) {
 
 	fakes := newFakeServices()
 	fakes.operations.landErr = status.Error(codes.Unavailable, "still syncing")
-	repo := dialFake(t, fakes.register).Repo("repo")
 
-	// The backoff is longer than the context, which ends during the first wait.
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	// The context ends once the client has the first Unavailable, so during the wait before the
+	// first retry, whatever the time the call took.
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	cancelAfterUnavailable := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if status.Code(err) == codes.Unavailable {
+			cancel()
+		}
+		return err
+	}
+	repo := dialFake(t, fakes.register, sdk.WithGRPCOptions(grpc.WithUnaryInterceptor(cancelAfterUnavailable))).Repo("repo")
+
 	opts := mergeLand()
 	opts.RetryUnavailable = sdk.UnavailableRetry{Base: time.Hour, Cap: time.Hour}
-	// Each wait is drawn from [0, 1h]: the context ends during one of them unless five draws in
-	// a row fall below 50ms.
 	_, err := repo.Land(ctx, opts)
-	require.Equal(t, codes.DeadlineExceeded, sdk.Code(err))
-	require.Less(t, len(fakes.operations.landRequests), 6)
+	require.Equal(t, codes.Canceled, sdk.Code(err))
+	require.Len(t, fakes.operations.landRequests, 1)
 
 	// The error keeps what the server answered last.
 	var retriesErr *sdk.UnavailableRetriesError
