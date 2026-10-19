@@ -62,8 +62,9 @@ type llmStrategy struct {
 	provider llm.Provider
 	base     llm.Provider
 	budget   *Budget
-	// model is the configured model name.
+	// model is the configured model name, and routing its OpenRouter routing, if any.
 	model   string
+	routing *llm.Routing
 	opt     LLMOptions
 	timeout time.Duration
 }
@@ -118,7 +119,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
 	}
-	s := &llmStrategy{provider: p, base: p, model: cfg.Model, opt: opt, timeout: timeout}
+	s := &llmStrategy{provider: p, base: p, model: cfg.Model, routing: cfg.Routing, opt: opt, timeout: timeout}
 
 	budget, err := llmBudgetConfig(spec, spec.Options["llm"].(map[string]any))
 	if err != nil {
@@ -193,7 +194,7 @@ func llmProviderConfig(spec StrategySpec) (llm.Config, error) {
 	var unknown []string
 	for k := range tbl {
 		switch k {
-		case "type", "model", "base_url", "api_key_env", "command", "timeout", "max_tokens", "effort", "options", "budget":
+		case "type", "model", "base_url", "api_key_env", "command", "timeout", "max_tokens", "effort", "options", "routing", "budget":
 		default:
 			unknown = append(unknown, k)
 		}
@@ -240,10 +241,37 @@ func llmProviderConfig(spec StrategySpec) (llm.Config, error) {
 			cfg.Options[k] = s
 		}
 	}
+	if v, ok := tbl["routing"]; ok {
+		if cfg.Routing, err = routingField(v); err != nil {
+			return llm.Config{}, fmt.Errorf("strategy %q: llm: routing: %w", spec.Name, err)
+		}
+	}
 	if cfg.Type == "" {
 		return llm.Config{}, fmt.Errorf("strategy %q: llm: type is required", spec.Name)
 	}
 	return cfg, nil
+}
+
+// routingField reads the [strategy.llm.routing] table: the lists only and ignore, and nothing else.
+func routingField(v any) (*llm.Routing, error) {
+	tbl, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("must be a table")
+	}
+	for k := range tbl {
+		if k != "only" && k != "ignore" {
+			return nil, fmt.Errorf("unknown key %q (want only, ignore)", k)
+		}
+	}
+	var r llm.Routing
+	var err error
+	if r.Only, err = stringListField(tbl, "only"); err != nil {
+		return nil, err
+	}
+	if r.Ignore, err = stringListField(tbl, "ignore"); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 // llmOptInt reads an optional non-negative integer option of the strategy.

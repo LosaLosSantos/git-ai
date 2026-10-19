@@ -540,6 +540,7 @@ error at startup. None is dropped silently:
 | `max_tokens` | `max_tokens` | `max_tokens` (default 16000) | `GRAFT_LLM_MAX_TOKENS` |
 | `effort` | OpenRouter's `reasoning: {"effort": ...}`; `minimal`, `low`, `medium`, `high`, `xhigh` | `output_config.effort`; `low` to `max` (default `high`) | `GRAFT_LLM_EFFORT`, verbatim |
 | `options` | error | error | error |
+| `routing` | OpenRouter's `provider` object, with `allow_fallbacks: false` | error | error |
 
 The `openai` provider's `reasoning` parameter is OpenRouter's. Set `effort`
 only for an endpoint that takes it.
@@ -564,6 +565,38 @@ files you would not send to that provider. The server never calls the model.
 Turn AI on only if you accept that the resolution is produced by a model.
 Every AI resolution carries the `Graft-Resolved-By` trailer, so it can be
 audited with `graft log` and reverted with `graft-verify` if it breaks tests.
+
+### Pinning OpenRouter routing
+
+OpenRouter serves a model from several endpoints, at different prices: for
+example, a standard tier, a flex tier and priority tiers that cost up to six
+times more. Without routing, a call can go to any of them. The
+`[strategy.llm.routing]` table of the `openai` provider pins the endpoints a
+call may use:
+
+```toml
+[strategy.llm.routing]
+only = ["openai", "azure", "amazon-bedrock"]          # providers or endpoint tags allowed
+ignore = ["openai/flex", "openai/fast", "openai/ultrafast"]  # endpoint tags excluded
+```
+
+The names are OpenRouter's provider slugs, or endpoint tags as the `tag`
+field of `/api/v1/models/<model>/endpoints` lists them. The provider sends
+them as the request's `provider` object, always with `allow_fallbacks:
+false`: a call that the allowed endpoints cannot serve fails rather than going
+to another endpoint. At startup the provider refuses a routing table that names
+nothing, a malformed name, or a name listed twice or in both lists.
+
+The budget is exact only when routing is pinned. Without it, the prices of the
+budget must be those of the most expensive endpoint, or a call routed there is
+undercounted. `graft-resolve bench run --pricing openrouter` prices each call
+at the highest price of the endpoints the routing allows, read at run time. It
+reads the names in the way that can only overstate the price: a slug in
+`only` admits every endpoint of that provider, its tagged variants included,
+while a name in `ignore` excludes only the endpoint whose tag is exactly that
+name. It refuses to start when the allowed set cannot be determined: when an
+endpoint has no tag, when a name matches no endpoint of the model (most likely
+a typo), or when the routing allows none.
 
 ### Monthly AI spending cap
 
@@ -601,7 +634,8 @@ rewrites the file atomically (temporary file, fsync, rename), so the spend
 survives restarts and is shared by every graft-resolve process that uses the
 same file. The state file needs a platform with `flock` (Linux, macOS, the
 BSDs). The prices are configuration values: graft-resolve does not look them
-up, and they should be set from the provider's price page.
+up, and they should be set from the provider's price page: with OpenRouter, the
+highest price of the endpoints the routing allows (see above).
 
 The spend is reported in three places:
 
@@ -644,7 +678,7 @@ resolved in real repositories. It needs the grammars (a cgo build).
   model needs `--max-usd`: every call books its worst case first, and a call
   that would pass the cap is not made. The model's price is read at run time
   from OpenRouter's endpoints API (`--pricing openrouter`, the highest price
-  of the model's endpoints), or given as flags (`--pricing fixed`). The
+  of the model's endpoints, or of those the routing allows), or given as flags (`--pricing fixed`). The
   answers are kept in `--answers-dir`.
 - `bench rejudge --report-in R --manifest M --clones DIR --answers-dir A`:
   judges the stored answers again with the current judge, with no model call.

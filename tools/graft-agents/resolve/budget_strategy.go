@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
 // The llm strategy's budget is the [strategy.llm.budget] table:
@@ -116,6 +118,18 @@ func (r *Resolver) LLMModels() map[string]string {
 	for _, bd := range r.bindings {
 		if s, ok := bd.Strategy.(*llmStrategy); ok {
 			out[bd.Name] = s.model
+		}
+	}
+	return out
+}
+
+// LLMRoutings returns the OpenRouter routing of each llm strategy of r, by strategy name; nil for
+// a strategy without one.
+func (r *Resolver) LLMRoutings() map[string]*llm.Routing {
+	out := map[string]*llm.Routing{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			out[bd.Name] = s.routing
 		}
 	}
 	return out

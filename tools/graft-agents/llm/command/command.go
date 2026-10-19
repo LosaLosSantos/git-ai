@@ -124,6 +124,9 @@ func New(cfg llm.Config) (*Provider, error) {
 		sort.Strings(keys)
 		unsupported = append(unsupported, fmt.Sprintf("options %v", keys))
 	}
+	if cfg.Routing != nil {
+		unsupported = append(unsupported, "routing")
+	}
 	if len(unsupported) > 0 {
 		return nil, fmt.Errorf("command: unsupported settings %s: the program reads its endpoint and credentials from its own environment", strings.Join(unsupported, ", "))
 	}

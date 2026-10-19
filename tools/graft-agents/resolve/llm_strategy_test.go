@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -424,6 +425,18 @@ type = "llm"
 			config: base + "[strategy.llm]\ntype = \"wp19-resolve-fake\"\nmax_tokens = -5\n",
 			want:   "max_tokens must be an integer",
 		},
+		"routing not a table": {
+			config: base + "[strategy.llm]\ntype = \"wp19-resolve-fake\"\nrouting = \"openai\"\n",
+			want:   "routing: must be a table",
+		},
+		"unknown routing key": {
+			config: base + "[strategy.llm]\ntype = \"wp19-resolve-fake\"\n[strategy.llm.routing]\norder = [\"openai\"]\n",
+			want:   `unknown key "order"`,
+		},
+		"routing only not a list": {
+			config: base + "[strategy.llm]\ntype = \"wp19-resolve-fake\"\n[strategy.llm.routing]\nonly = \"openai\"\n",
+			want:   `"only" must be a list of strings`,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := wp19BuildErr(tc.config)
@@ -431,6 +444,27 @@ type = "llm"
 				t.Fatalf("err = %v, want it to mention %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestLLMStrategyRouting(t *testing.T) {
+	r := wp19Build(t, `
+[[strategy]]
+type = "llm"
+[strategy.llm]
+type = "wp19-resolve-fake"
+[strategy.llm.routing]
+only = ["openai", "azure/eu"]
+ignore = ["openai/ultrafast"]
+`)
+	want := &llm.Routing{Only: []string{"openai", "azure/eu"}, Ignore: []string{"openai/ultrafast"}}
+	for name, got := range r.LLMRoutings() {
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("strategy %s: routing %+v, want %+v", name, got, want)
+		}
+	}
+	if len(r.LLMRoutings()) != 1 {
+		t.Fatalf("routings %v, want one", r.LLMRoutings())
 	}
 }
 

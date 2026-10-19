@@ -84,6 +84,9 @@ func New(cfg llm.Config) (*Provider, error) {
 	if len(cfg.Command) > 0 {
 		return nil, errors.New("anthropic: command is for the command provider; this provider takes none")
 	}
+	if cfg.Routing != nil {
+		return nil, errors.New("anthropic: routing is OpenRouter's, for the openai provider; this provider takes none")
+	}
 	if len(cfg.Options) > 0 {
 		keys := make([]string, 0, len(cfg.Options))
 		for k := range cfg.Options {

@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -91,6 +92,7 @@ type Provider struct {
 	model            string
 	maxTokens        int
 	effort           string
+	routing          *providerPreference
 	timeout          time.Duration
 	client           *http.Client
 	maxResponseBytes int64
@@ -132,6 +134,17 @@ func New(cfg llm.Config) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	var routing *providerPreference
+	if cfg.Routing != nil {
+		if err := cfg.Routing.Validate(); err != nil {
+			return nil, fmt.Errorf("openai: %w", err)
+		}
+		routing = &providerPreference{
+			Only:           slices.Clone(cfg.Routing.Only),
+			Ignore:         slices.Clone(cfg.Routing.Ignore),
+			AllowFallbacks: false,
+		}
+	}
 
 	endpoint, err := chatEndpoint(cfg.BaseURL)
 	if err != nil {
@@ -152,6 +165,7 @@ func New(cfg llm.Config) (*Provider, error) {
 		model:            model,
 		maxTokens:        cfg.MaxTokens,
 		effort:           effort,
+		routing:          routing,
 		timeout:          timeout,
 		client:           &http.Client{},
 		maxResponseBytes: defaultMaxResponseBytes,
@@ -301,6 +315,17 @@ type chatRequest struct {
 	MaxTokens      int        `json:"max_tokens,omitempty"`
 	ResponseFormat any        `json:"response_format,omitempty"`
 	Reasoning      *reasoning `json:"reasoning,omitempty"`
+	// Provider is OpenRouter's provider-routing object, sent when routing is configured.
+	Provider *providerPreference `json:"provider,omitempty"`
+}
+
+// providerPreference is OpenRouter's provider-routing object (llm.Routing). allow_fallbacks is
+// always sent, and always false: a call that the allowed endpoints cannot serve fails rather than
+// going to another endpoint, whose price the budget may not have counted.
+type providerPreference struct {
+	Only           []string `json:"only,omitempty"`
+	Ignore         []string `json:"ignore,omitempty"`
+	AllowFallbacks bool     `json:"allow_fallbacks"`
 }
 
 // reasoning is OpenRouter's reasoning parameter, sent when an effort is
@@ -320,6 +345,7 @@ func (p *Provider) body(system, prompt string, maxTokens int, format any) []byte
 		Model:          p.model,
 		MaxTokens:      maxTokens,
 		ResponseFormat: format,
+		Provider:       p.routing,
 	}
 	if p.effort != "" {
 		req.Reasoning = &reasoning{Effort: p.effort}

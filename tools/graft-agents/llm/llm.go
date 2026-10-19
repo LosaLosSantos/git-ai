@@ -100,6 +100,8 @@ type Config struct {
 	Effort string `toml:"effort" json:"effort"`
 	// Options holds extra provider-specific settings.
 	Options map[string]string `toml:"options" json:"options"`
+	// Routing pins the OpenRouter endpoints a call may use (openai provider only).
+	Routing *Routing `toml:"routing" json:"routing"`
 }
 
 // DefaultTimeout is the default completion timeout.

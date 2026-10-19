@@ -63,6 +63,7 @@ func TestNewRejectsSettingsTheProgramCannotTake(t *testing.T) {
 		want   string
 	}{
 		"base_url":    {func(c *llm.Config) { c.BaseURL = "https://example.com/v1" }, "base_url"},
+		"routing":     {func(c *llm.Config) { c.Routing = &llm.Routing{Only: []string{"openai"}} }, "routing"},
 		"api_key_env": {func(c *llm.Config) { c.APIKeyEnv = "KEY" }, "api_key_env"},
 		"options":     {func(c *llm.Config) { c.Options = map[string]string{"b": "1", "a": "2"} }, "options [a b]"},
 		"nul effort":  {func(c *llm.Config) { c.Effort = "lo\x00w" }, "effort contains a NUL byte"},

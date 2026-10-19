@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
@@ -21,13 +22,17 @@ import (
 const DefaultOpenRouterAPI = "https://openrouter.ai/api/v1"
 
 // Pricing is the price of the measured model, as read at run time (never from memory, PLAN10 12):
-// the highest price of each kind over the model's endpoints, in USD per token, since OpenRouter
-// may route a call to any of them.
+// the highest price of each kind over the endpoints a call may reach, in USD per token, since
+// OpenRouter may route a call to any of them. Without routing that is every endpoint of the model;
+// with routing (llm.Routing) it is the endpoints the routing allows.
 type Pricing struct {
 	Model     string    `json:"model"`
 	Source    string    `json:"source"`
 	FetchedAt time.Time `json:"fetched_at"`
-	Endpoints int       `json:"endpoints"`
+	// Endpoints is the number of endpoints of the model, and Priced the tags of those the prices
+	// come from when routing narrows them (empty: every endpoint).
+	Endpoints int      `json:"endpoints"`
+	Priced    []string `json:"priced_endpoints,omitempty"`
 	// Prompt, Completion and Reasoning are per token; Request is per call.
 	Prompt     float64 `json:"prompt_usd_per_token"`
 	Completion float64 `json:"completion_usd_per_token"`
@@ -67,6 +72,7 @@ type openRouterEndpoints struct {
 		ID        string `json:"id"`
 		Endpoints []struct {
 			Name    string                     `json:"name"`
+			Tag     string                     `json:"tag"`
 			Pricing map[string]json.RawMessage `json:"pricing"`
 		} `json:"endpoints"`
 	} `json:"data"`
@@ -92,7 +98,11 @@ func openRouterPrice(raw json.RawMessage) (float64, error) {
 //
 // maxPromptTokens is an upper bound of the prompt of one call; an override tier whose
 // min_prompt_tokens is above it is left out, since it cannot apply. 0 counts every tier.
-func OpenRouterPricing(ctx context.Context, client *http.Client, api, model string, maxPromptTokens int) (Pricing, error) {
+//
+// routing, when set, narrows the endpoints to those it allows (llm.Routing.Allows). The allowed set
+// must be known exactly, so the pricing fails when an endpoint has no tag, when a name of routing
+// matches no endpoint, or when routing allows none.
+func OpenRouterPricing(ctx context.Context, client *http.Client, api, model string, maxPromptTokens int, routing *llm.Routing) (Pricing, error) {
 	parts := strings.Split(model, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Pricing{}, fmt.Errorf("pricing: model %q is not author/slug", model)
@@ -127,6 +137,18 @@ func OpenRouterPricing(ctx context.Context, client *http.Client, api, model stri
 	// towards the highest price too. A discount is ignored, which can only overstate the cost, and so are the prices of
 	// what the run never uses (web search, images, cache reads and writes).
 	p := Pricing{Model: model, Source: source, FetchedAt: time.Now().UTC(), Endpoints: len(doc.Data.Endpoints)}
+	if routing != nil {
+		tags := make([]string, 0, len(doc.Data.Endpoints))
+		for _, e := range doc.Data.Endpoints {
+			if e.Tag == "" {
+				return Pricing{}, fmt.Errorf("pricing: endpoint %q of %s has no tag, so the endpoints the routing allows are not known", e.Name, model)
+			}
+			tags = append(tags, e.Tag)
+		}
+		if err := routing.CheckNames(tags); err != nil {
+			return Pricing{}, fmt.Errorf("pricing: %w", err)
+		}
+	}
 	take := func(endpoint string, prices map[string]json.RawMessage, required bool) error {
 		for _, f := range []struct {
 			key      string
@@ -154,6 +176,12 @@ func OpenRouterPricing(ctx context.Context, client *http.Client, api, model stri
 		return nil
 	}
 	for _, e := range doc.Data.Endpoints {
+		if routing != nil {
+			if !routing.Allows(e.Tag) {
+				continue
+			}
+			p.Priced = append(p.Priced, e.Tag)
+		}
 		if err := take(e.Name, e.Pricing, true); err != nil {
 			return Pricing{}, err
 		}

@@ -11,11 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/bench"
 	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
@@ -189,7 +191,17 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			for m := range distinct {
 				model = m
 			}
-			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model, res.LLMMaxPromptTokens())
+			// The strategies of the one model must route it the same way, or no one price fits.
+			var routing *llm.Routing
+			first := true
+			for _, r := range res.LLMRoutings() {
+				if !first && !reflect.DeepEqual(r, routing) {
+					fmt.Fprintln(stderr, "graft-resolve bench run: --pricing openrouter needs one routing, the llm strategies route differently")
+					return 2
+				}
+				routing, first = r, false
+			}
+			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model, res.LLMMaxPromptTokens(), routing)
 			if err != nil {
 				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 				return 1
