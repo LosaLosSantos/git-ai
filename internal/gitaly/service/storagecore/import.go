@@ -61,8 +61,8 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	}
 
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo); err != nil {
+		return nil, err
 	}
 
 	local := s.localRepo(repo)

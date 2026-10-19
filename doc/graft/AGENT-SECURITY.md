@@ -57,7 +57,8 @@ These can never be enabled, not even through `graft.agent_rpcs`:
 - `RemoteService` `UpdateRemoteMirror`, `FindRemoteRepository` and
   `FindRemoteRootRef`, which push to or query a URL the caller chooses.
 - `CleanupService`, `ObjectPoolService`, `HookService`, `InternalGitaly`,
-  `PartitionService`.
+  `PartitionService`, and `StorageCoreService` (imports, checkpoints and
+  garbage collection, which deletes packs of the bucket).
 
 Every other RPC that is not on the allowlist (for example the other
 `OperationService` RPCs such as `UserMergeBranch`, or `SSHService`) is denied

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -327,6 +328,38 @@ func TestRunOnceStopsWhenTheLeaseIsLost(t *testing.T) {
 	}
 	require.Len(t, after, len(before)+1, "the uploaded checkpoint pack is an orphan")
 	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_runs_total", "error"))
+}
+
+// TestHoldLeaseRenewsUntilReleased verifies the lease the background
+// maintenance and the CollectGarbage request hold while they work: no other
+// holder takes it for several times its time to live, and it is free once
+// released.
+func TestHoldLeaseRenewsUntilReleased(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
+	const ttl = 300 * time.Millisecond
+	const holder = "node-a/1/request-1"
+
+	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, holder, ttl)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	var lost atomic.Bool
+	leaseCtx, release := maintenance.HoldLease(ctx, e.core, testhelper.NewLogger(t), e.repo.ID, holder, ttl, func() { lost.Store(true) })
+
+	require.Never(t, func() bool {
+		acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", ttl)
+		require.NoError(t, err)
+		return acquired
+	}, 5*ttl, ttl/10, "the lease is renewed")
+	require.NoError(t, leaseCtx.Err())
+	require.False(t, lost.Load())
+
+	release()
+	require.ErrorIs(t, leaseCtx.Err(), context.Canceled)
+	acquired, err = e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", ttl)
+	require.NoError(t, err)
+	require.True(t, acquired, "released")
 }
 
 func (e *env) bucketKeys() map[string]bool {

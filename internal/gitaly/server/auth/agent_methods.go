@@ -26,12 +26,16 @@ import (
 //   - CleanupService and PartitionService are administrative: they rewrite and
 //     clean up repositories and partitions outside the reference policy.
 //   - InternalGitaly serves the internal calls between Gitaly nodes.
+//   - StorageCoreService is the storage core's administration: imports,
+//     checkpoints and garbage collection, which deletes packs of the bucket.
+//     It is reserved for operators (doc/graft/STORAGE.md).
 var agentNeverAllowedServices = []string{
 	gitalypb.HookService_ServiceDesc.ServiceName,
 	gitalypb.ObjectPoolService_ServiceDesc.ServiceName,
 	gitalypb.CleanupService_ServiceDesc.ServiceName,
 	gitalypb.PartitionService_ServiceDesc.ServiceName,
 	gitalypb.InternalGitaly_ServiceDesc.ServiceName,
+	gitalypb.StorageCoreService_ServiceDesc.ServiceName,
 }
 
 // agentNeverAllowedMethods are RPCs that no caller authenticated with a

@@ -178,6 +178,39 @@ func TestCollectRemovedRepositoriesRefusals(t *testing.T) {
 	require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
 }
 
+// TestStorageCoreRejectsReservedRelativePaths verifies that no storage core
+// RPC acts on a repository inside Gitaly's data directory, where the storage
+// core keeps untrusted copies for an operator: the gate does not see these
+// RPCs, so they check it themselves.
+func TestStorageCoreRejectsReservedRelativePaths(t *testing.T) {
+	t.Parallel()
+
+	h := setup(t, corestore.ModeAuthoritative, sqlstore.SQLite)
+	repo := &gitalypb.Repository{StorageName: h.repo.GetStorageName(), RelativePath: "+gitaly/graft-untrusted/stale-1/repo.git"}
+	for name, call := range map[string]func() error{
+		"GetStorageState": func() error {
+			_, err := h.client.GetStorageState(h.ctx, &gitalypb.GetStorageStateRequest{Repository: repo})
+			return err
+		},
+		"VerifyRepository": func() error {
+			_, err := h.client.VerifyRepository(h.ctx, &gitalypb.VerifyRepositoryRequest{Repository: repo})
+			return err
+		},
+		"CreateCheckpoint": func() error {
+			_, err := h.client.CreateCheckpoint(h.ctx, &gitalypb.CreateCheckpointRequest{Repository: repo})
+			return err
+		},
+		"CollectGarbage": func() error {
+			_, err := h.client.CollectGarbage(h.ctx, &gitalypb.CollectGarbageRequest{Repository: repo})
+			return err
+		},
+	} {
+		err := call()
+		require.Equal(t, codes.InvalidArgument, status.Code(err), "%s: %v", name, err)
+		require.ErrorContains(t, err, "Gitaly's data directory", name)
+	}
+}
+
 // packKeys returns the objects of the repository in the bucket.
 func (h *harness) packKeys(repoID int64) map[string]bool {
 	h.t.Helper()

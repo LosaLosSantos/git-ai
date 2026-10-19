@@ -33,8 +33,8 @@ func (s *server) VerifyRepository(ctx context.Context, req *gitalypb.VerifyRepos
 	}
 
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
+		return nil, err
 	}
 
 	if core.Authoritative() {

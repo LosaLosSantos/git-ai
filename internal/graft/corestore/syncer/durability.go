@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -41,6 +43,8 @@ func (s *Syncer) StartLocalReferences(ctx context.Context, storages []string) (s
 	if !d.Enabled() {
 		return func() {}, nil
 	}
+	kept := append([]string(nil), storages...)
+	s.keptStorages.Store(&kept)
 
 	owned, err := d.TryOwn(ctx, storages)
 	if err != nil {
@@ -73,7 +77,7 @@ func (s *Syncer) StartLocalReferences(ctx context.Context, storages []string) (s
 		}
 		finalCtx, cancelFinal := context.WithTimeout(context.WithoutCancel(ctx), finalStepTimeout)
 		defer cancelFinal()
-		for _, path := range d.Dirty() {
+		for _, path := range d.Tracked() {
 			s.durableStep(finalCtx, path, true)
 		}
 	}, nil
@@ -111,7 +115,7 @@ func (s *Syncer) runDurableSteps(ctx context.Context, storages []string, recover
 			s.logger.Info("storage core: this process owns the deferred durability of the storages now")
 		}
 
-		for _, path := range d.Dirty() {
+		for _, path := range d.Tracked() {
 			s.durableStep(ctx, path, false)
 		}
 	}
@@ -131,8 +135,9 @@ func (s *Syncer) runDurableSteps(ctx context.Context, storages []string, recover
 //
 // Only a cache of the storage core is moved (storageCoreCache). Any other
 // marker of another boot (the repository was removed, or replaced by one being
-// imported, whose local copy may be the only one) is dropped; an untrusted one
-// is kept, with its repository untrusted, and logged.
+// imported, whose local copy may be the only one) is handed over (Forget); an
+// untrusted one is kept, with its repository untrusted, so never served, and
+// logged.
 func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) error {
 	d := s.core.RefDurability
 	found, err := d.Recover(ctx, storages)
@@ -157,12 +162,12 @@ func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) 
 			if rec.Reboot {
 				s.logger.WithField("repository_path", rec.Path).
 					Warn("storage core: dropped the dirty marker of a local repository that is not a cache of the storage core")
-				if err := d.Forget(ctx, rec.Repo, rec.Path); err != nil {
+				if err := s.forget(ctx, rec.Repo, rec.Path); err != nil {
 					return err
 				}
 			} else {
 				s.logger.WithField("repository_path", rec.Path).
-					Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place, untrusted")
+					Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place, untrusted, and not served")
 			}
 			continue
 		}
@@ -177,11 +182,13 @@ func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) 
 // storageCoreCache reports whether the local repository at path is a cache of
 // the storage core that a hydration can rebuild: the database holds it with
 // changesets (an import that is not complete has none, and its local copy may
-// be the only one). keep reports that the copy holds history written in shadow
-// mode and not imported yet (checkReplaceable, the guard of a sync's
+// be the only one). keep reports that the copy may hold history written in
+// shadow mode and not imported yet (checkReplaceable, the guard of a sync's
 // hydration): the copy is moved aside all the same, so that it is never served,
-// but kept, so that the history is not lost. An error (the database, or the
-// repository's files, cannot be read) is returned: the caller tries again.
+// but kept, so that the history is not lost. A local changelog or review file
+// that cannot be read (Internal) means keep too: whether it holds such history
+// is unknown, and a corrupt file must not stop the node. An error of the
+// database is returned: the caller tries again.
 func (s *Syncer) storageCoreCache(ctx context.Context, repo localrefs.RepoRef, path string) (cache, keep bool, err error) {
 	r, err := s.core.Meta.GetRepository(ctx, corestore.RepoKey{Storage: repo.Storage, RelativePath: repo.RelativePath})
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
@@ -202,12 +209,27 @@ func (s *Syncer) storageCoreCache(ctx context.Context, repo localrefs.RepoRef, p
 
 	wm, ok := s.readWatermark(path)
 	if err := s.checkReplaceable(ctx, r, path, wm, ok); err != nil {
-		if status.Code(err) == codes.FailedPrecondition {
+		switch status.Code(err) {
+		case codes.FailedPrecondition:
+			return true, true, nil
+		case codes.Internal:
+			s.logger.WithError(err).WithField("repository_path", path).
+				Error("storage core: the history files of an untrusted local repository cannot be read; it is kept for an operator")
 			return true, true, nil
 		}
 		return false, false, err
 	}
 	return true, false, nil
+}
+
+// forget is Forget under the repository lock.
+func (s *Syncer) forget(ctx context.Context, repo localrefs.RepoRef, path string) error {
+	release, err := s.lock(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return s.core.RefDurability.Forget(ctx, repo, path)
 }
 
 // durableStep makes the references of the repository at path durable under the
@@ -253,9 +275,9 @@ func (s *Syncer) durableStep(ctx context.Context, path string, final bool) {
 		return
 	}
 	if !cache {
-		// Its marker stays (the untrusted state is sticky): after a reboot the
-		// recovery decides again.
-		logger.Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place")
+		// Its marker stays and it is not served (the untrusted state is sticky):
+		// after a restart the recovery decides again.
+		logger.Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place and not served")
 		return
 	}
 	if err := s.distrustLocked(ctx, untrusted.Repo, path, localrefs.ReasonSyncFailed, untrusted, keep); err != nil {
@@ -280,6 +302,72 @@ func (s *Syncer) distrust(ctx context.Context, repo localrefs.RepoRef, path, rea
 // that hold history not imported yet are moved: they are never served, and an
 // operator imports what they hold or removes them.
 const KeptDirName = "+gitaly/graft-untrusted"
+
+var (
+	keptRepositoriesDesc = prometheus.NewDesc(
+		"graft_storage_kept_untrusted_repositories",
+		"Number of untrusted local repositories kept in "+KeptDirName+" for an operator, by storage: they hold history not imported yet (doc/graft/STORAGE.md, kept copies).",
+		[]string{"storage"}, nil)
+	keptBytesDesc = prometheus.NewDesc(
+		"graft_storage_kept_untrusted_bytes",
+		"Bytes of the untrusted local repositories kept in "+KeptDirName+", by storage.",
+		[]string{"storage"}, nil)
+)
+
+// collectKept reports the kept untrusted copies of the storages. It reads the
+// directories at every scrape: they are empty unless an operator has copies to
+// import, which the metric is there to show. A storage whose directory cannot
+// be read is logged and left out.
+func (s *Syncer) collectKept(metrics chan<- prometheus.Metric) {
+	storages := s.keptStorages.Load()
+	if storages == nil {
+		return
+	}
+	for _, storageName := range *storages {
+		root, err := s.locator.GetStorageByName(context.Background(), storageName)
+		if err != nil {
+			s.logger.WithError(err).WithField("storage", storageName).Warn("storage core: measure the kept untrusted repositories")
+			continue
+		}
+		repos, size, err := keptSize(filepath.Join(root, KeptDirName))
+		if err != nil {
+			s.logger.WithError(err).WithField("storage", storageName).Warn("storage core: measure the kept untrusted repositories")
+			continue
+		}
+		metrics <- prometheus.MustNewConstMetric(keptRepositoriesDesc, prometheus.GaugeValue, float64(repos), storageName)
+		metrics <- prometheus.MustNewConstMetric(keptBytesDesc, prometheus.GaugeValue, float64(size), storageName)
+	}
+}
+
+// keptSize returns the number of kept repositories in dir (one directory each)
+// and the bytes of their files.
+func keptSize(dir string) (int, int64, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	var size int64
+	err = filepath.WalkDir(dir, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			size += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return len(entries), size, nil
+}
 
 // distrustLocked moves the local repository at path out of the way, then drops
 // its dirty marker: the next request hydrates it. It goes into the temporary

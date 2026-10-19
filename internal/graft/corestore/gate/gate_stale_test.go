@@ -229,11 +229,16 @@ func TestGateRemoveRepositoryDropsReinstalledCache(t *testing.T) {
 }
 
 // The database key is the relative path as given, so the gate only accepts
-// relative paths in their cleaned form.
-func TestGateRejectsNonCanonicalRelativePath(t *testing.T) {
+// relative paths in their cleaned form; and none inside Gitaly's data
+// directory, where the storage core keeps untrusted copies that the stale-cache
+// rule must never remove.
+func TestGateRejectsNonCanonicalOrReservedRelativePath(t *testing.T) {
 	t.Parallel()
 
-	for _, rel := range []string{"grp//proj.git", "./grp/proj.git", "grp/proj.git/", "grp/../grp/proj.git", "grp/./proj.git"} {
+	for _, rel := range []string{
+		"grp//proj.git", "./grp/proj.git", "grp/proj.git/", "grp/../grp/proj.git", "grp/./proj.git",
+		"+gitaly", "+gitaly/graft-untrusted/stale-1/repo.git", "+gitaly/tmp/hydrate-1/repo.git",
+	} {
 		t.Run(rel, func(t *testing.T) {
 			t.Parallel()
 

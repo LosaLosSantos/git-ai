@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 )
@@ -197,6 +198,23 @@ func (c *Core) Close() error {
 		}
 	}
 	return firstErr
+}
+
+// ErrReservedRelativePath is returned for a repository named inside Gitaly's
+// own data directory of a storage (config.GitalyDataPrefix): the temporary,
+// cache and state directories, the dirty markers, and the untrusted copies the
+// storage core keeps for an operator. A request naming one could make the
+// storage core treat a kept copy as a stale cache and remove it.
+var ErrReservedRelativePath = errors.New("the relative path is inside Gitaly's data directory of the storage, which no request may name")
+
+// CheckRelativePath rejects a relative path that names Gitaly's data directory
+// of the storage or anything in it (ErrReservedRelativePath).
+func CheckRelativePath(relativePath string) error {
+	rel := NormalizeRelativePath(relativePath)
+	if rel == config.GitalyDataPrefix || strings.HasPrefix(rel, config.GitalyDataPrefix+"/") {
+		return fmt.Errorf("%w: %q", ErrReservedRelativePath, relativePath)
+	}
+	return nil
 }
 
 // KeyOf returns the RepoKey of a gitaly repository. The relative path is

@@ -585,14 +585,19 @@ func TestRecoverTellsAKernelRestartFromAProcessRestart(t *testing.T) {
 	require.NoError(t, sameBoot.Settle(f.path, false))
 	require.NoFileExists(t, f.markerPath(t, sameBoot))
 
-	// Another boot: the writes may not have reached the disk.
+	// Another boot: the writes may not have reached the disk. The repository is
+	// untrusted until the caller moves it aside (Forget): never served, its
+	// marker never removed by a durable step.
 	require.NoError(t, sameBoot.MarkDirty(f.ctx, f.repo, f.path))
 	require.NoError(t, sameBoot.Close())
 	otherBoot := f.durability(t, "boot-b", 0)
 	found, err = otherBoot.Recover(f.ctx, storages)
 	require.NoError(t, err)
 	require.Equal(t, []Recovered{{Repo: f.repo, Path: f.path, Reboot: true}}, found)
-	require.Empty(t, otherBoot.Dirty())
+	require.Equal(t, []string{f.path}, otherBoot.Dirty())
+	require.True(t, otherBoot.Untrusted(f.path))
+	require.ErrorIs(t, otherBoot.Settle(f.path, true), ErrUntrusted)
+	require.FileExists(t, f.markerPath(t, otherBoot))
 }
 
 // TestRecoverRemovesWhatADurableStepThatDiedLeft verifies that the reference

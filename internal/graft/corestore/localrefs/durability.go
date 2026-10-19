@@ -90,6 +90,11 @@ const stackLockTag = "graft durable step "
 // writes, so the local repository must not be served before it is rebuilt.
 var ErrUntrusted = errors.New("storage core: the local references may have lost writes")
 
+// errReboot makes a repository untrusted whose marker is of another kernel
+// boot: the kernel restarted while its references had writes that were not
+// durable, so its stack may be torn.
+var errReboot = errors.New("the kernel restarted while the references had writes that were not durable")
+
 // UntrustedError is ErrUntrusted for one repository.
 type UntrustedError struct {
 	Repo RepoRef
@@ -126,9 +131,13 @@ func (e writebackError) Unwrap() error { return e.err }
 //   - before the first reference write that is not durable, the repository
 //     gets a dirty marker, written durably, that holds the identity of the
 //     kernel boot (MarkDirty);
-//   - a durable step makes the references durable and removes the marker,
-//     under git's reference lock and only when no transaction of the process is
-//     live (Settle);
+//   - a durable step makes the references durable under git's reference lock
+//     (Settle); one function removes markers, every path through it, and only
+//     when nothing can leave a write that is not durable in the stack any more
+//     (dropMarker);
+//   - a repository whose writes may be lost (a failed fsync, a marker of
+//     another boot) is untrusted: never served, its marker never removed, until
+//     it is moved aside (Forget);
 //   - when it takes the ownership, a marker of another boot means the kernel
 //     restarted while the repository had writes that may never have reached the
 //     disk: its reftable stack may be torn, which git reads as an empty
@@ -157,13 +166,14 @@ type Durability struct {
 	ownerFiles []*os.File
 	locked     bool
 	// recoveryGrace is how long a repository recovered dirty keeps its marker
-	// at least: a git process of the previous owner that outlived it (killed
-	// with it, but not reaped yet) may still be committing for that long.
+	// at least, and how long after git activity was last seen in a stack: a git
+	// process of the previous owner that outlived it (killed with it, but not
+	// reaped yet) may still be committing for that long.
 	recoveryGrace time.Duration
 
 	mu sync.Mutex
-	// repos holds the state of every repository written since the process
-	// started (one entry per repository; Forget drops it).
+	// repos holds the state of every repository that is dirty or that a live
+	// git process counts on (one entry per repository; dropMarker drops it).
 	repos map[string]*refState
 
 	marked     prometheus.Counter
@@ -179,28 +189,37 @@ var _ prometheus.Collector = (*Durability)(nil)
 
 // refState is what Durability knows of one local repository, by its path. Its
 // fields are guarded by Durability.mu, except marker writes and removals,
-// which file serializes.
+// which file serializes. A state leaves the map only in dropMarker, under its
+// file lock, so whoever holds the file lock of the map's state keeps it current
+// (lockState).
 type refState struct {
 	// file serializes the writes and the removal of the marker file.
 	file   sync.Mutex
 	repo   RepoRef
 	marker string
-	dirty  bool
+	// dirty is set while the marker may be on disk: from before it is written
+	// until dropMarker removed it.
+	dirty bool
+	// markerPlain is set when the marker on disk is a plain marker of the
+	// running boot: neither one that records untrusted nor one of another boot,
+	// which would make a restart distrust what is at the path.
+	markerPlain bool
 	// nLive counts the git processes of this process that write the
 	// repository's references without fsync and have not exited: any of them
 	// may still write a table or compact the stack.
 	nLive     int
 	lastWrite time.Time
-	// recovered is set for a repository found dirty when the process took the
-	// ownership: a git process of the previous owner that outlived it may still
-	// be writing, so its marker stays while git's lock or temporary files are
-	// there (gitActive), and not before settleAfter.
-	recovered   bool
+	// settleAfter is the earliest time the marker may go: the recovery grace of
+	// a repository found dirty when the process took the ownership (a git
+	// process of the previous owner that outlived it may still be committing),
+	// pushed forward whenever git activity is seen in its stack.
 	settleAfter time.Time
-	// untrusted is the first failed fsync of the repository. The kernel reports
-	// a failed writeback once, so a later fsync can succeed although writes
-	// were lost: the repository never becomes clean again, only moved aside.
-	// The marker records it, so that a restart of the process keeps it.
+	// untrusted is the first failed fsync of the repository, or the restart of
+	// the kernel that a marker of another boot shows. The kernel reports a
+	// failed writeback once, so a later fsync can succeed although writes were
+	// lost: the repository is never served and never becomes clean, it is only
+	// moved aside (Forget). The marker records a failed fsync, so that a restart
+	// of the process keeps it.
 	untrusted error
 	// synced holds the tables made durable during the current dirty period that
 	// the stack still lists. Tables are immutable, so one fsync each is enough.
@@ -289,7 +308,7 @@ func newDurability(locator storage.Locator, idle time.Duration) *Durability {
 		}),
 		cleared: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "graft_storage_ref_dirty_cleared_total",
-			Help: "Number of dirty markers removed by a durable step.",
+			Help: "Number of dirty markers removed: the repository's reference writes are durable, or the repository was moved aside, and no git process can still write it.",
 		}),
 		untrusted: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_ref_untrusted_total",
@@ -449,32 +468,15 @@ func (d *Durability) MarkDirty(ctx context.Context, repo RepoRef, path string) e
 		return nil
 	}
 
-	// The state is the map's after its file lock is taken: a durable step may
-	// have dropped a clean state meanwhile.
-	var st *refState
-	for {
-		d.mu.Lock()
-		st = d.stateLocked(path)
-		d.mu.Unlock()
-		st.file.Lock()
-		d.mu.Lock()
-		current := d.repos[path] == st
-		if current {
-			st.lastWrite = time.Now()
-		}
-		dirty := st.dirty
-		d.mu.Unlock()
-		if !current {
-			st.file.Unlock()
-			continue
-		}
-		if dirty {
-			st.file.Unlock()
-			return nil
-		}
-		break
-	}
+	st := d.lockState(path)
 	defer st.file.Unlock()
+	d.mu.Lock()
+	st.lastWrite = time.Now()
+	dirty := st.dirty
+	d.mu.Unlock()
+	if dirty {
+		return nil
+	}
 
 	markerPath, err := d.markerPath(ctx, repo, path)
 	if err != nil {
@@ -492,12 +494,37 @@ func (d *Durability) MarkDirty(ctx context.Context, repo RepoRef, path string) e
 	defer d.mu.Unlock()
 	st.repo = repo
 	st.marker = markerPath
+	st.markerPlain = true
 	d.marked.Inc()
+	d.setDirtyLocked(st)
+	return nil
+}
+
+// lockState returns the state of the repository at path, created when there is
+// none, with its file lock held: the state stays the map's until the lock is
+// released, because only dropMarker removes a state, under its file lock.
+func (d *Durability) lockState(path string) *refState {
+	for {
+		d.mu.Lock()
+		st := d.stateLocked(path)
+		d.mu.Unlock()
+		st.file.Lock()
+		d.mu.Lock()
+		current := d.repos[path] == st
+		d.mu.Unlock()
+		if current {
+			return st
+		}
+		st.file.Unlock()
+	}
+}
+
+// setDirtyLocked marks the state dirty. The caller holds d.mu.
+func (d *Durability) setDirtyLocked(st *refState) {
 	if !st.dirty {
 		st.dirty = true
 		d.dirty.Inc()
 	}
-	return nil
 }
 
 // Begin records that a git process that writes the references of the
@@ -505,7 +532,8 @@ func (d *Durability) MarkDirty(ctx context.Context, repo RepoRef, path string) e
 // once the process has exited. Until then the process may write a table or
 // compact the stack, whatever hooks git runs or skips (a failed prepare, a
 // failed commit, a kill), so the durable step keeps the marker. end may be
-// called more than once.
+// called more than once. A state with a live process never leaves the map
+// (dropMarker), so end always counts down the state Begin counted up.
 func (d *Durability) Begin(path string) (end func()) {
 	if d == nil {
 		return func() {}
@@ -522,13 +550,24 @@ func (d *Durability) Begin(path string) (end func()) {
 		once.Do(func() {
 			d.mu.Lock()
 			defer d.mu.Unlock()
-			// Forget may have dropped the state; the count belongs to it.
-			if d.repos[path] == st {
-				st.nLive--
-				d.inflight.Dec()
-			}
+			st.nLive--
+			d.inflight.Dec()
 		})
 	}
+}
+
+// Untrusted reports whether the local repository at path may have lost
+// reference writes: it must not be served until it is moved aside and
+// hydrated again.
+func (d *Durability) Untrusted(path string) bool {
+	if d == nil {
+		return false
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	st := d.repos[path]
+	return st != nil && st.untrusted != nil
 }
 
 // Dirty returns the paths of the dirty repositories.
@@ -576,13 +615,14 @@ func (d *Durability) CountStepError() {
 // durable. A failed fsync is an *UntrustedError (the caller moves the
 // repository aside at once); any other error is transient. When the repository
 // has been idle for the idle period, or final is set (the process stops), and
-// no transaction of the process is live, it then removes the marker: the
-// decision is taken under git's reference lock, taken without waiting (a busy
-// lock leaves the marker for the next step), and the marker file is removed
-// after the lock is released, under the state's file lock that a writer's
-// MarkDirty waits for. A repository that no longer exists (moved aside as a
-// stale cache) loses its marker. The caller holds the syncer's repository lock,
-// so no syncer write and no replacement of the repository runs meanwhile.
+// no git process of the process is live, it then takes git's reference lock
+// without waiting (a busy lock leaves the marker for the next step), makes the
+// stack durable again under it, and lets dropMarker decide. A repository that
+// no longer exists (moved aside as a stale cache) has no stack, and its marker
+// goes by the same rule: it stays while a git process that names the path is
+// live. A clean state with no live process leaves the map. The caller holds the
+// syncer's repository lock, so no syncer write and no replacement of the
+// repository runs meanwhile.
 func (d *Durability) Settle(path string, final bool) error {
 	if !d.Deferring() {
 		return nil
@@ -590,7 +630,7 @@ func (d *Durability) Settle(path string, final bool) error {
 
 	d.mu.Lock()
 	st := d.repos[path]
-	if st == nil || !st.dirty {
+	if st == nil {
 		d.mu.Unlock()
 		return nil
 	}
@@ -601,34 +641,33 @@ func (d *Durability) Settle(path string, final bool) error {
 		d.mu.Unlock()
 		return &UntrustedError{Repo: repo, Path: path, Err: untrusted}
 	}
-	now := time.Now()
-	idle := st.nLive == 0 && now.After(st.settleAfter) && (final || now.Sub(st.lastWrite) >= d.idle)
-	recovered := st.recovered
+	dirty := st.dirty
+	due := st.nLive == 0 && (final || time.Since(st.lastWrite) >= d.idle)
 	d.mu.Unlock()
-	if idle && recovered {
-		// A git process of the previous owner may still be writing.
-		active, err := gitActive(path)
-		if err != nil {
-			return err
-		}
-		idle = !active
-	}
 
+	exists := true
 	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
-		st.file.Lock()
+		exists = false
+	} else if err != nil {
+		return fmt.Errorf("stat the repository: %w", err)
+	}
+	if !dirty || !exists {
+		// A repository that is gone has no stack; a clean state only leaves the
+		// map. A transaction that marked an existing repository meanwhile leaves
+		// it to the next step, under git's reference lock (dropMarker refuses
+		// otherwise).
+		st := d.lockState(path)
 		defer st.file.Unlock()
-		d.clear(st)
-		if err := d.removeMarker(st); err != nil {
-			return err
-		}
-		d.prune(path, st)
-		return nil
+		_, err := d.dropMarker(path, st, false)
+		return err
 	}
 
 	if err := d.syncStack(path, st); err != nil {
-		return d.stepError(st, repo, path, err)
+		st := d.lockState(path)
+		defer st.file.Unlock()
+		return d.stepErrorLocked(st, repo, path, err)
 	}
-	if !idle {
+	if !due {
 		return nil
 	}
 
@@ -639,49 +678,113 @@ func (d *Durability) Settle(path string, final bool) error {
 	if !ok {
 		return nil
 	}
-
-	cleared, err := d.settleLocked(path, st)
-	if err != nil {
-		_ = lock.release()
-		return d.stepError(st, repo, path, err)
+	err = d.settleLocked(path, repo)
+	if releaseErr := lock.release(); err == nil {
+		err = releaseErr
 	}
-	if !cleared {
-		return lock.release()
-	}
-
-	// The state is clean from here on, and a writer that takes git's lock now
-	// writes a new marker: it waits for the file lock, held until the old
-	// marker is removed.
-	defer st.file.Unlock()
-	if err := lock.release(); err != nil {
-		return err
-	}
-	if err := d.removeMarker(st); err != nil {
-		return err
-	}
-	d.prune(path, st)
-	return nil
+	return err
 }
 
-// prune drops the state of a repository that is clean and has no live git
-// process, so that the states do not grow with every repository ever written.
-// The caller holds the state's file lock: MarkDirty takes the state again from
-// the map after its own.
-func (d *Durability) prune(path string, st *refState) {
+// settleLocked makes the stack durable under git's reference lock, which the
+// caller holds (no transaction commits meanwhile), and removes the marker when
+// dropMarker finds it safe. The marker file goes before git's lock is
+// released, under the state's file lock, which a writer's MarkDirty waits for.
+func (d *Durability) settleLocked(path string, repo RepoRef) error {
+	st := d.lockState(path)
+	defer st.file.Unlock()
+
+	if err := d.syncStack(path, st); err != nil {
+		return d.stepErrorLocked(st, repo, path, err)
+	}
+	if d.crashAt == crashDurableStep {
+		os.Exit(crashExitCode)
+	}
+	_, err := d.dropMarker(path, st, true)
+	return err
+}
+
+// dropMarker is the only code that removes a dirty marker or drops a state
+// from the map. It removes the marker of the repository at path only when
+// nothing can still leave a reference write that is not durable in its stack:
+//
+//   - no git process of this process that writes the references without fsync
+//     is live (nLive);
+//   - the repository is not untrusted;
+//   - when the repository exists, the caller holds git's reference lock
+//     (ownLock) and made the stack durable under it (settleLocked): no git
+//     process can write meanwhile, and the ones that exited before are in what
+//     was made durable. A repository that does not exist has no stack, and a
+//     git process cannot write it (the caller holds the syncer's repository
+//     lock, so it is not hydrated meanwhile);
+//   - no git process writes the stack now (gitActive: a git lock or a table
+//     being written; seeing one also pushes settleAfter a recovery grace
+//     forward), and settleAfter has passed.
+//
+// The caller holds the state's file lock, which MarkDirty waits for before it
+// reads whether the repository is dirty. The checks and the state change are
+// made under d.mu, which Begin takes. It reports whether the marker was
+// removed. A clean state that no live git process counts on and that is
+// trusted leaves the map, so that the states do not grow with every repository
+// ever written.
+func (d *Durability) dropMarker(path string, st *refState, ownLock bool) (bool, error) {
+	exists := true
+	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+		exists = false
+	} else if err != nil {
+		return false, fmt.Errorf("stat the repository: %w", err)
+	}
+	active := false
+	if exists {
+		var err error
+		if active, err = gitActive(path, ownLock); err != nil {
+			return false, err
+		}
+	}
+
+	d.mu.Lock()
+	now := time.Now()
+	if active {
+		if until := now.Add(d.recoveryGrace); until.After(st.settleAfter) {
+			st.settleAfter = until
+		}
+	}
+	safe := st.dirty && st.nLive == 0 && st.untrusted == nil && (ownLock || !exists) && !active && !now.Before(st.settleAfter)
+	if safe {
+		st.dirty = false
+		d.dirty.Dec()
+		st.synced = map[string]struct{}{}
+	}
+	markerPath := st.marker
+	d.mu.Unlock()
+
+	if safe && markerPath != "" {
+		if err := os.Remove(markerPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			d.mu.Lock()
+			d.setDirtyLocked(st)
+			d.mu.Unlock()
+			return false, fmt.Errorf("remove the dirty marker: %w", err)
+		}
+	}
+	if safe {
+		d.cleared.Inc()
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.repos[path] == st && !st.dirty && st.untrusted == nil && st.nLive == 0 {
+	if d.repos[path] == st && !st.dirty && st.nLive == 0 && st.untrusted == nil {
 		delete(d.repos, path)
 	}
+	return safe, nil
 }
 
-// stepError is the error of a durable step: an *UntrustedError for a failed
-// fsync, which makes the repository untrusted for good, the error itself
-// otherwise. The first failure is written into the marker, so that the
+// stepErrorLocked is the error of a durable step: an *UntrustedError for a
+// failed fsync, which makes the repository untrusted for good, the error
+// itself otherwise. The first failure is written into the marker, so that the
 // repository stays untrusted across a restart of the process (the next fsync
 // would succeed); when even that write fails, the disk is failing and the
-// state of this process keeps it untrusted.
-func (d *Durability) stepError(st *refState, repo RepoRef, path string, err error) error {
+// state of this process keeps it untrusted. The caller holds the state's file
+// lock.
+func (d *Durability) stepErrorLocked(st *refState, repo RepoRef, path string, err error) error {
 	var writeback writebackError
 	if !errors.As(err, &writeback) {
 		return err
@@ -693,86 +796,47 @@ func (d *Durability) stepError(st *refState, repo RepoRef, path string, err erro
 		st.untrusted = err
 	}
 	markerPath := st.marker
+	dirty := st.dirty
 	d.mu.Unlock()
 
-	if first && markerPath != "" {
-		st.file.Lock()
+	if first && dirty && markerPath != "" {
 		content, encodeErr := json.Marshal(marker{RepoRef: repo, BootID: d.bootID, Untrusted: err.Error()})
 		if encodeErr == nil {
 			encodeErr = d.writeDurably(markerPath, content)
 		}
-		st.file.Unlock()
 		if encodeErr != nil {
 			return &UntrustedError{Repo: repo, Path: path, Err: fmt.Errorf("%w (recording it in the marker failed: %w)", err, encodeErr)}
 		}
+		d.mu.Lock()
+		st.markerPlain = false
+		d.mu.Unlock()
 	}
 	return &UntrustedError{Repo: repo, Path: path, Err: err}
 }
 
 // gitActive reports whether a git process may be writing the reftable stack of
-// the repository at path: git's lock of the list, a lock of a table being
-// compacted, or a table being written is there.
-func gitActive(path string) (bool, error) {
+// the repository at path: git's lock of the list (unless ownLock: the caller
+// holds it), a lock of a table being compacted, or a table being written is
+// there (the names of git's reftable/stack.c). A repository without a reftable
+// directory has no stack to write.
+func gitActive(path string, ownLock bool) (bool, error) {
 	entries, err := os.ReadDir(filepath.Join(path, "reftable"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("read the reftable directory: %w", err)
 	}
 	for _, entry := range entries {
 		name := entry.Name()
+		if ownLock && name == "tables.list.lock" {
+			continue
+		}
 		if strings.HasSuffix(name, ".lock") || strings.Contains(name, ".temp.") {
 			return true, nil
 		}
 	}
 	return false, nil
-}
-
-// settleLocked makes the tables written since the first pass durable and, when
-// no transaction of the process is live, marks the state clean with its file
-// lock held (the caller releases it). The caller holds git's reference lock: no
-// transaction can take it meanwhile, and the live transactions are counted from
-// before they take it until their end.
-func (d *Durability) settleLocked(path string, st *refState) (bool, error) {
-	d.mu.Lock()
-	busy := st.nLive > 0 || st.untrusted != nil
-	d.mu.Unlock()
-	if busy {
-		return false, nil
-	}
-
-	if err := d.syncStack(path, st); err != nil {
-		return false, err
-	}
-	if d.crashAt == crashDurableStep {
-		os.Exit(crashExitCode)
-	}
-
-	st.file.Lock()
-	d.clear(st)
-	return true, nil
-}
-
-// clear marks the state clean. The caller holds the state's file lock.
-func (d *Durability) clear(st *refState) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if st.dirty {
-		st.dirty = false
-		d.cleared.Inc()
-		d.dirty.Dec()
-	}
-	st.synced = map[string]struct{}{}
-}
-
-// removeMarker removes the marker file of a clean state. The caller holds the
-// state's file lock.
-func (d *Durability) removeMarker(st *refState) error {
-	if st.marker == "" {
-		return nil
-	}
-	if err := os.Remove(st.marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove the dirty marker: %w", err)
-	}
-	return nil
 }
 
 // stackLock is git's reference lock of a repository, taken by the durable
@@ -939,9 +1003,34 @@ func (d *Durability) syncStack(path string, st *refState) error {
 	return nil
 }
 
-// Forget drops the state and the marker of the repository at path, which the
-// caller moved aside under the syncer's repository lock. A writer that still
-// writes to the moved repository writes to a directory that is removed.
+// Tracked returns the paths of the repositories that have a state: the dirty
+// ones and the clean ones that a live git process still counts on. The durable
+// steps visit them all, so that a clean state leaves the map once its last
+// process ended.
+func (d *Durability) Tracked() []string {
+	if d == nil {
+		return nil
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	paths := make([]string, 0, len(d.repos))
+	for path := range d.repos {
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// Forget hands the path of a repository over to what comes there next: the
+// caller moved the local repository aside under the syncer's repository lock,
+// or, after a kernel restart, decided to keep in place a repository that is not
+// a cache of the storage core. The state stops being untrusted, since what made
+// it so is no longer at path, and the marker goes by dropMarker's rule. A git
+// process of this process that is still live names the repository by its path,
+// so its later writes land in what is there now (the hydrated repository, say):
+// the marker then stays, plain (without the untrusted record, so that a restart
+// does not move the new repository aside), until the process exited and a
+// durable step made the stack durable.
 func (d *Durability) Forget(ctx context.Context, repo RepoRef, path string) error {
 	if d == nil {
 		return nil
@@ -952,56 +1041,74 @@ func (d *Durability) Forget(ctx context.Context, repo RepoRef, path string) erro
 		return err
 	}
 
-	d.mu.Lock()
-	st := d.repos[path]
-	d.mu.Unlock()
-	if st != nil {
-		st.file.Lock()
-		defer st.file.Unlock()
-	}
+	st := d.lockState(path)
+	defer st.file.Unlock()
 
 	d.mu.Lock()
-	live := st != nil && d.repos[path] == st && st.nLive > 0
+	// A plain marker of this boot is on disk when the state was dirty with one;
+	// otherwise one is written if the marker has to stay.
+	plainOnDisk := st.dirty && st.markerPlain && st.marker == markerPath
+	st.repo = repo
+	st.marker = markerPath
+	d.setDirtyLocked(st)
+	st.untrusted = nil
+	st.synced = map[string]struct{}{}
 	d.mu.Unlock()
-	if live {
-		// A git process that writes without fsync is still running. It names the
-		// repository by its path, so its later writes land in what is there now
-		// (the hydrated repository, say): the repository stays dirty, with a plain
-		// marker, until it exited and a durable step made the stack durable.
-		content, err := json.Marshal(marker{RepoRef: repo, BootID: d.bootID})
-		if err != nil {
-			return fmt.Errorf("encode the dirty marker: %w", err)
-		}
-		if err := d.writeDurably(markerPath, content); err != nil {
-			return fmt.Errorf("write the dirty marker: %w", err)
-		}
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		if !st.dirty {
-			st.dirty = true
-			d.dirty.Inc()
-		}
-		st.repo = repo
-		st.marker = markerPath
-		st.untrusted = nil
-		st.recovered = false
-		st.synced = map[string]struct{}{}
-		return nil
+
+	dropped, err := d.forgetLocked(path, st, repo)
+	d.mu.Lock()
+	untrusted := st.untrusted != nil
+	d.mu.Unlock()
+	if dropped || plainOnDisk || untrusted {
+		// An untrusted state (a failed fsync of a repository kept in place) has
+		// its record in the marker, or is kept untrusted by this process.
+		return err
 	}
 
-	if err := os.Remove(markerPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove the dirty marker: %w", err)
+	content, encodeErr := json.Marshal(marker{RepoRef: repo, BootID: d.bootID})
+	if encodeErr == nil {
+		encodeErr = d.writeDurably(markerPath, content)
 	}
-
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if st != nil && d.repos[path] == st {
-		if st.dirty {
-			d.dirty.Dec()
+	if encodeErr != nil {
+		// The state is dirty, so a writer's MarkDirty would not write the
+		// marker: without one on disk, the repository at path cannot be
+		// trusted. It is moved aside again, and Forget retried.
+		if st.untrusted == nil {
+			st.untrusted = fmt.Errorf("write the dirty marker: %w", encodeErr)
 		}
-		delete(d.repos, path)
+		return errors.Join(err, st.untrusted)
 	}
-	return nil
+	st.markerPlain = true
+	return err
+}
+
+// forgetLocked lets dropMarker decide the marker of a forgotten repository.
+// One kept in place is made durable under git's reference lock first, as a
+// durable step does; when the lock is busy the marker stays for the next step.
+// The caller holds the state's file lock.
+func (d *Durability) forgetLocked(path string, st *refState, repo RepoRef) (bool, error) {
+	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+		return d.dropMarker(path, st, false)
+	} else if err != nil {
+		return false, fmt.Errorf("stat the repository: %w", err)
+	}
+
+	lock, ok, err := lockStack(path)
+	if err != nil || !ok {
+		return false, err
+	}
+	dropped := false
+	if err = d.syncStack(path, st); err != nil {
+		err = d.stepErrorLocked(st, repo, path, err)
+	} else {
+		dropped, err = d.dropMarker(path, st, true)
+	}
+	if releaseErr := lock.release(); err == nil {
+		err = releaseErr
+	}
+	return dropped, err
 }
 
 // Recovered is a dirty repository found by Recover.
@@ -1018,14 +1125,16 @@ type Recovered struct {
 }
 
 // Recover reads the dirty markers of the storages; only the owner calls it,
-// when it takes the ownership. A marker of the running boot makes its
-// repository dirty again, to be settled once no git process of the previous
-// owner can still write it (gitActive, and the recovery grace), or untrusted
-// again when the marker says so; what a durable step of the previous owner
+// when it takes the ownership. Every marker makes its repository dirty again.
+// One of the running boot is settled once no git process of the previous owner
+// can still write the stack (dropMarker: gitActive, and the recovery grace),
+// unless the marker records it untrusted; one of another boot makes the
+// repository untrusted (errReboot). What a durable step of the previous owner
 // left (its reference lock, its temporary files) is removed. It returns every
 // repository found; the caller moves aside the ones of another boot and the
-// untrusted ones before serving. A marker that cannot be read is an error: its
-// repository is unknown, and serving could read a torn stack.
+// untrusted ones before serving (Forget then hands their paths over). A marker
+// that cannot be read is an error: its repository is unknown, and serving
+// could read a torn stack.
 func (d *Durability) Recover(ctx context.Context, storages []string) ([]Recovered, error) {
 	if d == nil || !d.ownsLocks() {
 		return nil, nil
@@ -1076,29 +1185,33 @@ func (d *Durability) Recover(ctx context.Context, storages []string) ([]Recovere
 				return nil, fmt.Errorf("dirty marker %q: %w", markerPath, err)
 			}
 
-			reboot := m.BootID != d.bootID
-			if !reboot {
-				if err := removeStaleStackLock(path); err != nil {
-					return nil, err
-				}
-				if err := removeStepTemporaries(path); err != nil {
-					return nil, err
-				}
-				d.mu.Lock()
-				st := d.stateLocked(path)
-				if !st.dirty {
-					st.dirty = true
-					d.dirty.Inc()
-				}
-				st.repo = m.RepoRef
-				st.marker = markerPath
-				st.recovered = true
-				st.settleAfter = time.Now().Add(d.recoveryGrace)
-				if m.Untrusted != "" {
-					st.untrusted = errors.New(m.Untrusted)
-				}
-				d.mu.Unlock()
+			if err := removeStaleStackLock(path); err != nil {
+				return nil, err
 			}
+			if err := removeStepTemporaries(path); err != nil {
+				return nil, err
+			}
+
+			reboot := m.BootID != d.bootID
+			st := d.lockState(path)
+			d.mu.Lock()
+			d.setDirtyLocked(st)
+			st.repo = m.RepoRef
+			st.marker = markerPath
+			st.markerPlain = !reboot && m.Untrusted == ""
+			switch {
+			case m.Untrusted != "":
+				st.untrusted = errors.New(m.Untrusted)
+			case reboot:
+				st.untrusted = errReboot
+			}
+			if !reboot {
+				// A git process of the previous owner, of this boot, may still be
+				// committing (dropMarker).
+				st.settleAfter = time.Now().Add(d.recoveryGrace)
+			}
+			d.mu.Unlock()
+			st.file.Unlock()
 			found = append(found, Recovered{Repo: m.RepoRef, Path: path, Reboot: reboot, Untrusted: m.Untrusted != ""})
 		}
 	}

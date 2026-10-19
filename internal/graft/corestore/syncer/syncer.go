@@ -132,6 +132,10 @@ type Syncer struct {
 	syncChangesets prometheus.Counter
 	syncBytes      prometheus.Counter
 	syncSeeds      prometheus.Counter
+
+	// keptStorages are the storages whose kept untrusted copies (KeptDirName)
+	// the metrics report, set by StartLocalReferences.
+	keptStorages atomic.Pointer[[]string]
 }
 
 type repoLock struct {
@@ -307,6 +311,8 @@ func (s *Syncer) Describe(descs chan<- *prometheus.Desc) {
 	s.syncChangesets.Describe(descs)
 	s.syncBytes.Describe(descs)
 	s.syncSeeds.Describe(descs)
+	descs <- keptRepositoriesDesc
+	descs <- keptBytesDesc
 }
 
 // Collect implements prometheus.Collector.
@@ -319,6 +325,7 @@ func (s *Syncer) Collect(metrics chan<- prometheus.Metric) {
 	s.syncChangesets.Collect(metrics)
 	s.syncBytes.Collect(metrics)
 	s.syncSeeds.Collect(metrics)
+	s.collectKept(metrics)
 }
 
 func (s *Syncer) syncTimeout() time.Duration {
@@ -348,6 +355,12 @@ func (s *Syncer) sync(ctx context.Context, key corestore.RepoKey) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return structerr.NewUnavailable("storage core: sync: %w", err)
+		}
+		// A repository whose references may have lost writes is never served:
+		// the durable step moves a cache aside (the next request hydrates it), and
+		// any other one waits for an operator.
+		if s.core.RefDurability.Untrusted(path) {
+			return structerr.NewUnavailable("storage core: the local references of %s may have lost writes; the repository is not served until it is rebuilt", key)
 		}
 
 		// The record is read again on every round: a restart can mean that the

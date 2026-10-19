@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
 	"unicode/utf8"
 
 	"github.com/feder-cr/git-ai/internal/graft/workspace"
@@ -20,7 +21,7 @@ const storageSynopsis = "usage: graft storage import|state|verify|checkpoint|gc 
 const storageUsage = "storage requires a subcommand: import, state, verify, checkpoint or gc (" + storageSynopsis + ")"
 
 // storageFlags holds the flags of graft storage. Each subcommand reads only
-// some of them, as its help text says.
+// some of them, as its help text says, and rejects the others (checkUsed).
 type storageFlags struct {
 	repo         string
 	connectivity bool
@@ -57,6 +58,11 @@ func cmdStorage(ctx context.Context, out io.Writer, o *options, f *storageFlags,
 		return usagef("%s", storageUsage)
 	}
 	sub, rest := args[0], args[1:]
+	if used, known := storageSubcommandFlags[sub]; known {
+		if err := f.checkUsed(sub, used); err != nil {
+			return err
+		}
+	}
 	switch sub {
 	case "import":
 		return storageImport(ctx, out, o, f, rest)
@@ -70,6 +76,35 @@ func cmdStorage(ctx context.Context, out io.Writer, o *options, f *storageFlags,
 		return storageGC(ctx, out, o, f, rest)
 	}
 	return usagef("unknown storage subcommand %q: %s", sub, storageUsage)
+}
+
+// storageSubcommandFlags are the subcommand-specific flags each subcommand
+// reads.
+var storageSubcommandFlags = map[string][]string{
+	"import":     nil,
+	"state":      nil,
+	"verify":     {"connectivity"},
+	"checkpoint": nil,
+	"gc":         {"dry-run", "removed"},
+}
+
+// checkUsed rejects a subcommand-specific flag that the subcommand sub does not
+// read: a flag that does nothing must not look accepted (checkpoint --dry-run
+// would create a checkpoint).
+func (f *storageFlags) checkUsed(sub string, used []string) error {
+	for _, flag := range []struct {
+		name string
+		set  bool
+	}{
+		{"connectivity", f.connectivity},
+		{"dry-run", f.dryRun},
+		{"removed", f.removed},
+	} {
+		if flag.set && !slices.Contains(used, flag.name) {
+			return usagef("storage %s does not take --%s: %s", sub, flag.name, storageSynopsis)
+		}
+	}
+	return nil
 }
 
 func storageCheckpoint(ctx context.Context, out io.Writer, o *options, f *storageFlags, args []string) error {

@@ -11,6 +11,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
@@ -318,6 +320,75 @@ func TestSyncerUntrustedRepositoryWithShadowHistoryIsKept(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, last)
 	require.Empty(t, e.markers(t))
+}
+
+// TestSyncerNeverServesAnUntrustedRepository verifies that a repository whose
+// references may have lost writes is not served while it is still in place
+// (its move aside failed): every request is Unavailable until the next durable
+// step moves it aside, and the request after that hydrates it.
+func TestSyncerNeverServesAnUntrustedRepository(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+	e, repo, _ := caughtUpDirty(t, localrefs.WithSync(failReferences(&failing)))
+	tmpDir, err := e.locator.TempDir(e.storageName)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpDir, 0o700))
+
+	failing.Store(true)
+	require.NoError(t, os.Chmod(tmpDir, 0o500))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.NoError(t, os.Chmod(tmpDir, 0o700))
+	failing.Store(false)
+	require.DirExists(t, e.localPath(), "the move aside failed")
+
+	err = e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath))
+	require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
+
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.NoDirExists(t, e.localPath())
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.verifySynced(t, repo)
+}
+
+// TestSyncerRecoveryKeepsACopyWhoseHistoryCannotBeRead verifies that a local
+// changelog that cannot be read does not stop the recovery, so the node: the
+// untrusted copy is moved aside and kept for an operator, as one with history
+// not imported yet, and the kept-copies metrics report it.
+func TestSyncerRecoveryKeepsACopyWhoseHistoryCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	e, repo, _ := caughtUpDirty(t, localrefs.WithBootID("boot-a"))
+	// A directory where the changelog file is: reading it fails.
+	require.NoError(t, os.MkdirAll(changelog.Path(e.localPath()), 0o700))
+
+	coretest.EnableLocalRefs(t, e.core, e.cfg, localrefs.WithBootID("boot-b"))
+	e.sy = syncer.New(e.core, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
+	stop, err := e.sy.StartLocalReferences(e.ctx, []string{e.storageName})
+	require.NoError(t, err)
+	defer stop()
+
+	require.NoDirExists(t, e.localPath(), "never served")
+	kept, err := filepath.Glob(filepath.Join(e.storagePath, syncer.KeptDirName, "*", "repo.git"))
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+	require.Empty(t, e.markers(t))
+
+	reg := prometheus.NewPedanticRegistry()
+	require.NoError(t, reg.Register(e.sy))
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	values := map[string]float64{}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			values[family.GetName()] = metric.GetGauge().GetValue()
+		}
+	}
+	require.Equal(t, float64(1), values["graft_storage_kept_untrusted_repositories"])
+	require.Positive(t, values["graft_storage_kept_untrusted_bytes"])
+
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.verifySynced(t, repo)
 }
 
 // TestSyncerUntrustedRepositoryThatIsGoneLosesItsMarker verifies that an

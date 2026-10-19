@@ -177,6 +177,11 @@ func TestCLIStorageUsageErrorsDoNotContactServer(t *testing.T) {
 		"gc with arg":               {"storage", "gc", "-C", dir, "extra"},
 		"gc removed and repo":       {"storage", "gc", "--removed", "-C", dir, "-repo", "a.git"},
 		"gc removed without server": {"storage", "gc", "--removed", "-C", dir},
+		"import dry run":            {"storage", "import", "--dry-run", "-C", dir},
+		"checkpoint dry run":        {"storage", "checkpoint", "--dry-run", "-C", dir},
+		"state connectivity":        {"storage", "state", "--connectivity", "-C", dir},
+		"verify removed":            {"storage", "verify", "--removed", "-C", dir},
+		"checkpoint removed":        {"storage", "checkpoint", "--removed", "-C", dir},
 	}
 	for name, args := range cases {
 		code, _, stderr := runCLI(t, args...)

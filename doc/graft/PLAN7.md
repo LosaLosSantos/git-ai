@@ -657,11 +657,12 @@ repository-wide lock.
          written, which a writing git process always has: `tables.list.lock`
          (prepare to commit), `<table>.lock` (the tables a compaction merges),
          `*.temp.*` (a table being written). On top of that there is a floor
-         of 2 s (`RecoveryGrace`), for the instant between a commit's rename
-         and the start of its auto-compaction.
+         of 2 s (`RecoveryGrace`) from the recovery and from the last git
+         activity seen, for the instant between a commit's rename and the
+         start of its auto-compaction.
        * A marker that records an untrusted repository is handled like a
          marker of another boot: the repository is moved aside if it is a
-         cache, and its marker is never settled otherwise.
+         cache; otherwise its marker is never settled, and it is not served.
        * Why the grace bound holds: when the previous owner dies, the stdin
          of its `update-ref --stdin` children closes.
          * A child that has not been sent `commit` aborts at end of input and
@@ -748,6 +749,61 @@ repository-wide lock.
   * m-4: a test proves the end of a deferred process runs after it exited. The
     mutation that swaps the two defers fails it.
   * Clean states are dropped; MarkDirty takes its state from the map again.
+* Fourth review (of 32d0ac4 and 03ef6c2). Four reviews in a row found marker
+  defects in different branches (Settle, Forget, Recover). The root cause:
+  "a marker may go only when that is safe" was re-implemented branch by
+  branch. Fixed one level up:
+  * One function, `dropMarker`, removes markers and drops states. Every path
+    goes through it: Settle, the missing-path case, Forget, recovered markers,
+    pruning. It checks the whole condition under the state's file lock (which
+    MarkDirty waits for) and `d.mu` (which Begin takes):
+    * no live deferred git process (`nLive`);
+    * not untrusted;
+    * an existing repository only under git's reference lock, after its stack
+      was made durable under that lock. A missing repository has no stack, and
+      the syncer's repository lock keeps it from being hydrated meanwhile;
+    * no git activity in the stack (stack.c's lock and temporary names). Seeing
+      some pushes the 2 s floor forward.
+  * Finding 1 (MAJOR): the missing-path branch no longer removes a marker that
+    a live process needs (moved aside, then hydrated, then the orphan write).
+  * Finding 3: a recovered marker of a missing repository is settled. No
+    reftable directory means no activity.
+  * Finding 5: a state leaves the map only in `dropMarker`, in the same `d.mu`
+    section that checks `nLive`, so a Begin is never lost.
+  * Finding 6: the floor counts from the last activity seen.
+  * Forget rewrites a marker that is not a plain marker of the running boot.
+    The model test found this one: a marker of another boot, kept for a live
+    process, made the next restart distrust the hydrated copy.
+  * A marker of another boot makes the state untrusted (`errReboot`), so
+    nothing settles it before the move.
+  * Untrusted means never served: `EnsureFresh`, which the gate runs for every
+    repository RPC, answers `Unavailable` for an untrusted path. A repository
+    that is not a cache stays in place, unserved, for an operator.
+  * Finding 2:
+    * `+gitaly` is reserved (`corestore.CheckRelativePath`), in the gate for
+      every repository RPC and in every storage core RPC;
+    * STORAGE.md has a procedure for importing a kept copy;
+    * metrics `graft_storage_kept_untrusted_repositories` and `_bytes`.
+  * Finding 4: a local history file that cannot be read means keep (moved to
+    `graft-untrusted`), never a failed startup. Database errors still fail the
+    recovery and are retried.
+  * Finding 7: the downgrade is documented (STORAGE.md, Failures).
+  * Finding 8: `StorageCoreService` is never allowed for per-agent tokens.
+  * Finding 9: a flag that a storage subcommand does not read is a usage error.
+  * Finding 10: CollectGarbage holds its lease with the runner's renewal
+    (`maintenance.HoldLease`). A lease lost during the collection is `Aborted`.
+  * `TestMarkerLifecycleModel`: 40 seeds × 250 random steps.
+    * The steps: MarkDirty; Begin and end; table writes without fsync; Settle,
+      final or not; failed fsyncs; move aside and Forget; hydration; a process
+      restart with git processes of the previous owner in the middle of a
+      write; a kernel restart; acceptance in place.
+    * After every step it asserts that a write that may not be durable means a
+      marker on disk, and that untrusted equals reported untrusted, with the
+      marker kept. The model learns durability from the fsyncs themselves.
+    * Mutation check: removing any one condition fails the model or
+      `TestDropMarkerGuards`. The conditions: live processes, git's lock, git
+      activity, untrusted, the plain-marker rewrite, the missing-path removal,
+      the recovered untrusted record, the reboot distrust.
 
 **Tests.**
 * `localrefs`:

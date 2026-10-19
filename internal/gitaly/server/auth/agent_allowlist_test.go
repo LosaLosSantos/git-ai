@@ -174,6 +174,9 @@ func TestAgentAllowlist_EveryRegisteredRPC(t *testing.T) {
 		gitalypb.ObjectPoolService_DeleteObjectPool_FullMethodName,
 		gitalypb.CleanupService_RewriteHistory_FullMethodName,
 		gitalypb.PartitionService_BackupPartition_FullMethodName,
+		gitalypb.StorageCoreService_CollectGarbage_FullMethodName,
+		gitalypb.StorageCoreService_CollectRemovedRepositories_FullMethodName,
+		gitalypb.StorageCoreService_GetStorageState_FullMethodName,
 	} {
 		require.False(t, allowlist.mayCall(fullMethod), "agent may not call %s", fullMethod)
 	}
@@ -350,6 +353,8 @@ func TestNewAgentAllowlist_Validation(t *testing.T) {
 		{desc: "object pool", rpcs: []string{gitalypb.ObjectPoolService_DeleteObjectPool_FullMethodName}, wantErr: "may never be called by an agent"},
 		{desc: "cleanup service", rpcs: []string{gitalypb.CleanupService_RewriteHistory_FullMethodName}, wantErr: "may never be called by an agent"},
 		{desc: "partition service", rpcs: []string{gitalypb.PartitionService_BackupPartition_FullMethodName}, wantErr: "may never be called by an agent"},
+		{desc: "storage core garbage collection", rpcs: []string{gitalypb.StorageCoreService_CollectGarbage_FullMethodName}, wantErr: "may never be called by an agent"},
+		{desc: "storage core state", rpcs: []string{gitalypb.StorageCoreService_GetStorageState_FullMethodName}, wantErr: "may never be called by an agent"},
 		{desc: "one bad entry among good ones", rpcs: []string{"/gitaly.RepositoryService/RepositorySize", gitalypb.RepositoryService_FetchRemote_FullMethodName}, wantErr: "entry 2"},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {

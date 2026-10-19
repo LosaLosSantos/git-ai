@@ -3,7 +3,6 @@ package storagecore
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
@@ -14,15 +13,12 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// releaseTimeout bounds the release of a maintenance lease after a request.
-const releaseTimeout = 10 * time.Second
-
 // CreateCheckpoint implements gitalypb.StorageCoreServiceServer
 // (doc/graft/PLAN7.md, "Checkpoint creation").
 func (s *server) CreateCheckpoint(ctx context.Context, req *gitalypb.CreateCheckpointRequest) (*gitalypb.CreateCheckpointResponse, error) {
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
+		return nil, err
 	}
 	core, err := s.enabledCore()
 	if err != nil {
@@ -54,12 +50,13 @@ func (s *server) CreateCheckpoint(ctx context.Context, req *gitalypb.CreateCheck
 
 // CollectGarbage implements gitalypb.StorageCoreServiceServer
 // (doc/graft/PLAN7.md, "Pack GC"). It holds the repository's maintenance lease
-// while it collects, so that it does not run alongside the background
-// maintenance or another request; correctness does not depend on the lease.
+// while it collects, renewed (maintenance.HoldLease), so that it does not run
+// alongside the background maintenance or another request; correctness does
+// not depend on the lease.
 func (s *server) CollectGarbage(ctx context.Context, req *gitalypb.CollectGarbageRequest) (*gitalypb.CollectGarbageResponse, error) {
 	repo := req.GetRepository()
-	if err := s.deps.GetLocator().ValidateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
-		return nil, structerr.NewInvalidArgument("%w", err)
+	if err := s.validateRepository(ctx, repo, storage.WithSkipRepositoryExistenceCheck()); err != nil {
+		return nil, err
 	}
 	core, err := s.enabledCore()
 	if err != nil {
@@ -89,16 +86,17 @@ func (s *server) CollectGarbage(ctx context.Context, req *gitalypb.CollectGarbag
 	if !acquired {
 		return nil, structerr.NewFailedPrecondition("another maintenance operation of this repository is in progress")
 	}
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		defer cancel()
-		if err := core.Meta.ReleaseMaintenanceLease(releaseCtx, record.ID, holder); err != nil {
-			s.deps.GetLogger().WithError(err).WarnContext(ctx, "storage core: release the maintenance lease; it expires by itself")
-		}
-	}()
+	// The lease is renewed while the collection runs, like the background
+	// maintenance's: a collection longer than lease_ttl keeps others out.
+	lost := false
+	leaseCtx, release := maintenance.HoldLease(ctx, core, s.deps.GetLogger(), record.ID, holder, ttl, func() { lost = true })
 
-	report, err := gc.New(core, s.deps.GetLogger()).CollectRepository(ctx, record.ID, req.GetDryRun())
+	report, err := gc.New(core, s.deps.GetLogger()).CollectRepository(leaseCtx, record.ID, req.GetDryRun())
+	release()
 	if err != nil {
+		if lost {
+			return nil, structerr.NewAborted("the maintenance lease was lost to another maintenance operation of this repository: %w", err)
+		}
 		return nil, err
 	}
 	return &gitalypb.CollectGarbageResponse{

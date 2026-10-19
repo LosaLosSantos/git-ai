@@ -245,17 +245,10 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 		return "", nil
 	}
 
-	leaseCtx, cancel := context.WithCancel(ctx)
-	renewed := r.renew(leaseCtx, cancel, record.ID)
-	defer func() {
-		cancel()
-		<-renewed
-		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
-		defer cancelRelease()
-		if err := r.core.Meta.ReleaseMaintenanceLease(releaseCtx, record.ID, r.holder); err != nil {
-			r.logger.WithError(err).WithField("repository_id", record.ID).Warn("storage core: release the maintenance lease; it expires by itself")
-		}
-	}()
+	leaseCtx, release := HoldLease(ctx, r.core, r.logger, record.ID, r.holder, r.cfg.LeaseTTL, func() {
+		r.failures.WithLabelValues(stepLease).Inc()
+	})
+	defer release()
 
 	due, err := r.checkpointDue(leaseCtx, record)
 	if err != nil {
@@ -282,36 +275,49 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 	return "", nil
 }
 
-// renew renews the lease of repoID every third of its time to live until ctx
-// ends, and cancels the run (cancel) when the lease is lost: another process
-// may then do the same work, which is wasted but correct. The returned channel
-// is closed when it stops.
-func (r *Runner) renew(ctx context.Context, cancel context.CancelFunc, repoID int64) <-chan struct{} {
+// HoldLease keeps the maintenance lease of repoID, which holder acquired with
+// time to live ttl, for the work done under the returned context: it renews the
+// lease every third of ttl, and when the lease is lost it calls lost and
+// cancels the context (another process may then do the same work, which is
+// wasted but correct). release stops the renewal, waits for it, and releases
+// the lease; the background maintenance and the CollectGarbage request use it
+// alike.
+func HoldLease(ctx context.Context, core *corestore.Core, logger log.Logger, repoID int64, holder string, ttl time.Duration, lost func()) (context.Context, func()) {
+	leaseCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(r.cfg.LeaseTTL / 3)
+		ticker := time.NewTicker(ttl / 3)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-leaseCtx.Done():
 				return
 			case <-ticker.C:
 			}
-			held, err := r.core.Meta.RenewMaintenanceLease(ctx, repoID, r.holder, r.cfg.LeaseTTL)
-			if ctx.Err() != nil {
+			held, err := core.Meta.RenewMaintenanceLease(leaseCtx, repoID, holder, ttl)
+			if leaseCtx.Err() != nil {
 				return
 			}
 			if err != nil || !held {
-				r.logger.WithError(err).WithField("repository_id", repoID).WithField("held", held).
-					Warn("storage core: the maintenance lease was lost, the run of the repository stops")
-				r.failures.WithLabelValues(stepLease).Inc()
+				logger.WithError(err).WithField("repository_id", repoID).WithField("held", held).
+					Warn("storage core: the maintenance lease was lost, the work on the repository stops")
+				lost()
 				cancel()
 				return
 			}
 		}
 	}()
-	return done
+
+	return leaseCtx, func() {
+		cancel()
+		<-done
+		releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+		defer cancelRelease()
+		if err := core.Meta.ReleaseMaintenanceLease(releaseCtx, repoID, holder); err != nil {
+			logger.WithError(err).WithField("repository_id", repoID).Warn("storage core: release the maintenance lease; it expires by itself")
+		}
+	}
 }
 
 // checkpointDue reports whether the repository needs a checkpoint: enough

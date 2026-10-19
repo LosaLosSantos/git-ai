@@ -82,7 +82,7 @@ they are rejected with `PermissionDenied` and need the shared token:
 - `RemoteService`: `UpdateRemoteMirror`, `FindRemoteRepository`,
   `FindRemoteRootRef` (they push to or query a URL the caller chooses);
 - every RPC of `HookService`, `ObjectPoolService`, `CleanupService`,
-  `PartitionService` and `InternalGitaly`.
+  `PartitionService`, `InternalGitaly` and `StorageCoreService`.
 
 `CreateRepositoryFromSnapshot` downloads a tar archive from a URL that the
 client chooses and extracts it into the new repository without filtering it.

@@ -364,15 +364,18 @@ graft storage gc --removed -address unix:/var/opt/graft/gitaly.sock [-storage de
     died before their database commit). The first run only observes them.
 
   It runs in shadow mode too (orphans only: there are no checkpoints). It holds
-  the repository's maintenance lease while it runs, and fails with
-  `FailedPrecondition` when another maintenance of the repository (the
-  background one, another node) holds it.
+  the repository's maintenance lease while it runs, renewed like the background
+  maintenance's, and fails with `FailedPrecondition` when another maintenance
+  of the repository (the background one, another node) holds it, or `Aborted`
+  when the lease is lost during the collection.
 - `gc --removed` deletes every object of the repositories of the storage that
   were removed at least `gc_grace` ago.
-- `--dry-run` reports what would be deleted and changes nothing.
+- `--dry-run` reports what would be deleted and changes nothing. It is a usage
+  error on the subcommands that do not read it, like `--connectivity` outside
+  `verify` and `--removed` outside `gc`.
 
-These commands are for operators: they need the shared token, and an agent
-token is refused.
+These commands are for operators: they need the shared token. A per-agent token
+can never call the storage core service, whatever `agent_rpcs` says.
 
 ### Switching from shadow to authoritative
 
@@ -521,16 +524,57 @@ or re-import the repository from scratch (see
   - *A write the kernel reports as failed* (a writeback error, same boot): the
     durable step's fsync fails, the repository is moved aside at once and logged,
     and the next request hydrates it. The kernel reports such a failure once, so
-    from then on the repository's marker is never removed: if the move aside
-    fails, it is retried every second. Other errors of the step (a file that
-    cannot be opened for a moment) are retried every second and counted.
+    from then on the repository is untrusted. Every request for it fails with
+    `Unavailable`, and its marker is never removed, until it is moved aside. If
+    the move fails, it is retried every second. A repository that is not a
+    cache of the storage core (the database cannot rebuild it) stays in place,
+    untrusted and not served, for an operator. Other errors of the step (a file
+    that cannot be opened for a moment) are retried every second and counted.
   - *Process restart*: a marker found is kept while the repository's reftable
     directory holds a git lock or a table being written (a git process of the
-    previous process may still be finishing), and for 2 s at least. A
-    repository the previous process had found untrusted is moved aside.
-  - A repository moved aside that holds shadow-mode history not imported yet
-    goes to `<storage>/+gitaly/graft-untrusted/` and stays there: import what
-    it holds, or remove it.
+    previous process may still be finishing), and for 2 s at least after the
+    restart and after the last such file seen. A repository the previous
+    process had found untrusted is moved aside.
+  - A marker stays while a git process of the node that writes without fsync
+    is running, even when its repository was moved aside meanwhile: the
+    process names the repository by its path, so a hydrated copy there would
+    get its writes.
+  - **Kept copies.** A repository moved aside that may hold shadow-mode history
+    not imported yet goes to `<storage>/+gitaly/graft-untrusted/<stale-*>/repo.git`
+    and stays there. That is history written in shadow mode (file changelog
+    entries, file reviews) that the database does not have yet, or history
+    files that cannot be read. The repository itself is hydrated from the
+    database by its next request.
+    `graft_storage_kept_untrusted_repositories` and
+    `graft_storage_kept_untrusted_bytes` report the kept copies per storage. No
+    request can name a path under `+gitaly/`: the gate and the storage core
+    RPCs reject it with `InvalidArgument`.
+
+    To import what a kept copy holds:
+    1. Take the node out of service: no client traffic to it during the
+       procedure. `gitaly serve` keeps running.
+    2. Move the repository's current copy at `<storage>/<relative path>` out of
+       the storage, then move the kept `repo.git` to `<storage>/<relative path>`.
+    3. `graft storage import -address <node> -storage <storage> -repo <relative path>`.
+       It imports the file changelog entries and the reviews the database does
+       not have, without touching the references.
+    4. Remove the copy at `<storage>/<relative path>` again: its references are
+       not trusted. The next request hydrates the repository from the database.
+       `graft storage verify -repo <relative path>` must then report
+       `consistent`.
+    5. Remove the kept directory, and put the node back in service.
+
+    A kept copy whose history files cannot be read cannot be imported: repair
+    them, or extract what is readable by hand. Removing a kept copy loses only
+    its history that was not imported.
+  - *Downgrade*: a release without this rule (v0.2.x) ignores the markers. It
+    would serve a repository that is untrusted, or dirty from an unclean
+    shutdown. Before a downgrade, stop `gitaly serve` cleanly: the final step
+    makes every repository durable. Then check that
+    `<storage>/+gitaly/graft-ref-durability/` holds no `*.json` marker. A
+    marker left there names a repository that is untrusted or that a live
+    process kept. Move that repository out of the storage first; its next
+    request after the downgrade hydrates it.
   - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
     repository durable and removes its marker, so a clean reboot hydrates
     nothing.
@@ -596,11 +640,12 @@ without a single divergence.
 | `graft_storage_ref_admission_bypassed_total{writer}` | Writers that went on to git's lock without their turn after `reftable.lockTimeout` (10 s). |
 | `graft_storage_ref_admission_expired_total` | Turns ended by the 10 s bound instead of their release (a git process that died between its phases). |
 | `graft_storage_ref_dirty_repositories` | Repositories with reference writes not yet made durable. |
-| `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written and removed by the durable step. |
+| `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written, and removed (the writes are durable, or the repository was moved aside, and no git process can still write it). |
 | `graft_storage_ref_writes_inflight` | git processes of this node that write references without fsync and have not exited; their repositories keep their markers. |
 | `graft_storage_ref_durability_owner` | 1 when this process owns the deferred durability of its storages, 0 while another process (the old one of a graceful upgrade) does. |
 | `graft_storage_ref_durable_step_errors_total` | Durable steps that failed with a transient error (not a failed fsync); retried every second. |
 | `graft_storage_ref_untrusted_total{reason}` | Repositories moved aside to be hydrated again: `reboot` (dirty at a kernel restart), `sync_failed` (the durable step's fsync failed). |
+| `graft_storage_kept_untrusted_repositories{storage}`, `graft_storage_kept_untrusted_bytes{storage}` | Untrusted copies kept in `+gitaly/graft-untrusted/` for an operator (see Kept copies), and their size. Read at every scrape. |
 
 ## Benchmark
 
