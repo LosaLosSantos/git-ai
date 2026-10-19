@@ -8,6 +8,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
@@ -115,6 +116,21 @@ func (s *Server) landPreResolve(ctx context.Context, in *gitalypb.UserLandReques
 	switch {
 	case err == nil, errors.Is(err, errLandNoConflicts):
 		return nil
+	}
+	// Only a conflict that the resolution left unresolved is a merge conflict, and only the policy's
+	// refusal is a refusal. Any other error (a git command that failed, a caller that gave up) means
+	// the conflicts could not be listed or resolved, and goes out with its cause.
+	var unresolved *landUnresolvedError
+	var denied *landPolicyDeniedError
+	if !errors.As(err, &unresolved) && !errors.As(err, &denied) {
+		switch {
+		case errors.Is(err, context.Canceled):
+			return structerr.NewCanceled("resolving the conflicts of the land: %w", err)
+		case errors.Is(err, context.DeadlineExceeded):
+			return structerr.NewDeadlineExceeded("resolving the conflicts of the land: %w", err)
+		}
+		s.logger.WithError(err).WithField("branch", string(in.GetBranch())).Error("graft: the conflicts of the land could not be resolved")
+		return structerr.NewInternal("resolving the conflicts of the land: %w", err)
 	}
 	files := l.files[:min(len(l.files), landMaxPackageFiles)]
 	paths := make([][]byte, 0, len(files))

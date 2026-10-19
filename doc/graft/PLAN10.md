@@ -1098,6 +1098,15 @@ The resolution is bound to the files instead (the PM's correction):
     runs the classification again on every file it reuses: local git work, bounded like the
     package's, never the resolver. A file whose classification at the lane's tip differs from its
     verdict's counts as changed.
+  * A request carries the files that still need a verdict, and which files travel together depends
+    on the round: after a tip moved, only the files whose sides changed are sent, alone. A resolver
+    can therefore not rely on seeing the other conflicting files of the land, and a verdict must
+    depend on its file only (its path, its sides and modes, the change's message, the
+    configuration). A third-party resolver (the command or the HTTP service) must
+    respect that contract; one that reads the tip, another file or the history of the repository
+    through its own means would have its answer reused where it no longer holds. The risk is
+    bounded: an answer of a model never lands unverified (the final ruling, 14 and 15.9), and the
+    operator's rules are the resolver's own.
   * The request no longer carries the tip, its merge base or its commit message: the fields
     `tip`, `merge_base` and `messages.tip` are always empty, kept in the protocol for
     compatibility (a test asserts it). A verdict reused at another tip is then correct by

@@ -193,7 +193,7 @@ cause.
 | `command` | array of strings | empty | Program and arguments. It reads one request on stdin and writes the answer on stdout. |
 | `url` | string | empty | `http://` or `https://` endpoint that receives the request as a JSON POST. Exactly one of `command` and `url` must be set when `enabled` is true. |
 | `token_file` | string | empty | For `url`: file with the bearer token, read at startup. |
-| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration). |
+| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration), and on the whole land that the server resolves for `resolve_conflicts`: its rounds (the resolutions, the waits for a resolve slot, and the passes through the branch's lane) end at this deadline. A round that the lane hands back after it fails the land with the merge conflict, "files kept changing", naming the files. |
 | `max_files` | int | `20` | Conflicted files per land. A land with more is not sent to the resolver. |
 | `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. At most 12566528 (about 12 MiB): one file, its three sides and its resolution, must fit one check request. |
 | `proposal_ttl` | string | `"168h"` | How long the proposals of a failed land are kept under `refs/graft/proposals/` (Go duration, by the server's clock); at most 20 are kept per branch. Lands with a resolution and the housekeeping pass prune them. |

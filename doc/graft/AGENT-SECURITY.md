@@ -104,12 +104,18 @@ the hiding:
 2. **The sinks.** Every writer of revisions into a newline-delimited git stdin
    (`git rev-list --stdin`) refuses a revision with a line feed, a carriage
    return or a NUL, whatever its caller validated, through
-   `git.ValidateStdinRevision`. Today there are two: `gitpipe.Revlist` (ListCommits,
-   ListBlobs, ListLFSPointers, GetTagSignatures and the other revision walks) and
-   `ObjectsSize`. A test (`internal/git/stdin_writers_test.go`) lists every
-   `--stdin` writer by file and the way it is safe (a request's revisions
-   through the helper; NUL-delimited `-z`; input the server builds), and fails
-   on a writer it does not know, so a new one is classified when it is added.
+   `git.ValidateStdinRevision`. Today there are three: `gitpipe.Revlist` (ListCommits,
+   ListBlobs, ListLFSPointers, GetTagSignatures and the other revision walks),
+   `ObjectsSize`, and `CreateBundleFromRefList`, whose patterns go to
+   `git bundle create --stdin`. A test (`internal/git/stdin_writers_test.go`)
+   parses the code and lists every file that gives a git command a flag that
+   makes it read its stdin (`--stdin`, `--revs`, `--batch` and the flags that
+   begin with them) by how it is safe: a request's revisions through the helper
+   (the test finds the call in the syntax tree, not a word in a comment);
+   NUL-delimited (`-z`, `-Z`); or input the server builds from object IDs (a
+   request's revisions are resolved to object IDs first), packs, content or
+   paths of its own. It fails on a writer it does not know, so a new one is
+   classified when it is added.
 3. **The filter reads lines as git does.** The `--exclude-hidden` flag is put
    before a line that git reads as `--all` or `--glob=...`: without its line
    feed and the carriage return before it, and cut at the first NUL.

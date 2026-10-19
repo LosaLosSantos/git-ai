@@ -1,6 +1,7 @@
 package operations
 
 import (
+	"errors"
 	"time"
 
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -43,6 +44,10 @@ const (
 	landBatchOutcomeConflict = "conflict"
 	// landBatchOutcomeDenied is a request that the access policy or the hooks denied.
 	landBatchOutcomeDenied = "denied"
+	// landBatchOutcomeNeedsResolution is a request the lane handed back because the files it found
+	// conflicting have no verdict at its tip (PLAN10 15.8): not a failure, the land resolves them
+	// out of the lane and enters the lane again, so a land that loses k rounds counts k of these.
+	landBatchOutcomeNeedsResolution = "needs_resolution"
 	// landBatchOutcomeError is a request that failed for any other reason.
 	landBatchOutcomeError = "error"
 )
@@ -63,7 +68,7 @@ var (
 
 	landBatchMembersTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "graft_land_batch_members_total",
-		Help: "Land requests executed by batches, by outcome: landed, already_landed, conflict, denied or error.",
+		Help: "Land requests executed by batches, by outcome: landed, already_landed, conflict, denied, needs_resolution or error.",
 	}, []string{"outcome"})
 )
 
@@ -105,6 +110,11 @@ func landBatchOutcomeLabel(outcome landBatchOutcome) string {
 
 // landBatchErrorLabel returns the outcome label of a request that failed with err.
 func landBatchErrorLabel(err error) string {
+	var needs *landNeedsResolution
+	if errors.As(err, &needs) {
+		return landBatchOutcomeNeedsResolution
+	}
+
 	st := status.Convert(err)
 	if st.Code() == codes.PermissionDenied {
 		return landBatchOutcomeDenied

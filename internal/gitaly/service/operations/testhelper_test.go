@@ -14,6 +14,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/service/repository"
 	"github.com/feder-cr/git-ai/internal/gitaly/service/ssh"
 	"github.com/feder-cr/git-ai/internal/gitlab"
+	"github.com/feder-cr/git-ai/internal/graft/landlane"
 	"github.com/feder-cr/git-ai/internal/grpc/client"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/internal/testhelper"
@@ -78,7 +79,19 @@ func setupOperationsService(
 func runOperationServiceServer(tb testing.TB, cfg config.Cfg, options ...testserver.GitalyServerOpt) string {
 	tb.Helper()
 
+	return runOperationServiceServerWithLanes(tb, cfg, nil, options...)
+}
+
+// runOperationServiceServerWithLanes is runOperationServiceServer with the land lanes of the test, which
+// the test can then observe (their queue depth is a metric of the lanes). Nil means lanes of the server's
+// own, as in every other test.
+func runOperationServiceServerWithLanes(tb testing.TB, cfg config.Cfg, lanes *landlane.Shared, options ...testserver.GitalyServerOpt) string {
+	tb.Helper()
+
 	return testserver.RunGitalyServer(tb, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
+		if lanes != nil {
+			deps.GraftLandLanes = lanes
+		}
 		gitalypb.RegisterOperationServiceServer(srv, NewServer(deps))
 		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 		gitalypb.RegisterRepositoryServiceServer(srv, repository.NewServer(deps))

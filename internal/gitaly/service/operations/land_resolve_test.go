@@ -26,10 +26,12 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/landlane"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // resolverScript writes a resolver command into a new temporary directory and returns the
@@ -131,6 +133,27 @@ type resolveFixture struct {
 	base      git.ObjectID
 	tip       git.ObjectID
 	commit    git.ObjectID
+	// lanes are the land lanes of the service when the fixture runs a standalone server (the lands
+	// then batch through them); nil otherwise.
+	lanes *landlane.Shared
+}
+
+// laneQueueDepth returns the number of land requests queued in the lanes of the fixture.
+func (fx resolveFixture) laneQueueDepth(t *testing.T) float64 {
+	t.Helper()
+
+	require.NotNil(t, fx.lanes, "the fixture has no lanes of its own")
+	reg := prometheus.NewPedanticRegistry()
+	require.NoError(t, reg.Register(fx.lanes))
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() == "graft_land_lane_queue_depth" {
+			return family.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	require.FailNow(t, "the lanes export no graft_land_lane_queue_depth")
+	return 0
 }
 
 // newResolveFixture starts an operation service that resolves with rcfg and creates the
@@ -173,7 +196,19 @@ func newResolveFixtureIn(t *testing.T, graft config.Graft, baseEntries, tipEntri
 
 	cfg := testcfg.Build(t)
 	cfg.Graft = graft
-	ctx, cfg, client := setupOperationsServiceWithCfg(t, testhelper.Context(t), cfg)
+	var lanes *landlane.Shared
+	if graft.Standalone {
+		laneCfg, err := landlane.ConfigFromGraft(graft.Land.Batch)
+		require.NoError(t, err)
+		lanes = landlane.NewShared(laneCfg)
+		t.Cleanup(lanes.Close)
+	}
+	testcfg.BuildGitalySSH(t, cfg)
+	testcfg.BuildGitalyHooks(t, cfg)
+	cfg.SocketPath = runOperationServiceServerWithLanes(t, cfg, lanes)
+	client, conn := newOperationClient(t, cfg.SocketPath)
+	t.Cleanup(func() { conn.Close() })
+	ctx := testhelper.MergeOutgoingMetadata(testhelper.Context(t), testcfg.GitalyServersMetadataFromCfg(t, cfg))
 	// The resolution writes commits directly, outside an RPC, so the feature flags that
 	// commit writing checks are set explicitly.
 	ctx = featureflag.ContextWithFeatureFlag(ctx, featureflag.GPGSigning, true)
@@ -207,6 +242,7 @@ func newResolveFixtureIn(t *testing.T, graft config.Graft, baseEntries, tipEntri
 		base:      base,
 		tip:       tip,
 		commit:    commit,
+		lanes:     lanes,
 	}
 }
 

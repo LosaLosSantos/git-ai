@@ -174,14 +174,7 @@ func (s *Server) landResolveAt(
 
 		// The client applies the timeout, the request policy and the acceptance rules of the
 		// answer; the request waits for a resolve slot within the deadline of ctx.
-		var resp *resolver.Response
-		var err error
-		if slot, slotErr := s.conflictResolver.AcquireResolveSlot(ctx); slotErr != nil {
-			err = slotErr
-		} else {
-			resp, err = slot.Resolve(ctx, req)
-			slot.Release()
-		}
+		resp, err := s.landResolveSlotted(ctx, req)
 		resolveErr = err
 		switch {
 		case err != nil:
@@ -246,6 +239,20 @@ func (s *Server) landResolveAt(
 		}
 	}
 	return l, combined, nil
+}
+
+// landResolveSlotted sends the resolve request with a resolve slot. The slot is given back when the
+// call returns, even on a panic: a lost slot would refuse every later resolution of the process.
+func (s *Server) landResolveSlotted(ctx context.Context, req resolver.Request) (*resolver.Response, error) {
+	slot, err := s.conflictResolver.AcquireResolveSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer slot.Release()
+	if s.landResolveHook != nil {
+		s.landResolveHook()
+	}
+	return slot.Resolve(ctx, req)
 }
 
 // landCombinedAnswer is the answer of a land whose files are resolved in rounds: the files the
@@ -335,7 +342,16 @@ func (s *Server) landApplyVerdicts(
 			}
 		}
 	}
-	if len(missing) > 0 || len(l.files) == 0 {
+	if len(l.files) == 0 {
+		// A merge that is unclean without a conflicting file (a directory rename split) at this tip.
+		// The pre-resolution refuses it with the same reason when it sees it at its own tip; here the
+		// tip moved to it. No file can be resolved, so asking for files again would only repeat the
+		// round: the land is refused, with the package that says why.
+		s.logger.WithField("branch", string(in.GetBranch())).WithField("tip", tip.String()).
+			Warn("graft: the merge at the lane's tip has conflicts without a conflicting file")
+		return landResolution{}, l.notAttempted(landNoConflictingFiles, nil)
+	}
+	if len(missing) > 0 {
 		return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: missing}
 	}
 

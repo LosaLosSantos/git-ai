@@ -252,6 +252,12 @@ Response (resolver to server):
 - `action` is `write` (with `mode` and `content`) or `delete`.
 - `resolver` names the resolver. It goes into the `Graft-Resolved-By`
   trailer, so it must be 1 to 128 bytes of printable, single-line UTF-8.
+  The server answers with one `resolver` for a land it resolved in rounds (the
+  files of a round that were resolved earlier keep their resolver): the
+  distinct names of the rounds, joined by commas in the order they were made
+  (`graft-resolve/trivial,graft-resolve/llm`), and, when the list would exceed
+  128 bytes, the names that fit followed by `,+N` for the N that do not. It is
+  always one line, and one `Graft-Resolved-By` trailer carries it.
 - `explanation` is free text. It is logged with the resolution (cut to
   4 KiB) and never interpreted.
 

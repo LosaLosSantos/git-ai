@@ -41,6 +41,9 @@ type Server struct {
 	// landCheckBatchHook, when set, runs in every check batch while it holds its slot; only tests
 	// set it.
 	landCheckBatchHook func()
+	// landResolveHook, when set, runs in every resolver call while it holds its resolve slot; only
+	// tests set it.
+	landResolveHook func()
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
 	// or when the configured resolver cannot be built: then resolverErr says why, and every land
 	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).

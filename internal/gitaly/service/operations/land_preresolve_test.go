@@ -302,9 +302,10 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 		require.Eventually(t, func() bool { return countIn(t, filepath.Join(h.dir, "calls")) == 2 }, 30*time.Second, 10*time.Millisecond)
 		third := landAsync(h.fx, h.c, "Land c")
 		require.Eventually(t, func() bool { return countIn(t, filepath.Join(h.dir, "calls")) == 3 }, 30*time.Second, 10*time.Millisecond)
-		// The two requests submit to the lane right after their answers; the lane is held for as
-		// long as the test wants, so this wait only lets them queue.
-		time.Sleep(500 * time.Millisecond)
+		// The lane is held: the two requests wait in it together. Wait until it says so, not for a
+		// while.
+		require.Eventually(t, func() bool { return h.fx.laneQueueDepth(t) == 2 }, 30*time.Second, 10*time.Millisecond,
+			"b and c never queued in the lane")
 		requireRunning(t, h.first, "the land of a")
 
 		h.release()
