@@ -159,6 +159,9 @@ type Syncer struct {
 	syncChangesets prometheus.Counter
 	syncBytes      prometheus.Counter
 	syncSeeds      prometheus.Counter
+	// buildCleanupFailures counts the build directories CleanBuilds could not
+	// check or remove.
+	buildCleanupFailures prometheus.Counter
 
 	// keptStorages are the storages whose kept untrusted copies (KeptDirName)
 	// the metrics report, set by StartLocalReferences.
@@ -216,6 +219,10 @@ func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoF
 		syncSeeds: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "graft_storage_sync_checkpoint_seeds_total",
 			Help: "Number of hydrations that started from a checkpoint instead of changeset 1.",
+		}),
+		buildCleanupFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "graft_storage_build_cleanup_failures_total",
+			Help: "Number of build directories of hydrations that the startup cleanup could not check or remove; they are kept.",
 		}),
 	}
 	for _, result := range []string{resultFresh, resultCaughtUp, resultHydrated, resultPartial, resultSeeding, resultError} {
@@ -342,6 +349,7 @@ func (s *Syncer) Describe(descs chan<- *prometheus.Desc) {
 	s.syncChangesets.Describe(descs)
 	s.syncBytes.Describe(descs)
 	s.syncSeeds.Describe(descs)
+	s.buildCleanupFailures.Describe(descs)
 	descs <- keptRepositoriesDesc
 	descs <- keptBytesDesc
 }
@@ -356,6 +364,7 @@ func (s *Syncer) Collect(metrics chan<- prometheus.Metric) {
 	s.syncChangesets.Collect(metrics)
 	s.syncBytes.Collect(metrics)
 	s.syncSeeds.Collect(metrics)
+	s.buildCleanupFailures.Collect(metrics)
 	s.collectKept(metrics)
 }
 
@@ -1569,7 +1578,7 @@ func (s *Syncer) newBuild(ctx context.Context, repo *gitalypb.Repository, r core
 		return nil, structerr.NewInternal("storage core: create hydration directory: %w", err)
 	}
 	b := &build{dir: dir, path: filepath.Join(dir, "repo.git"), tmpDir: tmpDir}
-	if b.lock, err = lockBuild(dir); err != nil {
+	if b.lock, err = lockBuild(dir, nil); err != nil {
 		b.remove()
 		return nil, structerr.NewInternal("storage core: lock the hydration directory: %w", err)
 	}
@@ -1778,6 +1787,7 @@ func (s *Syncer) seedAndInstall(ctx context.Context, repo *gitalypb.Repository, 
 	if err != nil {
 		return err
 	}
+	s.hook("seeded")
 	// A seed that indexed the whole pack holds every object of the
 	// checkpoint, verified against its key, so it may be installed after its
 	// deadline; what the deadline protects is the changeset packs after the
@@ -1796,6 +1806,7 @@ func (s *Syncer) seedAndInstall(ctx context.Context, repo *gitalypb.Repository, 
 	case err != nil:
 		return err
 	}
+	s.hook("installed")
 
 	s.syncBytes.Add(float64(n))
 	s.report(ctx, r, cp.Seq)

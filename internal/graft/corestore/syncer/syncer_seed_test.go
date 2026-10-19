@@ -1,9 +1,12 @@
 package syncer_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -13,7 +16,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
 )
 
 // seedFixture is a repository written on node a with a checkpoint followed by
@@ -138,6 +143,78 @@ func TestSeedOfARepositoryRemovedAndCreatedAgain(t *testing.T) {
 	f.b.verifySynced(t, again)
 }
 
+// skewedMeta is a MetaStore whose database clock, as GetRepository reports
+// it, runs skew ahead of the host's: the host was suspended, its monotonic
+// clock stopped, the database's did not.
+type skewedMeta struct {
+	corestore.MetaStore
+	skew atomic.Int64
+}
+
+func (m *skewedMeta) GetRepository(ctx context.Context, key corestore.RepoKey) (corestore.Repository, error) {
+	r, err := m.MetaStore.GetRepository(ctx, key)
+	r.ReadAt = r.ReadAt.Add(time.Duration(m.skew.Load()))
+	return r, err
+}
+
+// TestSeedInstalledPastItsDeadlineThenSuperseded is the path of a seed that
+// indexed its whole pack and passed its deadline on the database clock (the
+// host's clock lagged): it is installed, its objects being complete; then
+// C_sync moves past it, and the next pass of the round finds the copy below
+// C_sync and seeds again from the newest checkpoint, never catching up over
+// packs that may be collected (final review item 5). On Postgres, whose clock
+// is the database's own.
+func TestSeedInstalledPastItsDeadlineThenSuperseded(t *testing.T) {
+	t.Parallel()
+	if !slices.Contains(coretest.Dialects(), sqlstore.Postgres) {
+		t.Skip("Postgres is not configured")
+	}
+
+	a := newEnv(t, envOptions{dialect: sqlstore.Postgres})
+	src := a.newSource(t)
+	c := a.writeCommit(t, src)
+	repo := a.register(t, a.key(localRelPath), src, c)
+	c = a.advanceMain(t, repo.ID, src, c)
+	first := a.checkpoint(t, repo.ID, src)
+	a.advanceMain(t, repo.ID, src, c)
+
+	b := a.secondNode(t, sqlstore.Postgres)
+	b.core.SyncTimeout = time.Minute
+	skewed := &skewedMeta{MetaStore: b.core.Meta}
+	b.core.Meta = skewed
+
+	var (
+		installs     atomic.Int32
+		pastDeadline atomic.Bool
+		newer        corestore.Checkpoint
+	)
+	b.sy.SetTestHook(func(point string) {
+		switch {
+		case point == "seeded" && installs.Load() == 0:
+			// The whole pack is indexed; on the database clock the seed's
+			// deadline (its record's read + W) has passed.
+			skewed.skew.Store(int64(2 * b.core.WriteDeadline()))
+			r, err := skewed.GetRepository(b.ctx, repo.Key)
+			require.NoError(t, err)
+			pastDeadline.Store(r.ReadAt.After(time.Now().Add(b.core.WriteDeadline())))
+		case point == "installed" && installs.Add(1) == 1:
+			// C_sync moves past the installed copy.
+			newer = a.checkpoint(t, repo.ID, src)
+			a.ageCheckpoint(t, repo.ID, newer.Seq, b.core.GCGrace+time.Minute)
+		}
+	})
+
+	require.NoError(t, b.sy.EnsureFresh(b.ctx, b.pbRepo(localRelPath)))
+	require.True(t, pastDeadline.Load(), "the first seed was past its deadline on the database clock")
+	require.Equal(t, int32(2), installs.Load(), "installed past the deadline, then seeded again from the newest")
+	require.Greater(t, newer.Seq, first.Seq)
+	require.Equal(t, float64(2), counter(t, b.sy, "graft_storage_sync_checkpoint_seeds_total", ""))
+
+	current, err := b.core.Meta.GetRepository(b.ctx, repo.Key)
+	require.NoError(t, err)
+	b.verifySynced(t, current)
+}
+
 // TestStopSeedsEndsTheSeedJobs: StopSeeds cancels a running seed, waits for it
 // and its build directory to be gone, and no seed starts after it (final
 // minor 3).
@@ -199,13 +276,19 @@ func TestCleanBuildsRemovesOnlyDeadBuilds(t *testing.T) {
 	require.NoError(t, syscall.Flock(int(lockFile(running).Fd()), syscall.LOCK_EX|syscall.LOCK_NB))
 	dead := mkdir("hydrate-dead")
 	require.NoError(t, lockFile(dead).Close(), "a lock file nobody holds: its process died")
+	// A directory without a lock file (a v0.2 process, or one that died before
+	// its lock) is removed only once it is older than any hydration or seed
+	// lives: the larger of W and sync_timeout.
+	limit := max(e.core.WriteDeadline(), e.core.SyncTimeout)
 	oldUnlocked := mkdir("hydrate-old-unlocked")
-	require.NoError(t, os.Chtimes(oldUnlocked, time.Now().Add(-2*time.Minute), time.Now().Add(-2*time.Minute)))
-	newUnlocked := mkdir("hydrate-new-unlocked")
+	require.NoError(t, os.Chtimes(oldUnlocked, time.Now().Add(-limit-time.Minute), time.Now().Add(-limit-time.Minute)))
+	youngUnlocked := mkdir("hydrate-young-unlocked")
+	require.NoError(t, os.Chtimes(youngUnlocked, time.Now().Add(-2*time.Minute), time.Now().Add(-2*time.Minute)))
 	other := mkdir("stale-other")
 
-	require.NoError(t, e.sy.CleanBuilds(e.ctx, []string{e.storageName}))
-	for dir, kept := range map[string]bool{running: true, dead: false, oldUnlocked: false, newUnlocked: true, other: true} {
+	e.sy.CleanBuilds(e.ctx, []string{e.storageName})
+	require.Zero(t, counter(t, e.sy, "graft_storage_build_cleanup_failures_total", ""))
+	for dir, kept := range map[string]bool{running: true, dead: false, oldUnlocked: false, youngUnlocked: true, other: true} {
 		_, err := os.Stat(dir)
 		if kept {
 			require.NoError(t, err, "%s is kept", dir)
@@ -213,4 +296,64 @@ func TestCleanBuildsRemovesOnlyDeadBuilds(t *testing.T) {
 			require.ErrorIs(t, err, os.ErrNotExist, "%s is removed", dir)
 		}
 	}
+}
+
+// TestCleanBuildsNeverStopsTheServer: a build directory that its process
+// removes while the cleanup looks at it is not an error, and one that cannot
+// be checked is kept, logged and counted; the cleanup goes on (final review
+// item 1).
+func TestCleanBuildsNeverStopsTheServer(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{})
+	tmpDir, err := e.locator.TempDir(e.storageName)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpDir, 0o700))
+
+	// Gone between the listing and the check: the old process of a graceful
+	// upgrade removed its finished build.
+	removed, err := syncer.CleanBuild(e.sy, filepath.Join(tmpDir, "hydrate-gone"))
+	require.NoError(t, err)
+	require.False(t, removed)
+
+	// A lock file that cannot be opened: kept, counted, and the dead build
+	// next to it is still removed.
+	unreadable := filepath.Join(tmpDir, "hydrate-unreadable")
+	require.NoError(t, os.MkdirAll(unreadable, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(unreadable, "build.lock"), nil, 0o000))
+	dead := filepath.Join(tmpDir, "hydrate-dead")
+	require.NoError(t, os.MkdirAll(dead, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dead, "build.lock"), nil, 0o600))
+
+	e.sy.CleanBuilds(e.ctx, []string{e.storageName})
+	require.Equal(t, 1.0, counter(t, e.sy, "graft_storage_build_cleanup_failures_total", ""))
+	_, err = os.Stat(unreadable)
+	require.NoError(t, err, "kept")
+	_, err = os.Stat(dead)
+	require.ErrorIs(t, err, os.ErrNotExist, "the cleanup went on")
+}
+
+// TestLockBuildFailsWhenItsDirectoryWasCleanedUp: CleanBuilds may find the
+// lock file of a build free between its creation and its flock, and remove
+// the directory; the build then fails instead of running without its lock
+// (final review item 2).
+func TestLockBuildFailsWhenItsDirectoryWasCleanedUp(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	f, err := syncer.LockBuild(dir, nil)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	other := t.TempDir()
+	_, err = syncer.LockBuild(other, func(path string) {
+		// The cleanup's work, between the open and the flock: the file opened
+		// is unlinked; a new build or a cleanup may then create another.
+		require.NoError(t, os.Remove(path))
+		require.NoError(t, os.WriteFile(path, nil, 0o600))
+	})
+	require.ErrorContains(t, err, "removed before its lock was taken")
+
+	gone := t.TempDir()
+	_, err = syncer.LockBuild(gone, func(path string) { require.NoError(t, os.RemoveAll(filepath.Dir(path))) })
+	require.ErrorContains(t, err, "removed before its lock was taken")
 }

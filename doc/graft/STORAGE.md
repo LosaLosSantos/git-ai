@@ -721,6 +721,7 @@ without a single divergence.
 | `graft_storage_sync_seconds` | Duration of the catch-up before a request. |
 | `graft_storage_sync_changesets_total`, `graft_storage_sync_bytes_total` | Changesets applied and pack bytes downloaded by catch-up and hydration. |
 | `graft_storage_sync_checkpoint_seeds_total` | Hydrations that started from a checkpoint instead of changeset 1. |
+| `graft_storage_build_cleanup_failures_total` | Build directories of hydrations (`+gitaly/tmp/hydrate-*`) that the startup cleanup could not check or remove; they are kept and logged. |
 | `graft_storage_maintenance_runs_total{result}` | Runs of the background maintenance; `ok`, or `error` when at least one step failed. |
 | `graft_storage_maintenance_checkpoints_total` | Checkpoints created by the background maintenance. |
 | `graft_storage_maintenance_packs_deleted_total`, `graft_storage_maintenance_bytes_reclaimed_total` | Bucket objects, and their bytes, deleted by the background garbage collection. |

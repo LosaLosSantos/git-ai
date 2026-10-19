@@ -1,116 +1,157 @@
 package corestore_test
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"go/types"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strings"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
-// TestUploadPackIsTheOnlyUploader enforces invariant U (doc/graft/PLAN7.md,
-// RULE 26 and "Removed repositories"): every object of the bucket is written
-// by Core.UploadPack, which needs a repository record that a read found. The
-// bucket is reached through the field Core.Blobs only, so in the module's
-// non-test code:
-//   - Blobs.Put is called in core.go only (UploadPack);
-//   - Blobs is not taken as a value (assigned, passed, returned), which would
-//     let a Put happen under another name, except where the core is built.
-//
-// Tests may write the bucket directly to set up states. The files checked are
-// those that can reach a *corestore.Core: they import corestore or one of its
-// packages, call the dependencies' GetGraftStorage, or are in internal/graft
-// or the storagecore service (other fields named Blobs, in protobuf messages
-// and git packfile code, are unrelated).
-func TestUploadPackIsTheOnlyUploader(t *testing.T) {
-	root := moduleRoot(t)
-	// Where Blobs may be used as a value: the core is built and closed there.
-	wiring := map[string]bool{
-		"internal/graft/corestore/core.go":      true,
-		"internal/graft/corestore/open/open.go": true,
-	}
+const corestorePath = "github.com/feder-cr/git-ai/internal/graft/corestore"
 
-	var violations []string
-	fset := token.NewFileSet()
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			if rel != "." && (strings.HasPrefix(d.Name(), ".") || d.Name() == "_build" || d.Name() == "_support" || d.Name() == "testdata") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		src, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		file, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-		if !reachesCore(rel, file, src) {
-			return nil
-		}
-
-		var stack []ast.Node
-		ast.Inspect(file, func(n ast.Node) bool {
-			if n == nil {
-				stack = stack[:len(stack)-1]
-				return true
-			}
-			stack = append(stack, n)
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Blobs" {
-				return true
-			}
-			pos := fset.Position(sel.Pos())
-			// The parent of x.Blobs: a method selection (x.Blobs.M) or a use as
-			// a value.
-			if len(stack) >= 2 {
-				if method, ok := stack[len(stack)-2].(*ast.SelectorExpr); ok && method.X == sel {
-					if method.Sel.Name == "Put" && rel != "internal/graft/corestore/core.go" {
-						violations = append(violations, pos.String()+": Blobs.Put outside Core.UploadPack")
-					}
-					return true
-				}
-			}
-			if !wiring[rel] {
-				violations = append(violations, pos.String()+": Blobs used as a value outside the core's wiring")
-			}
-			return true
-		})
-		return nil
-	})
-	require.NoError(t, err)
-	require.Empty(t, violations, "every bucket write goes through Core.UploadPack (RULE 26, invariant U)")
+// listedPackage is the part of `go list -json` the test reads.
+type listedPackage struct {
+	ImportPath string
+	Dir        string
+	GoFiles    []string
+	Export     string
+	Deps       []string
+	Module     *struct{ Path string }
 }
 
-// reachesCore reports whether the file at rel can reach a *corestore.Core.
-func reachesCore(rel string, file *ast.File, src []byte) bool {
-	if strings.HasPrefix(rel, "internal/graft/") || strings.HasPrefix(rel, "internal/gitaly/service/storagecore/") {
-		return true
+// goList runs go list -json with args in the module root and decodes the
+// packages it prints.
+func goList(t *testing.T, root string, args ...string) []listedPackage {
+	t.Helper()
+	cmd := exec.Command("go", append([]string{"list", "-e", "-json=ImportPath,Dir,GoFiles,Export,Deps,Module"}, args...)...)
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "go list: %s", stderr.String())
+
+	var pkgs []listedPackage
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var p listedPackage
+		if err := dec.Decode(&p); errors.Is(err, io.EOF) {
+			break
+		} else {
+			require.NoError(t, err)
+		}
+		pkgs = append(pkgs, p)
 	}
-	for _, imp := range file.Imports {
-		if strings.HasPrefix(strings.Trim(imp.Path.Value, `"`), "github.com/feder-cr/git-ai/internal/graft/corestore") {
-			return true
+	return pkgs
+}
+
+// TestUploadPackIsTheOnlyUploader enforces invariant U (doc/graft/PLAN7.md,
+// RULE 26 and "Removed repositories"): every object of the bucket is written
+// by Core.UploadPack, which needs a repository record that a read found. In
+// the module's non-test code, type-checked, the calls of Put on a value whose
+// static type implements corestore.BlobStore, whatever its name (the field
+// Core.Blobs, a variable, a parameter, a wrapper), are exactly one: in
+// Core.UploadPack. Only packages that depend on corestore can hold such a
+// value. Tests may write the bucket directly to set up states.
+func TestUploadPackIsTheOnlyUploader(t *testing.T) {
+	root := moduleRoot(t)
+
+	// The module's packages that depend on corestore, and corestore.
+	var targets []string
+	for _, p := range goList(t, root, "./...") {
+		if p.ImportPath == corestorePath || slices.Contains(p.Deps, corestorePath) {
+			targets = append(targets, p.ImportPath)
 		}
 	}
-	return strings.Contains(string(src), "GetGraftStorage")
+	require.Contains(t, targets, corestorePath)
+
+	// Their export data, and that of everything they import.
+	exports := map[string]string{}
+	listed := map[string]listedPackage{}
+	for _, p := range goList(t, root, append([]string{"-export", "-deps"}, targets...)...) {
+		exports[p.ImportPath] = p.Export
+		listed[p.ImportPath] = p
+	}
+	fset := token.NewFileSet()
+	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		file, ok := exports[path]
+		if !ok || file == "" {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(file)
+	})
+
+	corestore, err := imp.Import(corestorePath)
+	require.NoError(t, err)
+	blobStore, ok := corestore.Scope().Lookup("BlobStore").Type().Underlying().(*types.Interface)
+	require.True(t, ok, "corestore.BlobStore is an interface")
+
+	type put struct{ file, function string }
+	var puts []put
+	for _, path := range targets {
+		p := listed[path]
+		var files []*ast.File
+		for _, name := range p.GoFiles {
+			f, err := parser.ParseFile(fset, filepath.Join(p.Dir, name), nil, parser.SkipObjectResolution)
+			require.NoError(t, err)
+			files = append(files, f)
+		}
+		info := &types.Info{Selections: map[*ast.SelectorExpr]*types.Selection{}}
+		conf := types.Config{Importer: imp}
+		pkg, err := conf.Check(path, fset, files, info)
+		require.NoError(t, err, "type-check %s", path)
+		// Checked from source, corestore has its own BlobStore type (the
+		// importer's is that of the export data).
+		iface := blobStore
+		if path == corestorePath {
+			iface = pkg.Scope().Lookup("BlobStore").Type().Underlying().(*types.Interface)
+		}
+
+		for _, f := range files {
+			for _, decl := range f.Decls {
+				function := ""
+				if fn, ok := decl.(*ast.FuncDecl); ok {
+					function = fn.Name.Name
+				}
+				ast.Inspect(decl, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					sel, ok := call.Fun.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "Put" {
+						return true
+					}
+					selection, ok := info.Selections[sel]
+					if !ok || selection.Kind() != types.MethodVal {
+						return true
+					}
+					recv := selection.Recv()
+					if types.Implements(recv, iface) || types.Implements(types.NewPointer(recv), iface) {
+						rel, err := filepath.Rel(root, fset.Position(call.Pos()).Filename)
+						require.NoError(t, err)
+						puts = append(puts, put{file: filepath.ToSlash(rel), function: function})
+					}
+					return true
+				})
+			}
+		}
+	}
+
+	require.Equal(t, []put{{file: "internal/graft/corestore/core.go", function: "UploadPack"}}, puts,
+		"every bucket write goes through Core.UploadPack (RULE 26, invariant U)")
 }
 
 // moduleRoot returns the directory of the module's go.mod.

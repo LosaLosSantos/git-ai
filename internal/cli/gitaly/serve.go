@@ -643,10 +643,9 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			}
 			// The build directories of hydrations of a process that died are
 			// removed; those of a process that runs (the old one of a graceful
-			// upgrade) hold their lock and are kept.
-			if err := syncer.CleanBuilds(ctx, storageNames); err != nil {
-				return err
-			}
+			// upgrade) hold their lock and are kept. A failure is logged and
+			// counted: it never stops the server.
+			syncer.CleanBuilds(ctx, storageNames)
 			stopLocalReferences, err := syncer.StartLocalReferences(ctx, storageNames)
 			if err != nil {
 				return err

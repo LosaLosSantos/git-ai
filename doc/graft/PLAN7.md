@@ -1753,13 +1753,26 @@ leaves it:
 * **Lifecycle (final minor 3).** `StopSeeds` (deferred by `gitaly serve` after
   its servers, before the last durable step) cancels the seed jobs, waits for
   them, and refuses new ones ("the server is stopping"). Every build directory
-  (`hydrate-*`) holds a flock on its `build.lock` until it is removed;
-  `CleanBuilds`, at startup before the listeners, removes those whose lock is
-  free (their process died) or that have none and are older than a minute,
-  and keeps those of a process that runs (the old one of a graceful upgrade).
+  (`hydrate-*`) holds a flock on its `build.lock` until it is removed; after
+  the flock the build checks that the file it locked is still the one at the
+  path, else it fails (a cleanup found the lock free in between and removed
+  the directory). `CleanBuilds`, at startup before the listeners, removes the
+  directories whose lock is free (their process died), and those without a
+  lock file older than the larger of W and `sync_timeout` (no hydration or
+  seed lives longer; a v0.2 process, whose builds have no lock, may still run
+  one during a graceful upgrade); it keeps those of a process that runs. A
+  directory gone meanwhile (its process removed it) is not an error; one that
+  cannot be checked or removed is kept, logged and counted
+  (`graft_storage_build_cleanup_failures_total`): the cleanup never stops the
+  server.
 * Tests: `TestSeedSupersededByANewerCheckpoint`, `TestSeedPastItsDeadline`,
   `TestSeedOfARepositoryRemovedAndCreatedAgain`, `TestStopSeedsEndsTheSeedJobs`,
-  `TestCleanBuildsRemovesOnlyDeadBuilds`.
+  `TestCleanBuildsRemovesOnlyDeadBuilds`, `TestCleanBuildsNeverStopsTheServer`,
+  `TestLockBuildFailsWhenItsDirectoryWasCleanedUp`, and on Postgres
+  `TestSeedInstalledPastItsDeadlineThenSuperseded` (the path above: a seed that
+  indexed its pack is installed past its deadline on a database clock that
+  runs ahead of the host's, then C_sync moves and the next pass seeds again
+  from the newest).
 
 **Tests.** `TestSyncerResumesAHydrationAcrossRounds`: rounds of 4 changesets
 on a 10-changeset repository give Unavailable at 4 and at 8, with the
@@ -2313,11 +2326,12 @@ path: the voter is m3's; the land paths call it unchanged.
     repository row lock.
 26. **One upload path**: every production upload goes through `Core.UploadPack`, and
     every row that references an upload is committed under its `CommitContext`.
-    Enforced by `TestUploadPackIsTheOnlyUploader` (`internal/graft/corestore`): in
-    the non-test code that can reach a `*corestore.Core`, `Blobs.Put` is called in
-    `core.go` only and `Blobs` is never taken as a value outside the core's wiring
-    (`core.go`, `open/open.go`). It is invariant U of the reconciliation
-    ("Removed repositories").
+    Enforced by `TestUploadPackIsTheOnlyUploader` (`internal/graft/corestore`):
+    the module's non-test packages that depend on corestore are type-checked
+    (`go list -export` and `go/types`, no new dependency), and the calls of
+    `Put` on a value whose static type implements `corestore.BlobStore`,
+    whatever its name, must be exactly one, in `Core.UploadPack`. It is
+    invariant U of the reconciliation ("Removed repositories").
 27. **Local references are a cache of the database**: in authoritative mode a local
     reference write without fsync happens only after its repository has a durable
     dirty marker; a marker is removed only after the stack is durable, under git's
