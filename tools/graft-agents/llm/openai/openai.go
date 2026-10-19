@@ -84,6 +84,13 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("openai: HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+// HTTPStatus implements llm.StatusError.
+func (e *APIError) HTTPStatus() int { return e.StatusCode }
+
+// BeforeGeneration implements llm.StatusError: the provider does not stream, so an error status
+// is the status of the response, before anything was generated.
+func (e *APIError) BeforeGeneration() bool { return true }
+
 // Provider is an OpenAI-compatible Chat Completions client. It is safe for
 // concurrent use.
 type Provider struct {

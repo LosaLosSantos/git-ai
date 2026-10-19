@@ -624,8 +624,12 @@ and `max_tokens` of output. If that would take the month's spend past the
 cap, the call is not made. The file then fails with the reason "AI budget
 exhausted", which the server puts in the conflict package for the agent.
 After the call the worst case is replaced by the cost of the usage the
-provider reports. A provider that reports no usage, or a call that fails, is
-left at its worst case. So the recorded spend is never below the real one.
+provider reports. A call that the provider refused before generating anything,
+with HTTP 400, 401, 402 or 403 (a bad request, no or a wrong key, no credit,
+forbidden), is not billed: its worst case is released. A provider that reports
+no usage, and every other failure (a 429 or 5xx answer, a timeout, a broken
+connection, an error in the middle of a stream), is left at its worst case, as
+it may have been billed. So the recorded spend is never below the real one.
 A new calendar month (UTC) starts at zero.
 
 The spend is kept in the `state` file (`{"month": "2026-10", "spent_usd":
@@ -676,7 +680,9 @@ resolved in real repositories. It needs the grammars (a cgo build).
   against the human file. The sample is stratified by family, with Rust and
   Java apart, so a language with few cases is taken whole. A chain with a
   model needs `--max-usd`: every call books its worst case first, and a call
-  that would pass the cap is not made. The model's price is read at run time
+  that would pass the cap is not made. The first HTTP 402 of the provider (no
+  credit) stops the run: the remaining cases are reported as stopped, with the
+  reason, apart from those the cap left out. The model's price is read at run time
   from OpenRouter's endpoints API (`--pricing openrouter`, the highest price
   of the model's endpoints, or of those the routing allows), or given as flags (`--pricing fixed`). The
   answers are kept in `--answers-dir`.

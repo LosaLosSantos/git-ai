@@ -240,6 +240,16 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			fmt.Fprintf(stderr, "[%d/%d] %s %s %s: %s %s\n", done, total, r.Family, r.Repo, r.Path, r.Outcome, r.Reason)
 		},
 	}
+	// The first HTTP 402 of the provider (no credit) stops the run: every call after it fails the
+	// same way, and a run that goes on only measures the refusals.
+	if budget != nil {
+		runner.Stop = func() string {
+			if n := budget.PaymentRefusals(); n > 0 {
+				return "the provider refused a call with HTTP 402 (no credit)"
+			}
+			return ""
+		}
+	}
 	results, runErr := runner.Run(ctx, cases)
 	report := bench.NewReport(*label, results)
 	if budget != nil {

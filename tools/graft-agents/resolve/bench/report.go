@@ -18,6 +18,7 @@ type Counts struct {
 	NotSent   int `json:"not_sent"`
 	Model     int `json:"model_error"`
 	NotRun    int `json:"not_run_cap"`
+	Stopped   int `json:"not_run_stopped"`
 	Abstained int `json:"abstained"`
 	// BlankLinesOnly counts the wrong results that differ from the human resolution in blank
 	// lines only (part of Wrong); SyntaxUnchecked the accepted results the syntax check gave no
@@ -62,6 +63,8 @@ func (c *Counts) add(r Result) {
 		c.Model++
 	case OutcomeNotRun:
 		c.NotRun++
+	case OutcomeStopped:
+		c.Stopped++
 	case OutcomeAbstained:
 		c.Abstained++
 	}
@@ -86,7 +89,9 @@ type Report struct {
 	MaxUSD   float64 `json:"max_usd,omitempty"`
 	// Pricing is the price the spend was computed with, as read at run time.
 	Pricing *Pricing `json:"pricing,omitempty"`
-	Results []Result `json:"results"`
+	// StopReason is why the run stopped before its last cases (OutcomeStopped), if it did.
+	StopReason string   `json:"stop_reason,omitempty"`
+	Results    []Result `json:"results"`
 }
 
 // LowN is the number of cases below which a row is marked as low-n in the Markdown report.
@@ -109,6 +114,9 @@ func NewReport(label string, results []Result) Report {
 		if r.Outcome == OutcomeNotSent {
 			rep.NotSent[r.Reason]++
 		}
+		if r.Outcome == OutcomeStopped && rep.StopReason == "" {
+			rep.StopReason = r.Reason
+		}
 	}
 	return rep
 }
@@ -117,9 +125,12 @@ func NewReport(label string, results []Result) Report {
 func (rep Report) WriteMarkdown(w io.Writer) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "## graft-resolve bench: %s\n\n", rep.Label)
-	fmt.Fprintf(&b, "Cases sampled: %d; run: %d", rep.Total.Cases, rep.Total.Cases-rep.Total.NotRun)
+	fmt.Fprintf(&b, "Cases sampled: %d; run: %d", rep.Total.Cases, rep.Total.Cases-rep.Total.NotRun-rep.Total.Stopped)
 	if rep.Total.NotRun > 0 {
 		fmt.Fprintf(&b, " (%d not run: the cap was reached)", rep.Total.NotRun)
+	}
+	if rep.Total.Stopped > 0 {
+		fmt.Fprintf(&b, " (%d not run: the run stopped: %s)", rep.Total.Stopped, rep.StopReason)
 	}
 	if rep.MaxUSD > 0 {
 		fmt.Fprintf(&b, "; AI spend $%.4f of the $%.2f cap", rep.SpendUSD, rep.MaxUSD)
@@ -134,16 +145,16 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 			p.Model, p.Source, p.FetchedAt.Format(time.RFC3339), over,
 			PerMillion(p.Prompt), PerMillion(p.Completion, p.Reasoning), PerMillion(p.Completion), PerMillion(p.Reasoning), p.Request)
 	}
-	b.WriteString("| family | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | abstained | error rate |\n")
-	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	b.WriteString("| family | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | stopped | abstained | error rate |\n")
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	families := make([]string, 0, len(rep.Families))
 	for f := range rep.Families {
 		families = append(families, f)
 	}
 	sort.Strings(families)
 	row := func(name string, c Counts) {
-		fmt.Fprintf(&b, "| %s | %d | %d (%d) | %d | %d | %d | %d | %d | %d | %.1f%% |\n",
-			name, c.Cases, c.Correct, c.Exact, c.Wrong, c.Rejected, c.NotSent, c.Model, c.NotRun, c.Abstained, 100*c.ErrorRate())
+		fmt.Fprintf(&b, "| %s | %d | %d (%d) | %d | %d | %d | %d | %d | %d | %d | %.1f%% |\n",
+			name, c.Cases, c.Correct, c.Exact, c.Wrong, c.Rejected, c.NotSent, c.Model, c.NotRun, c.Stopped, c.Abstained, 100*c.ErrorRate())
 	}
 	for _, f := range families {
 		row(f, rep.Families[f])
@@ -158,8 +169,8 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		if len(group.m) == 0 {
 			continue
 		}
-		fmt.Fprintf(&b, "\n| %s | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | abstained | error rate |\n", group.title)
-		b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+		fmt.Fprintf(&b, "\n| %s | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | stopped | abstained | error rate |\n", group.title)
+		b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 		keys := make([]string, 0, len(group.m))
 		for k := range group.m {
 			keys = append(keys, k)

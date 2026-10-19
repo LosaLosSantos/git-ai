@@ -33,6 +33,9 @@ const (
 	OutcomeModelError = "model_error"
 	// OutcomeNotRun: the AI budget of the run was spent before the case.
 	OutcomeNotRun = "not_run_cap"
+	// OutcomeStopped: the run stopped before the case (Runner.Stop), for example because the
+	// provider refused a call for lack of credit; the reason is the result's.
+	OutcomeStopped = "not_run_stopped"
 	// OutcomeAbstained: no strategy applied to the file.
 	OutcomeAbstained = "abstained"
 )
@@ -121,6 +124,9 @@ type Runner struct {
 	// same answers judged again (Rejudge) without new model calls. The directory holds
 	// third-party code and stays local.
 	AnswersDir string
+	// Stop, when set, is asked before each case whether the run must stop. A reason stops it:
+	// that case and every case after it are not run, with outcome stopped and that reason.
+	Stop func() string
 }
 
 // Run replays every case and returns the results in the order of cases.
@@ -134,6 +140,19 @@ func (r Runner) Run(ctx context.Context, cases []Case) ([]Result, error) {
 	for i, c := range cases {
 		if err := ctx.Err(); err != nil {
 			return results, err
+		}
+		if r.Stop != nil {
+			if reason := r.Stop(); reason != "" {
+				for j, rest := range cases[i:] {
+					res := Result{ID: rest.ID, Repo: rest.Repo, Family: rest.Family, Language: LanguageOf(rest.Path), Kind: rest.Kind, Path: rest.Path,
+						Outcome: OutcomeStopped, Reason: reason}
+					results = append(results, res)
+					if r.Progress != nil {
+						r.Progress(i+j+1, len(cases), res)
+					}
+				}
+				return results, nil
+			}
 		}
 		res, err := r.runCase(ctx, c, maxBytes)
 		if err != nil {
@@ -225,7 +244,9 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 			return res, err
 		}
 	}
-	if f.Action == protocol.ActionWrite {
+	// A symbolic link has no syntax: its verdict is none, as in the check operation, never
+	// unchecked.
+	if f.Action == protocol.ActionWrite && f.Mode != protocol.ModeSymlink {
 		if _, ok := syntax.LanguageOf(c.Path); ok {
 			checked, err := syntax.CheckMerge(ctx, c.Path, f.Content, sideBytes(sides["ours"]), sideBytes(sides["theirs"]))
 			if err != nil && ctx.Err() != nil {

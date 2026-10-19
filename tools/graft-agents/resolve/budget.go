@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -90,6 +91,8 @@ type Budget struct {
 	calls atomic.Int64
 	// exhausted counts the calls refused for the cap.
 	exhausted atomic.Int64
+	// paymentRefusals counts the calls the provider refused with HTTP 402.
+	paymentRefusals atomic.Int64
 }
 
 // budgetState is the content of the state file: {"month": "2026-10", "spent_usd": 1.250000000},
@@ -301,6 +304,23 @@ func (r *Reservation) Book(u llm.Usage) error {
 	return err
 }
 
+// Release removes the reservation of a call that the provider refused before generating anything
+// with a status it does not bill (llm.Unbilled): it cost nothing. A reservation of a month that
+// has ended stays in that month.
+func (r *Reservation) Release() error {
+	if r == nil {
+		return nil
+	}
+	_, err := r.b.update(func(st *budgetState) error {
+		if st.Month != r.month {
+			return nil
+		}
+		st.Spent -= min(st.Spent, r.worst)
+		return nil
+	})
+	return err
+}
+
 // BudgetSnapshot is the state of a budget, for metrics and reports.
 type BudgetSnapshot struct {
 	Month string
@@ -364,6 +384,17 @@ func (bp budgetProvider) Complete(ctx context.Context, req llm.Request) (*llm.Re
 		return nil, err
 	}
 	resp, err := bp.p.Complete(ctx, req)
+	if status, ok := llm.HTTPStatus(err); ok && status == http.StatusPaymentRequired {
+		bp.b.paymentRefusals.Add(1)
+	}
+	// A refusal before generation that the provider does not bill releases the worst case; any
+	// other failure keeps it, as it may have been billed.
+	if err != nil && llm.Unbilled(err) {
+		if relErr := res.Release(); relErr != nil {
+			return nil, errors.Join(err, relErr)
+		}
+		return nil, err
+	}
 	var usage llm.Usage
 	if resp != nil {
 		usage = resp.Usage
@@ -372,4 +403,10 @@ func (bp budgetProvider) Complete(ctx context.Context, req llm.Request) (*llm.Re
 		return nil, bookErr
 	}
 	return resp, err
+}
+
+// PaymentRefusals returns the number of calls the provider refused with HTTP 402 (no credit), of
+// any kind. A run that meets one should stop: the calls after it fail the same way.
+func (b *Budget) PaymentRefusals() int64 {
+	return b.paymentRefusals.Load()
 }

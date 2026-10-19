@@ -5,6 +5,7 @@ package bench
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -186,13 +187,19 @@ func TestMineSkipsUnrelatedHistories(t *testing.T) {
 type fixedStrategy struct {
 	content []byte
 	err     error
+	// mode is the mode of the answer; empty is a regular file.
+	mode string
 }
 
 func (s fixedStrategy) Resolve(_ context.Context, _ resolve.File, _ protocol.Request) (resolve.Resolution, bool, error) {
 	if s.err != nil {
 		return resolve.Resolution{}, false, s.err
 	}
-	return resolve.Resolution{Action: protocol.ActionWrite, Mode: protocol.ModeFile, Content: s.content}, true, nil
+	mode := s.mode
+	if mode == "" {
+		mode = protocol.ModeFile
+	}
+	return resolve.Resolution{Action: protocol.ActionWrite, Mode: mode, Content: s.content}, true, nil
 }
 
 func TestRunnerOutcomes(t *testing.T) {
@@ -230,6 +237,49 @@ func TestRunnerOutcomes(t *testing.T) {
 				t.Fatalf("results %+v, want outcome %s exact %v", results, tc.want, tc.exact)
 			}
 		})
+	}
+
+}
+
+// TestRunnerSyntaxUnchecked: an accepted Go answer whose sides the grammar cannot read counts as
+// having no syntax verdict, while a symbolic link, which has no syntax, never does.
+func TestRunnerSyntaxUnchecked(t *testing.T) {
+	const broken = "package a\n\nfunc A( int {\n\treturn %d\n}\n"
+	f := newFixture(t)
+	f.commit("base", map[string]string{"a.go": fmt.Sprintf(broken, 1)})
+	f.git("checkout", "-q", "-b", "feature")
+	f.commit("feature", map[string]string{"a.go": fmt.Sprintf(broken, 3)})
+	f.git("checkout", "-q", "main")
+	f.commit("main", map[string]string{"a.go": fmt.Sprintf(broken, 2)})
+	f.conflictMerge("feature", map[string]string{"a.go": fmt.Sprintf(broken, 5)})
+	head := f.git("rev-parse", "HEAD")
+	cases, _, err := Mine(context.Background(), Repo{Name: "fixture", Commit: head, License: "MIT"}, f.dir, MineOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) != 1 {
+		t.Fatalf("%d cases, want 1", len(cases))
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mode      string
+		unchecked bool
+	}{
+		{"a regular file the grammar cannot check", protocol.ModeFile, true},
+		{"a symbolic link", protocol.ModeSymlink, false},
+	} {
+		res, err := resolve.NewResolver([]resolve.Binding{{Name: "fake", Strategy: fixedStrategy{content: []byte("target\n"), mode: tc.mode}}}, nil, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results, err := Runner{Resolver: res, Clone: func(string) string { return f.dir }}.Run(context.Background(), cases)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 || results[0].Outcome != OutcomeWrong || results[0].SyntaxUnchecked != tc.unchecked {
+			t.Fatalf("%s: results %+v, want an accepted answer with syntax_unchecked %v", tc.name, results, tc.unchecked)
+		}
 	}
 }
 
@@ -280,5 +330,54 @@ func TestMineLeavesOutInvalidReferences(t *testing.T) {
 	}
 	if len(kept) != 0 || fstats["fixture: "+InvalidMarkers] != 1 || fstats["fixture: "+InvalidSyntax] != 1 {
 		t.Fatalf("kept %d, stats %v", len(kept), fstats)
+	}
+}
+
+// TestRunnerStops: once Stop gives a reason, that case and the ones after it are not run; they
+// are counted apart from the cap, and the report says why.
+func TestRunnerStops(t *testing.T) {
+	f := newFixture(t)
+	buildHistory(f)
+	head := f.git("rev-parse", "HEAD")
+	cases, _, err := Mine(context.Background(), Repo{Name: "fixture", Commit: head, License: "MIT"}, f.dir, MineOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases = append(cases, cases[0], cases[0])
+
+	res, err := resolve.NewResolver([]resolve.Binding{{Name: "fake", Strategy: fixedStrategy{content: []byte(goHuman)}}}, nil, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked := 0
+	stop := func() string {
+		asked++
+		if asked > 1 {
+			return "the provider refused a call with HTTP 402 (no credit)"
+		}
+		return ""
+	}
+	results, err := Runner{Resolver: res, Clone: func(string) string { return f.dir }, Stop: stop}.Run(context.Background(), cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(cases) || results[0].Outcome != OutcomeCorrect {
+		t.Fatalf("results %+v, want the first case run", results)
+	}
+	for _, r := range results[1:] {
+		if r.Outcome != OutcomeStopped || !strings.Contains(r.Reason, "HTTP 402") {
+			t.Fatalf("result %+v, want stopped", r)
+		}
+	}
+	rep := NewReport("stop", results)
+	if rep.Total.Stopped != len(cases)-1 || rep.Total.NotRun != 0 || !strings.Contains(rep.StopReason, "HTTP 402") {
+		t.Fatalf("report totals %+v, reason %q", rep.Total, rep.StopReason)
+	}
+	var md strings.Builder
+	if err := rep.WriteMarkdown(&md); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(md.String(), "not run: the run stopped: the provider refused a call with HTTP 402") {
+		t.Fatalf("markdown does not say why the run stopped:\n%s", md.String())
 	}
 }

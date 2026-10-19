@@ -213,12 +213,19 @@ func (p *Provider) Complete(ctx context.Context, req llm.Request) (*llm.Response
 		msg *anthropicsdk.Message
 		err error
 	)
+	// started is set once a stream has delivered an event: an error after it came in the middle of
+	// the generation. A request that is not streamed has no such error.
+	started := false
 	if maxTokens > streamingThreshold {
-		msg, err = p.stream(ctx, params)
+		msg, err = p.stream(ctx, params, &started)
 	} else {
 		msg, err = p.client.Messages.New(ctx, params)
 	}
 	if err != nil {
+		var apiErr *anthropicsdk.Error
+		if errors.As(err, &apiErr) {
+			err = &statusError{err: err, status: apiErr.StatusCode, beforeGeneration: !started}
+		}
 		return nil, fmt.Errorf("anthropic: %w", err)
 	}
 
@@ -266,13 +273,27 @@ func (p *Provider) Complete(ctx context.Context, req llm.Request) (*llm.Response
 	return resp, nil
 }
 
-// stream runs the request as a stream and accumulates the final message.
-func (p *Provider) stream(ctx context.Context, params anthropicsdk.MessageNewParams) (*anthropicsdk.Message, error) {
+// statusError is an error answer of the API with its status (llm.StatusError).
+type statusError struct {
+	err              error
+	status           int
+	beforeGeneration bool
+}
+
+func (e *statusError) Error() string          { return e.err.Error() }
+func (e *statusError) Unwrap() error          { return e.err }
+func (e *statusError) HTTPStatus() int        { return e.status }
+func (e *statusError) BeforeGeneration() bool { return e.beforeGeneration }
+
+// stream runs the request as a stream and accumulates the final message. It sets *started once
+// the stream delivered an event.
+func (p *Provider) stream(ctx context.Context, params anthropicsdk.MessageNewParams, started *bool) (*anthropicsdk.Message, error) {
 	stream := p.client.Messages.NewStreaming(ctx, params)
 	defer stream.Close()
 
 	var msg anthropicsdk.Message
 	for stream.Next() {
+		*started = true
 		if err := msg.Accumulate(stream.Current()); err != nil {
 			return nil, err
 		}
