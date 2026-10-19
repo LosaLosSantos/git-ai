@@ -18,6 +18,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
+	"github.com/feder-cr/git-ai/internal/gitaly/service/hook"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
@@ -68,9 +69,15 @@ func setup(t *testing.T, mode corestore.Mode, dialect sqlstore.Dialect, adjust .
 	if mode == corestore.ModeAuthoritative {
 		cfg.Graft.Standalone = true
 	}
+	// The server's own reference writes (the review roots that a checkpoint
+	// backfills) go through the reference-transaction hook and its HookService,
+	// as in production: without the hook binary git would skip it and write
+	// past the database.
+	testcfg.BuildGitalyHooks(t, cfg)
 
 	cfg.SocketPath = testserver.RunGitalyServer(t, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
 		gitalypb.RegisterStorageCoreServiceServer(srv, NewServer(deps))
+		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 	}, testserver.WithGraftStorage(core))
 
 	conn, err := client.New(ctx, cfg.SocketPath)

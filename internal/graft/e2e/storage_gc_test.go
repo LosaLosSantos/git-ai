@@ -127,3 +127,70 @@ func TestStorageGCAcrossNodes(t *testing.T) {
 		}
 	})
 }
+
+// TestStorageCheckpointBackfillsReviewRoots: the review roots are a
+// precondition of a checkpoint, and so of garbage collection (integrated
+// review m3). An open review written before the REVIEW ROOTS RULE has no
+// keep-around references; when its branch is gone, only a changeset pack holds
+// its head commit. The checkpoint build writes the references first, so the
+// checkpoint holds the commit and the collection of the packs it covers loses
+// nothing: a node that joins afterwards still has it.
+func TestStorageCheckpointBackfillsReviewRoots(t *testing.T) {
+	forEachStorageDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
+		graft, tokens := workerGraft(1)
+		cluster := newStorageCluster(t, dialect, corestore.ModeAuthoritative, unbatched(graft))
+		cluster.adjust = func(core *corestore.Core) {
+			core.GCGrace = 2 * time.Second
+			core.GCMargin = 200 * time.Millisecond
+		}
+		a := cluster.addNode(t)
+
+		rel := a.createRepository(t).GetRelativePath()
+		onA := a.agent(t, rel, tokens[workerName(0)])
+		base, err := commitFile(a.ctx, onA, workerName(0), "main", "", "README.md", "base\n")
+		require.NoError(t, err)
+		head, err := commitFile(a.ctx, onA, workerName(0), "topic", base, "topic.txt", "topic\n")
+		require.NoError(t, err)
+		_, err = gitalypb.NewRefServiceClient(a.conn(t)).DeleteRefs(a.ctx, &gitalypb.DeleteRefsRequest{
+			Repository: a.repository(rel),
+			Refs:       [][]byte{[]byte("refs/heads/topic")},
+		})
+		require.NoError(t, err)
+		require.True(t, a.dbRefs(t, rel)["refs/heads/topic"].Absent())
+
+		// A review from before the rule: recorded without its roots.
+		repoID := a.record(t, rel).ID
+		_, err = a.core.Meta.InsertReview(a.ctx, repoID, func(id string) (*gitalypb.Review, error) {
+			return &gitalypb.Review{Id: id, TargetBranch: []byte("main"), HeadCommitId: head, BaseCommitId: base, Title: []byte("before the rule")}, nil
+		}, false)
+		require.NoError(t, err)
+
+		cp, err := a.operator(t, rel).StorageCheckpoint(a.ctx)
+		require.NoError(t, err)
+		require.True(t, cp.Created)
+		snapshot, err := a.core.Meta.CheckpointRefs(a.ctx, repoID, cp.Sequence)
+		require.NoError(t, err)
+		require.Equal(t, corestore.Target(head), snapshot[corestore.KeepAroundRef(head)], "the checkpoint holds the review head")
+		require.Equal(t, corestore.Target(base), snapshot[corestore.KeepAroundRef(base)], "the checkpoint holds the review base")
+
+		covered := a.referencedPacks(t, rel)
+		require.Eventually(t, func() bool {
+			res, err := a.operator(t, rel).StorageGC(a.ctx, false)
+			require.NoError(t, err)
+			return res.Boundary == cp.Sequence && res.CoveredDeleted > 0
+		}, 60*time.Second, 200*time.Millisecond)
+		inBucket := bucketPacks(t, cluster.bucketURL)
+		for key := range covered {
+			require.False(t, inBucket[key], "covered pack %s deleted", key)
+		}
+
+		// Only the checkpoint is left to hydrate from, and it has the commit.
+		b := cluster.addNode(t)
+		onB := b.agent(t, rel, tokens[workerName(0)])
+		got, err := onB.ResolveRevision(b.ctx, "main")
+		require.NoError(t, err)
+		require.Equal(t, base, got)
+		require.Equal(t, "commit", b.git(t, rel, "cat-file", "-t", head))
+		b.requireConsistent(t, rel)
+	})
+}

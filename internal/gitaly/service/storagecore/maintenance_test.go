@@ -49,7 +49,7 @@ func TestCreateCheckpoint(t *testing.T) {
 	t.Parallel()
 	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
 		h := setup(t, corestore.ModeAuthoritative, dialect)
-		h.seed()
+		main := h.seed()
 		repoID := h.importRepo()
 
 		resp, err := h.client.CreateCheckpoint(h.ctx, &gitalypb.CreateCheckpointRequest{Repository: h.repo})
@@ -60,7 +60,15 @@ func TestCreateCheckpoint(t *testing.T) {
 		require.True(t, resp.GetCreated())
 		require.Equal(t, record.HeadSeq, resp.GetCheckpointSequence())
 		require.Positive(t, resp.GetPackBytes())
-		require.Equal(t, uint32(len(h.localRefs())), resp.GetReferences(), "HEAD, the branch and the tag")
+		// The open review imported from the files has no keep-around reference:
+		// the build backfills it through the write path first (integrated review
+		// m3), so the checkpoint holds HEAD, the branch, the tag and the review
+		// root, as the database and the local copy do.
+		snapshot, err := h.core.Meta.CheckpointRefs(h.ctx, repoID, resp.GetCheckpointSequence())
+		require.NoError(t, err)
+		require.Equal(t, corestore.Target(main), snapshot[corestore.KeepAroundRef(main.String())])
+		require.Equal(t, h.localRefs(), snapshot)
+		require.Equal(t, uint32(4), resp.GetReferences())
 
 		again, err := h.client.CreateCheckpoint(h.ctx, &gitalypb.CreateCheckpointRequest{Repository: h.repo})
 		require.NoError(t, err)

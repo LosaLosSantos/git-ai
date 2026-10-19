@@ -399,10 +399,14 @@ guarded nor swept).
     counted (`graft_review_roots_sweep_failures_total{trigger="close"}`), and
     the backstop below deletes the reference. Not returning it is a design
     decision with a backstop, not a swallowed error.
-  * **Backstop, every mode.** After Gitaly's daily housekeeping of a repository
+  * **Backstop, every mode.** Before Gitaly's daily housekeeping of a repository
     (`DailyOptimizationWorker`, on by default, the same job that prunes
     unreferenced objects), `reviewroots.Sweeper.Housekeep` runs the backfill
-    and then the full sweep of the repository's review references. The
+    and then the full sweep of the repository's review references. Before, not
+    after (integrated review m3): the prune takes unreferenced objects older
+    than its grace, so a review commit left without its reference would be
+    taken in the same run that was about to protect it; a repository whose
+    backfill fails is not optimized that day, and the error is the job's. The
     backfill writes the references that open reviews lack: reviews written
     before this rule, or imported from shadow-mode files. The full sweep
     deletes the references no open review uses: leftovers of a failed close
@@ -416,6 +420,18 @@ guarded nor swept).
     shows as a growing counter. Lost commits are logged with their review ID
     and commit. Limit: an operator who disables the daily maintenance also
     disables this backstop (and the scheduled object pruning it guards).
+  * **Precondition of a checkpoint, and so of garbage collection (integrated
+    review m3).** In authoritative mode the commits of a review are kept in the
+    storage core by the checkpoint closure, which is the references. A review
+    without its keep-around references whose branch is gone has its commits
+    only in changeset packs, and garbage collection deletes the packs a
+    checkpoint covers. So `checkpoint.Create` runs `Housekeep` first (step 0),
+    through the write path, before it reads the reference snapshot; a build
+    whose backfill fails records no checkpoint (`Unavailable`), and without a
+    checkpoint garbage collection deletes no changeset pack. A commit already
+    missing from the repository is logged; the checkpoint cannot hold it.
+    Test: `TestStorageCheckpointBackfillsReviewRoots` (e2e; a mutant without
+    step 0 fails it on both dialects).
   * A sweep may skip references younger than `gc_grace` to make the
     creation/sweep race rare. That is an efficiency measure only; correctness
     comes from the invariant and the bounded retry.

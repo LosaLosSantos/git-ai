@@ -26,6 +26,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -90,6 +91,26 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 		"repository_id": record.ID,
 	})
 
+	// Step 0: the review roots. An open review written before the REVIEW ROOTS
+	// RULE has no keep-around references: its commits would be in no checkpoint,
+	// and garbage collection could then delete the only changeset packs that
+	// hold them. The backfill writes them first (through the write path, so
+	// they are in the snapshot read below); a repository whose backfill fails
+	// gets no checkpoint. Garbage collection deletes changeset packs only behind
+	// a checkpoint, so this is its precondition too. The backfill reads the
+	// local repository, so the Freshener contract is checked before it.
+	if err := c.catchUp(ctx, repo, record.ID, record.HeadSeq); err != nil {
+		return corestore.Checkpoint{}, false, err
+	}
+	backfill, _, err := reviewroots.DefaultSweeper.Housekeep(ctx, c.core, c.fresh, c.repoFactory.Build(repo), repo)
+	if err != nil {
+		return corestore.Checkpoint{}, false, structerr.NewUnavailable("storage core: backfill the review roots before the checkpoint: %w", err)
+	}
+	for _, missing := range backfill.Missing {
+		logger.WithFields(log.Fields{"review_id": missing.ReviewID, "commit_id": missing.Commit}).
+			Warn("review roots: a commit of an open review is not in the repository; the checkpoint cannot hold it")
+	}
+
 	// Step 1: the reference snapshot at N, and the checkpoint at N if there is
 	// one.
 	refs, seq, err := c.core.Meta.Refs(ctx, record.ID)
@@ -120,18 +141,8 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 
 	// Step 2 (change D): catch the local repository up to a head read after
 	// the call, so at least N.
-	if err := c.fresh.EnsureFresh(ctx, repo); err != nil {
+	if err := c.catchUp(ctx, repo, record.ID, seq); err != nil {
 		return corestore.Checkpoint{}, false, err
-	}
-	wm, ok, err := c.fresh.Applied(ctx, repo)
-	if err != nil {
-		return corestore.Checkpoint{}, false, structerr.NewInternal("read the local watermark: %w", err)
-	}
-	if !ok || wm.RepoID != record.ID || wm.Seq < seq {
-		// EnsureFresh succeeded, so the local repository is at a head read after
-		// this call arrived: anything else breaks the Freshener contract.
-		return corestore.Checkpoint{}, false, structerr.NewInternal("the local repository is not caught up after EnsureFresh: watermark %+v (present %t), repository %d at changeset %d",
-			wm, ok, record.ID, seq)
 	}
 
 	// Step 3. After EnsureFresh the local repository holds every object of the
@@ -205,6 +216,25 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 		}).Info("storage core: checkpoint created")
 	}
 	return cp, created, nil
+}
+
+// catchUp catches the local repository up (EnsureFresh) and checks that it is
+// at changeset seq of repository id or later.
+func (c *Checkpointer) catchUp(ctx context.Context, repo *gitalypb.Repository, id int64, seq uint64) error {
+	if err := c.fresh.EnsureFresh(ctx, repo); err != nil {
+		return err
+	}
+	wm, ok, err := c.fresh.Applied(ctx, repo)
+	if err != nil {
+		return structerr.NewInternal("read the local watermark: %w", err)
+	}
+	if !ok || wm.RepoID != id || wm.Seq < seq {
+		// EnsureFresh succeeded, so the local repository is at a head read after
+		// this call arrived: anything else breaks the Freshener contract.
+		return structerr.NewInternal("the local repository is not caught up after EnsureFresh: watermark %+v (present %t), repository %d at changeset %d",
+			wm, ok, id, seq)
+	}
+	return nil
 }
 
 // objectTips returns the object IDs the references point to (symbolic

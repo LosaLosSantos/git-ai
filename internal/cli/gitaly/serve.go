@@ -877,13 +877,15 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			logger,
 			maintenance.DailyOptimizationWorker(cfg, maintenance.OptimizerFunc(func(ctx context.Context, logger log.Logger, repo storage.Repository) error {
 				local := localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
-				if err := housekeepingManager.OptimizeRepository(ctx, local); err != nil {
+				// Graft: the backstop of the review roots, in every mode, before the
+				// housekeeping that prunes unreferenced objects (doc/graft/PLAN7.md,
+				// REVIEW ROOTS RULE): the commits of an open review written without
+				// its keep-around references are referenced before a prune could
+				// take them.
+				if err := housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo); err != nil {
 					return err
 				}
-				// Graft: the backstop of the review roots, in every mode, where the
-				// housekeeping that prunes unreferenced objects runs
-				// (doc/graft/PLAN7.md, REVIEW ROOTS RULE).
-				return housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo)
+				return housekeepingManager.OptimizeRepository(ctx, local)
 			})),
 		)
 		if err != nil {
@@ -925,7 +927,7 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	return waitErr
 }
 
-// housekeepReviewRoots runs the backstop of the review roots after the daily
+// housekeepReviewRoots runs the backstop of the review roots before the daily
 // housekeeping of a repository: it writes the keep-around references that
 // open reviews lack and deletes those no open review uses (in authoritative
 // mode after catching the repository up). Open reviews whose commits are lost
