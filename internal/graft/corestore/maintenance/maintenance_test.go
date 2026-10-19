@@ -175,6 +175,63 @@ func config3(changesets uint64, packBytes int64) maintenance.Config {
 	return maintenance.Config{Interval: time.Hour, Checkpoints: true, Collect: true, CheckpointChangesets: changesets, CheckpointPackBytes: packBytes, LeaseTTL: time.Minute}
 }
 
+// TestRunOnceDropsSupersededCheckpointsWithGCOff verifies that the default
+// configuration (checkpoints on, garbage collection off) does not keep every
+// checkpoint ever built: once the newest checkpoint is gc_grace old (C_gc), the
+// older ones go, under the same rule as the collection's. The changeset packs
+// stay: they are the collection's. With nothing due, a run takes no lease.
+func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.Collect = false
+	e := newEnv(t, coretest.Options{GCGrace: 200 * time.Millisecond, GCMargin: 50 * time.Millisecond}, cfg)
+
+	var built []corestore.Checkpoint
+	for i := 0; i < 3; i++ {
+		e.advance(1)
+		e.fresh()
+		require.NoError(t, e.runner.RunOnce(ctx))
+		cp, ok := e.newestCheckpoint()
+		require.True(t, ok)
+		built = append(built, cp)
+	}
+	changesetPacks := e.bucketKeys()
+	for _, cp := range built {
+		delete(changesetPacks, cp.PackKey)
+	}
+
+	newest := built[len(built)-1]
+	require.Eventually(t, func() bool {
+		require.NoError(t, e.runner.RunOnce(ctx))
+		return len(e.checkpoints()) == 1
+	}, 30*time.Second, 50*time.Millisecond, "the superseded checkpoints are dropped")
+	require.Equal(t, newest.Seq, e.checkpoints()[0].Seq)
+
+	keys := e.bucketKeys()
+	for _, cp := range built[:len(built)-1] {
+		require.NotContains(t, keys, cp.PackKey, "the pack of a dropped checkpoint is deleted")
+	}
+	require.Contains(t, keys, newest.PackKey)
+	for key := range changesetPacks {
+		require.Contains(t, keys, key, "garbage collection is off: the changeset packs stay")
+	}
+	require.Len(t, keys, len(changesetPacks)+1)
+
+	// Nothing is due any more: the run decides it without the lease.
+	before := e.metric("graft_storage_maintenance_skipped_total", "nothing_due")
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Equal(t, before+1, e.metric("graft_storage_maintenance_skipped_total", "nothing_due"))
+}
+
+// checkpoints returns the checkpoints of the repository.
+func (e *env) checkpoints() []corestore.Checkpoint {
+	e.t.Helper()
+	st, err := e.core.Meta.GCSnapshot(testhelper.Context(e.t), e.repo.ID)
+	require.NoError(e.t, err)
+	return st.Checkpoints
+}
+
 // TestRunOnceDoesOnlyWhatIsOn verifies that the checkpoints and the garbage
 // collection are configured apart: checkpoints alone delete nothing, and the
 // collection alone creates no checkpoint.

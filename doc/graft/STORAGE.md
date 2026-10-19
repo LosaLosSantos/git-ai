@@ -234,6 +234,19 @@ does not:
 - Garbage collection deletes packs, so it is turned on deliberately
   (`gc = "auto"`), or run with `graft storage gc`. Until it runs, the bucket
   only grows.
+- Space cost with the defaults (checkpoints on, `gc` off). The bucket holds
+  every changeset pack (it grows with the history), plus the checkpoints at or
+  above `C_gc`: the newest checkpoint at least `gc_grace` old and the newer
+  ones. The background checkpoints drop the older ones, under the same rule as
+  garbage collection (a checkpoint below `C_gc` has no reader), so a repository
+  keeps about one or two checkpoints, not one per `checkpoint_changesets`.
+- A checkpoint is a whole copy of the repository: one pack of every object
+  reachable from its references, about the size of a fresh clone.
+- With `gc = "auto"` the changeset packs that a checkpoint `C_gc` covers go
+  too, and the bucket holds about one or two checkpoints plus the packs of the
+  changesets after `C_gc`.
+- Orphan packs stay until garbage collection runs: those of failed writes, and
+  of a drop interrupted between the row and the pack.
 
 The metrics are `graft_storage_maintenance_*` (runs, checkpoints, packs and
 bytes deleted, skipped repositories, failed steps).

@@ -1569,6 +1569,17 @@ shutdown.
   `maintenance_interval` and the lease serve both, and `Config.Checkpoints` and
   `Config.Collect` gate the steps. Test: `TestRunOnceDoesOnlyWhatIsOn`. The e2e
   test of the background checkpoints runs with the defaults.
+* **Integrated review M2 and m8.**
+  * M2: with checkpoints on and GC off, every checkpoint stayed forever. The
+    runs now drop the superseded checkpoints even with GC off
+    (`gc.CollectCheckpoints`, step 2 of `CollectRepository` on its own), under
+    the same `C_gc` rule: no reader uses a checkpoint below `C_gc`, whether the
+    covered changeset packs are collected or not.
+  * m8: what is due is decided by reads, before the lease: `checkpointDue` and
+    `C_gc` = `SyncBoundary(gc_grace)`. The runner remembers, per repository, the
+    `C_gc` it dropped below. A repository with nothing due is skipped
+    (`nothing_due`) without a write.
+  * Test: `TestRunOnceDropsSupersededCheckpointsWithGCOff`.
 * **Database openers (audit).** Only `gitaly serve` opens the storage database
   (`corestoreopen.Open`, one `sqlstore.Store` per process). The `graft` CLI and
   every other binary reach it through gRPC. Two Stores on one SQLite file exist

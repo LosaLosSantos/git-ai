@@ -82,6 +82,10 @@ type Runner struct {
 	// so that two processes of one node (a graceful upgrade) do not both hold a
 	// lease.
 	holder string
+	// dropped is, per repository ID, the C_gc below which this runner dropped
+	// the superseded checkpoints. Only the runs read and write it, one at a
+	// time.
+	dropped map[int64]uint64
 
 	runs        *prometheus.CounterVec
 	checkpoints prometheus.Counter
@@ -121,6 +125,7 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 		cfg:       cfg,
 		storages:  storages,
 		holder:    LeaseHolder(core),
+		dropped:   map[int64]uint64{},
 		runs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_runs_total",
 			Help: "Runs of the background maintenance of the storage core, by result (ok, error: at least one step failed).",
@@ -139,7 +144,7 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 		}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_skipped_total",
-			Help: "Repositories the background maintenance skipped, by reason (no_local_copy, lease_held).",
+			Help: "Repositories the background maintenance skipped, by reason (no_local_copy, nothing_due: no checkpoint due, no superseded checkpoint and no collection, decided without the lease; lease_held).",
 		}, []string{"reason"}),
 		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_failures_total",
@@ -149,7 +154,7 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 	for _, result := range []string{"ok", "error"} {
 		r.runs.WithLabelValues(result)
 	}
-	for _, reason := range []string{"no_local_copy", "lease_held"} {
+	for _, reason := range []string{"no_local_copy", "nothing_due", "lease_held"} {
 		r.skipped.WithLabelValues(reason)
 	}
 	for _, step := range []string{stepCollectRemoved, stepList, stepLease, stepCheckpoint, stepCollect} {
@@ -245,6 +250,27 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 		return "", nil
 	}
 
+	// What is due is decided by reads, before the lease (a row-lock write) is
+	// taken: a repository with nothing due costs no write.
+	due, err := r.checkpointDue(ctx, record)
+	if err != nil {
+		return stepCheckpoint, err
+	}
+	var boundary uint64
+	if r.cfg.Checkpoints {
+		// C_gc: the newest checkpoint at least gc_grace old on the database
+		// clock. The checkpoints below it are superseded; a C_gc that this
+		// runner dropped below already has none left.
+		if boundary, err = r.core.Meta.SyncBoundary(ctx, record.ID, r.core.GCGrace); err != nil {
+			return stepCheckpoint, err
+		}
+	}
+	dropDue := boundary > 0 && boundary != r.dropped[record.ID]
+	if !due && !dropDue && !r.cfg.Collect {
+		r.skipped.WithLabelValues("nothing_due").Inc()
+		return "", nil
+	}
+
 	acquired, err := r.core.Meta.AcquireMaintenanceLease(ctx, record.ID, r.holder, r.cfg.LeaseTTL)
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return "", nil
@@ -262,10 +288,6 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 	})
 	defer release()
 
-	due, err := r.checkpointDue(leaseCtx, record)
-	if err != nil {
-		return stepCheckpoint, err
-	}
 	if due {
 		_, created, err := r.cp.Create(leaseCtx, repo)
 		if err != nil {
@@ -276,16 +298,23 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 		}
 	}
 
-	if !r.cfg.Collect {
+	var report gc.Report
+	switch {
+	case r.cfg.Collect:
+		// The collection drops the superseded checkpoints too.
+		report, err = r.collector.CollectRepository(leaseCtx, record.ID, false)
+	case dropDue:
+		report, err = r.collector.CollectCheckpoints(leaseCtx, record.ID, false)
+	default:
 		return "", nil
 	}
-	report, err := r.collector.CollectRepository(leaseCtx, record.ID, false)
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return "", nil
 	}
 	if err != nil {
 		return stepCollect, err
 	}
+	r.dropped[record.ID] = report.Boundary
 	r.count(report)
 	return "", nil
 }

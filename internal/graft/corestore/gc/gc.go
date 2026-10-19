@@ -93,22 +93,34 @@ func repoPrefix(repoID int64) string {
 	return "repos/" + strconv.FormatInt(repoID, 10) + "/"
 }
 
-// CollectRepository reclaims the dead packs of one repository. The caller holds
-// the repository's maintenance lease, which only prevents wasted runs:
-// correctness does not depend on it. The errors carry gRPC codes: NotFound for
-// an untracked repository, Unavailable for the database and the bucket.
-func (c *Collector) CollectRepository(ctx context.Context, repoID int64, dryRun bool) (Report, error) {
+// CollectCheckpoints drops the checkpoints of one repository that the newest
+// checkpoint at least gc_grace old supersedes (C_gc), and nothing else: it is
+// step 2 of CollectRepository on its own. No reader uses a checkpoint below
+// C_gc (GC BOUNDARY rule), whether or not the changeset packs it covers are
+// collected, so the background checkpoints run it with garbage collection off:
+// a repository then keeps the checkpoints at or above C_gc, not every
+// checkpoint ever built. A crash between a row and its pack leaves an
+// unreferenced pack, which the orphan protocol of CollectRepository reclaims.
+func (c *Collector) CollectCheckpoints(ctx context.Context, repoID int64, dryRun bool) (Report, error) {
 	if err := c.validTimes(); err != nil {
 		return Report{}, err
 	}
+	_, report, _, _, err := c.dropSuperseded(ctx, repoID, dryRun)
+	return report, err
+}
 
+// dropSuperseded reads the snapshot of the repository, computes the boundary
+// C_gc and drops the checkpoints below it (steps 1 and 2 of CollectRepository).
+// It returns the snapshot, the report so far, the live checkpoint packs and the
+// dropped ones.
+func (c *Collector) dropSuperseded(ctx context.Context, repoID int64, dryRun bool) (corestore.GCState, Report, map[string]struct{}, map[string]struct{}, error) {
 	// Step 1: one snapshot and the boundary.
+	report := Report{DryRun: dryRun}
 	st, err := c.core.Meta.GCSnapshot(ctx, repoID)
 	if err != nil {
-		return Report{}, errDatabase(err)
+		return st, report, nil, nil, errDatabase(err)
 	}
 	cutoff := st.Now.Add(-c.core.GCGrace)
-	report := Report{DryRun: dryRun}
 	for _, cp := range st.Checkpoints {
 		if !cp.CreatedAt.After(cutoff) && cp.Seq > report.Boundary {
 			report.Boundary = cp.Seq
@@ -134,15 +146,33 @@ func (c *Collector) CollectRepository(ctx context.Context, repoID int64, dryRun 
 			continue
 		}
 		if _, err := c.core.Meta.DeleteCheckpoint(ctx, repoID, cp.Seq); err != nil {
-			return report, errDatabase(err)
+			return st, report, live, dropped, errDatabase(err)
 		}
 		if err := c.fault(PointAfterDropRow); err != nil {
-			return report, err
+			return st, report, live, dropped, err
 		}
 		if err := c.core.Blobs.Delete(ctx, cp.PackKey); err != nil {
-			return report, errBucket(err)
+			return st, report, live, dropped, errBucket(err)
 		}
 	}
+	return st, report, live, dropped, nil
+}
+
+// CollectRepository reclaims the dead packs of one repository. The caller holds
+// the repository's maintenance lease, which only prevents wasted runs:
+// correctness does not depend on it. The errors carry gRPC codes: NotFound for
+// an untracked repository, Unavailable for the database and the bucket.
+func (c *Collector) CollectRepository(ctx context.Context, repoID int64, dryRun bool) (Report, error) {
+	if err := c.validTimes(); err != nil {
+		return Report{}, err
+	}
+
+	// Steps 1 and 2: one snapshot, the boundary, the superseded checkpoints.
+	st, report, live, dropped, err := c.dropSuperseded(ctx, repoID, dryRun)
+	if err != nil {
+		return report, err
+	}
+	cutoff := st.Now.Add(-c.core.GCGrace)
 
 	// Step 3: liveness per key (change G): a key is live when its greatest
 	// referencing sequence is above the boundary, covered otherwise.
