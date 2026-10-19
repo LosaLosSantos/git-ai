@@ -46,6 +46,9 @@ type Request struct {
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
+	// ReasoningTokens are the output tokens the model spent reasoning (part of OutputTokens),
+	// when the provider reports them.
+	ReasoningTokens int
 }
 
 // Response is one completion.

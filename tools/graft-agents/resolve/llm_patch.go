@@ -453,6 +453,9 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		if err != nil {
 			return LLMResult{}, err
 		}
+		if stats := llmRegionStatsFrom(ctx); stats != nil {
+			stats.RecordUsage(resp.Usage)
+		}
 		rejected := func(err error) error {
 			err = fmt.Errorf("region %d: %w", k+1, err)
 			if stats := llmRegionStatsFrom(ctx); stats != nil {

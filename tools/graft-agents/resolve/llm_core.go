@@ -136,6 +136,23 @@ type LLMRegionStats struct {
 	regions, equalOurs int
 	recorded           bool
 	rejected           []string
+	usage              llm.Usage
+}
+
+// RecordUsage adds the token usage of one model call, answered or rejected.
+func (s *LLMRegionStats) RecordUsage(u llm.Usage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage.InputTokens += u.InputTokens
+	s.usage.OutputTokens += u.OutputTokens
+	s.usage.ReasoningTokens += u.ReasoningTokens
+}
+
+// Usage returns the token usage of the model calls recorded.
+func (s *LLMRegionStats) Usage() llm.Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usage
 }
 
 // RecordRejected keeps the raw text of a model answer that was rejected, with why, for audit.

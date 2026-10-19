@@ -68,7 +68,12 @@ type Result struct {
 	// LineEndings are those of the sides of a content conflict (resolve.LLMLineEndings): the llm
 	// strategy sends a CRLF file as LF, and a mixed one as it is.
 	LineEndings string `json:"line_endings,omitempty"`
-	Strategy    string `json:"strategy,omitempty"`
+	// InputTokens, OutputTokens and ReasoningTokens (part of the output) are the token usage of
+	// the model calls of the case, answered or rejected, as the provider reports them.
+	InputTokens     int    `json:"input_tokens,omitempty"`
+	OutputTokens    int    `json:"output_tokens,omitempty"`
+	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	Strategy        string `json:"strategy,omitempty"`
 	// Answer is the action of an accepted resolution ("write" or "delete"); with
 	// Runner.AnswersDir its content is stored for audit and Rejudge.
 	Answer  string  `json:"answer,omitempty"`
@@ -243,6 +248,8 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	regionStats := &resolve.LLMRegionStats{}
 	resp, err := r.Resolver.Resolve(resolve.WithLLMRegionStats(ctx, regionStats), req)
 	res.Seconds = time.Since(start).Seconds()
+	usage := regionStats.Usage()
+	res.InputTokens, res.OutputTokens, res.ReasoningTokens = usage.InputTokens, usage.OutputTokens, usage.ReasoningTokens
 	if err != nil {
 		var unresolved *resolve.UnresolvedError
 		if !errors.As(err, &unresolved) || len(unresolved.Failures) != 1 {

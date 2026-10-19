@@ -377,8 +377,11 @@ type chatResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens            int `json:"prompt_tokens"`
+		CompletionTokens        int `json:"completion_tokens"`
+		CompletionTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -415,8 +418,9 @@ func (p *Provider) answer(chat *chatResponse, wantJSON bool) (*llm.Response, err
 		Text:  text,
 		Model: model,
 		Usage: llm.Usage{
-			InputTokens:  chat.Usage.PromptTokens,
-			OutputTokens: chat.Usage.CompletionTokens,
+			InputTokens:     chat.Usage.PromptTokens,
+			OutputTokens:    chat.Usage.CompletionTokens,
+			ReasoningTokens: chat.Usage.CompletionTokensDetails.ReasoningTokens,
 		},
 	}
 	if wantJSON {

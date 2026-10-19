@@ -122,7 +122,8 @@ func (benchOursProvider) Complete(_ context.Context, req llm.Request) (*llm.Resp
 		return nil, fmt.Errorf("no CODE in the request")
 	}
 	n := m[1]
-	return &llm.Response{Text: "===== BEGIN PATCHED CODE " + n + " =====\n" + m[2] + "===== END PATCHED CODE " + n + " =====\n", Model: "bench-ours"}, nil
+	return &llm.Response{Text: "===== BEGIN PATCHED CODE " + n + " =====\n" + m[2] + "===== END PATCHED CODE " + n + " =====\n", Model: "bench-ours",
+		Usage: llm.Usage{InputTokens: 100, OutputTokens: 40, ReasoningTokens: 10}}, nil
 }
 
 func init() {
@@ -158,6 +159,12 @@ func TestRunnerCountsRegionsEqualToOurs(t *testing.T) {
 	var md strings.Builder
 	if err := rep.WriteMarkdown(&md); err != nil {
 		t.Fatal(err)
+	}
+	if results[0].InputTokens != 100 || results[0].OutputTokens != 40 || results[0].ReasoningTokens != 10 {
+		t.Fatalf("tokens %+v", results[0])
+	}
+	if !strings.Contains(md.String(), "Tokens of the model calls, as the provider reports them: input 100, output 40, of which reasoning 10 (25.0% of the output).") {
+		t.Fatalf("markdown:\n%s", md.String())
 	}
 	if !strings.Contains(md.String(), "Regions of the accepted model answers answered with OURS' region unchanged: 1 of 1.") {
 		t.Fatalf("markdown:\n%s", md.String())

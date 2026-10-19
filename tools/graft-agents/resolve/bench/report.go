@@ -33,6 +33,11 @@ type Counts struct {
 	// those answered with OURS' region unchanged.
 	Regions          int `json:"regions"`
 	RegionsEqualOurs int `json:"regions_equal_ours"`
+	// InputTokens, OutputTokens and ReasoningTokens (part of the output) sum the token usage of
+	// the model calls.
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // Accepted is the number of results that would land: correct and wrong.
@@ -60,6 +65,9 @@ func (c *Counts) add(r Result) {
 	}
 	c.Regions += r.Regions
 	c.RegionsEqualOurs += r.RegionsEqualOurs
+	c.InputTokens += r.InputTokens
+	c.OutputTokens += r.OutputTokens
+	c.ReasoningTokens += r.ReasoningTokens
 	switch r.Outcome {
 	case OutcomeCorrect:
 		c.Correct++
@@ -235,6 +243,14 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		rep.Total.EqualsOurs, rep.Total.Accepted(), rep.equalsOurs(OutcomeCorrect), rep.equalsOurs(OutcomeWrong))
 	fmt.Fprintf(&b, "\nRegions of the accepted model answers answered with OURS' region unchanged: %d of %d.\n",
 		rep.Total.RegionsEqualOurs, rep.Total.Regions)
+	if t := rep.Total; t.InputTokens+t.OutputTokens > 0 {
+		share := 0.0
+		if t.OutputTokens > 0 {
+			share = 100 * float64(t.ReasoningTokens) / float64(t.OutputTokens)
+		}
+		fmt.Fprintf(&b, "\nTokens of the model calls, as the provider reports them: input %d, output %d, of which reasoning %d (%.1f%% of the output).\n",
+			t.InputTokens, t.OutputTokens, t.ReasoningTokens, share)
+	}
 	endings := map[string]Counts{}
 	for _, r := range rep.Results {
 		if r.LineEndings == "" {
