@@ -10,23 +10,35 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 const (
 	// landsFileName is the name of the index of the land identities inside dirName.
 	landsFileName = "changelog.lands"
 	// maxIdleLandsIndexes bounds the number of indexes that are kept in memory while no lookup
-	// uses them. An index holds every land of its repository, so fewer of them are kept than of
-	// the states of the logs (maxIdleStates). A dropped index is loaded from its file again.
+	// uses them. A dropped index is loaded from its file again.
 	maxIdleLandsIndexes = 64
+	// maxIdleLandsBytes bounds the memory of the indexes that are kept while no lookup uses them,
+	// as estimated by landsIndex.bytes. The least recently used ones beyond it are dropped, so an
+	// index larger than the bound is dropped as soon as its lookup ends.
+	maxIdleLandsBytes = 256 << 20
+	// compactLandsMinSize is the size from which an index file is compacted once most of its
+	// records are superseded by later ones.
+	compactLandsMinSize = 1 << 20
+	// compactIntentsMinSize is the size from which an intents file is compacted, see
+	// compactIntents.
+	compactIntentsMinSize = 64 << 10
 )
 
 // The index of the land identities of a repository (doc/graft/PLAN11.md, 4.2) maps a branch and an
 // original commit to the last changelog entry that landed that commit on that branch. It is derived
 // from the changelog: the log entries carry the lands (Entry.Lands), and the index is the result of
 // reading them, kept in memory and in the file graft/changelog.lands so that a new process does not
-// read the whole log again.
+// read the whole log again. A lookup also reads the land intents (see landIntent), which cover the
+// lands whose update git committed before the changelog recorded it.
 //
 // The file is a sequence of blocks of JSON lines. A block holds the records of the lands of some
 // log entries, in log order, and ends with a mark: the sequence of the last log entry the block
@@ -41,6 +53,10 @@ const (
 // entry is not the one the mark names (the log was replaced, for example by a repository created
 // again at the same path) the index is rebuilt from the whole log. The file is therefore written
 // without fsync: what a crash leaves of it is either a good prefix or is cut off.
+//
+// In memory, the index also knows the log file it was built from: a log file that is another file
+// (another inode) rebuilds it, and a lookup whose log ends with the entry of the mark, in the same
+// file, reads nothing.
 
 // landsIndexKey identifies a land in an index.
 type landsIndexKey struct {
@@ -60,29 +76,55 @@ func (m landsMark) matches(entry Entry) bool {
 	return entry.Sequence == m.sequence && entry.Reference == m.reference && entry.NewOID == m.newOID
 }
 
+// describes reports whether head is the head of the log that the mark names the last entry of.
+func (m landsMark) describes(head logHead) bool {
+	return head.sequence == m.sequence && head.reference == m.reference && head.newOID == m.newOID
+}
+
 // landsIndex is the in-process view of the index of one repository.
 type landsIndex struct {
 	// mu serializes the lookups of this process in the repository and guards the fields below.
 	mu sync.Mutex
-	// users counts the callers that hold the index. It is guarded by landsIndexesMu.
-	users int
+	// users and lastUsed are guarded by landsIndexesMu: the callers that hold the index, and the
+	// tick of its last release, which orders the eviction.
+	users    int
+	lastUsed uint64
+	// bytes is the estimate of the memory of the index, see estimate. It is read by the eviction
+	// without mu.
+	bytes atomic.Int64
+
 	// loaded is false until the index has been read from its file.
 	loaded bool
 	// mark is the log entry up to which records is complete; its sequence is zero when records
 	// covers no entry.
 	mark landsMark
+	// logDevice and logInode identify the log file that records was read from.
+	logDevice, logInode uint64
 	// records maps the lands of the log entries up to mark to their last record.
 	records map[landsIndexKey]LandRecord
+	// recordLines is the number of record lines of the index file, superseded ones included.
+	recordLines int
 	// fileSize is the size of the index file when this process last read or wrote it. A file of
 	// another size was written by another process and is read again.
 	fileSize int64
+
+	// intents are the land intents read from the intents file, by land, and intentsFile what is
+	// known of that file.
+	intents     map[landsIndexKey][]landIntent
+	intentsFile intentsFile
+	// intentsKept is the size of the intents file after its last compaction by this process. The
+	// file is compacted again once it doubled, so that intents that cannot go yet are not
+	// rewritten by every lookup.
+	intentsKept int64
 }
 
 var (
 	landsIndexesMu sync.Mutex
 	// landsIndexes holds the indexes by the path of their file. An index is kept after its last
-	// user releases it, up to maxIdleLandsIndexes idle ones.
+	// user releases it, within maxIdleLandsIndexes and maxIdleLandsBytes.
 	landsIndexes = map[string]*landsIndex{}
+	// landsTick orders the releases of the indexes. It is guarded by landsIndexesMu.
+	landsTick uint64
 )
 
 // acquireLandsIndex returns the index whose file is path, and the function that releases it.
@@ -101,32 +143,45 @@ func acquireLandsIndex(path string) (*landsIndex, func()) {
 		defer landsIndexesMu.Unlock()
 
 		index.users--
+		landsTick++
+		index.lastUsed = landsTick
 		evictIdleLandsIndexes()
 	}
 }
 
-// evictIdleLandsIndexes drops idle indexes until at most maxIdleLandsIndexes remain idle. The caller
-// must hold landsIndexesMu.
+// evictIdleLandsIndexes drops the least recently used idle indexes until at most
+// maxIdleLandsIndexes of them, of at most maxIdleLandsBytes together, remain. The caller must hold
+// landsIndexesMu.
 func evictIdleLandsIndexes() {
-	if len(landsIndexes) <= maxIdleLandsIndexes {
+	type idleIndex struct {
+		path     string
+		lastUsed uint64
+		bytes    int64
+	}
+
+	var (
+		idle  []idleIndex
+		total int64
+	)
+	for path, index := range landsIndexes {
+		if index.users == 0 {
+			bytes := index.bytes.Load()
+			idle = append(idle, idleIndex{path: path, lastUsed: index.lastUsed, bytes: bytes})
+			total += bytes
+		}
+	}
+	if len(idle) <= maxIdleLandsIndexes && total <= maxIdleLandsBytes {
 		return
 	}
 
-	idle := 0
-	for _, index := range landsIndexes {
-		if index.users == 0 {
-			idle++
-		}
-	}
-
-	for path, index := range landsIndexes {
-		if idle <= maxIdleLandsIndexes {
+	sort.Slice(idle, func(a, b int) bool { return idle[a].lastUsed < idle[b].lastUsed })
+	for _, index := range idle {
+		if len(idle) <= maxIdleLandsIndexes && total <= maxIdleLandsBytes {
 			return
 		}
-		if index.users == 0 {
-			delete(landsIndexes, path)
-			idle--
-		}
+		delete(landsIndexes, index.path)
+		idle = idle[1:]
+		total -= index.bytes
 	}
 }
 
@@ -136,12 +191,14 @@ func landsPath(repoPath string) string {
 	return filepath.Join(repoPath, dirName, landsFileName)
 }
 
-// LookupLand returns the last land of original on reference that the changelog of the repository
-// whose git directory is repoPath recorded (doc/graft/PLAN11.md): the sequence of its entry and the
-// commit it landed as. found is false when the changelog recorded no land of original on reference.
-// The lookup reads the durable entries of the log (see AppendGroup) that the index does not cover
-// yet, and adds them to the index first.
-func LookupLand(repoPath, reference, original string) (record LandRecord, found bool, err error) {
+// LookupLand returns what the repository whose git directory is repoPath knows of the lands of
+// original on reference (doc/graft/PLAN11.md): first the last land that the changelog recorded,
+// with the sequence of its entry and the commit it landed as, then the land intents (see
+// landIntent) of lands that the changelog does not record, with a zero sequence. A land answers
+// only when its landed commit is on the branch, which the caller checks. The result is empty when
+// nothing is known. The lookup reads the durable entries of the log (see AppendGroup) and the
+// intents that the index does not cover yet, and adds them to the index first.
+func LookupLand(repoPath, reference, original string) ([]LandRecord, error) {
 	index, release := acquireLandsIndex(landsPath(repoPath))
 	defer release()
 
@@ -151,26 +208,71 @@ func LookupLand(repoPath, reference, original string) (record LandRecord, found 
 	if err := index.catchUp(repoPath); err != nil {
 		// What the failed catch-up did to the index is not known, so the next lookup reads it again.
 		index.loaded = false
-		return LandRecord{}, false, err
+		index.intentsFile = intentsFile{}
+		return nil, err
 	}
 
-	record, found = index.records[landsIndexKey{reference: reference, original: original}]
-	return record, found, nil
+	key := landsIndexKey{reference: reference, original: original}
+	var lands []LandRecord
+	confirmed, found := index.records[key]
+	if found {
+		lands = append(lands, confirmed)
+	}
+	for _, intent := range index.intents[key] {
+		if found && (intent.Landed == confirmed.Landed || confirmed.Sequence > intent.Head) {
+			continue
+		}
+		lands = append(lands, LandRecord{Landed: intent.Landed})
+	}
+
+	return lands, nil
 }
 
-// catchUp brings the index up to the last durable entry of the log. The caller must hold i.mu.
+// catchUp brings the index up to the last durable entry of the log and the intents up to the end
+// of their file, and compacts their files when they grew large. The caller must hold i.mu.
 func (i *landsIndex) catchUp(repoPath string) error {
-	last, err := LastSequence(repoPath)
+	if err := i.catchUpLog(repoPath); err != nil {
+		return err
+	}
+	if err := i.catchUpIntents(repoPath); err != nil {
+		return err
+	}
+	i.bytes.Store(i.estimate())
+
+	return nil
+}
+
+// estimate returns an estimate of the memory of the index: its strings and the overhead of maps
+// and slices. The caller must hold i.mu.
+func (i *landsIndex) estimate() int64 {
+	const overhead = 96
+	var bytes int64
+	for key, record := range i.records {
+		bytes += int64(len(key.reference)+len(key.original)+len(record.Landed)) + overhead
+	}
+	for key, intents := range i.intents {
+		for _, intent := range intents {
+			bytes += int64(len(key.reference)+len(key.original)+len(intent.Landed)+len(intent.Reference)) + overhead
+		}
+	}
+	return bytes
+}
+
+// catchUpLog brings the index up to the last durable entry of the log. The caller must hold i.mu.
+func (i *landsIndex) catchUpLog(repoPath string) error {
+	head, err := readLogHead(repoPath)
 	if err != nil {
 		return err
 	}
-	if last == 0 {
+	if head.sequence == 0 {
 		// A log without entries recorded no land. The index, in memory or in its file, is of
 		// another log if it holds anything, and is rebuilt once this log has entries.
 		i.reset(0)
 		return nil
 	}
-	if i.loaded && last == i.mark.sequence {
+
+	sameLog := i.loaded && head.device == i.logDevice && head.inode == i.logInode
+	if sameLog && i.mark.describes(head) {
 		return nil
 	}
 
@@ -195,13 +297,20 @@ func (i *landsIndex) catchUp(repoPath string) error {
 	if err != nil {
 		return fmt.Errorf("stat land index: %w", err)
 	}
-	if !i.loaded || info.Size() != i.fileSize {
+
+	block, err := landsBlock{}, errLandsIndexStale
+	switch {
+	case i.loaded && !sameLog:
+		// The log is another file than the one the index was read from: the repository was
+		// created again. The index is rebuilt.
+	case !i.loaded || info.Size() != i.fileSize:
 		if err := i.load(f); err != nil {
 			return err
 		}
+		block, err = i.scanLog(repoPath)
+	default:
+		block, err = i.scanLog(repoPath)
 	}
-
-	block, err := i.scanLog(repoPath)
 	if errors.Is(err, errLandsIndexStale) {
 		// The log is not the one the index was built from: build it again from the whole log.
 		if err := truncateFile(f, 0); err != nil {
@@ -214,25 +323,109 @@ func (i *landsIndex) catchUp(repoPath string) error {
 		return err
 	}
 
-	if block.mark.sequence == i.mark.sequence {
-		i.loaded = true
-		return nil
+	if block.mark.sequence != i.mark.sequence {
+		encoded, err := block.encode()
+		if err != nil {
+			return err
+		}
+		if _, err := f.WriteAt(encoded, i.fileSize); err != nil {
+			return fmt.Errorf("writing land index: %w", err)
+		}
+
+		for _, record := range block.records {
+			i.records[landsIndexKey{reference: record.reference, original: record.original}] = LandRecord{Sequence: record.sequence, Landed: record.landed}
+		}
+		i.recordLines += len(block.records)
+		i.mark = block.mark
+		i.fileSize += int64(len(encoded))
 	}
+
+	i.logDevice, i.logInode = head.device, head.inode
+	i.loaded = true
+
+	if i.fileSize >= compactLandsMinSize && i.recordLines > 2*len(i.records) {
+		return i.compact(path)
+	}
+
+	return nil
+}
+
+// compact rewrites the index file with only the records that are not superseded, as one block,
+// and replaces the old file with it. The caller must hold i.mu and the lock file of the index; the
+// rename makes the other processes read the new file.
+func (i *landsIndex) compact(path string) error {
+	block := landsBlock{mark: i.mark}
+	for key, record := range i.records {
+		block.records = append(block.records, landsBlockRecord{sequence: record.Sequence, reference: key.reference, original: key.original, landed: record.Landed})
+	}
+	sort.Slice(block.records, func(a, b int) bool { return block.records[a].sequence < block.records[b].sequence })
 
 	encoded, err := block.encode()
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteAt(encoded, i.fileSize); err != nil {
-		return fmt.Errorf("writing land index: %w", err)
+
+	tmp := path + ".compact"
+	if err := os.WriteFile(tmp, encoded, 0o644); err != nil {
+		return fmt.Errorf("compacting land index: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("compacting land index: %w", err)
 	}
 
-	for _, record := range block.records {
-		i.records[landsIndexKey{reference: record.reference, original: record.original}] = LandRecord{Sequence: record.sequence, Landed: record.landed}
+	i.recordLines = len(block.records)
+	i.fileSize = int64(len(encoded))
+
+	return nil
+}
+
+// catchUpIntents reads the land intents recorded since the last lookup, and compacts the intents
+// file when it grew large. The caller must hold i.mu.
+func (i *landsIndex) catchUpIntents(repoPath string) error {
+	path := intentsPath(repoPath)
+
+	add := func(intent landIntent) {
+		key := landsIndexKey{reference: string(intent.Reference), original: intent.Original}
+		i.intents[key] = append(i.intents[key], intent)
 	}
-	i.mark = block.mark
-	i.fileSize += int64(len(encoded))
-	i.loaded = true
+
+	if i.intents == nil {
+		i.intents = map[landsIndexKey][]landIntent{}
+	}
+	known, reset, err := readIntents(path, i.intentsFile, add)
+	if err != nil {
+		return err
+	}
+	if reset {
+		// The file is not the one that was read before, and the intents read before are not
+		// its: they are dropped, and the file is read again from its start.
+		i.intents = map[landsIndexKey][]landIntent{}
+		if known, _, err = readIntents(path, intentsFile{}, add); err != nil {
+			return err
+		}
+	}
+	i.intentsFile = known
+
+	if known.offset < compactIntentsMinSize || known.offset < 2*i.intentsKept {
+		return nil
+	}
+
+	// An intent may go once the changelog confirms it (a record of its land with its landed
+	// commit) or supersedes it (a later record of the same original commit on the branch).
+	if err := compactIntents(repoPath, path, func(intent landIntent) bool {
+		record, found := i.records[landsIndexKey{reference: string(intent.Reference), original: intent.Original}]
+		return found && (record.Landed == intent.Landed || record.Sequence > intent.Head)
+	}); err != nil {
+		return err
+	}
+
+	i.intents = map[landsIndexKey][]landIntent{}
+	known, _, err = readIntents(path, intentsFile{}, add)
+	if err != nil {
+		return err
+	}
+	i.intentsFile = known
+	i.intentsKept = known.offset
 
 	return nil
 }
@@ -350,6 +543,7 @@ func (b landsBlock) encode() ([]byte, error) {
 func (i *landsIndex) reset(fileSize int64) {
 	i.mark = landsMark{}
 	i.records = map[landsIndexKey]LandRecord{}
+	i.recordLines = 0
 	i.fileSize = fileSize
 	i.loaded = false
 }
@@ -408,6 +602,7 @@ func (i *landsIndex) load(f *os.File) error {
 		for _, record := range pending {
 			i.records[landsIndexKey{reference: record.reference, original: record.original}] = LandRecord{Sequence: record.sequence, Landed: record.landed}
 		}
+		i.recordLines += len(pending)
 		i.mark = landsMark{sequence: decoded.Mark, reference: string(decoded.Reference), newOID: decoded.NewOID}
 		i.fileSize = offset
 		pending = nil

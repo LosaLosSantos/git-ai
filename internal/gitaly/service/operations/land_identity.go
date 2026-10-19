@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/feder-cr/git-ai/internal/git"
@@ -29,9 +30,14 @@ type landIdentity struct {
 	revertedBy git.ObjectID
 }
 
-// detail explains the answer, see UserLandResponse.already_landed_detail.
+// detail explains the answer, see UserLandResponse.already_landed_detail. A land known from its
+// intent has no changelog sequence: git committed it and the changelog did not record it, or has not
+// yet.
 func (id *landIdentity) detail() string {
 	detail := fmt.Sprintf("landed as %s at changelog %d", id.landed, id.sequence)
+	if id.sequence == 0 {
+		detail = fmt.Sprintf("landed as %s, which the changelog does not record", id.landed)
+	}
 	if id.revertedBy != "" {
 		detail += fmt.Sprintf("; it was reverted later by %s", id.revertedBy)
 	}
@@ -60,44 +66,49 @@ func landWithRecord(ctx context.Context, reference git.ReferenceName, lands []ch
 // landedEarlier returns the earlier land of commitID on the branch reference when it is still on
 // the branch, that is when the commit it landed as is reachable from tip; nil otherwise. A change
 // whose commit is not reachable from tip may have landed as a rewritten commit, and the record of
-// that land is the only way to tell (doc/graft/PLAN11.md, section 5). Only then is the commit that
-// reverted it looked for, to explain the answer.
+// that land is the only way to tell (doc/graft/PLAN11.md, section 5). The lookup gives the land the
+// changelog recorded first, then the intents of lands it does not record; the first on the branch
+// answers. An intent of an update that was not committed is not on the branch, and answers
+// nothing. Only once a land answers is the commit that reverted it looked for, to explain the
+// answer.
 func (a *landingAttempt) landedEarlier(ctx context.Context, reference git.ReferenceName, tip, commitID git.ObjectID) (*landIdentity, error) {
-	record, found, err := a.server.lookupLand(ctx, a.repository, reference, commitID)
+	records, err := a.server.lookupLand(ctx, a.repository, reference, commitID)
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, nil
-	}
 
-	landed, err := a.objectHash.FromHex(record.Landed)
-	if err != nil {
-		return nil, structerr.NewInternal("land identity of %s: %w", commitID, err)
-	}
-
-	onBranch, err := a.repo.IsAncestor(ctx, landed.Revision(), tip.Revision())
-	if err != nil {
-		// The branch was reset past the earlier land and its commit was pruned since: the change
-		// is no longer on the branch.
-		if errors.As(err, new(localrepo.InvalidCommitError)) {
-			return nil, nil
+	for _, record := range records {
+		landed, err := a.objectHash.FromHex(record.Landed)
+		if err != nil {
+			return nil, structerr.NewInternal("land identity of %s: %w", commitID, err)
 		}
-		return nil, structerr.NewInternal("checking the earlier land of %s: %w", commitID, err)
-	}
-	if !onBranch {
-		return nil, nil
+
+		onBranch, err := a.repo.IsAncestor(ctx, landed.Revision(), tip.Revision())
+		if err != nil {
+			// The commit does not exist: an intent of an update that was not committed, whose
+			// objects were never migrated, or a land whose branch was reset past it and whose
+			// commit was pruned since. Either way the change is not on the branch through it.
+			if errors.As(err, new(localrepo.InvalidCommitError)) {
+				continue
+			}
+			return nil, structerr.NewInternal("checking the earlier land of %s: %w", commitID, err)
+		}
+		if !onBranch {
+			continue
+		}
+
+		// The revert only explains the answer, so a failure to look for it does not change the
+		// answer: it is logged, and the answer names no revert.
+		revertedBy, err := a.revertOf(ctx, landed, tip)
+		if err != nil {
+			a.server.logger.WithError(err).WithField("landed", landed.String()).
+				Error("graft: looking for the revert of an earlier land failed; the answer names no revert")
+		}
+
+		return &landIdentity{landed: landed, sequence: record.Sequence, revertedBy: revertedBy}, nil
 	}
 
-	// The revert only explains the answer, so a failure to look for it does not change the
-	// answer: it is logged, and the answer names no revert.
-	revertedBy, err := a.revertOf(ctx, landed, tip)
-	if err != nil {
-		a.server.logger.WithError(err).WithField("landed", landed.String()).
-			Error("graft: looking for the revert of an earlier land failed; the answer names no revert")
-	}
-
-	return &landIdentity{landed: landed, sequence: record.Sequence, revertedBy: revertedBy}, nil
+	return nil, nil
 }
 
 // revertSearchCommits bounds the commits that revertOf reads: the revert is looked for among the
@@ -106,10 +117,10 @@ func (a *landingAttempt) landedEarlier(ctx context.Context, reference git.Refere
 var revertSearchCommits = 1000
 
 // revertOf returns the latest commit after landed up to tip whose message holds "This reverts
-// commit <landed>", the line that git revert and graft-verify write, or an empty ID when there is
-// none among the revertSearchCommits commits closest to tip. A revert written another way, or
-// further from the tip, is not found. The revert only explains the answer: the land is already
-// landed whatever revertOf finds.
+// commit <landed>", the line that git revert and graft-verify write, and that no later commit
+// reverts in turn, or an empty ID when there is none among the revertSearchCommits commits closest
+// to tip. A revert written another way, or further from the tip, is not found. The revert only
+// explains the answer: the land is already landed whatever revertOf finds.
 func (a *landingAttempt) revertOf(ctx context.Context, landed, tip git.ObjectID) (git.ObjectID, error) {
 	var stdout, stderr bytes.Buffer
 	if err := a.repo.ExecAndWait(ctx, gitcmd.Command{
@@ -124,59 +135,87 @@ func (a *landingAttempt) revertOf(ctx context.Context, landed, tip git.ObjectID)
 	}
 
 	// The output is pairs of fields, the commit ID and its message, each ended by a NUL, newest
-	// commit first. Messages cannot hold a NUL.
-	line := "This reverts commit " + landed.String()
+	// commit first. Messages cannot hold a NUL. The commits that a newer commit reverts are
+	// collected on the way, so that a revert that was reverted in turn is passed over.
+	revertedLater := map[string]bool{}
 	fields := strings.Split(stdout.String(), "\x00")
 	for i := 0; i+1 < len(fields); i += 2 {
-		if !strings.Contains(fields[i+1], line) {
-			continue
+		commit := strings.TrimSpace(fields[i])
+		reverts := revertedCommits(fields[i+1], a.objectHash.EncodedLen())
+
+		if slices.Contains(reverts, landed.String()) && !revertedLater[commit] {
+			revertedBy, err := a.objectHash.FromHex(commit)
+			if err != nil {
+				return "", fmt.Errorf("looking for a revert of %s: %w", landed, err)
+			}
+			return revertedBy, nil
 		}
 
-		revertedBy, err := a.objectHash.FromHex(strings.TrimSpace(fields[i]))
-		if err != nil {
-			return "", fmt.Errorf("looking for a revert of %s: %w", landed, err)
+		for _, reverted := range reverts {
+			revertedLater[reverted] = true
 		}
-		return revertedBy, nil
 	}
 
 	return "", nil
 }
 
-// lookupLand returns the last land of original on the branch reference of repository that the
-// changelog recorded, from where the changelog lives: the storage core's database in its
-// authoritative mode, the file log of the repository otherwise. Without a changelog nothing is
-// recorded, and nothing is found.
-func (s *Server) lookupLand(ctx context.Context, repository *gitalypb.Repository, reference git.ReferenceName, original git.ObjectID) (changelog.LandRecord, bool, error) {
+// revertedCommits returns the commits that message says it reverts: the object IDs of length
+// hexLength that follow "This reverts commit ".
+func revertedCommits(message string, hexLength int) []string {
+	const prefix = "This reverts commit "
+
+	var reverted []string
+	for {
+		start := strings.Index(message, prefix)
+		if start < 0 {
+			return reverted
+		}
+		message = message[start+len(prefix):]
+		if len(message) >= hexLength {
+			reverted = append(reverted, message[:hexLength])
+		}
+	}
+}
+
+// lookupLand returns what is known of the lands of original on the branch reference of repository,
+// from where the changelog lives: in the storage core's authoritative mode, the land its database
+// recorded with the reference change, in one transaction; otherwise the land the file log recorded
+// and the land intents it does not record (see changelog.LookupLand). Without a changelog nothing
+// is recorded, and nothing is found.
+func (s *Server) lookupLand(ctx context.Context, repository *gitalypb.Repository, reference git.ReferenceName, original git.ObjectID) ([]changelog.LandRecord, error) {
 	if s.graftStorage.Authoritative() {
 		repo, err := s.graftStorage.Meta.GetRepository(ctx, corestore.KeyOf(repository))
 		if err != nil {
 			// A repository that the database does not track has no recorded land. Whether it
 			// can be written to is the write path's decision, as for any land.
 			if errors.Is(err, corestore.ErrRepositoryNotFound) {
-				return changelog.LandRecord{}, false, nil
+				return nil, nil
 			}
-			return changelog.LandRecord{}, false, structerr.NewUnavailable("storage core: %w", err)
+			return nil, structerr.NewUnavailable("storage core: %w", err)
 		}
 
 		record, found, err := s.graftStorage.Meta.LookupLand(ctx, repo.ID, reference.String(), original.String())
 		if err != nil {
-			return changelog.LandRecord{}, false, structerr.NewUnavailable("storage core: %w", err)
+			return nil, structerr.NewUnavailable("storage core: %w", err)
 		}
-		return record, found, nil
+		if !found {
+			return nil, nil
+		}
+		return []changelog.LandRecord{record}, nil
 	}
 
 	if s.graft.Changelog.Disabled {
-		return changelog.LandRecord{}, false, nil
+		return nil, nil
 	}
 
 	repoPath, err := s.locator.GetRepoPath(ctx, repository)
 	if err != nil {
-		return changelog.LandRecord{}, false, err
+		return nil, err
 	}
 
-	record, found, err := changelog.LookupLand(repoPath, reference.String(), original.String())
+	records, err := changelog.LookupLand(repoPath, reference.String(), original.String())
 	if err != nil {
-		return changelog.LandRecord{}, false, structerr.NewInternal("looking up the land identity: %w", err)
+		return nil, structerr.NewInternal("looking up the land identity: %w", err)
 	}
-	return record, found, nil
+	return records, nil
 }

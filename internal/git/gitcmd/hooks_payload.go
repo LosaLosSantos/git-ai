@@ -167,7 +167,10 @@ type ChangelogMeta struct {
 	// that branch (see changelog.WithLands and doc/graft/PLAN11.md). They are never cut:
 	// WithLands bounds them by changelog.MaxLandsSize and refuses a land whose identities
 	// do not fit. Only the server builds them from the context, like Members.
-	LandReference string           `json:"land_reference,omitempty"`
+	// LandReference holds the branch name as bytes, which JSON encodes in base64:
+	// a branch name may hold bytes that are not valid UTF-8, which a JSON string
+	// would replace.
+	LandReference []byte           `json:"land_reference,omitempty"`
 	Lands         []changelog.Land `json:"lands,omitempty"`
 }
 
@@ -182,7 +185,7 @@ func (m ChangelogMeta) IsZero() bool {
 		m.MVCCCommit == "" &&
 		len(m.Members) == 0 &&
 		!m.MembersTruncated &&
-		m.LandReference == "" &&
+		len(m.LandReference) == 0 &&
 		len(m.Lands) == 0
 }
 
@@ -290,7 +293,7 @@ func NewHooksPayload(
 			Rewritten:        changelog.IsRewritten(ctx),
 			Members:          members,
 			MembersTruncated: membersTruncated,
-			LandReference:    landReference,
+			LandReference:    []byte(landReference),
 			Lands:            lands,
 			MVCCCommit:       mvccCommitHandle(ctx, cfg),
 		},

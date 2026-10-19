@@ -323,6 +323,10 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 	rewritten := false
 	var members []int
 	var changes []changelog.Member
+	// landedAs maps the commit of each member to the commit it landed as in the running tip, so
+	// that a later request of the same commit, a retry that joined the batch of its first land,
+	// is answered as already landed.
+	landedAs := map[git.ObjectID]git.ObjectID{}
 	for pos, i := range idx {
 		req := reqs[i]
 		outs[pos].OldTip = cur
@@ -349,6 +353,14 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 				e.deliverEarly(ctx, i, len(reqs), outs[pos], final)
 			}
 
+		case step.tip == cur && landedAs[step.commit] != "":
+			// An earlier member of the batch landed the same commit: the request is a retry
+			// of it, and is answered as already landed with the commit of that member. The
+			// answer holds only if the update of the batch does: the request comes after a
+			// member, so when the update does not hold it is landed again (see run).
+			outs[pos].LandedCommit = landedAs[step.commit]
+			outs[pos].AlreadyLanded = true
+
 		case step.tip == cur:
 			// The commit became empty on top of the running tip and was dropped. The request
 			// reports a landing that changed nothing.
@@ -360,6 +372,7 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 
 			members = append(members, pos)
 			changes = append(changes, memberOf(req, step))
+			landedAs[step.commit] = step.tip
 
 			outs[pos].LandedCommit = step.tip
 			outs[pos].Rewritten = step.rewritten

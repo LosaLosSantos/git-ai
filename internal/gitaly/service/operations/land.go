@@ -466,6 +466,13 @@ func validateUserLandRequest(ctx context.Context, locator storage.Locator, in *g
 		return fmt.Errorf("invalid branch name: %w", err)
 	}
 
+	// The land records its identity in its update (doc/graft/PLAN11.md), which bounds the name of
+	// the branch. The request is refused here rather than its update, so that it fails alone, also
+	// in a batch.
+	if err := changelog.CheckLandReference("refs/heads/" + string(in.GetBranch())); err != nil {
+		return err
+	}
+
 	if in.GetCommitId() == "" {
 		return errors.New("empty commit id")
 	}

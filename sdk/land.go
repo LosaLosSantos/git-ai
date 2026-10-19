@@ -83,6 +83,14 @@ type LandOptions struct {
 // the update lands the change; with ResolveConflicts it may run the conflict
 // resolver again, a model included, for the same conflict, and LandResult
 // reports the retries (UnavailableRetries), so that this cost is visible.
+//
+// The record of the first land needs a server released after v0.2.0 with its
+// changeset log on ([graft.changelog] not disabled). Against an older server,
+// or one whose changeset log is disabled, the retry of a lost LandRebase replays
+// the change: every commit of it comes out empty and the branch is left
+// unchanged, without AlreadyLanded, unless a later commit reverted the change in
+// between, which the retry then lands again. Set SkipRebaseLands for such
+// servers.
 type UnavailableRetry struct {
 	// Disabled turns the retries off: Land returns Unavailable at once.
 	Disabled bool

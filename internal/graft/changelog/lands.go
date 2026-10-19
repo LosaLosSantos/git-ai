@@ -2,6 +2,7 @@ package changelog
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -32,20 +33,47 @@ const (
 	// MaxLandsSize bounds the encoded size of the identities of one update (the reference and its
 	// lands), which travel in the hooks payload, in the environment of every git process of the
 	// update, next to the members (see gitcmd.ChangelogMeta). Unlike the members, the identities are
-	// never cut: an update whose identities do not fit fails before it runs (WithLands). With the
-	// limits of the server it cannot happen: a batch has at most MaxLandsPerUpdate members, a land
-	// of a SHA-256 repository encodes in 156 bytes, and a branch name of 4096 bytes, which no files
-	// reference backend exceeds, encodes in at most 6 bytes per byte: 40 KiB hold both with room.
-	MaxLandsSize = 40 << 10
+	// never cut: a land request whose branch name could not fit is refused when it arrives
+	// (CheckLandReference), and WithLands checks the bound again before the update runs. A batch
+	// has at most MaxLandsPerUpdate members and a land of a SHA-256 repository encodes in 156
+	// bytes, 15.6 KB for a full batch; the branch name is encoded in base64, so 24 KiB hold a full
+	// batch and a branch name of 4096 bytes, which no files reference backend exceeds, with room.
+	MaxLandsSize = 24 << 10
 	// MaxLandsPerUpdate is the most lands that one update records: the largest batch the
 	// configuration allows (config.MaxGraftLandBatchMaxSize).
 	MaxLandsPerUpdate = 100
 )
 
-// encodedLands is the encoded form of the identities of one update whose size MaxLandsSize bounds.
+// encodedLands is the encoded form of the identities of one update whose size MaxLandsSize bounds,
+// as gitcmd.ChangelogMeta encodes them: the reference as bytes, in base64.
 type encodedLands struct {
-	Reference string `json:"land_reference"`
+	Reference []byte `json:"land_reference"`
 	Lands     []Land `json:"lands"`
+}
+
+// fullBatchLandsSize is the encoded size of the identities of a full batch of SHA-256 lands on a
+// branch with an empty name, the largest identities of any branch but its name.
+var fullBatchLandsSize = func() int {
+	lands := make([]Land, MaxLandsPerUpdate)
+	for i := range lands {
+		lands[i] = Land{Original: strings.Repeat("f", 64), Landed: strings.Repeat("f", 64)}
+	}
+	encoded, err := json.Marshal(encodedLands{Lands: lands})
+	if err != nil {
+		panic(fmt.Sprintf("encoding the identities of a full batch: %v", err))
+	}
+	return len(encoded)
+}()
+
+// CheckLandReference checks, when a land request arrives, that the identities of any update of
+// reference fit MaxLandsSize: those of a full batch of SHA-256 lands on it. A branch whose name is
+// too long for them cannot be landed on, since a land would not record its identity.
+func CheckLandReference(reference string) error {
+	if size := fullBatchLandsSize + base64.StdEncoding.EncodedLen(len(reference)); size > MaxLandsSize {
+		return fmt.Errorf("the name of branch %q is too long to record the identity of a land on it: %d bytes, at most %d",
+			reference, len(reference), (MaxLandsSize-fullBatchLandsSize)/4*3)
+	}
+	return nil
 }
 
 // ValidateLands checks the identities that an update of reference records: reference is a branch,
@@ -68,7 +96,7 @@ func ValidateLands(reference string, lands []Land) error {
 		}
 	}
 
-	encoded, err := json.Marshal(encodedLands{Reference: reference, Lands: lands})
+	encoded, err := json.Marshal(encodedLands{Reference: []byte(reference), Lands: lands})
 	if err != nil {
 		return fmt.Errorf("land identities of %q: %w", reference, err)
 	}

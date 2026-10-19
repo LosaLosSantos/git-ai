@@ -206,6 +206,10 @@ type logState struct {
 	loaded bool
 	// lastSeq is the sequence of the last valid entry.
 	lastSeq uint64
+	// lastReference and lastNewOID are the reference and the new value of the last valid entry,
+	// empty when there is none. With lastSeq they identify the last entry (see LogHead).
+	lastReference string
+	lastNewOID    string
 	// validEnd is the offset just after the last complete, valid entry.
 	validEnd int64
 	// fileSize is the size of the file when the cache was last updated.
@@ -452,6 +456,7 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 	var (
 		buf    bytes.Buffer
 		points []indexPoint
+		last   Entry
 	)
 	seq := s.lastSeq
 	for i, record := range records {
@@ -491,6 +496,7 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 			buf.Write(line)
 			buf.WriteByte('\n')
 			recorded = append(recorded, entry)
+			last = entry
 		}
 		entries[i] = recorded
 	}
@@ -520,6 +526,7 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 	}
 
 	s.lastSeq = seq
+	s.lastReference, s.lastNewOID = last.Reference, last.NewOID
 	s.validEnd += int64(buf.Len())
 	s.fileSize = s.validEnd
 	s.loaded = true
@@ -606,6 +613,7 @@ func (s *logState) load(f *os.File, size int64) error {
 func (s *logState) rescan(f *os.File, size int64) error {
 	s.rescans++
 	s.lastSeq = 0
+	s.lastReference, s.lastNewOID = "", ""
 	s.validEnd = 0
 
 	// The bytes after the last newline are a torn tail, which is not part of the
@@ -635,6 +643,7 @@ func (s *logState) rescan(f *os.File, size int64) error {
 		var entry Entry
 		if err := json.Unmarshal(line, &entry); err == nil && entry.Sequence != 0 {
 			s.lastSeq = entry.Sequence
+			s.lastReference, s.lastNewOID = entry.Reference, entry.NewOID
 			s.validEnd = nl + 1
 			break
 		}
@@ -760,7 +769,7 @@ var truncateFile = func(f *os.File, size int64) error {
 }
 
 // durableView returns the end of the durable entries of the log at path and the
-// sequence of the last of them. f is the log file, opened by the caller. Readers
+// last of them (see logHead). f is the log file, opened by the caller. Readers
 // read the log only up to that end.
 //
 // The cached state only moves past entries once they are durable, so while it
@@ -772,46 +781,46 @@ var truncateFile = func(f *os.File, size int64) error {
 // page cache are durable once a reader may see them. So are the directory entries
 // of the log, which that writer may have crashed before syncing (see
 // syncLogDirs), unless this process synced them already.
-func (s *logState) durableView(repoPath, path string, f *os.File) (int64, uint64, error) {
+func (s *logState) durableView(repoPath, path string, f *os.File) (int64, logHead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	info, err := f.Stat()
 	if err != nil {
-		return 0, 0, fmt.Errorf("stat changelog: %w", err)
+		return 0, logHead{}, fmt.Errorf("stat changelog: %w", err)
 	}
 	if valid, err := s.cacheDescribes(f, info.Size()); err != nil {
-		return 0, 0, err
+		return 0, logHead{}, err
 	} else if valid && s.dirsSynced {
-		return s.validEnd, s.lastSeq, nil
+		return s.validEnd, s.head(), nil
 	}
 
 	unlock, err := lockFile(path + lockSuffix)
 	if err != nil {
-		return 0, 0, err
+		return 0, logHead{}, err
 	}
 	defer unlock()
 
 	if err := syncFile(f); err != nil {
-		return 0, 0, fmt.Errorf("syncing changelog: %w", err)
+		return 0, logHead{}, fmt.Errorf("syncing changelog: %w", err)
 	}
 	if !s.dirsSynced {
 		if err := syncLogDirs(repoPath, path); err != nil {
-			return 0, 0, err
+			return 0, logHead{}, err
 		}
 		s.dirsSynced = true
 	}
 
 	info, err = f.Stat()
 	if err != nil {
-		return 0, 0, fmt.Errorf("stat changelog: %w", err)
+		return 0, logHead{}, fmt.Errorf("stat changelog: %w", err)
 	}
 	if err := s.load(f, info.Size()); err != nil {
 		s.loaded = false
-		return 0, 0, err
+		return 0, logHead{}, err
 	}
 
-	return s.validEnd, s.lastSeq, nil
+	return s.validEnd, s.head(), nil
 }
 
 // syncDir fsyncs the directory dir, so that the entries it holds are durable.
@@ -953,6 +962,37 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 // AppendGroup). It uses the cached state of the log while it describes the file,
 // so its cost does not depend on the size of the log.
 func LastSequence(repoPath string) (uint64, error) {
+	head, err := readLogHead(repoPath)
+	if err != nil {
+		return 0, err
+	}
+
+	return head.sequence, nil
+}
+
+// logHead identifies the last durable entry of a log and the file that holds it.
+type logHead struct {
+	// sequence, reference and newOID are those of the last durable entry; the zero value when the
+	// log has none.
+	sequence  uint64
+	reference string
+	newOID    string
+	// device and inode identify the log file. A log that was replaced, for example with its
+	// repository, is another file.
+	device uint64
+	inode  uint64
+}
+
+// head returns the head of the log as the cache describes it, without the file identity. The
+// caller must hold s.mu.
+func (s *logState) head() logHead {
+	return logHead{sequence: s.lastSeq, reference: s.lastReference, newOID: s.lastNewOID}
+}
+
+// readLogHead returns the head of the log of the repository whose git directory is repoPath: the
+// zero value when the log does not exist. Like LastSequence, it uses the cached state of the log
+// while it describes the file.
+func readLogHead(repoPath string) (logHead, error) {
 	path := Path(repoPath)
 
 	state, release := acquireState(path)
@@ -961,18 +1001,28 @@ func LastSequence(repoPath string) (uint64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
+			return logHead{}, nil
 		}
-		return 0, fmt.Errorf("opening changelog: %w", err)
+		return logHead{}, fmt.Errorf("opening changelog: %w", err)
 	}
 	defer f.Close()
 
-	_, lastSeq, err := state.durableView(repoPath, path, f)
+	info, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return logHead{}, fmt.Errorf("stat changelog: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return logHead{}, fmt.Errorf("stat changelog: no file identity in %T", info.Sys())
 	}
 
-	return lastSeq, nil
+	_, head, err := state.durableView(repoPath, path, f)
+	if err != nil {
+		return logHead{}, err
+	}
+	head.device, head.inode = uint64(stat.Dev), stat.Ino
+
+	return head, nil
 }
 
 // List returns up to limit entries with a sequence greater than after, in

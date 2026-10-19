@@ -40,13 +40,25 @@ func appendPlain(t *testing.T, repoPath, reference, newOID string) uint64 {
 	return entries[0].Sequence
 }
 
-// lookup looks up a land and fails the test on an error.
+// lookupAll looks up the lands of original on reference and fails the test on an error.
+func lookupAll(t *testing.T, repoPath, reference, original string) []LandRecord {
+	t.Helper()
+
+	records, err := LookupLand(repoPath, reference, original)
+	require.NoError(t, err)
+	return records
+}
+
+// lookup returns the land of original on reference that the changelog recorded.
 func lookup(t *testing.T, repoPath, reference, original string) (LandRecord, bool) {
 	t.Helper()
 
-	record, found, err := LookupLand(repoPath, reference, original)
-	require.NoError(t, err)
-	return record, found
+	for _, record := range lookupAll(t, repoPath, reference, original) {
+		if record.Sequence != 0 {
+			return record, true
+		}
+	}
+	return LandRecord{}, false
 }
 
 // forgetLandsIndex drops the in-memory index of the repository, as a new process starts without it.
@@ -77,14 +89,21 @@ func TestValidateLands(t *testing.T) {
 	})
 
 	t.Run("the largest batch with the longest branch name fits", func(t *testing.T) {
-		// Every byte of the name is escaped by JSON into 6 bytes, the worst case.
-		reference := "refs/heads/" + strings.Repeat("<", 4096-len("refs/heads/"))
+		// The name travels in base64; bytes that are not valid UTF-8 cost no more than others.
+		reference := "refs/heads/" + strings.Repeat("\xff<", (4096-len("refs/heads/"))/2)
 		lands := make([]Land, MaxLandsPerUpdate)
 		for i := range lands {
 			lands[i] = Land{Original: sha256OID(2 * i), Landed: sha256OID(2*i + 1)}
 		}
 
 		require.NoError(t, ValidateLands(reference, lands))
+		require.NoError(t, CheckLandReference(reference))
+	})
+
+	t.Run("a branch name too long for a full batch is refused when the land arrives", func(t *testing.T) {
+		longest := "refs/heads/" + strings.Repeat("a", (MaxLandsSize-fullBatchLandsSize)/4*3-len("refs/heads/"))
+		require.NoError(t, CheckLandReference(longest))
+		require.ErrorContains(t, CheckLandReference(longest+"aaaa"), "is too long to record the identity of a land on it")
 	})
 
 	t.Run("more lands than a batch has", func(t *testing.T) {
@@ -97,7 +116,7 @@ func TestValidateLands(t *testing.T) {
 	})
 
 	t.Run("identities beyond the size bound", func(t *testing.T) {
-		reference := "refs/heads/" + strings.Repeat("<", MaxLandsSize/6)
+		reference := "refs/heads/" + strings.Repeat("<", MaxLandsSize/4*3)
 
 		require.ErrorContains(t, ValidateLands(reference, []Land{land}), fmt.Sprintf("at most %d", MaxLandsSize))
 	})

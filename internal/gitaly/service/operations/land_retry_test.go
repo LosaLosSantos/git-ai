@@ -238,6 +238,35 @@ func testUserLandRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 		}
 	})
 
+	t.Run("after a revert that was reverted in turn", func(t *testing.T) {
+		t.Parallel()
+
+		// The change landed, a commit reverted it, and a later commit reverted the revert: the
+		// change is back on the branch, and the answer names no revert.
+		fx := newRetryFixture(t, ctx, cfg)
+		request := landRequest(fx.repoProto, git.DefaultBranch, fx.change)
+		first, err := client.UserLand(ctx, request)
+		require.NoError(t, err)
+		landed := git.ObjectID(first.GetLandedCommitId())
+
+		reverted := gittest.WriteCommit(t, cfg, fx.repoPath,
+			gittest.WithBranch(git.DefaultBranch),
+			gittest.WithParents(landed),
+			gittest.WithTreeEntries(fx.withoutY...),
+			gittest.WithMessage(fmt.Sprintf("Revert \"y\"\n\nThis reverts commit %s.\n", landed)),
+		)
+		gittest.WriteCommit(t, cfg, fx.repoPath,
+			gittest.WithBranch(git.DefaultBranch),
+			gittest.WithParents(reverted),
+			gittest.WithTreeEntries(append(fx.withoutY, gittest.TreeEntry{Mode: "100644", Path: "y", Content: "y"})...),
+			gittest.WithMessage(fmt.Sprintf("Revert \"Revert \"y\"\"\n\nThis reverts commit %s.\n", reverted)),
+		)
+
+		second, err := client.UserLand(ctx, request)
+		require.NoError(t, err)
+		requireLandedEarlier(t, second, landEntry(t, fx.repoPath, landed), landed, "")
+	})
+
 	t.Run("after the branch was reset past the land", func(t *testing.T) {
 		t.Parallel()
 
