@@ -16,7 +16,11 @@ import (
 //
 //   - core.fsync is set only by the command factory, for every git command, with objects in it;
 //     by WithoutObjectFsync, whose helpers' objects the batch attempts pack into one fsynced pack
-//     before their update; and by the custom hooks' environment, which repeats the factory's value.
+//     before their update; by the custom hooks' environment, which repeats the factory's value;
+//     and, to FsyncComponentsWithoutReferences (objects still in it), by the git update-ref of
+//     the storage core's deferred reference durability: updateref.go (the hook's update, run on
+//     the repository after Migrate) and the syncer (its catch-up, on the local repository or a
+//     build directory, never a quarantine). update-ref writes references only.
 //   - WithoutObjectFsync is used only by the rebase engine's deferred durability, which only the
 //     pack mode of the batch attempts asks for.
 //
@@ -64,7 +68,9 @@ func TestQuarantineWritersKeepTheDurabilityContract(t *testing.T) {
 		`"core.fsync"`: {
 			"internal/git/gitcmd/command_factory.go",
 			"internal/git/localrepo/merge_tree_stream.go",
+			"internal/git/updateref/updateref.go",
 			"internal/gitaly/hook/custom.go",
+			"internal/graft/corestore/syncer/syncer.go",
 		},
 		`"core.fsyncMethod"`: {
 			"internal/git/gitcmd/command_factory.go",
@@ -78,6 +84,17 @@ func TestQuarantineWritersKeepTheDurabilityContract(t *testing.T) {
 
 	factory, err := os.ReadFile(filepath.Join(root, "internal/git/gitcmd/command_factory.go"))
 	require.NoError(t, err)
-	require.Contains(t, string(factory), `ConfigPair{Key: "core.fsync", Value: "objects,derived-metadata,reference"}`,
+	require.Contains(t, string(factory), `FsyncComponents = "objects,derived-metadata,reference"`,
 		"the command factory fsyncs the objects of every git command")
+	require.Contains(t, string(factory), `ConfigPair{Key: "core.fsync", Value: FsyncComponents}`,
+		"the command factory fsyncs the objects of every git command")
+	require.Contains(t, string(factory), `FsyncComponentsWithoutReferences = "objects,derived-metadata"`,
+		"the deferred reference durability keeps the objects fsynced")
+	for _, file := range []string{"internal/git/updateref/updateref.go", "internal/graft/corestore/syncer/syncer.go"} {
+		data, err := os.ReadFile(filepath.Join(root, file))
+		require.NoError(t, err)
+		require.Contains(t, string(data), `ConfigPair{Key: "core.fsync", Value: gitcmd.FsyncComponentsWithoutReferences}`,
+			"%s sets core.fsync only to the components without references", file)
+		require.Equal(t, 1, strings.Count(string(data), `"core.fsync"`), "%s sets core.fsync once", file)
+	}
 }
