@@ -398,7 +398,9 @@ func LLMConflictRegions(base, ours, theirs []byte) int {
 // MaxRegions conflicting regions, or a region whose request is over MaxPromptBytes, is declined
 // before any call. The file is resolved only when every region is: the first rejected region
 // rejects the file, and no partial resolution is returned.
-func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOptions, nonce string) (LLMResult, error) {
+// crlf says that the file was CRLF and is sent as LF (ResolveLLM): CRLF in an answer is read as LF.
+// The raw text of a rejected answer goes to the LLMRegionStats of ctx, if any, for audit.
+func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOptions, nonce string, crlf bool) (LLMResult, error) {
 	base := llmSplitLines(f.Base)
 	oursEdits, err := llmDiff(base, llmSplitLines(f.Ours), defaultLLMMaxDiffCells)
 	if err != nil {
@@ -451,16 +453,26 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		if err != nil {
 			return LLMResult{}, err
 		}
+		rejected := func(err error) error {
+			err = fmt.Errorf("region %d: %w", k+1, err)
+			if stats := llmRegionStatsFrom(ctx); stats != nil {
+				stats.RecordRejected(fmt.Sprintf("%v\n----- raw answer -----\n%s", err, resp.Text))
+			}
+			return err
+		}
 		answer, err := llmPatchAnswer(resp.Text, nonce)
 		if err != nil {
-			return LLMResult{}, fmt.Errorf("region %d: %w", k+1, err)
+			return LLMResult{}, rejected(err)
+		}
+		if crlf {
+			answer = strings.ReplaceAll(answer, "\r\n", "\n")
 		}
 		region, err := llmCheckPatched(answer, material[k], r.ours, r.theirs)
 		if err != nil {
-			return LLMResult{}, fmt.Errorf("region %d: %w", k+1, err)
+			return LLMResult{}, rejected(err)
 		}
 		if err := llmCheckAnswer(region, opt); err != nil {
-			return LLMResult{}, fmt.Errorf("region %d: %w", k+1, err)
+			return LLMResult{}, rejected(err)
 		}
 		r.answer = region
 		if region == r.ours {

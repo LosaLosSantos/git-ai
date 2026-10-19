@@ -135,6 +135,21 @@ type LLMRegionStats struct {
 	mu                 sync.Mutex
 	regions, equalOurs int
 	recorded           bool
+	rejected           []string
+}
+
+// RecordRejected keeps the raw text of a model answer that was rejected, with why, for audit.
+func (s *LLMRegionStats) RecordRejected(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejected = append(s.rejected, text)
+}
+
+// Rejected returns the raw texts of the rejected answers, in order.
+func (s *LLMRegionStats) Rejected() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.rejected...)
 }
 
 // Record sets the counts of the last file resolved.
@@ -196,7 +211,54 @@ func ResolveLLM(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOptions) 
 		return LLMResult{}, err
 	}
 
-	return llmResolvePatch(ctx, p, f, opt, nonce)
+	// A file whose sides all end their lines with CRLF reaches the model with LF: a model answers
+	// with LF, and the context lines must come back exactly. The answer is read as LF (CRLF in
+	// it is taken as LF too) and the result is CRLF again. A file with mixed line endings is
+	// sent as it is.
+	crlf := LLMLineEndings(f.Base, f.Ours, f.Theirs) == LineEndingsCRLF
+	if crlf {
+		f.Base, f.Ours, f.Theirs = llmToLF(f.Base), llmToLF(f.Ours), llmToLF(f.Theirs)
+	}
+	res, err := llmResolvePatch(ctx, p, f, opt, nonce, crlf)
+	if err != nil {
+		return LLMResult{}, err
+	}
+	if crlf {
+		res.Content = bytes.ReplaceAll(res.Content, []byte("\n"), []byte("\r\n"))
+	}
+	return res, nil
+}
+
+// The line endings of a file's sides (LLMLineEndings).
+const (
+	LineEndingsLF    = "lf"
+	LineEndingsCRLF  = "crlf"
+	LineEndingsMixed = "mixed"
+)
+
+// LLMLineEndings returns the line endings of the sides that are present (nil is absent): CRLF when
+// every line break of every side is CRLF and there is one, LF when none is, and mixed otherwise.
+func LLMLineEndings(sides ...[]byte) string {
+	breaks, crlf := 0, 0
+	for _, s := range sides {
+		breaks += bytes.Count(s, []byte("\n"))
+		crlf += bytes.Count(s, []byte("\r\n"))
+	}
+	switch {
+	case crlf == 0:
+		return LineEndingsLF
+	case crlf == breaks:
+		return LineEndingsCRLF
+	}
+	return LineEndingsMixed
+}
+
+// llmToLF returns b with CRLF line breaks as LF, keeping an absent side nil.
+func llmToLF(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n"))
 }
 
 // llmNonce returns a random token that marks the data sections of a prompt.

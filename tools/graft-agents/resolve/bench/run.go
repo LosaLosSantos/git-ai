@@ -63,9 +63,12 @@ type Result struct {
 	// Regions and RegionsEqualOurs count, for an accepted answer of an llm strategy, the
 	// conflicting regions the model answered and those it answered with OURS' region unchanged
 	// (synthmerge's no-change check, per region).
-	Regions          int    `json:"regions,omitempty"`
-	RegionsEqualOurs int    `json:"regions_equal_ours,omitempty"`
-	Strategy         string `json:"strategy,omitempty"`
+	Regions          int `json:"regions,omitempty"`
+	RegionsEqualOurs int `json:"regions_equal_ours,omitempty"`
+	// LineEndings are those of the sides of a content conflict (resolve.LLMLineEndings): the llm
+	// strategy sends a CRLF file as LF, and a mixed one as it is.
+	LineEndings string `json:"line_endings,omitempty"`
+	Strategy    string `json:"strategy,omitempty"`
 	// Answer is the action of an accepted resolution ("write" or "delete"); with
 	// Runner.AnswersDir its content is stored for audit and Rejudge.
 	Answer  string  `json:"answer,omitempty"`
@@ -233,6 +236,9 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		Limits: protocol.Limits{MaxFileBytes: maxBytes},
 	}
 
+	if c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {
+		res.LineEndings = resolve.LLMLineEndings(sideBytes(sides["base"]), sideBytes(sides["ours"]), sideBytes(sides["theirs"]))
+	}
 	start := time.Now()
 	regionStats := &resolve.LLMRegionStats{}
 	resp, err := r.Resolver.Resolve(resolve.WithLLMRegionStats(ctx, regionStats), req)
@@ -243,6 +249,13 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 			return res, err
 		}
 		res.Outcome, res.Strategy, res.Reason = classifyFailure(unresolved.Failures[0])
+		// The raw text of a rejected model answer is kept beside the answers, for audit.
+		if rejected := regionStats.Rejected(); r.AnswersDir != "" && len(rejected) > 0 {
+			raw := strings.Join(rejected, "\n===== next rejected answer =====\n")
+			if err := os.WriteFile(filepath.Join(r.AnswersDir, c.ID+".rejected.txt"), []byte(raw), 0o600); err != nil {
+				return res, err
+			}
+		}
 		// A content conflict with more regions than the llm strategy sends is declined before
 		// any call: it is not sent, for that reason.
 		if res.Outcome == OutcomeAbstained && c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {

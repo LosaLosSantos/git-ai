@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
 // Counts aggregates the outcomes of a set of cases.
@@ -233,6 +235,24 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		rep.Total.EqualsOurs, rep.Total.Accepted(), rep.equalsOurs(OutcomeCorrect), rep.equalsOurs(OutcomeWrong))
 	fmt.Fprintf(&b, "\nRegions of the accepted model answers answered with OURS' region unchanged: %d of %d.\n",
 		rep.Total.RegionsEqualOurs, rep.Total.Regions)
+	endings := map[string]Counts{}
+	for _, r := range rep.Results {
+		if r.LineEndings == "" {
+			continue
+		}
+		c := endings[r.LineEndings]
+		c.add(r)
+		endings[r.LineEndings] = c
+	}
+	var lines []string
+	for _, e := range []string{resolve.LineEndingsLF, resolve.LineEndingsCRLF, resolve.LineEndingsMixed} {
+		if c, ok := endings[e]; ok {
+			lines = append(lines, fmt.Sprintf("%s %d (correct %d, wrong %d, rejected %d)", e, c.Cases, c.Correct, c.Wrong, c.Rejected))
+		}
+	}
+	if len(lines) > 0 {
+		fmt.Fprintf(&b, "\nContent conflicts by line endings (CRLF goes to the model as LF; mixed is sent as it is): %s.\n", strings.Join(lines, ", "))
+	}
 	if len(rep.Rejected) > 0 {
 		reasons := make([]string, 0, len(rep.Rejected))
 		for r := range rep.Rejected {

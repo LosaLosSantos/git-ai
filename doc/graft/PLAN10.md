@@ -703,6 +703,16 @@ Deviations, measured or stated:
 * (e) Leniency: a region at the end of a file may end without a newline when neither side has a
   final newline; synthmerge requires the newline.
 
+**R1 result and addendum** (r1-20261019-101514, real spend $0.099): strict error 41.8% (R0 on the
+same 300, re-judged: 53.8%); both accepted, wrong->correct 37 and correct->wrong 13, McNemar
+p = 0.0009; the bound with reorder and whitespace counted correct 32.9%; human-outside 29 cases,
+rate without them 33.2%. Of the 42 anchor rejections, 22 were CRLF files, and no CRLF file was
+accepted: the context went to the model with CR and had to come back byte for byte, which models
+do not do. Our bug, fixed before R2: a CRLF file is sent as LF and its answer converted back
+(mixed line endings are sent as they are, and the report counts the cases by line endings). The
+bench keeps the raw text of every rejected answer (<id>.rejected.txt beside the answers, 0600), so
+that rejections can be classified. R1b, R1 with the fix, is the baseline of R2.
+
 **Measurement.** Luna, effort low, max_tokens 8000, routing pinned to the standard tiers, the same
 300 paired cases (`--sample 300 --seed 1`, the first 300 of the Luna 600), cap $1.20 a run, the
 whole series under $5 real, and a run over $1.00 real stops the series until the PM is told.

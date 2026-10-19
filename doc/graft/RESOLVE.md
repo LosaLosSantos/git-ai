@@ -607,7 +607,10 @@ differently there is one model call, whose request holds:
   conflicting regions of the file for reference, and the directives last,
   closest to the answer.
 
-The model answers in plain text, the patched code between a BEGIN and an END
+A file whose sides all break their lines with CRLF reaches the model with LF,
+since a model answers with LF; its answer is read as LF (CRLF in it too) and
+the resolved file is CRLF again. A file with mixed line endings is sent as it
+is. The model answers in plain text, the patched code between a BEGIN and an END
 line that carry the request's random token: no JSON, no response format, and
 no explanation. The last such block of the answer is read, since a model may
 draft or quote before it answers. The answer is accepted for a region only

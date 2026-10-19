@@ -5,6 +5,8 @@ package bench
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -158,6 +160,72 @@ func TestRunnerCountsRegionsEqualToOurs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(md.String(), "Regions of the accepted model answers answered with OURS' region unchanged: 1 of 1.") {
+		t.Fatalf("markdown:\n%s", md.String())
+	}
+}
+
+// benchBadProvider answers every region with text that holds no patched code.
+type benchBadProvider struct{}
+
+func (benchBadProvider) Name() string { return "bench:bad" }
+
+func (benchBadProvider) Complete(context.Context, llm.Request) (*llm.Response, error) {
+	return &llm.Response{Text: "I cannot do that.", Model: "bench-bad"}, nil
+}
+
+func init() {
+	llm.Register("bench-bad-fake", func(llm.Config) (llm.Provider, error) { return benchBadProvider{}, nil })
+}
+
+// TestRunnerKeepsRejectedAnswers: the raw text of a rejected model answer is kept beside the
+// answers, readable by its owner only, and the report counts the cases by line endings.
+func TestRunnerKeepsRejectedAnswers(t *testing.T) {
+	f := newFixture(t)
+	buildHistory(f)
+	head := f.git("rev-parse", "HEAD")
+	cases, _, err := Mine(context.Background(), Repo{Name: "fixture", Commit: head, License: "MIT"}, f.dir, MineOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := resolve.ParseConfig([]byte("[[strategy]]\ntype = \"llm\"\n\n[strategy.llm]\ntype = \"bench-bad-fake\"\nmodel = \"m\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers := filepath.Join(t.TempDir(), "answers")
+	if err := os.MkdirAll(answers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	results, err := Runner{Resolver: res, Clone: func(string) string { return f.dir }, AnswersDir: answers}.Run(context.Background(), cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Outcome != OutcomeRejected || results[0].LineEndings != resolve.LineEndingsLF {
+		t.Fatalf("results %+v, want one rejected LF case", results)
+	}
+	path := filepath.Join(answers, results[0].ID+".rejected.txt")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "I cannot do that.") || !strings.Contains(string(raw), "has no patched code") {
+		t.Fatalf("rejected.txt = %q", raw)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v, want 0600", info.Mode().Perm())
+	}
+	var md strings.Builder
+	if err := NewReport("bad", results).WriteMarkdown(&md); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(md.String(), "Content conflicts by line endings (CRLF goes to the model as LF; mixed is sent as it is): lf 1 (correct 0, wrong 0, rejected 1).") {
 		t.Fatalf("markdown:\n%s", md.String())
 	}
 }
