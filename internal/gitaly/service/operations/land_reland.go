@@ -56,7 +56,7 @@ func (s *Server) landWithResolution(
 		return landResolution{}, structerr.NewInvalidArgument("resolution is for commit %q, not commit_id %q", r.GetCommit(), commitID)
 	}
 
-	l, err := landListConflicts(ctx, repo, tip, commitID)
+	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
 	if errors.Is(err, errLandNoConflicts) {
 		return landResolution{}, structerr.NewFailedPrecondition("the merge of tip %s and commit %s has no conflicts, so there is nothing to resolve: land without a resolution", tip, commitID)
 	}
@@ -65,15 +65,15 @@ func (s *Server) landWithResolution(
 	}
 	maxFiles := s.resolveCfg.MaxFilesOrDefault()
 	if r.GetTip() != tip.String() {
-		return landResolution{}, l.notAttempted(maxFiles, fmt.Sprintf("the branch tip moved from %s to %s since the resolution was made: resolve the conflicts of this package", r.GetTip(), tip), nil)
+		return landResolution{}, l.notAttempted(ctx, maxFiles, fmt.Sprintf("the branch tip moved from %s to %s since the resolution was made: resolve the conflicts of this package", r.GetTip(), tip), nil)
 	}
 	if l.bases > 1 {
-		return landResolution{}, l.notAttempted(maxFiles, fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", l.bases), nil)
+		return landResolution{}, l.notAttempted(ctx, maxFiles, fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", l.bases), nil)
 	}
 
 	resolved, reason := landResolutionFiles(r, l.files)
 	if reason != "" {
-		return landResolution{}, l.notAttempted(maxFiles, reason, nil)
+		return landResolution{}, l.notAttempted(ctx, maxFiles, reason, nil)
 	}
 
 	maxBytes := s.resolveCfg.MaxFileBytesOrDefault()
@@ -103,7 +103,7 @@ func (s *Server) landWithResolution(
 				f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_RESOLVED, ""
 			}
 		}
-		return landResolution{}, l.unresolved(maxFiles, "", "the resolution was rejected: "+landUnresolvedCause(l.files), nil)
+		return landResolution{}, l.unresolved(ctx, maxFiles, "", "the resolution was rejected: "+landUnresolvedCause(l.files), nil)
 	}
 
 	resp := &resolver.Response{Version: resolver.ProtocolVersion, Resolver: landAgentResolver(actor)}
@@ -209,10 +209,10 @@ func (s *Server) landCheckResolution(
 	maxFiles := s.resolveCfg.MaxFilesOrDefault()
 	resp, err := s.conflictResolver.Check(ctx, req)
 	if err != nil {
-		return "", l.notAttempted(maxFiles, fmt.Sprintf("the resolution could not be checked: %v", err), err)
+		return "", l.notAttempted(ctx, maxFiles, fmt.Sprintf("the resolution could not be checked: %v", err), err)
 	}
 	if !landResolverNameValid(resp.Resolver) {
-		return "", l.notAttempted(maxFiles, fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
+		return "", l.notAttempted(ctx, maxFiles, fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
 	}
 	syntaxUnchecked := 0
 	for i, v := range resp.Files {
@@ -222,6 +222,7 @@ func (s *Server) landCheckResolution(
 			continue
 		}
 		if v.Syntax == resolver.SyntaxUnchecked {
+			f.syntaxUnchecked = true
 			syntaxUnchecked++
 		}
 	}

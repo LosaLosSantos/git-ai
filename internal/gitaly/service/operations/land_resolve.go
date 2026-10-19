@@ -78,14 +78,14 @@ func (s *Server) resolveLandConflicts(
 	tip, commitID git.ObjectID,
 	committer git.Signature,
 ) (landResolution, error) {
-	l, err := landListConflicts(ctx, repo, tip, commitID)
+	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
 	if err != nil {
 		return landResolution{}, err
 	}
 	base, hasBase, conflicts, files := l.base, l.hasBase, l.conflicts, l.files
 	tipMessage, commitMessage := l.tipMessage, l.commitMessage
 	maxFiles := s.resolveCfg.MaxFilesOrDefault()
-	notAttempted := func(reason string) error { return l.notAttempted(maxFiles, reason, nil) }
+	notAttempted := func(reason string) error { return l.notAttempted(ctx, maxFiles, reason, nil) }
 	criss := l.bases
 
 	// The actor is the authenticated identity only. The name in the request is chosen by the
@@ -154,7 +154,7 @@ func (s *Server) resolveLandConflicts(
 
 	for _, f := range files {
 		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
-			return landResolution{}, l.unresolved(maxFiles, "", landUnresolvedCause(files), resolveErr)
+			return landResolution{}, l.unresolved(ctx, maxFiles, "", landUnresolvedCause(files), resolveErr)
 		}
 	}
 
@@ -164,6 +164,8 @@ func (s *Server) resolveLandConflicts(
 // landListing is the conflicting files of the merge of a tip and a change, with what the conflict
 // package needs.
 type landListing struct {
+	repo          *localrepo.Repo
+	maxFileBytes  int64
 	tip, commitID git.ObjectID
 	base          git.ObjectID
 	hasBase       bool
@@ -182,8 +184,8 @@ var errLandNoConflicts = errors.New("the merge of the tip and the change reports
 // error: when rebasing, the conflict may come from an intermediate commit that a later commit of
 // the change undoes, so the merge of the two ends is clean and the landing reports the merge
 // conflict. This is a documented limitation.
-func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID git.ObjectID) (landListing, error) {
-	l := landListing{tip: tip, commitID: commitID}
+func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID git.ObjectID, maxFileBytes int64) (landListing, error) {
+	l := landListing{repo: repo, maxFileBytes: maxFileBytes, tip: tip, commitID: commitID}
 	var err error
 	if l.base, l.hasBase, l.bases, err = landMergeBase(ctx, repo, tip, commitID); err != nil {
 		return l, err
@@ -207,8 +209,12 @@ func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID 
 }
 
 // unresolved returns the error of a land left unresolved, with its conflict package. err is the
-// error of the resolver or of the check that caused it, if any.
-func (l landListing) unresolved(maxFiles int, reason, cause string, err error) error {
+// error of the resolver or of the check that caused it, if any. The sides that the hunks of the
+// package need and that were not read yet are read here, whatever the outcome of the file.
+func (l landListing) unresolved(ctx context.Context, maxFiles int, reason, cause string, err error) error {
+	if readErr := l.readForHunks(ctx, maxFiles); readErr != nil {
+		return readErr
+	}
 	return &landUnresolvedError{
 		pkg:   landPackage(l.tip, l.commitID, l.base, l.tipMessage, l.commitMessage, l.files, maxFiles, reason),
 		cause: cause,
@@ -216,13 +222,51 @@ func (l landListing) unresolved(maxFiles int, reason, cause string, err error) e
 	}
 }
 
+// readForHunks reads the sides of the content and add/add conflicts of the package that are not
+// read yet and fit max_file_bytes, so that the package has their hunks. A larger side is not read:
+// its file gets no hunks, as a diff of that size is not computed anyway.
+func (l landListing) readForHunks(ctx context.Context, maxFiles int) error {
+	for i, f := range l.files {
+		if i == maxFiles {
+			break
+		}
+		if f.read || (f.kind != resolver.KindContent && f.kind != resolver.KindAddAdd) {
+			continue
+		}
+		var sides [3][]byte
+		fits := true
+		for j, b := range []*landBlob{f.conflict.base, f.conflict.ours, f.conflict.theirs} {
+			if b == nil {
+				continue
+			}
+			info, err := l.repo.ReadObjectInfo(ctx, b.oid.Revision())
+			if err != nil {
+				return fmt.Errorf("reading size of %q: %w", f.conflict.path, err)
+			}
+			if info.Size > l.maxFileBytes {
+				fits = false
+				break
+			}
+			content, err := l.repo.ReadObject(ctx, b.oid)
+			if err != nil {
+				return fmt.Errorf("reading blob of %q: %w", f.conflict.path, err)
+			}
+			sides[j] = content
+		}
+		if fits {
+			f.sides, f.read = sides, true
+		}
+	}
+	return nil
+}
+
 // notAttempted returns the error of a land the server did not try to resolve at all, every file
 // NOT_ATTEMPTED and the package carrying the reason.
-func (l landListing) notAttempted(maxFiles int, reason string, err error) error {
+func (l landListing) notAttempted(ctx context.Context, maxFiles int, reason string, err error) error {
 	for _, f := range l.files {
 		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, ""
 	}
-	return l.unresolved(maxFiles, reason, reason, err)
+	return l.unresolved(ctx, maxFiles, reason, reason, err)
 }
 
 // landRequestFile is the file of the resolve request for a classified file that is sent.

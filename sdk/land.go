@@ -54,8 +54,16 @@ type LandOptions struct {
 	// configured conflict resolver (see doc/graft/RESOLVE.md). A resolved
 	// landing is a merge commit of the branch tip and the change. If the
 	// resolver is disabled, refuses a file or fails, the landing fails with a
-	// merge conflict as without this option.
+	// merge conflict as without this option, and the error carries the
+	// conflict package (see LandConflict).
 	ResolveConflicts bool
+	// Resolution lands Commit with the caller's resolution of the conflicts of
+	// a conflict package (see LandConflict and ResolutionFor), as a merge
+	// commit of the branch tip and the change. The server accepts it only when
+	// it was made against the current tip and resolves exactly the conflicting
+	// paths; otherwise Land fails with a fresh package. The request must fit in
+	// MaxLandRequestBytes.
+	Resolution *Resolution
 }
 
 // LandResult describes the outcome of a successful Land call.
@@ -101,7 +109,8 @@ func oldTip(oid string) string {
 // without a merge queue.
 //
 // Failures carry structured details: use IsMergeConflict, IsNotAncestor,
-// IsReferenceUpdateConflict, IsRejectedByHook or LandError.
+// IsReferenceUpdateConflict, IsRejectedByHook or LandError, and LandConflict
+// for the conflict package of a land that asked for resolution.
 func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) {
 	switch {
 	case trimBranchPrefix(opts.Branch) == "":
@@ -125,6 +134,12 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 	}
 	if !opts.Timestamp.IsZero() {
 		req.Timestamp = timestamppb.New(opts.Timestamp)
+	}
+	if opts.Resolution != nil {
+		req.Resolution = opts.Resolution.toProto()
+		if err := checkLandRequestSize(req); err != nil {
+			return nil, err
+		}
 	}
 
 	resp, err := r.client.operations.UserLand(ctx, req)

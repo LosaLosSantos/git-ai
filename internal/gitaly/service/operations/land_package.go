@@ -48,6 +48,8 @@ type landFileState struct {
 	read    bool
 	outcome gitalypb.LandConflictFile_Outcome
 	reason  string
+	// syntaxUnchecked is set when a check accepted the file without a syntax verdict.
+	syntaxUnchecked bool
 }
 
 // sent reports whether the file is sent to the resolver.
@@ -152,13 +154,14 @@ func landPackage(tip, commitID, base git.ObjectID, tipMessage, commitMessage str
 			break
 		}
 		pf := &gitalypb.LandConflictFile{
-			Path:    []byte(f.conflict.path),
-			Kind:    landKindProto(f.kind),
-			Base:    landSideProto(f.conflict.base),
-			Ours:    landSideProto(f.conflict.ours),
-			Theirs:  landSideProto(f.conflict.theirs),
-			Outcome: f.outcome,
-			Reason:  landCutString(f.reason, landPackageReasonBytes),
+			Path:            []byte(f.conflict.path),
+			Kind:            landKindProto(f.kind),
+			Base:            landSideProto(f.conflict.base),
+			Ours:            landSideProto(f.conflict.ours),
+			Theirs:          landSideProto(f.conflict.theirs),
+			Outcome:         f.outcome,
+			Reason:          landCutString(f.reason, landPackageReasonBytes),
+			SyntaxUnchecked: f.syntaxUnchecked,
 		}
 		if f.textRead() && (f.kind == resolver.KindContent || f.kind == resolver.KindAddAdd) {
 			pf.Hunks = landConflictHunks(f.sides[0], f.sides[1], f.sides[2])

@@ -155,6 +155,26 @@ type LandOptions struct {
 	// ResolveConflicts asks the server to resolve merge conflicts with its
 	// conflict resolver.
 	ResolveConflicts bool
+	// Resolution lands Commit with the caller's resolution of the conflicts of
+	// the merge with the branch tip Resolution.Tip, as a merge commit. It must
+	// resolve exactly the conflicting paths. Strategy is then not used.
+	Resolution *Resolution
+}
+
+// Resolution is a caller's resolution of the conflicts of landing Commit onto
+// the branch tip Tip.
+type Resolution struct {
+	Tip, Commit string
+	Files       []ResolvedFile
+}
+
+// ResolvedFile resolves one conflicting path: Delete it, or write Content with
+// Mode.
+type ResolvedFile struct {
+	Path    string
+	Delete  bool
+	Mode    string
+	Content []byte
 }
 
 // LandResult is the outcome of a land.

@@ -261,3 +261,46 @@ func TestRepo_Land_Validation(t *testing.T) {
 		})
 	}
 }
+
+func TestRepo_Land_SendsTheResolution(t *testing.T) {
+	t.Parallel()
+
+	fakes := newFakeServices()
+	fakes.operations.landResponse = &gitalypb.UserLandResponse{LandedCommitId: "merged", Rewritten: true}
+	repo := dialFake(t, fakes.register).Repo("repo")
+
+	opts := validLand()
+	opts.Resolution = &sdk.Resolution{Tip: "tip-sha", Commit: "change-sha", Files: []sdk.ResolvedFile{
+		{Path: "a.go", Mode: "100644", Content: []byte("merged\n")},
+		{Path: "old.go", Delete: true, Mode: "100644", Content: []byte("ignored")},
+	}}
+	_, err := repo.Land(t.Context(), opts)
+	require.NoError(t, err)
+
+	req := fakes.operations.landRequests[0].GetResolution()
+	require.Equal(t, "tip-sha", req.GetTip())
+	require.Equal(t, "change-sha", req.GetCommit())
+	require.Len(t, req.GetFiles(), 2)
+	require.Equal(t, gitalypb.LandResolvedFile_ACTION_WRITE, req.GetFiles()[0].GetAction())
+	require.Equal(t, "merged\n", string(req.GetFiles()[0].GetContent()))
+	del := req.GetFiles()[1]
+	require.Equal(t, gitalypb.LandResolvedFile_ACTION_DELETE, del.GetAction())
+	require.Empty(t, del.GetMode(), "a deletion carries no mode")
+	require.Nil(t, del.GetContent(), "a deletion carries no content")
+}
+
+func TestRepo_Land_RefusesAResolutionOverTheMessageLimit(t *testing.T) {
+	t.Parallel()
+
+	fakes := newFakeServices()
+	repo := dialFake(t, fakes.register).Repo("repo")
+
+	opts := validLand()
+	opts.Resolution = &sdk.Resolution{Tip: "t", Commit: "c", Files: []sdk.ResolvedFile{
+		{Path: "big.bin", Mode: "100644", Content: make([]byte, sdk.MaxLandRequestBytes)},
+	}}
+	_, err := repo.Land(t.Context(), opts)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Contains(t, err.Error(), "4 MiB message limit")
+	require.Empty(t, fakes.operations.landRequests, "the request is not sent")
+}

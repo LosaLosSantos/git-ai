@@ -793,6 +793,47 @@ func TestIntegration_Land(t *testing.T) {
 		require.True(t, sdk.IsMergeConflict(err), "got %v", err)
 		require.Equal(t, codes.FailedPrecondition, sdk.Code(err))
 		require.Equal(t, tip.String(), env.mustResolve(t, "main"), "branch is unchanged")
+		_, ok := sdk.LandConflict(err)
+		require.False(t, ok, "no package without ResolveConflicts")
+	})
+
+	t.Run("the conflict package and the re-land", func(t *testing.T) {
+		t.Parallel()
+
+		env := startIntegration(t, nil) // no resolver: the agent resolves
+		base := env.writeCommit(t, "main", map[string]string{"f.txt": "1\nbase\n3\n", "g.txt": "g\n"})
+		tip := env.writeCommit(t, "main", map[string]string{"f.txt": "1\ntip\n3\n", "g.txt": "g\n"}, base)
+		change := env.writeCommit(t, "", map[string]string{"f.txt": "1\nchange\n3\n", "g.txt": "g\n", "h.txt": "h\n"}, base)
+
+		_, err := env.repo.Land(env.ctx, sdk.LandOptions{Branch: "main", Commit: change.String(), User: user, ResolveConflicts: true})
+		require.True(t, sdk.IsMergeConflict(err), "got %v", err)
+		pkg, ok := sdk.LandConflict(err)
+		require.True(t, ok, "the merge conflict carries the package")
+		require.Equal(t, tip.String(), pkg.GetTip())
+		require.Equal(t, change.String(), pkg.GetCommit())
+		require.Equal(t, base.String(), pkg.GetMergeBase())
+		require.Len(t, pkg.GetFiles(), 1)
+		f := pkg.GetFiles()[0]
+		require.Equal(t, "f.txt", string(f.GetPath()))
+		require.Len(t, f.GetHunks(), 1)
+		require.Equal(t, uint32(2), f.GetHunks()[0].GetOurs().GetStart())
+
+		sides, err := env.repo.ConflictSides(env.ctx, pkg)
+		require.NoError(t, err)
+		require.Equal(t, sdk.ConflictSides{Base: []byte("1\nbase\n3\n"), Ours: []byte("1\ntip\n3\n"), Theirs: []byte("1\nchange\n3\n")}, sides["f.txt"])
+
+		resolution := sdk.ResolutionFor(pkg)
+		resolution.Files = []sdk.ResolvedFile{{Path: "f.txt", Mode: "100644", Content: []byte("1\ntip and change\n3\n")}}
+		result, err := env.repo.Land(env.ctx, sdk.LandOptions{Branch: "main", Commit: change.String(), User: user, Resolution: resolution})
+		require.NoError(t, err)
+		require.True(t, result.Rewritten)
+		require.Equal(t, "agent", result.Resolver)
+		require.Equal(t, []string{"f.txt"}, result.ResolvedPaths)
+		require.Equal(t, "1\ntip and change\n3\n", env.readString(t, "main", "f.txt"))
+		require.Equal(t, "h\n", env.readString(t, "main", "h.txt"))
+		body := env.git(t, "log", "-1", "--format=%B", "main")
+		require.Contains(t, body, "Graft-Resolved-By: agent\n")
+		require.NotContains(t, body, "Graft-Checked-By:")
 	})
 
 	t.Run("create branch", func(t *testing.T) {

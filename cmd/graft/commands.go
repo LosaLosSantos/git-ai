@@ -10,6 +10,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/workspace"
+	"github.com/feder-cr/git-ai/sdk"
 )
 
 const (
@@ -165,13 +166,38 @@ func cmdLand(ctx context.Context, out io.Writer, o *options, args []string) erro
 	if err != nil {
 		return err
 	}
+	if o.conflictsDir != "" && !o.resolve {
+		return usagef("land --conflicts-dir requires --resolve")
+	}
+	if o.resolved != "" && (o.resolve || o.conflictsDir != "") {
+		return usagef("land --resolved takes neither --resolve nor --conflicts-dir")
+	}
 	ws, err := openWorkspace(ctx, o)
 	if err != nil {
 		return err
 	}
-	res, err := ws.LandResolving(ctx, branch, o.strategy, committer, o.resolve)
+	var res workspace.LandResult
+	if o.resolved != "" {
+		resolution, rerr := readResolution(o.resolved)
+		if rerr != nil {
+			return rerr
+		}
+		res, err = ws.LandResolution(ctx, branch, committer, resolution)
+	} else {
+		res, err = ws.LandResolving(ctx, branch, o.strategy, committer, o.resolve)
+	}
 	warnSkipped(o, ws)
 	if err != nil {
+		// A land that asked for resolution fails with the conflict package.
+		if pkg, ok := sdk.LandConflict(err); ok {
+			printConflict(out, pkg)
+			if o.conflictsDir != "" {
+				if werr := writeConflicts(ctx, ws, pkg, o.conflictsDir); werr != nil {
+					return fmt.Errorf("%w (and writing the conflicts failed: %v)", err, werr)
+				}
+				fmt.Fprintf(out, "wrote the conflicts to %s: edit the files, then run graft land --resolved %s\n", o.conflictsDir, o.conflictsDir)
+			}
+		}
 		return err
 	}
 	if res.AlreadyLanded {

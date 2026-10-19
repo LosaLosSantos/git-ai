@@ -203,6 +203,8 @@ func TestUserLand_conflictPackage(t *testing.T) {
 		require.Contains(t, pkg.GetReason(), "not enabled")
 		for _, f := range pkg.GetFiles() {
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, f.GetOutcome())
+			// The agent gets the hunks even though no file was read for a resolver.
+			require.Len(t, f.GetHunks(), 1, string(f.GetPath()))
 		}
 	})
 
@@ -288,7 +290,7 @@ func TestUserLand_reland(t *testing.T) {
 		dir, argv := resolverScript(t, "")
 		writeRawAnswer(t, dir, resolver.CheckResponse{
 			Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: "graft-resolve",
-			Files: []resolver.CheckFile{{Path: "a", OK: true, Syntax: resolver.SyntaxNone}, {Path: "b", OK: false, Reason: "check failed: tests", Syntax: resolver.SyntaxNone}},
+			Files: []resolver.CheckFile{{Path: "a", OK: true, Syntax: resolver.SyntaxUnchecked}, {Path: "b", OK: false, Reason: "check failed: tests", Syntax: resolver.SyntaxNone}},
 		})
 		fx := newResolveFixture(t, enabledResolver(argv))
 		req := fx.request("Land")
@@ -298,7 +300,9 @@ func TestUserLand_reland(t *testing.T) {
 		requireMergeConflict(t, err)
 		pkg := landConflictDetail(err)
 		require.NotNil(t, pkg)
-		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, pkg, "a").GetOutcome())
+		a := packageFile(t, pkg, "a")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, a.GetOutcome())
+		require.True(t, a.GetSyntaxUnchecked(), "a passed without a syntax verdict, and the package says so")
 		b := packageFile(t, pkg, "b")
 		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_REJECTED, b.GetOutcome())
 		require.Equal(t, "check failed: tests", b.GetReason())

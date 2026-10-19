@@ -482,7 +482,7 @@ func (w *Workspace) Commit(ctx context.Context, req CommitRequest) (CommitResult
 	if req.LandBranch == "" {
 		return res, nil
 	}
-	lres, err := w.land(ctx, req.LandBranch, req.Strategy, req.Author, req.Resolve)
+	lres, err := w.land(ctx, req.LandBranch, req.Strategy, req.Author, req.Resolve, nil)
 	if err != nil {
 		if w.state.Pending != nil && w.state.Pending.Landed != "" {
 			// The land succeeded; only the refresh failed, and err explains it.
@@ -514,11 +514,34 @@ func (w *Workspace) LandResolving(ctx context.Context, branch, strategy string, 
 		return LandResult{}, err
 	}
 	defer unlock()
-	return w.land(ctx, branch, strategy, committer, resolve)
+	return w.land(ctx, branch, strategy, committer, resolve, nil)
+}
+
+// GetObjects returns the contents of the requested blobs from the workspace's
+// server, such as the sides of a conflict. Missing objects are absent from the
+// result.
+func (w *Workspace) GetObjects(ctx context.Context, oids []string) (map[string][]byte, error) {
+	return w.backend.GetObjects(ctx, oids)
+}
+
+// LandResolution lands the pending commit with the caller's resolution of the
+// conflicts of its merge with the branch tip, as a merge commit, and then
+// refreshes the workspace as Land does. The resolution must be for the pending
+// commit.
+func (w *Workspace) LandResolution(ctx context.Context, branch string, committer Signature, resolution *Resolution) (LandResult, error) {
+	unlock, err := w.lockAndLoad()
+	if err != nil {
+		return LandResult{}, err
+	}
+	defer unlock()
+	if w.state.Pending != nil && resolution.Commit != w.state.Pending.Commit {
+		return LandResult{}, fmt.Errorf("the resolution is for commit %s, not the pending commit %s", resolution.Commit, w.state.Pending.Commit)
+	}
+	return w.land(ctx, branch, StrategyMerge, committer, false, resolution)
 }
 
 // land is Land without taking the workspace lock.
-func (w *Workspace) land(ctx context.Context, branch, strategy string, committer Signature, resolve bool) (LandResult, error) {
+func (w *Workspace) land(ctx context.Context, branch, strategy string, committer Signature, resolve bool, resolution *Resolution) (LandResult, error) {
 	if w.state.Pending == nil {
 		return LandResult{}, errors.New("nothing to land: no pending commit")
 	}
@@ -551,6 +574,7 @@ func (w *Workspace) land(ctx context.Context, branch, strategy string, committer
 			CreateBranch:     branch == w.state.Branch,
 			Committer:        committer,
 			ResolveConflicts: resolve,
+			Resolution:       resolution,
 		})
 		if err != nil {
 			return LandResult{}, err

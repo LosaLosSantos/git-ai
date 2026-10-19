@@ -228,17 +228,25 @@ func (b *sdkBackend) Land(ctx context.Context, opts workspace.LandOptions) (work
 		return workspace.LandResult{}, err
 	}
 
-	res, err := b.repo.Land(ctx, sdk.LandOptions{
+	lo := sdk.LandOptions{
 		Branch:           opts.Branch,
 		Commit:           opts.Commit,
 		User:             b.user(opts.Committer.Name, opts.Committer.Email, false),
 		Strategy:         strategy,
 		CreateBranch:     opts.CreateBranch,
 		ResolveConflicts: opts.ResolveConflicts,
-	})
+	}
+	if r := opts.Resolution; r != nil {
+		lo.Resolution = &sdk.Resolution{Tip: r.Tip, Commit: r.Commit}
+		for _, f := range r.Files {
+			lo.Resolution.Files = append(lo.Resolution.Files, sdk.ResolvedFile{Path: f.Path, Delete: f.Delete, Mode: f.Mode, Content: f.Content})
+		}
+	}
+	res, err := b.repo.Land(ctx, lo)
 	switch {
 	case sdk.IsMergeConflict(err):
-		return workspace.LandResult{}, fmt.Errorf("%w: %s", workspace.ErrMergeConflict, status.Convert(err).Message())
+		// The gRPC error stays in the chain, so that the conflict package it carries can be read.
+		return workspace.LandResult{}, &landConflictError{msg: status.Convert(err).Message(), err: err}
 	case sdk.IsNotAncestor(err):
 		return workspace.LandResult{}, fmt.Errorf("%w: %s", workspace.ErrNotFastForward, status.Convert(err).Message())
 	case err != nil:
@@ -255,6 +263,22 @@ func (b *sdkBackend) Land(ctx context.Context, opts workspace.LandOptions) (work
 		BatchPosition: res.Batch.Position,
 		Attempts:      res.Attempts,
 	}, nil
+}
+
+// landConflictError is a land that failed on a merge conflict: it is workspace.ErrMergeConflict,
+// and it keeps the gRPC error of the land, whose conflict package sdk.LandConflict reads.
+type landConflictError struct {
+	msg string
+	err error
+}
+
+func (e *landConflictError) Error() string {
+	return workspace.ErrMergeConflict.Error() + ": " + e.msg
+}
+
+// Unwrap returns workspace.ErrMergeConflict and the gRPC error.
+func (e *landConflictError) Unwrap() []error {
+	return []error{workspace.ErrMergeConflict, e.err}
 }
 
 // DeleteBranch implements workspace.Backend. The sdk has no branch deletion, so

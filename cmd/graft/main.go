@@ -40,23 +40,27 @@ var backendFactory = dialBackend
 
 // options holds the flags and environment shared by all commands.
 type options struct {
-	address  string
-	token    string
-	storage  string
-	user     string
-	author   string
-	dir      string
-	branch   string
-	sparse   string
-	message  string
-	land     string
-	abort    bool
-	resolve  bool
-	strategy string
-	revision string
-	after    uint64
-	limit    int
-	jsonOut  bool
+	address string
+	token   string
+	storage string
+	user    string
+	author  string
+	dir     string
+	branch  string
+	sparse  string
+	message string
+	land    string
+	abort   bool
+	resolve bool
+	// conflictsDir and resolved are the directories of graft land --conflicts-dir and
+	// --resolved.
+	conflictsDir string
+	resolved     string
+	strategy     string
+	revision     string
+	after        uint64
+	limit        int
+	jsonOut      bool
 	// stderr receives warnings of commands that succeed.
 	stderr io.Writer
 }
@@ -223,6 +227,8 @@ func bindLand(fs *flag.FlagSet, o *options) {
 	fs.StringVar(&o.strategy, "strategy", workspace.StrategyRebase, "land strategy: rebase, merge or ff_only")
 	fs.BoolVar(&o.abort, "abort", false, "drop the pending commit without landing it")
 	fs.BoolVar(&o.resolve, "resolve", false, "let the server resolve merge conflicts")
+	fs.StringVar(&o.conflictsDir, "conflicts-dir", "", "with --resolve: write the conflicts the server did not resolve into this directory")
+	fs.StringVar(&o.resolved, "resolved", "", "land the resolution in this directory (written by --conflicts-dir, then edited)")
 }
 
 func bindLog(fs *flag.FlagSet, o *options) {
@@ -253,7 +259,8 @@ commands:
   status                 list local changes
   diff                   show line changes against the base commit
   commit -m MSG          commit local changes (--land BRANCH to land them, --resolve for conflicts)
-  land [BRANCH]          land the pending commit (--strategy, --resolve; --abort drops it)
+  land [BRANCH]          land the pending commit (--strategy, --resolve [--conflicts-dir DIR],
+                         --resolved DIR; --abort drops it)
   revert [PATH...]       discard local changes to PATHs (default: all) and restore them
   update                 move the workspace to the tip of its branch
   sparse [PREFIX...]     restrict the workspace to PREFIX paths
