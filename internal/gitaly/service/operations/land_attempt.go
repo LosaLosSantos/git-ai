@@ -224,10 +224,16 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 			return landStep{}, err
 		}
 
-		// The conflict is resolved into a merge commit. When that fails, the request gets the
-		// merge conflict it would have got without resolution, with the conflict package as a
+		// The conflict is resolved into a merge commit from the verdicts made before the lane
+		// (PLAN10 15.8); the resolver is never called here. Files without a verdict go back to
+		// UserLand to be resolved out of the lane. When the land fails otherwise, the request gets
+		// the merge conflict it would have got without resolution, with the conflict package as a
 		// second detail when the server listed the conflicts.
-		res, resolveErr := a.server.resolveLandConflicts(ctx, in, a.repo, tip, commitID, req.committer)
+		res, resolveErr := a.server.landApplyVerdicts(ctx, in, a.repo, tip, commitID, req.committer, req.preResolution)
+		var need *landNeedsResolution
+		if errors.As(resolveErr, &need) {
+			return landStep{}, need
+		}
 		if resolveErr != nil {
 			a.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
 				Info("graft: conflict resolution of land failed")

@@ -77,8 +77,8 @@ func TestGraftResolverMinifiedDefaults(t *testing.T) {
 
 // TestGraftResolverValidateBuildable: a resolver configuration that the server could not build is
 // a startup error, not a resolver turned off: an empty command, a URL that is no http or https URL
-// with a host, a token file that cannot be read or is empty, a negative check_concurrency, or a
-// max_file_bytes over the bound of a check request.
+// with a host, a token file that cannot be read or is empty, a negative check_concurrency,
+// resolve_concurrency or resolve_rounds, or a max_file_bytes over the bound of a check request.
 func TestGraftResolverValidateBuildable(t *testing.T) {
 	t.Parallel()
 
@@ -110,6 +110,12 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 		"negative check_concurrency": {
 			GraftResolver{Command: []string{"graft-resolve"}, CheckConcurrency: -1}, "must not be negative",
 		},
+		"negative resolve_concurrency": {
+			GraftResolver{Command: []string{"graft-resolve"}, ResolveConcurrency: -1}, "must not be negative",
+		},
+		"negative resolve_rounds": {
+			GraftResolver{Command: []string{"graft-resolve"}, ResolveRounds: -1}, "must not be negative",
+		},
 		"max_file_bytes over the bound": {
 			GraftResolver{Command: []string{"graft-resolve"}, MaxFileBytes: GraftResolverMaxCheckFileBytes + 1}, "max_file_bytes",
 		},
@@ -127,6 +133,10 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 	require.Equal(t, "168h0m0s", ttl.String())
 	require.Equal(t, DefaultGraftResolverCheckConcurrency, GraftResolver{}.CheckConcurrencyOrDefault())
 	require.Equal(t, 5, GraftResolver{CheckConcurrency: 5}.CheckConcurrencyOrDefault())
+	require.Equal(t, DefaultGraftResolverResolveConcurrency, GraftResolver{}.ResolveConcurrencyOrDefault())
+	require.Equal(t, 4, GraftResolver{ResolveConcurrency: 4}.ResolveConcurrencyOrDefault())
+	require.Equal(t, DefaultGraftResolverResolveRounds, GraftResolver{}.ResolveRoundsOrDefault())
+	require.Equal(t, 7, GraftResolver{ResolveRounds: 7}.ResolveRoundsOrDefault())
 }
 
 // TestGraftResolverCheckBounds: a file of GraftResolverMaxCheckFileBytes, its three sides and its

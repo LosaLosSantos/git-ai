@@ -323,6 +323,15 @@ type GraftResolver struct {
 	// each holds a check request of up to GraftResolverMaxCheckRequestBytes. Zero means
 	// DefaultGraftResolverCheckConcurrency.
 	CheckConcurrency int `json:"check_concurrency" toml:"check_concurrency,omitempty"`
+	// ResolveConcurrency bounds the resolutions that run at once on this server (PLAN10 15.8), in a
+	// pool of their own so that long resolutions never delay the short checks. Zero means
+	// DefaultGraftResolverResolveConcurrency.
+	ResolveConcurrency int `json:"resolve_concurrency" toml:"resolve_concurrency,omitempty"`
+	// ResolveRounds is a safety cap on the rounds of a land whose conflicting files keep changing
+	// while it is resolved (PLAN10 15.8). The rounds are bounded by the resolver's timeout; the cap
+	// is set well above realistic contention and is no contract. Zero means
+	// DefaultGraftResolverResolveRounds.
+	ResolveRounds int `json:"resolve_rounds" toml:"resolve_rounds,omitempty"`
 	// ProposalTTL is how long the server keeps the proposals of a failed land
 	// (refs/graft/proposals/), as a Go duration ("168h"). Empty means
 	// DefaultGraftResolverProposalTTL.
@@ -509,8 +518,8 @@ func (r GraftResolver) validate() error {
 	if _, err := r.ProposalTTLOrDefault(); err != nil {
 		return err
 	}
-	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 {
-		return fmt.Errorf("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")
+	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 || r.ResolveConcurrency < 0 || r.ResolveRounds < 0 {
+		return fmt.Errorf("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency and resolve_rounds must not be negative")
 	}
 	// The check of an agent's resolution sends a file's three sides and its resolution in one
 	// request, which must fit its bound.
@@ -576,6 +585,29 @@ func (r GraftResolver) CheckConcurrencyOrDefault() int {
 		return r.CheckConcurrency
 	}
 	return DefaultGraftResolverCheckConcurrency
+}
+
+// DefaultGraftResolverResolveConcurrency is the default of GraftResolver.ResolveConcurrency.
+const DefaultGraftResolverResolveConcurrency = 2
+
+// ResolveConcurrencyOrDefault returns ResolveConcurrency or its default.
+func (r GraftResolver) ResolveConcurrencyOrDefault() int {
+	if r.ResolveConcurrency > 0 {
+		return r.ResolveConcurrency
+	}
+	return DefaultGraftResolverResolveConcurrency
+}
+
+// DefaultGraftResolverResolveRounds is the default of GraftResolver.ResolveRounds: a cap well
+// above the lands that contend for one file at once.
+const DefaultGraftResolverResolveRounds = 32
+
+// ResolveRoundsOrDefault returns ResolveRounds or its default.
+func (r GraftResolver) ResolveRoundsOrDefault() int {
+	if r.ResolveRounds > 0 {
+		return r.ResolveRounds
+	}
+	return DefaultGraftResolverResolveRounds
 }
 
 // DefaultGraftResolverProposalTTL is the default of GraftResolver.ProposalTTL: a week.

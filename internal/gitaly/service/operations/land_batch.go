@@ -31,6 +31,9 @@ type landBatchRequest struct {
 	actor string
 	// precheck is the check of the request's resolution, run before the request entered its lane.
 	precheck *landPrecheck
+	// preResolution holds the verdicts the server made on the request's conflicting files before
+	// it entered its lane (PLAN10 15.8); nil unless the request asked for resolution.
+	preResolution *landPreResolution
 }
 
 // reference returns the branch the request lands on.

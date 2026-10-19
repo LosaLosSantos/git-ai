@@ -990,7 +990,10 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | resolver check, bounded slots | `landCheckResolution`, `landCheckSlotted`, `Client.AcquireCheckSlot` | operations/land_reland.go; graft/resolver/check.go |
 | LANE, re-land | `landAttempt`, `landingAttempt.decide`, `landWithResolution` | operations/land.go, land_attempt.go, land_reland.go |
 | 3-way merge, listing | `landingAttempt.decide`, `landListConflicts` | operations/land_attempt.go, land_resolve.go |
-| per-file verdicts, decide | `resolveLandConflicts`, `decideLand`, `landAnswerProposes` | operations/land_resolve.go, land_proposals.go |
+| out of the lane: rounds, deadline | `landResolving`, `landPreResolve` | operations/land_preresolve.go |
+| per-file verdicts, decide | `landResolveAt`, `decideLand`, `landAnswerProposes`, `landKeyOf` | operations/land_resolve.go, land_proposals.go, land_preresolve.go |
+| verdicts applied in the lane | `landApplyVerdicts`, `landNeedsResolution` | operations/land_resolve.go, land_preresolve.go |
+| resolver call, bounded slots | `Client.AcquireResolveSlot`, `ResolveSlot.Resolve` | graft/resolver/check.go |
 | policy before resolving | `hook.CheckAgentPolicy`, `landPolicyDeniedError` | operations/land_resolve.go, land_proposals.go |
 | classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
 | operator rules, file checks | `Resolver.resolveFile`, `Resolver.runChecks`, `syntax.CheckMerge` | tools/graft-agents/resolve/resolve.go |
@@ -1095,10 +1098,11 @@ The resolution is bound to the files instead (the PM's correction):
     runs the classification again on every file it reuses: local git work, bounded like the
     package's, never the resolver. A file whose classification at the lane's tip differs from its
     verdict's counts as changed.
-  * The request also carries the tip's commit message. R1's prompt sends only THEIRS' message,
-    which is fixed for the land; an operator's command strategy could read the tip's message, and
-    its verdict would then be reused across tips. That is stated in RESOLVE.md: a resolver's
-    answer for a file must depend on the file, not on the tip's message.
+  * The request no longer carries the tip, its merge base or its commit message: the fields
+    `tip`, `merge_base` and `messages.tip` are always empty, kept in the protocol for
+    compatibility (a test asserts it). A verdict reused at another tip is then correct by
+    construction: no resolver, the operator's command strategy included, can read the tip.
+    RESOLVE.md states that an answer must depend on the file only.
 * **Pre-resolve before the lane.** UserLand reads the tip T as the lane does and, in a quarantine
   it discards, merges T and the change. Skipped (the lane answers as today) when the branch does
   not exist, the change already landed, or the merge is clean. Otherwise it runs the per-file flow
@@ -1117,9 +1121,16 @@ The resolution is bound to the files instead (the PM's correction):
 * **Needs resolution.** When a conflicting file has no verdict with its key (it is new, or a side
   changed), the lane returns the attempt with those files, without resolving. UserLand
   pre-resolves only them against the new tip, out of the lane, keeps every other verdict, and
-  enters the lane again. The rounds are bounded by the resolver's timeout for the whole land and
-  by resolve_rounds (default 3); past them the land fails with the merge conflict and the reason
-  "files kept changing: a, b". A tip that moves on unrelated files costs no resolver call at all.
+  enters the lane again. A tip that moves on unrelated files costs no resolver call at all.
+* **Progress, and its limit.** A round is lost only when the lane found a file whose sides
+  changed, that is when another land on that file landed. So the lands that contend for a file
+  all land, at least one per round, and N contenders need at most N rounds each. The rounds are
+  therefore bounded by the resolver's timeout for the whole land only; resolve_rounds (default
+  32) is a safety cap well above realistic contention, documented as a cap and not a contract
+  (decided after the 12-concurrent graft-bench test failed with a cap of 3). The limit, stated:
+  under continuous new arrivals on the same file, one land can keep losing until its deadline,
+  and then fails with the merge conflict and the reason "files kept changing while the land was
+  resolved, until the deadline of <timeout>: a"; past the cap, "after <n> rounds".
 * **Rules alike.** The operator rules' verdicts (trivial, union, rerere, command) are kept and
   reused by the same key, so the policy is the same for every strategy.
 * **Slots: two pools.** check_concurrency bounds the checks of agents' resolutions and
@@ -1131,14 +1142,34 @@ The resolution is bound to the files instead (the PM's correction):
 * **Still in the lane, stated:** verify.command, the operator's tests on the merged tree, runs in
   the lane for the rules' resolutions and for agents' resolutions alike. It is the next candidate
   to move out, as its own step.
+* **Measured (TestLandResolveBench, GRAFT_LAND_BENCH=1).** Six lands that the server resolves,
+  all on the same file, and six plain lands that conflict with nothing, at once through the lanes
+  of a standalone server, with a resolver that takes 500 ms; the same bench on the tree before
+  and after, three runs each:
+
+  | | before (resolver in the lane) | after (out of the lane) |
+  |---|---|---|
+  | lane held | 3.48-3.54 s | 0.72-0.93 s |
+  | plain lands, p50 | 3.47-3.53 s | 151-205 ms |
+  | resolve lands, p95 | 3.44-3.58 s | 3.21-3.22 s |
+  | resolver calls | 6 | 11 |
+
+  The plain lands no longer wait for the resolutions, and the lane is held for git work only.
+  The cost is in resolver calls: every land on the same file loses a round to each land that
+  lands before it, and resolves again. That is the worst case by construction (one file, every
+  land on it); lands on different files, or a tip that moves on other files, cost no extra call.
 * **Tests.**
   * The resolver is never called with the lane held: a resolver that blocks while another land of
     the branch proceeds.
   * A not-landable answer never enters the lane.
   * A tip that moves on an unrelated file reuses every verdict, with no second resolver call.
   * A tip that changes one conflicting file re-resolves only that file.
-  * Files that keep changing fail after resolve_rounds, with the reason naming them.
+  * Files that keep changing fail at the deadline, or after resolve_rounds, with the reason
+    naming them.
   * A batch member reuses its verdicts.
   * A high-churn test: many concurrent lands on the branch, the resolve lands among them land
-    eventually, with no starvation.
+    eventually, with no starvation; and with a short deadline, every land ends, landed or with
+    its reason, and none hangs.
+  * A proposal kept while a batch holds the lane has the published tip as parent (review of
+    6090d5b, item 4): proposals are written before the lane only.
   * The two pools: a held resolve slot does not delay a check.

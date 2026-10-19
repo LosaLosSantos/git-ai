@@ -163,8 +163,16 @@ func newResolveFixture(t *testing.T, rcfg config.GraftResolver) resolveFixture {
 func newResolveFixtureWith(t *testing.T, rcfg config.GraftResolver, baseEntries, tipEntries, commitEntries []gittest.TreeEntry) resolveFixture {
 	t.Helper()
 
+	return newResolveFixtureIn(t, config.Graft{Land: config.GraftLand{Resolver: rcfg}}, baseEntries, tipEntries, commitEntries)
+}
+
+// newResolveFixtureIn is newResolveFixtureWith with the whole Graft configuration of the service,
+// for the tests that land through the lanes of a standalone server.
+func newResolveFixtureIn(t *testing.T, graft config.Graft, baseEntries, tipEntries, commitEntries []gittest.TreeEntry) resolveFixture {
+	t.Helper()
+
 	cfg := testcfg.Build(t)
-	cfg.Graft.Land.Resolver = rcfg
+	cfg.Graft = graft
 	ctx, cfg, client := setupOperationsServiceWithCfg(t, testhelper.Context(t), cfg)
 	// The resolution writes commits directly, outside an RPC, so the feature flags that
 	// commit writing checks are set explicitly.
@@ -258,9 +266,12 @@ func TestResolveLandConflicts_mergesResolvedFiles(t *testing.T) {
 	req := resolverRequest(t, dir, 1)
 	require.Equal(t, resolver.ProtocolVersion, req.Version)
 	require.Equal(t, git.DefaultBranch, req.Branch)
-	require.Equal(t, fx.tip.String(), req.Tip)
 	require.Equal(t, fx.commit.String(), req.Commit)
-	require.Equal(t, fx.base.String(), req.MergeBase)
+	// A request carries only what a file's verdict may depend on (PLAN10 15.8): not the tip, its
+	// merge base or its message, which a verdict reused at another tip must not depend on.
+	require.Empty(t, req.Tip)
+	require.Empty(t, req.MergeBase)
+	require.Empty(t, req.Messages.Tip)
 	// There is no authenticated identity, so the request carries no actor, whatever the user name.
 	require.Empty(t, req.Actor)
 	require.Equal(t, int64(1048576), req.Limits.MaxFileBytes)
@@ -923,13 +934,14 @@ func TestUserLand_resolveConflicts(t *testing.T) {
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 	})
 
-	t.Run("retries against the new tip after a concurrent writer", func(t *testing.T) {
+	t.Run("a writer that moves the tip on another file costs no second resolution", func(t *testing.T) {
 		t.Parallel()
 
-		// The script moves the branch to the writer commit while the first attempt is being
-		// resolved. The first compare-and-swap then fails, and the second attempt resolves
-		// against the writer. The paths of the repository and the commits are read from files
-		// the test writes, because the repository exists only once the service runs.
+		// The script moves the branch to the writer commit while the land is being resolved, out
+		// of the lane. The writer adds e and leaves a and b as they were: their verdicts hold at
+		// the writer (PLAN10 15.8), so the lane lands them on the writer without calling the
+		// resolver again. The paths of the repository and the commits are read from files the test
+		// writes, because the repository exists only once the service runs.
 		dir, argv := resolverScript(t, fmt.Sprintf(`if [ "$N" = 1 ]; then
   "$(cat "$DIR/git")" -C "$(cat "$DIR/repo")" update-ref refs/heads/%s "$(cat "$DIR/writer")" "$(cat "$DIR/tip")"
 fi`, git.DefaultBranch))
@@ -957,9 +969,8 @@ fi`, git.DefaultBranch))
 
 		resp, err := fx.client.UserLand(fx.ctx, fx.request("Land agent work"))
 		require.NoError(t, err)
-		require.Equal(t, int32(2), resp.GetAttempts())
-		require.Equal(t, 2, resolverCalls(t, dir))
-		require.Equal(t, writer.String(), resolverRequest(t, dir, 2).Tip)
+		require.Equal(t, int32(1), resp.GetAttempts())
+		require.Equal(t, 1, resolverCalls(t, dir), "the verdicts on a and b are reused at the writer")
 		// The old tip reported is the tip of the attempt that landed, the writer commit.
 		require.Equal(t, writer.String(), resp.GetOldTip())
 

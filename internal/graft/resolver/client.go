@@ -97,8 +97,11 @@ type Client struct {
 	pathsDeny    []string
 	actors       []string
 	httpClient   *http.Client
-	// checkSlots bounds the checks of agents' resolutions that run at once (CheckSlot).
-	checkSlots chan struct{}
+	// checkSlots bounds the checks of agents' resolutions that run at once (CheckSlot), and
+	// resolveSlots the resolutions (ResolveSlot): two pools, so that long resolutions never delay
+	// the short checks (PLAN10 15.8).
+	checkSlots   chan struct{}
+	resolveSlots chan struct{}
 	// sendRules decide the files that are never sent (SendRules).
 	sendRules *SendRules
 }
@@ -132,8 +135,8 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		return nil, err
 	}
 
-	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 {
-		return nil, errors.New("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")
+	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 || cfg.ResolveConcurrency < 0 || cfg.ResolveRounds < 0 {
+		return nil, errors.New("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency and resolve_rounds must not be negative")
 	}
 	// The check of an agent's resolution sends a file's three sides and its resolution in one
 	// request, which must fit its bound.
@@ -155,6 +158,7 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		actors:       slices.Clone(cfg.Actors),
 		sendRules:    rules,
 		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
+		resolveSlots: make(chan struct{}, cfg.ResolveConcurrencyOrDefault()),
 	}
 
 	if cfg.URL != "" {
@@ -188,13 +192,13 @@ func New(cfg config.GraftResolver) (*Client, error) {
 	return c, nil
 }
 
-// Resolve sends req to the resolver and returns its validated answer. The
-// request's Version and Limits are set by the client. A refusal is an error
-// matching ErrUnresolvable; any other failure (timeout, bound exceeded, invalid
-// answer, transport error) is a distinct error. Resolve returns an error
-// without calling the resolver when the request breaks the client's limits or
-// policy.
-func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
+// resolve sends req to the resolver and returns its validated answer; callers
+// send it with a resolve slot (ResolveSlot.Resolve). The request's Version and
+// Limits are set by the client. A refusal is an error matching
+// ErrUnresolvable; any other failure (timeout, bound exceeded, invalid answer,
+// transport error) is a distinct error. It returns an error without calling
+// the resolver when the request breaks the client's limits or policy.
+func (c *Client) resolve(ctx context.Context, req Request) (*Response, error) {
 	if c == nil {
 		return nil, ErrDisabled
 	}

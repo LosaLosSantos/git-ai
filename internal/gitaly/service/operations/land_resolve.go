@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -75,35 +76,37 @@ type landFileConflict struct {
 	theirs *landBlob
 }
 
-// resolveLandConflicts lands commitID onto tip by resolving the files that conflict between the
-// two. The result is a merge commit with parents [tip, commitID].
-//
-// Every conflicting file is decided on its own. A file that may not or cannot be sent (its path,
-// its sides, or the never-send rules of resolver.SendRules) goes to the agent; the others go to
-// the resolver in one request. Nothing lands partially: unless every file is resolved, the land
-// fails with a *landUnresolvedError, whose conflict package says what happened to each file. A
-// request the server does not attempt at all (resolution disabled, the actor not allowed, too many
-// files, a criss-cross history) also gets a package, with the reason. Any other error means the
-// conflicts could not even be listed, and the caller reports the merge conflict alone.
-func (s *Server) resolveLandConflicts(
+// landResolveAt resolves, against tip, the conflicting files of the land that have no verdict in
+// verdicts yet (PLAN10 15.8). It runs out of the lane: the policy first (an agent that may not
+// update the branch gets nothing resolved), the listing, the classification of every file, one
+// resolver request for the files to resolve, taken with a resolve slot, and the validation; then
+// decideLand over every file, the verdicts reused included. A request carries only what a file's
+// verdict may depend on: the sides, the path and modes, the change's message, the configuration;
+// not the tip, its merge base or its message, so that a verdict can be reused at another tip
+// (15.8). When the land is landable, the new verdicts are added to verdicts, and the listing and
+// the answer to write are returned. Otherwise the answer is kept as proposals (14) and the land
+// fails with a *landUnresolvedError, whose package says what happened to each file; a request the
+// server does not attempt at all also gets a package, with the reason. Any other error means the
+// conflicts could not be listed, and the caller reports the merge conflict alone.
+func (s *Server) landResolveAt(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
 	repo *localrepo.Repo,
 	tip, commitID git.ObjectID,
 	committer git.Signature,
-) (landResolution, error) {
+	verdicts landVerdicts,
+) (landListing, *resolver.Response, error) {
 	// An agent that may not update the branch gets nothing resolved, and no proposal is kept for
 	// it: the policy decides on the actor and the reference alone, so it is checked first.
 	reference := git.NewReferenceNameFromBranchName(string(in.GetBranch()))
 	if err := hook.CheckAgentPolicy(ctx, s.graft, fmt.Sprintf("%s %s %s\n", tip, commitID, reference)); err != nil {
-		return landResolution{}, &landPolicyDeniedError{err: err}
+		return landListing{}, nil, &landPolicyDeniedError{err: err}
 	}
 	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
 	if err != nil {
-		return landResolution{}, err
+		return l, nil, err
 	}
-	base, hasBase, conflicts, files := l.base, l.hasBase, l.conflicts, l.files
-	tipMessage, commitMessage := l.tipMessage, l.commitMessage
+	base, conflicts, files := l.base, l.conflicts, l.files
 	// max_files bounds the request to the resolver only: the package lists every conflicting file.
 	maxFiles := s.resolveCfg.MaxFilesOrDefault()
 	notAttempted := func(reason string) error { return l.notAttempted(reason, nil) }
@@ -115,28 +118,38 @@ func (s *Server) resolveLandConflicts(
 	actor := identity.Actor(ctx, "")
 	switch {
 	case len(files) == 0:
-		return landResolution{}, notAttempted(landNoConflictingFiles)
+		return l, nil, notAttempted(landNoConflictingFiles)
 	case s.conflictResolver == nil && s.resolverErr != nil:
-		return landResolution{}, notAttempted(fmt.Sprintf("conflict resolution is configured, but its resolver cannot be built: %v", s.resolverErr))
+		return l, nil, notAttempted(fmt.Sprintf("conflict resolution is configured, but its resolver cannot be built: %v", s.resolverErr))
 	case s.conflictResolver == nil:
-		return landResolution{}, notAttempted("conflict resolution is not enabled on this server")
+		return l, nil, notAttempted("conflict resolution is not enabled on this server")
 	case !s.conflictResolver.ActorAllowed(actor):
-		return landResolution{}, notAttempted(fmt.Sprintf("actor %q may not resolve conflicts", actor))
+		return l, nil, notAttempted(fmt.Sprintf("actor %q may not resolve conflicts", actor))
 	case criss > 1:
-		return landResolution{}, notAttempted(fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", criss))
+		return l, nil, notAttempted(fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", criss))
 	case len(conflicts) > maxFiles:
-		return landResolution{}, notAttempted(fmt.Sprintf("%d conflicting files exceed max_files %d", len(conflicts), maxFiles))
+		return l, nil, notAttempted(fmt.Sprintf("%d conflicting files exceed max_files %d", len(conflicts), maxFiles))
 	}
 
 	if err := s.landClassify(ctx, repo, files, base, tip, commitID, newLandClassifyCache(files, tip)); err != nil {
-		return landResolution{}, err
+		return l, nil, err
 	}
 
+	// A file the classification sends and that has a verdict with its key is not resolved again.
+	reused := map[string]resolver.ResponseFile{}
+	var reusedNames []string
 	var sent []resolver.File
 	for _, f := range files {
-		if f.sent() {
-			sent = append(sent, landRequestFile(f))
+		if !f.sent() {
+			continue
 		}
+		if v, ok := verdicts[landKeyOf(f.conflict)]; ok {
+			reused[f.conflict.path] = v.file
+			reusedNames = append(reusedNames, v.resolver)
+			f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
+			continue
+		}
+		sent = append(sent, landRequestFile(f))
 	}
 
 	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
@@ -145,7 +158,6 @@ func (s *Server) resolveLandConflicts(
 	// agent, who lands its own resolution (PLAN10 14).
 	var answer *resolver.Response
 	var resolveErr error
-	proposes := false
 	if len(sent) > 0 {
 		req := resolver.Request{
 			Version: resolver.ProtocolVersion,
@@ -154,18 +166,22 @@ func (s *Server) resolveLandConflicts(
 				RelativePath: in.GetRepository().GetRelativePath(),
 			},
 			Branch:   string(in.GetBranch()),
-			Tip:      tip.String(),
 			Commit:   commitID.String(),
-			Messages: resolver.Messages{Tip: tipMessage, Commit: commitMessage},
+			Messages: resolver.Messages{Commit: l.commitMessage},
 			Actor:    actor,
 			Files:    sent,
 		}
-		if hasBase {
-			req.MergeBase = base.String()
-		}
 
-		// The client applies the timeout, the request policy and the acceptance rules of the answer.
-		resp, err := s.conflictResolver.Resolve(ctx, req)
+		// The client applies the timeout, the request policy and the acceptance rules of the
+		// answer; the request waits for a resolve slot within the deadline of ctx.
+		var resp *resolver.Response
+		var err error
+		if slot, slotErr := s.conflictResolver.AcquireResolveSlot(ctx); slotErr != nil {
+			err = slotErr
+		} else {
+			resp, err = slot.Resolve(ctx, req)
+			slot.Release()
+		}
 		resolveErr = err
 		switch {
 		case err != nil:
@@ -175,7 +191,7 @@ func (s *Server) resolveLandConflicts(
 			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
 		default:
 			answer = resp
-			proposes = landAnswerProposes(resp)
+			proposes := landAnswerProposes(resp)
 			// A resolver that names the llm strategy but marks no file is taken to have proposed
 			// every file: the mark may be missing, never the other way round.
 			flagged := landAnswerFlagsProposals(resp)
@@ -199,27 +215,139 @@ func (s *Server) resolveLandConflicts(
 		}
 	}
 
-	landed := decideLand(answer, files)
+	combined := landCombinedAnswer(answer, reused, reusedNames, len(sent) > 0)
+	landed := decideLand(combined, files)
 	// An answer that does not land, because a model made part of it or another file is left, is
 	// kept for the agent: the files that rules resolved can be landed as they are. The proposals
 	// are an aid and the package is the contract: when they cannot be kept, the package still goes
 	// to the agent, each file of the answer saying that its proposal was not stored, and the
 	// failure is logged and counted.
-	if answer != nil && !landed {
-		ref, err := s.landWriteProposals(ctx, in, l, answer, committer)
+	if combined != nil && !landed {
+		ref, err := s.landWriteProposals(ctx, in, l, combined, committer)
 		if err != nil {
 			landProposalWriteErrors.Inc()
 			s.logger.WithError(err).WithField("branch", string(in.GetBranch())).ErrorContext(ctx, "graft: the resolver's answer could not be kept as proposals")
-			landProposalsNotStored(files, answer, err)
+			landProposalsNotStored(files, combined, err)
 		} else {
 			l.proposalRef = ref
 		}
 	}
 	if !landed {
-		return landResolution{}, l.unresolved("", landUnresolvedCause(files), resolveErr)
+		return l, nil, l.unresolved("", landUnresolvedCause(files), resolveErr)
 	}
 
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, answer, "")
+	if answer != nil {
+		for _, f := range files {
+			for _, rf := range answer.Files {
+				if rf.Path == f.conflict.path {
+					verdicts[landKeyOf(f.conflict)] = landVerdict{file: rf, resolver: answer.Resolver}
+				}
+			}
+		}
+	}
+	return l, combined, nil
+}
+
+// landCombinedAnswer is the answer of a land whose files are resolved in rounds: the files the
+// resolver answered now and the verdicts reused, under the names of the resolvers that made them.
+// It is nil when the resolver was asked and did not answer, or when there is nothing at all.
+func landCombinedAnswer(answer *resolver.Response, reused map[string]resolver.ResponseFile, reusedNames []string, asked bool) *resolver.Response {
+	if asked && answer == nil {
+		return nil
+	}
+	if answer == nil && len(reused) == 0 {
+		return nil
+	}
+	combined := &resolver.Response{Version: resolver.ProtocolVersion}
+	var names []string
+	if answer != nil {
+		combined.Files = append(combined.Files, answer.Files...)
+		combined.Explanation = answer.Explanation
+		names = append(names, answer.Resolver)
+	}
+	paths := make([]string, 0, len(reused))
+	for p := range reused {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		combined.Files = append(combined.Files, reused[p])
+	}
+	names = append(names, reusedNames...)
+	combined.Resolver = landJoinResolverNames(names)
+	return combined
+}
+
+// landJoinResolverNames joins the distinct resolver names of an answer made in rounds, within
+// the bound of a resolver name: the names that fit, and "+N" for the others.
+func landJoinResolverNames(names []string) string {
+	seen := map[string]bool{}
+	var distinct []string
+	for _, n := range names {
+		if !seen[n] {
+			seen[n] = true
+			distinct = append(distinct, n)
+		}
+	}
+	joined := strings.Join(distinct, ",")
+	if len(joined) <= maxResolverNameBytes {
+		return joined
+	}
+	for kept := len(distinct) - 1; kept > 0; kept-- {
+		cut := strings.Join(distinct[:kept], ",") + fmt.Sprintf(",+%d", len(distinct)-kept)
+		if len(cut) <= maxResolverNameBytes {
+			return cut
+		}
+	}
+	return distinct[0][:min(len(distinct[0]), maxResolverNameBytes)]
+}
+
+// landApplyVerdicts lands, in the lane, the verdicts that the pre-resolution made out of it
+// (PLAN10 15.8). It lists the conflicts at the lane's tip and classifies every file again (the
+// classification reads the tip), and writes the merge commit only when every conflicting file is
+// sent and has a verdict with its key; the resolver is never called. A file without one makes it
+// return *landNeedsResolution, which UserLand resolves out of the lane. A clean merge of the tip
+// and the change is errLandNoConflicts, as before.
+func (s *Server) landApplyVerdicts(
+	ctx context.Context,
+	in *gitalypb.UserLandRequest,
+	repo *localrepo.Repo,
+	tip, commitID git.ObjectID,
+	committer git.Signature,
+	pre *landPreResolution,
+) (landResolution, error) {
+	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
+	if err != nil {
+		return landResolution{}, err
+	}
+	var missing []string
+	if pre == nil || s.conflictResolver == nil || l.bases > 1 {
+		for _, f := range l.files {
+			missing = append(missing, f.conflict.path)
+		}
+	} else {
+		if err := s.landClassify(ctx, repo, l.files, l.base, tip, commitID, newLandClassifyCache(l.files, tip)); err != nil {
+			return landResolution{}, err
+		}
+		for _, f := range l.files {
+			if _, ok := pre.verdicts[landKeyOf(f.conflict)]; !ok || !f.sent() {
+				missing = append(missing, f.conflict.path)
+			}
+		}
+	}
+	if len(missing) > 0 || len(l.files) == 0 {
+		return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: missing}
+	}
+
+	reused := map[string]resolver.ResponseFile{}
+	var names []string
+	for _, f := range l.files {
+		v := pre.verdicts[landKeyOf(f.conflict)]
+		reused[f.conflict.path] = v.file
+		names = append(names, v.resolver)
+	}
+	answer := landCombinedAnswer(nil, reused, names, false)
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "")
 	return res, l.verifyRejected(err)
 }
 

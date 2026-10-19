@@ -41,6 +41,11 @@ actors = ["builder", "planner"]
 - `check_concurrency` (default 2): the checks of agents' resolutions that run
   at once in the Gitaly process, whatever listener the lands arrive on (see
   the check below).
+- `resolve_concurrency` (default 2): the resolutions that run at once in the
+  Gitaly process, in a pool apart from the checks', so that long resolutions
+  never delay the short checks. `resolve_rounds` (default 32) is a safety cap
+  on the rounds of a land whose files keep changing (see "Out of the lane"
+  below); the rounds are bounded by `timeout`, and the cap is no contract.
 - A configuration the server could not use is a startup error (see
   [CONFIGURATION](CONFIGURATION.md)). A configured resolver is never treated
   as no resolver: if it cannot be built later, every land that needs it fails
@@ -209,8 +214,8 @@ Request (server to resolver):
 ```json
 {"version": 1,
  "repository": {"storage": "default", "relative_path": "x.git"},
- "branch": "main", "tip": "<oid>", "commit": "<oid>", "merge_base": "<oid>",
- "messages": {"tip": "<tip commit message>", "commit": "<landed commit message>"},
+ "branch": "main", "tip": "", "commit": "<oid>", "merge_base": "",
+ "messages": {"tip": "", "commit": "<landed commit message>"},
  "actor": "agent-7",
  "files": [{"path": "a/b.go", "kind": "content",
             "base":   {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
@@ -220,6 +225,12 @@ Request (server to resolver):
 ```
 
 - `ours` is the current branch tip side. `theirs` is the change being landed.
+- `tip`, `merge_base` and `messages.tip` are always empty since this version;
+  they stay in the protocol for compatibility. The server reuses a file's
+  answer at any tip where the file's sides are the same (see "Out of the lane"
+  below), so an answer for a file must depend only on the file: its path, its
+  sides and their modes, the change's message and the resolver's own
+  configuration, never on the tip.
 - Any side may be `null` when it is absent (for example in an add-add
   conflict the base is `null`).
 - `kind` is one of `content`, `modify-delete`, `add-add`, `mode`.
@@ -401,6 +412,37 @@ Every resolution carries its trailers, so it can be found and undone:
 - `graft-verify` ([VERIFY.md](VERIFY.md)) tests the tip after landing,
   bisects a failure to the commit that broke it and reverts it with
   `UserRevert`, whether it was an AI resolution or not.
+
+## Out of the lane
+
+The server calls the resolver before a land enters its branch's lane, never
+while the lane is held, so a resolution that takes minutes does not hold the
+branch for the other lands:
+
+1. The server merges the branch's current tip and the change in a quarantine it
+   discards, and resolves the conflicting files there: the policy first, the
+   classification, one request with a resolve slot, the validation and the
+   decision. Each landable answer for a file is kept by the file's key: its
+   path and its three sides, each by object ID and mode.
+2. An answer that does not land (a model's proposal, a refusal, a file left)
+   never enters the lane: the land fails with the package, and the proposals
+   are kept.
+3. A landable answer enters the lane, which merges its own tip and the change
+   and writes the merge commit when every conflicting file has an answer with
+   its key; the resolver is not called. A tip that moved on other files costs
+   nothing. When a file changed (or is new), the lane hands the land back, and
+   the server resolves only that file, out of the lane, and enters the lane
+   again.
+
+A round is lost only when another land changed one of the files, so the lands
+that contend for a file all land, one per round. The rounds are bounded by the
+resolver's `timeout` for the whole land, and by `resolve_rounds`, a safety cap
+well above realistic contention. The limit, stated: under continuous new
+arrivals on the same file, one land can keep losing until its deadline; it then
+fails with the merge conflict and the reason `files kept changing while the land
+was resolved, until the deadline of <timeout>: <paths>`.
+
+`verify.command` still runs in the lane, on the merged tree of the lane's tip.
 
 ## The conflict package and the re-land
 
@@ -903,6 +945,8 @@ in blank lines only, and the accepted results that got no syntax verdict.
 | reason of a refusal (stderr, or `error` of the error response) | 4 KiB | server |
 | check answer | 64 KiB + 8 KiB per file | server |
 | checks of agents' resolutions at once | 2 | `check_concurrency` |
+| resolutions at once | 2 | `resolve_concurrency` |
+| rounds of a land whose files keep changing | 32 (a safety cap; `timeout` bounds the land) | `resolve_rounds` |
 | verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |
 | land request with an agent's resolution | 4 MiB, the gRPC message limit | server; the SDK refuses larger ones |

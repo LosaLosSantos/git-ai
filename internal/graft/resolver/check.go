@@ -79,6 +79,55 @@ func (s *CheckSlot) Release() {
 	<-s.c.checkSlots
 }
 
+// resolveSlotWait is the time the resolutions waited for a resolve slot.
+var resolveSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "graft_resolver_resolve_slot_wait_seconds",
+	Help:    "Time a resolution waited for one of the resolver's resolve slots.",
+	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
+})
+
+// ResolveSlot is the right to send one resolve request at a time: the client runs at most
+// resolve_concurrency resolutions at once (AcquireResolveSlot), in a pool apart from the checks'.
+// Release it when the request is done.
+type ResolveSlot struct {
+	c        *Client
+	released bool
+}
+
+// AcquireResolveSlot waits for a resolve slot. The wait counts against the deadline of ctx: when
+// ctx ends first, it fails, and the resolution fails closed.
+func (c *Client) AcquireResolveSlot(ctx context.Context) (*ResolveSlot, error) {
+	if c == nil {
+		return nil, ErrDisabled
+	}
+	start := time.Now()
+	select {
+	case c.resolveSlots <- struct{}{}:
+		resolveSlotWait.Observe(time.Since(start).Seconds())
+		return &ResolveSlot{c: c}, nil
+	case <-ctx.Done():
+		resolveSlotWait.Observe(time.Since(start).Seconds())
+		return nil, fmt.Errorf("waiting for a resolve slot of the resolver: %w", ctx.Err())
+	}
+}
+
+// Release gives the slot back; a second call does nothing.
+func (s *ResolveSlot) Release() {
+	if s == nil || s.released {
+		return
+	}
+	s.released = true
+	<-s.c.resolveSlots
+}
+
+// Resolve sends one resolve request with the slot (Client.resolve).
+func (s *ResolveSlot) Resolve(ctx context.Context, req Request) (*Response, error) {
+	if s == nil || s.released {
+		return nil, errors.New("resolve without a resolve slot")
+	}
+	return s.c.resolve(ctx, req)
+}
+
 // Check sends one check request with the slot (Client.check).
 func (s *CheckSlot) Check(ctx context.Context, req Request) (*CheckResponse, error) {
 	if s == nil || s.released {

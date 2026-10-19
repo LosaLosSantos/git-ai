@@ -217,23 +217,19 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		return res, nil
 	}
 
-	oursMessage, err := g.message(ctx, c.Ours)
-	if err != nil {
-		return res, err
-	}
 	theirsMessage, err := g.message(ctx, c.Theirs)
 	if err != nil {
 		return res, err
 	}
 
+	// The request is the server's (PLAN10 15.8): no tip, no merge base, no message of the tip, which
+	// a verdict reused at another tip must not depend on.
 	req := protocol.Request{
 		Version:    protocol.Version,
 		Repository: protocol.Repository{Storage: "bench", RelativePath: c.Repo},
 		Branch:     "bench",
-		Tip:        c.Ours,
 		Commit:     c.Theirs,
-		MergeBase:  c.Base,
-		Messages:   protocol.Messages{Tip: oursMessage, Commit: theirsMessage},
+		Messages:   protocol.Messages{Commit: theirsMessage},
 		Actor:      "bench",
 		Files: []protocol.FileConflict{{
 			Path: c.Path, Kind: c.Kind, Base: sides["base"], Ours: sides["ours"], Theirs: sides["theirs"],

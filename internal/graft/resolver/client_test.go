@@ -170,7 +170,7 @@ func TestNilClient(t *testing.T) {
 	t.Parallel()
 
 	var client *Client
-	resp, err := client.Resolve(context.Background(), sampleRequest())
+	resp, err := client.resolve(context.Background(), sampleRequest())
 	require.ErrorIs(t, err, ErrDisabled)
 	require.Nil(t, resp)
 }
@@ -184,7 +184,7 @@ func TestResolve_CommandSuccess(t *testing.T) {
 	req := sampleRequest()
 	req.Limits = Limits{MaxFileBytes: 1 << 30} // the caller's value must not leak through
 
-	resp, err := client.Resolve(testhelper.Context(t), req)
+	resp, err := client.resolve(testhelper.Context(t), req)
 	require.NoError(t, err)
 	require.Equal(t, "graft-resolve/test", resp.Resolver)
 	require.Equal(t, "merged both sides", resp.Explanation)
@@ -218,7 +218,7 @@ func TestResolve_NonASCIIPathRoundTrips(t *testing.T) {
 	req := sampleRequest()
 	req.Files[0].Path = p
 
-	got, err := client.Resolve(testhelper.Context(t), req)
+	got, err := client.resolve(testhelper.Context(t), req)
 	require.NoError(t, err)
 	require.Equal(t, p, got.Files[0].Path)
 
@@ -236,7 +236,7 @@ func TestResolve_CommandDefaultLimits(t *testing.T) {
 	command, reqFile := capturingCommand(t, mustJSON(t, validResponse("x")))
 	client := newClient(t, commandConfig(command))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.NoError(t, err)
 
 	raw, err := os.ReadFile(reqFile)
@@ -252,7 +252,7 @@ func TestResolve_CommandRefusal(t *testing.T) {
 
 	client := newClient(t, commandConfig([]string{writeScript(t, "cat > /dev/null\necho 'binary conflict' >&2\nexit 3\n")}))
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, ErrUnresolvable)
 	require.False(t, errors.Is(err, ErrInvalidResponse))
@@ -267,7 +267,7 @@ func TestResolve_CommandRefusalWithoutStderr(t *testing.T) {
 
 	client := newClient(t, commandConfig([]string{writeScript(t, "cat > /dev/null\nexit 3\n")}))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.ErrorIs(t, err, ErrUnresolvable)
 	require.ErrorContains(t, err, "exit status 3")
 }
@@ -279,7 +279,7 @@ func TestResolve_CommandRefusalWithOutputIsStillRefusal(t *testing.T) {
 	stdout := mustJSON(t, validResponse("merged"))
 	client := newClient(t, commandConfig([]string{writeScript(t, fmt.Sprintf("cat > /dev/null\nprintf '%%s' '%s'\necho nope >&2\nexit 1\n", stdout))}))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.ErrorIs(t, err, ErrUnresolvable)
 	require.ErrorContains(t, err, "nope")
 }
@@ -312,7 +312,7 @@ func TestResolve_CommandInvalidAnswers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newClient(t, commandConfig(cannedCommand(t, tc.stdout)))
 
-			resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+			resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 			require.Nil(t, resp)
 			require.ErrorIs(t, err, ErrInvalidResponse)
 			require.False(t, errors.Is(err, ErrUnresolvable))
@@ -328,7 +328,7 @@ func TestResolve_CommandOversizedOutput(t *testing.T) {
 	// of output is far beyond that bound.
 	client := newClient(t, config.GraftResolver{Enabled: true, Command: []string{writeScript(t, "cat > /dev/null\nhead -c 300000 /dev/zero\n")}, Timeout: "10s", MaxFileBytes: 1024})
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, ErrInvalidResponse)
 	require.ErrorContains(t, err, "exceeds")
@@ -340,7 +340,7 @@ func TestResolve_CommandTimeout(t *testing.T) {
 	client := newClient(t, config.GraftResolver{Enabled: true, Command: []string{writeScript(t, "cat > /dev/null\nexec sleep 30\n")}, Timeout: "200ms"})
 
 	start := time.Now()
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	elapsed := time.Since(start)
 
 	require.Nil(t, resp)
@@ -358,7 +358,7 @@ func TestResolve_CommandTimeoutWithGrandchild(t *testing.T) {
 	client := newClient(t, config.GraftResolver{Enabled: true, Command: []string{writeScript(t, "cat > /dev/null\nsleep 5 &\nwait\n")}, Timeout: "200ms"})
 
 	start := time.Now()
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.Less(t, time.Since(start), 15*time.Second)
 }
@@ -371,7 +371,7 @@ func TestResolve_CallerCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(testhelper.Context(t))
 	time.AfterFunc(100*time.Millisecond, cancel)
 
-	_, err := client.Resolve(ctx, sampleRequest())
+	_, err := client.resolve(ctx, sampleRequest())
 	require.ErrorIs(t, err, context.Canceled)
 	require.False(t, errors.Is(err, ErrUnresolvable))
 }
@@ -381,7 +381,7 @@ func TestResolve_CommandNotFound(t *testing.T) {
 
 	client := newClient(t, commandConfig([]string{filepath.Join(t.TempDir(), "no-such-resolver")}))
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.Error(t, err)
 	require.False(t, errors.Is(err, ErrUnresolvable))
@@ -398,7 +398,7 @@ func TestResolve_CommandGetsMinimalEnvironment(t *testing.T) {
 	client := newClient(t, commandConfig(command))
 
 	// The output is invalid on purpose: only the environment matters here.
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.ErrorIs(t, err, ErrInvalidResponse)
 
 	raw, err := os.ReadFile(envFile)
@@ -430,10 +430,10 @@ func TestCheck_runsForEveryActorAndFileCount(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resp.Files, 2)
 
-	_, err = client.Resolve(testhelper.Context(t), req)
+	_, err = client.resolve(testhelper.Context(t), req)
 	require.ErrorContains(t, err, "2 conflicted files, limit is 1")
 	cfg.MaxFiles = 0
-	_, err = newClient(t, cfg).Resolve(testhelper.Context(t), req)
+	_, err = newClient(t, cfg).resolve(testhelper.Context(t), req)
 	require.ErrorContains(t, err, `actor "agent-7" may not request conflict resolution`)
 }
 
@@ -586,7 +586,7 @@ func TestResolve_RequestChecksDoNotRunTheResolver(t *testing.T) {
 				tc.mutate(&req)
 			}
 
-			resp, err := client.Resolve(testhelper.Context(t), req)
+			resp, err := client.resolve(testhelper.Context(t), req)
 			require.Nil(t, resp)
 			require.ErrorContains(t, err, tc.wantErr)
 			require.NoFileExists(t, marker, "a rejected request must never reach the resolver")
@@ -607,7 +607,7 @@ func TestResolve_ConcurrentCalls(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			resp, err := client.Resolve(context.Background(), sampleRequest())
+			resp, err := client.resolve(context.Background(), sampleRequest())
 			if err == nil && string(resp.Files[0].Content) != "merged\n" {
 				err = fmt.Errorf("unexpected content %q", resp.Files[0].Content)
 			}
@@ -725,6 +725,94 @@ func TestAcquireCheckSlot_boundsTheChecksAtOnce(t *testing.T) {
 func TestAcquireCheckSlot_defaultConcurrency(t *testing.T) {
 	client := newClient(t, commandConfig([]string{"/bin/true"}))
 	require.Equal(t, config.DefaultGraftResolverCheckConcurrency, cap(client.checkSlots))
+}
+
+// TestAcquireResolveSlot_boundsTheResolutionsAtOnce: at most resolve_concurrency slots are held at
+// once; a wait for one counts against the caller's deadline and fails when it ends; a released slot
+// frees its place once, and cannot resolve any more.
+func TestAcquireResolveSlot_boundsTheResolutionsAtOnce(t *testing.T) {
+	cfg := commandConfig([]string{"/bin/true"})
+	cfg.ResolveConcurrency = 1
+	client := newClient(t, cfg)
+	ctx := testhelper.Context(t)
+
+	first, err := client.AcquireResolveSlot(ctx)
+	require.NoError(t, err)
+
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = client.AcquireResolveSlot(waitCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "waiting for a resolve slot of the resolver")
+
+	first.Release()
+	first.Release()
+	_, err = first.Resolve(ctx, sampleRequest())
+	require.ErrorContains(t, err, "resolve without a resolve slot")
+
+	second, err := client.AcquireResolveSlot(ctx)
+	require.NoError(t, err)
+	waitCtx2, cancel2 := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel2()
+	_, err = client.AcquireResolveSlot(waitCtx2)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "a second release must not free a second place")
+	second.Release()
+
+	var none *ResolveSlot
+	_, err = none.Resolve(ctx, sampleRequest())
+	require.ErrorContains(t, err, "resolve without a resolve slot")
+	none.Release()
+
+	var disabled *Client
+	_, err = disabled.AcquireResolveSlot(ctx)
+	require.ErrorIs(t, err, ErrDisabled)
+}
+
+// TestResolveSlots_apartFromTheCheckSlots: the resolutions and the checks have pools of their own
+// (PLAN10 15.8): every resolve slot held does not delay a check, and every check slot held does not
+// delay a resolution.
+func TestResolveSlots_apartFromTheCheckSlots(t *testing.T) {
+	cfg := commandConfig([]string{"/bin/true"})
+	cfg.CheckConcurrency = 1
+	cfg.ResolveConcurrency = 1
+	client := newClient(t, cfg)
+	ctx := testhelper.Context(t)
+
+	resolveSlot, err := client.AcquireResolveSlot(ctx)
+	require.NoError(t, err)
+	quick, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	checkSlot, err := client.AcquireCheckSlot(quick)
+	require.NoError(t, err, "a held resolve slot delays no check")
+
+	resolveSlot.Release()
+	quick2, cancel2 := context.WithTimeout(ctx, time.Second)
+	defer cancel2()
+	again, err := client.AcquireResolveSlot(quick2)
+	require.NoError(t, err, "a held check slot delays no resolution")
+	again.Release()
+	checkSlot.Release()
+}
+
+// TestAcquireResolveSlot_defaultConcurrency: without resolve_concurrency, the client holds
+// DefaultGraftResolverResolveConcurrency slots.
+func TestAcquireResolveSlot_defaultConcurrency(t *testing.T) {
+	client := newClient(t, commandConfig([]string{"/bin/true"}))
+	require.Equal(t, config.DefaultGraftResolverResolveConcurrency, cap(client.resolveSlots))
+}
+
+// TestNew_refusesNegativePools: a negative resolve_concurrency or resolve_rounds is refused, as a
+// negative check_concurrency is.
+func TestNew_refusesNegativePools(t *testing.T) {
+	for name, set := range map[string]func(*config.GraftResolver){
+		"resolve_concurrency": func(c *config.GraftResolver) { c.ResolveConcurrency = -1 },
+		"resolve_rounds":      func(c *config.GraftResolver) { c.ResolveRounds = -1 },
+	} {
+		cfg := commandConfig([]string{"/bin/true"})
+		set(&cfg)
+		_, err := New(cfg)
+		require.ErrorContains(t, err, "must not be negative", name)
+	}
 }
 
 // TestCheck_namesTheDeadlineThatEnded: a check request that runs out of its own timeout says so; one

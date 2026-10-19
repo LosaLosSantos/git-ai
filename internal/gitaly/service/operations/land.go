@@ -81,8 +81,20 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 		}
 	}
 
+	// A land that asks the server to resolve its conflicts is resolved out of the lane (PLAN10
+	// 15.8).
+	if in.GetResolveConflicts() && in.GetResolution() == nil {
+		return s.landResolving(ctx, in, committer)
+	}
+	return s.landOnce(ctx, in, committer, precheck, nil)
+}
+
+// landOnce lands the request once through its lane, in a batch or alone, with the precheck of an
+// agent's resolution or the pre-resolution of the server's, if any, and prunes the branch's
+// proposals once it landed.
+func (s *Server) landOnce(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
 	if s.landBatchable(ctx, in) {
-		resp, err := s.userLandBatched(ctx, in, committer, precheck)
+		resp, err := s.userLandBatched(ctx, in, committer, precheck, pre)
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +102,7 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 		return resp, nil
 	}
 
-	resp, err := s.landWithRetries(ctx, in, committer, precheck)
+	resp, err := s.landWithRetries(ctx, in, committer, precheck, pre)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +133,7 @@ func (s *Server) landPrecheckInQuarantine(ctx context.Context, in *gitalypb.User
 // On MVCC repositories, the attempt runs against a snapshot that is pinned for the whole RPC.
 // Retrying within the RPC would read the same tip again, so the conflict is reported to the
 // client instead and the client has to retry the landing.
-func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck) (*gitalypb.UserLandResponse, error) {
+func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
 	snapshotPinned := mvcc.CacheFromContext(ctx) != nil
 
 	maxAttempts := int(in.GetMaxAttempts())
@@ -130,7 +142,7 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 	}
 
 	for attempt := 1; ; attempt++ {
-		resp, err := s.landAttempt(ctx, in, committer, precheck)
+		resp, err := s.landAttempt(ctx, in, committer, precheck, pre)
 		if err == nil {
 			resp.Attempts = int32(attempt)
 			return resp, nil
@@ -194,7 +206,7 @@ func (s *Server) landAncestry(ctx context.Context, quarantineRepo *localrepo.Rep
 
 // landAttempt performs a single compare-and-swap attempt of UserLand. It returns a landConflict
 // if the branch was moved by a concurrent writer, in which case the caller retries.
-func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck) (*gitalypb.UserLandResponse, error) {
+func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
 	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), landPublishLoose, ignoreLandPhase)
 	if err != nil {
 		return nil, err
@@ -209,7 +221,7 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 
 	// The request is decided as a member of a batch is (landingAttempt.decide). The policy is not
 	// evaluated here: the update runs with the identity of the request, so the hooks judge it.
-	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in), precheck: precheck}
+	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in), precheck: precheck, preResolution: pre}
 	step, err := attempt.decide(ctx, tip, req)
 	if err != nil {
 		return nil, err
