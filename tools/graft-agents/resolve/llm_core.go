@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
@@ -20,7 +22,9 @@ const (
 	defaultLLMContextLines   = 3
 	defaultLLMMaxAnswerBytes = 1 << 20
 	defaultLLMMaxRegions     = 20
-	defaultLLMMaxDiffCells   = 8 << 20
+	// defaultLLMCallTimeout bounds one model call; the strategy's timeout bounds the whole file.
+	defaultLLMCallTimeout  = 120 * time.Second
+	defaultLLMMaxDiffCells = 8 << 20
 	// llmMaxMessageBytes bounds each commit message put in a prompt. A longer
 	// message is cut, and the prompt says so.
 	llmMaxMessageBytes = 4 << 10
@@ -57,6 +61,10 @@ type LLMOptions struct {
 	// the limit to the provider (its configured default), so that models with
 	// reasoning need no tuning here.
 	MaxTokens int
+	// CallTimeout bounds one model call (one region), within the deadline of
+	// the whole file that the caller's context carries. Zero means the
+	// default.
+	CallTimeout time.Duration
 }
 
 func (o LLMOptions) withDefaults() (LLMOptions, error) {
@@ -75,6 +83,12 @@ func (o LLMOptions) withDefaults() (LLMOptions, error) {
 	if o.MaxRegions <= 0 {
 		o.MaxRegions = defaultLLMMaxRegions
 	}
+	if o.CallTimeout < 0 {
+		return o, fmt.Errorf("resolve: invalid llm call timeout %s", o.CallTimeout)
+	}
+	if o.CallTimeout == 0 {
+		o.CallTimeout = defaultLLMCallTimeout
+	}
 	return o, nil
 }
 
@@ -82,16 +96,15 @@ func (o LLMOptions) withDefaults() (LLMOptions, error) {
 // non-nil for a content conflict (an empty file is []byte{}, an absent side
 // is nil). Base is nil when the file was added on both sides.
 //
-// OursMessage and TheirsMessage are the commit messages of the two sides (the
-// tip the change lands on, and the change), given to the model as the intent of
-// each side. They are untrusted data like the contents, and each is cut to
-// 4 KiB. Either may be empty.
+// TheirsMessage is the commit message of the change being landed, given to the
+// model as the intent of the PATCH, as synthmerge sends the message of the
+// commit it applies. It is untrusted data like the contents, cut to 4 KiB, and
+// may be empty.
 type LLMFile struct {
 	Path          string
 	Base          []byte
 	Ours          []byte
 	Theirs        []byte
-	OursMessage   string
 	TheirsMessage string
 }
 
@@ -108,6 +121,47 @@ type LLMResult struct {
 	// Hunks is the number of conflicting regions the model answered: zero
 	// for a file whose changes merged without overlap.
 	Hunks int
+	// RegionsEqualOurs is the number of those regions whose answer is OURS'
+	// region unchanged.
+	RegionsEqualOurs int
+}
+
+// LLMRegionStats receives, from the llm strategy, the counts of the last file
+// it resolved: the conflicting regions the model answered, and those whose
+// answer is OURS' region unchanged. The bench puts one in the context of a
+// case (WithLLMRegionStats) to count the answers equal to OURS per region, as
+// synthmerge's no-change check does, besides per file.
+type LLMRegionStats struct {
+	mu                 sync.Mutex
+	regions, equalOurs int
+	recorded           bool
+}
+
+// Record sets the counts of the last file resolved.
+func (s *LLMRegionStats) Record(regions, equalOurs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.regions, s.equalOurs, s.recorded = regions, equalOurs, true
+}
+
+// Get returns the counts of the last file resolved, and false when none was.
+func (s *LLMRegionStats) Get() (regions, equalOurs int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.regions, s.equalOurs, s.recorded
+}
+
+type llmRegionStatsKey struct{}
+
+// WithLLMRegionStats returns ctx carrying s, for the llm strategy to record into.
+func WithLLMRegionStats(ctx context.Context, s *LLMRegionStats) context.Context {
+	return context.WithValue(ctx, llmRegionStatsKey{}, s)
+}
+
+// llmRegionStatsFrom returns the LLMRegionStats of ctx, or nil.
+func llmRegionStatsFrom(ctx context.Context) *LLMRegionStats {
+	s, _ := ctx.Value(llmRegionStatsKey{}).(*LLMRegionStats)
+	return s
 }
 
 // ResolveLLM asks p to resolve one conflicted file: region by region, by applying THEIRS' change
@@ -228,20 +282,12 @@ func llmModel(resp *llm.Response, p llm.Provider) string {
 // llmMessages writes the commit messages of both sides, each cut to
 // llmMaxMessageBytes, as data sections. An empty message is left out. The
 // messages count towards the prompt size like the file data.
-func llmMessages(sb *strings.Builder, nonce string, f LLMFile) {
-	for _, m := range []struct{ title, text string }{
-		{"OURS COMMIT MESSAGE", f.OursMessage},
-		{"THEIRS COMMIT MESSAGE", f.TheirsMessage},
-	} {
-		if m.text == "" {
-			continue
-		}
-		text := llmClip(m.text, llmMaxMessageBytes)
-		if len(text) < len(m.text) {
-			m.title += " (cut to the first 4 KiB)"
-		}
-		llmSection(sb, nonce, m.title, text, false)
+func llmMessage(sb *strings.Builder, nonce, title, message string) {
+	text := llmClip(message, llmMaxMessageBytes)
+	if len(text) < len(message) {
+		title += " (cut to the first 4 KiB)"
 	}
+	llmSection(sb, nonce, title, text, false)
 }
 
 // llmSection writes one data section delimited by BEGIN and END lines that

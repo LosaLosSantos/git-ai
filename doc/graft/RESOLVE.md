@@ -575,8 +575,12 @@ api_key_env = "OPENROUTER_API_KEY"
 model = "openai/gpt-6-luna"
 effort = "low"
 max_tokens = 8000
-timeout = "180s"
+timeout = "2400s"   # the whole file: all its calls
 ```
+
+`call_timeout` in `[[strategy]]` (default `"120s"`) bounds each model call,
+one region; `timeout` in `[strategy.llm]` bounds the whole file, all its
+calls, and stays the outer bound.
 
 The `llm` strategy is registered by `tools/graft-agents` and uses an
 `llm.Provider` configured in `resolve.toml`. Providers are anthropic, any
@@ -593,18 +597,24 @@ differently there is one model call, whose request holds:
   `context_lines` (default 3) of context;
 - the CODE: OURS' version of the region, with the same context lines (taken
   from the file with every other conflicting region as OURS);
-- in the system message, in this order: one worked example of the task, the
-  commit messages of both sides (the tip's and the change's, as the intent of
-  each side, at most 4 KiB each), the other conflicting regions of the file
-  for reference, and the directives last, closest to the answer.
+- in the system message, in this order: one worked example of the task (its
+  sections have tags of their own, so it never reads as the answer), the
+  commit message of the change, THEIRS' (as the intent of the PATCH, at most
+  4 KiB; the tip's message is not sent, as in synthmerge), the other
+  conflicting regions of the file for reference, and the directives last,
+  closest to the answer.
 
 The model answers in plain text, the patched code between a BEGIN and an END
 line that carry the request's random token: no JSON, no response format, and
-no explanation. The answer is accepted for a region only when:
+no explanation. The last such block of the answer is read, since a model may
+draft or quote before it answers. The answer is accepted for a region only
+when:
 
 - it starts with the context lines before the region and ends with those
   after it, copied unchanged (a model that drops blank lines at a boundary is
-  given them back, up to the number of context lines less one);
+  given back up to n-2 of them, n the context lines at that boundary);
+- a `\ No newline at end of ...` note appears, if at all, only as its last
+  line, where it means that the code ends without a newline;
 - what is between them ends with a newline (unless the region ends a file
   that has no final newline) and does not read as a patch (lines starting
   with `+` or `-` when neither the CODE nor the PATCH has such lines);
@@ -615,7 +625,7 @@ rejected rejects the file, which goes to the agent. A file with more than
 `max_regions` (default 20) conflicting regions, or a region whose request is
 over `max_prompt_bytes`, is declined before any call. An answer equal to
 OURS is kept (taking the tip's version is often right); the bench counts how
-often it happens. The PATCH is our own line diff, not git's histogram diff
+often it happens, per file and per region. The PATCH is our own line diff, not git's histogram diff
 that synthmerge uses: on the benchmark sample of 300 cases the two differ in
 18 of 403 regions.
 
@@ -763,7 +773,10 @@ with HTTP 400, 401, 402 or 403 (a bad request, no or a wrong key, no credit,
 forbidden), is not billed: its worst case is released. A provider that reports
 no usage, and every other failure (a 429 or 5xx answer, a timeout, a broken
 connection, an error in the middle of a stream), is left at its worst case, as
-it may have been billed. So the recorded spend is never below the real one.
+it may have been billed. So the recorded spend is not below the real one, with
+one rare exception: the provider's transport retries of a call share its one
+booking, so a 5xx answer that was billed and then retried can be billed twice
+while booked once.
 A new calendar month (UTC) starts at zero.
 
 The spend is kept in the `state` file (`{"month": "2026-10", "spent_usd":

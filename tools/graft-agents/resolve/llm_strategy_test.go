@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
@@ -558,6 +559,43 @@ func TestLLMClip(t *testing.T) {
 	} {
 		if got := llmClip(tc.in, tc.n); got != tc.want {
 			t.Errorf("llmClip(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
+
+// TestLLMStrategyRecordsRegionStats: a caller that puts LLMRegionStats in the context gets the
+// regions of the file the strategy resolved, and those answered with OURS' region unchanged.
+func TestLLMStrategyRecordsRegionStats(t *testing.T) {
+	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
+		return wp19Answer("ours\n"), nil
+	})
+	r := wp19Build(t, wp19LLMConfig)
+	stats := &LLMRegionStats{}
+	if _, err := r.Resolve(WithLLMRegionStats(context.Background(), stats), wp19Request(wp19Conflict("a.txt"))); err != nil {
+		t.Fatal(err)
+	}
+	if regions, equal, ok := stats.Get(); !ok || regions != 1 || equal != 1 {
+		t.Fatalf("stats %d, %d, %v: want one region, equal to ours", regions, equal, ok)
+	}
+}
+
+// TestLLMStrategyCallTimeout: call_timeout bounds each call; it must be a positive duration.
+func TestLLMStrategyCallTimeout(t *testing.T) {
+	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) { return wp19Answer("x\n"), nil })
+	withCall := func(v string) string {
+		return strings.Replace(wp19LLMConfig, "paths = [", "call_timeout = "+v+"\npaths = [", 1)
+	}
+	r := wp19Build(t, withCall(`"2s"`))
+	if got := r.bindings[0].Strategy.(*llmStrategy).opt.CallTimeout; got != 2*time.Second {
+		t.Fatalf("call timeout %s, want 2s", got)
+	}
+	r = wp19Build(t, wp19LLMConfig)
+	if got := r.bindings[0].Strategy.(*llmStrategy).opt.CallTimeout; got != defaultLLMCallTimeout {
+		t.Fatalf("call timeout %s, want the default %s", got, defaultLLMCallTimeout)
+	}
+	for _, v := range []string{`"soon"`, `"0s"`, `"-1s"`, `5`} {
+		if _, err := wp19BuildErr(withCall(v)); err == nil || !strings.Contains(err.Error(), "call_timeout") {
+			t.Fatalf("call_timeout = %s: err = %v", v, err)
 		}
 	}
 }

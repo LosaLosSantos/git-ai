@@ -27,6 +27,10 @@ type Counts struct {
 	SyntaxUnchecked int `json:"syntax_unchecked"`
 	// EqualsOurs counts the accepted results equal to OURS (part of Correct and Wrong).
 	EqualsOurs int `json:"equals_ours"`
+	// Regions counts the conflicting regions of the accepted llm answers, and RegionsEqualOurs
+	// those answered with OURS' region unchanged.
+	Regions          int `json:"regions"`
+	RegionsEqualOurs int `json:"regions_equal_ours"`
 }
 
 // Accepted is the number of results that would land: correct and wrong.
@@ -52,6 +56,8 @@ func (c *Counts) add(r Result) {
 	if r.EqualsOurs {
 		c.EqualsOurs++
 	}
+	c.Regions += r.Regions
+	c.RegionsEqualOurs += r.RegionsEqualOurs
 	switch r.Outcome {
 	case OutcomeCorrect:
 		c.Correct++
@@ -225,6 +231,8 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		rep.Total.SyntaxUnchecked, rep.Total.Accepted(), strings.Join(unchecked, ", "))
 	fmt.Fprintf(&b, "\nAccepted results equal to OURS (the model kept the tip's version): %d of %d (correct %d, wrong %d).\n",
 		rep.Total.EqualsOurs, rep.Total.Accepted(), rep.equalsOurs(OutcomeCorrect), rep.equalsOurs(OutcomeWrong))
+	fmt.Fprintf(&b, "\nRegions of the accepted model answers answered with OURS' region unchanged: %d of %d.\n",
+		rep.Total.RegionsEqualOurs, rep.Total.Regions)
 	if len(rep.Rejected) > 0 {
 		reasons := make([]string, 0, len(rep.Rejected))
 		for r := range rep.Rejected {

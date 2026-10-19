@@ -24,12 +24,13 @@ import (
 //	context_lines = 3              # optional: context lines of the PATCH and the CODE
 //	max_answer_bytes = 1048576     # optional
 //	max_regions = 20               # optional: most conflicting regions per file (one call each)
+//	call_timeout = "120s"          # optional: bound on one model call (one region)
 //
 //	[strategy.llm]
 //	type = "openai"
 //	model = "llama3.1"
 //	base_url = "http://localhost:11434/v1"
-//	timeout = "120s"
+//	timeout = "120s"               # the whole file, all its calls; call_timeout bounds each
 //	max_tokens = 4096              # optional: answer limit; unset = provider default
 //
 //	[strategy.llm.options]         # provider specific; the built-in providers take none
@@ -48,9 +49,10 @@ import (
 // (package syntax: TypeScript, JavaScript, Python, Go, Rust, Java) must parse,
 // or it is a check failure; the checks configured for the path run after.
 //
-// The prompt carries the commit messages of both sides (request.messages) as
-// the intent of each side. The model reports no confidence: an answer is
-// accepted on the checks alone, and min_confidence is no longer an option.
+// The prompt carries the commit message of the change (request.messages.commit)
+// as the intent of the PATCH, as synthmerge does; the tip's message is not
+// sent. The model reports no confidence: an answer is accepted on the checks
+// alone, and min_confidence is no longer an option.
 func init() {
 	RegisterStrategy("llm", newLLMStrategy)
 }
@@ -78,7 +80,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	if _, ok := spec.Options["min_confidence"]; ok {
 		return nil, fmt.Errorf("strategy %q: min_confidence is gone: the model reports no confidence and an answer is accepted on the checks alone; remove the option", spec.Name)
 	}
-	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions"); err != nil {
+	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions", "call_timeout"); err != nil {
 		return nil, err
 	}
 
@@ -95,6 +97,11 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	}
 	if opt.MaxRegions, err = llmOptInt(spec, "max_regions"); err != nil {
 		return nil, err
+	}
+	if v, ok := spec.Options["call_timeout"]; ok {
+		if opt.CallTimeout, err = durationValue(v, "call_timeout"); err != nil || opt.CallTimeout <= 0 {
+			return nil, fmt.Errorf("strategy %q: call_timeout must be a positive Go duration", spec.Name)
+		}
 	}
 
 	cfg, err := llmProviderConfig(spec)
@@ -148,7 +155,6 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 		Path:          f.Path,
 		Ours:          llmBytes(f.Ours.Content),
 		Theirs:        llmBytes(f.Theirs.Content),
-		OursMessage:   req.Messages.Tip,
 		TheirsMessage: req.Messages.Commit,
 	}
 	if f.Base != nil {
@@ -164,6 +170,9 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 		return Resolution{}, false, nil
 	case err != nil:
 		return Resolution{}, false, err
+	}
+	if stats := llmRegionStatsFrom(ctx); stats != nil {
+		stats.Record(res.Hunks, res.RegionsEqualOurs)
 	}
 	return Resolution{Action: protocol.ActionWrite, Mode: f.Ours.Mode, Content: res.Content}, true, nil
 }

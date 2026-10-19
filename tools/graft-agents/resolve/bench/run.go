@@ -59,8 +59,13 @@ type Result struct {
 	SyntaxUnchecked bool `json:"syntax_unchecked,omitempty"`
 	// EqualsOurs marks an accepted resolution equal to OURS after the judge's normalization:
 	// taking ours is often the right answer, and the report counts how often the model did.
-	EqualsOurs bool   `json:"equals_ours,omitempty"`
-	Strategy   string `json:"strategy,omitempty"`
+	EqualsOurs bool `json:"equals_ours,omitempty"`
+	// Regions and RegionsEqualOurs count, for an accepted answer of an llm strategy, the
+	// conflicting regions the model answered and those it answered with OURS' region unchanged
+	// (synthmerge's no-change check, per region).
+	Regions          int    `json:"regions,omitempty"`
+	RegionsEqualOurs int    `json:"regions_equal_ours,omitempty"`
+	Strategy         string `json:"strategy,omitempty"`
 	// Answer is the action of an accepted resolution ("write" or "delete"); with
 	// Runner.AnswersDir its content is stored for audit and Rejudge.
 	Answer  string  `json:"answer,omitempty"`
@@ -229,7 +234,8 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	}
 
 	start := time.Now()
-	resp, err := r.Resolver.Resolve(ctx, req)
+	regionStats := &resolve.LLMRegionStats{}
+	resp, err := r.Resolver.Resolve(resolve.WithLLMRegionStats(ctx, regionStats), req)
 	res.Seconds = time.Since(start).Seconds()
 	if err != nil {
 		var unresolved *resolve.UnresolvedError
@@ -268,6 +274,13 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	}
 	judgeResult(&res, f.Content, f.Action == protocol.ActionDelete, human, c.HumanBlob == nil)
 	res.EqualsOurs = f.Action == protocol.ActionWrite && sides["ours"] != nil && bytes.Equal(normalize(f.Content), normalize(sides["ours"].Content))
+	// The region counts belong to the answer only when an llm strategy gave it: the chain may have
+	// gone on past an llm answer that a check rejected.
+	if _, llm := r.Resolver.LLMModels()[res.Strategy]; llm {
+		if regions, equal, ok := regionStats.Get(); ok {
+			res.Regions, res.RegionsEqualOurs = regions, equal
+		}
+	}
 	return res, nil
 }
 

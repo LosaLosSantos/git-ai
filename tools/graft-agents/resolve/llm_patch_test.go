@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
@@ -101,15 +102,15 @@ func TestLLMUnifiedDiff(t *testing.T) {
 	}
 }
 
-// TestLLMPatchRequestLayout: one call per region; the system message holds the worked example,
-// the commit messages, the other regions and the directives last; the user message the PATCH,
+// TestLLMPatchRequestLayout: one call per region; the system message holds the worked example
+// (with tags of its own), THEIRS' commit message, the other regions and the directives last; the user message the PATCH,
 // then the CODE with three lines of context on each side; no JSON is asked for.
 func TestLLMPatchRequestLayout(t *testing.T) {
 	base := numbered("line", 30)
 	ours := strings.NewReplacer("line 5\n", "o5\n", "line 20\n", "o20\n").Replace(base)
 	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 20\n", "t20\n").Replace(base)
 	p := patchFake(t, func(i int, _ llm.Request) (*llm.Response, error) { return llmFakeAnswer("merged\n"), nil })
-	f := LLMFile{Path: "two.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs), OursMessage: "ours did this", TheirsMessage: "theirs did that"}
+	f := LLMFile{Path: "two.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs), TheirsMessage: "theirs did that"}
 
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
@@ -138,7 +139,7 @@ func TestLLMPatchRequestLayout(t *testing.T) {
 		t.Fatal("the PATCH must come before the CODE")
 	}
 	sys := req.System
-	order := []string{"A worked example", "OURS COMMIT MESSAGE", "THEIRS COMMIT MESSAGE", "BEGIN OTHER CODE 2", "The task, for two.txt", `a line "===== BEGIN PATCHED CODE ` + nonce, "starts with the first 3 lines and ends with the last 3 lines"}
+	order := []string{"A worked example", "BEGIN EXAMPLE PATCHED CODE " + nonce, "THEIRS COMMIT MESSAGE", "BEGIN OTHER CODE 2", "The task, for two.txt", `a line "===== BEGIN PATCHED CODE ` + nonce, "starts with the first 3 lines and ends with the last 3 lines"}
 	last := -1
 	for _, s := range order {
 		i := strings.Index(sys, s)
@@ -215,7 +216,7 @@ func TestLLMCheckPatchedBoundaries(t *testing.T) {
 		t.Fatalf("got %q, %v: want the blank lines given back", got, err)
 	}
 	if _, err := llmCheckPatched("x\nnew\ny\n", llmPatchRegion{head: "\n\n\nx\n", nHead: 4, tail: "y\n", nTail: 1}, "o\n", "t\n"); err == nil {
-		t.Fatal("three dropped blank lines with four context lines accepted, the bound is three")
+		t.Fatal("three dropped blank lines with four context lines accepted, the bound is n-2, two")
 	}
 
 	end := llmPatchRegion{head: "a\n", nHead: 1}
@@ -266,5 +267,153 @@ func TestLLMPatchBounds(t *testing.T) {
 	_, err = ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 4096})
 	if !errors.Is(err, ErrLLMNotApplicable) || len(p.reqs) != 0 {
 		t.Fatalf("err = %v, calls %d", err, len(p.reqs))
+	}
+}
+
+// TestLLMPatchExampleIsNotTheAnswer: the worked example has tags of its own, so the system
+// message holds no PATCHED CODE section of the answer's tag.
+func TestLLMPatchExampleIsNotTheAnswer(t *testing.T) {
+	p := llmFixed("merged\n")
+	f := LLMFile{Path: "a.txt", Base: []byte("base\n"), Ours: []byte("ours\n"), Theirs: []byte("theirs\n")}
+	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	nonce := patchNonceRE.FindStringSubmatch(p.reqs[0].Prompt)[1]
+	if strings.Contains(p.reqs[0].System, "===== BEGIN PATCHED CODE "+nonce+" =====\n") {
+		t.Fatalf("the worked example uses the answer's tag:\n%s", p.reqs[0].System)
+	}
+}
+
+// TestLLMPatchAnswerTakesTheLastBlock: a model that drafts or quotes a block before its answer is
+// read at its last block.
+func TestLLMPatchAnswerTakesTheLastBlock(t *testing.T) {
+	const n = "0a1b"
+	block := func(body string) string {
+		return "===== BEGIN PATCHED CODE " + n + " =====\n" + body + "===== END PATCHED CODE " + n + " =====\n"
+	}
+	got, err := llmPatchAnswer("A draft:\n"+block("draft\n")+"The answer:\n"+block("final\n"), n)
+	if err != nil || got != "final\n" {
+		t.Fatalf("got %q, %v: want the last block", got, err)
+	}
+	// A last BEGIN without its END is no answer, even after a complete block.
+	if _, err := llmPatchAnswer(block("draft\n")+"===== BEGIN PATCHED CODE "+n+" =====\nfinal\n", n); err == nil || !strings.Contains(err.Error(), "has no end line") {
+		t.Fatalf("err = %v, want the missing end line", err)
+	}
+}
+
+// TestLLMPatchAnswerNoNewlineNotes: either note as the last line means no final newline; a note
+// anywhere else is not code, and rejects the answer.
+func TestLLMPatchAnswerNoNewlineNotes(t *testing.T) {
+	const n = "0a1b"
+	block := func(body string) string {
+		return "===== BEGIN PATCHED CODE " + n + " =====\n" + body + "===== END PATCHED CODE " + n + " =====\n"
+	}
+	for name, tc := range map[string]struct{ body, want, reason string }{
+		"the prompt's note last":  {"a\nb\n\\ No newline at end of data\n", "a\nb", ""},
+		"git's note last":         {"a\nb\n\\ No newline at end of file\n", "a\nb", ""},
+		"git's note in the code":  {"a\n\\ No newline at end of file\nb\n", "", `"\ No newline" note`},
+		"a note after the note":   {"a\n\\ No newline at end of file\n\\ No newline at end of data\n", "", `"\ No newline" note`},
+		"a note without its line": {"a\n\\ No newline at end of file", "", `"\ No newline" note`},
+	} {
+		got, err := llmPatchAnswer(block(tc.body), n)
+		if tc.reason != "" {
+			if !errors.Is(err, ErrLLMRejected) || !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("%s: err = %v, want %s", name, err, tc.reason)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Fatalf("%s: got %q, %v, want %q", name, got, err, tc.want)
+		}
+	}
+}
+
+// TestLLMPatchCountsRegionsEqualOurs: the result counts the regions whose answer is OURS' region
+// unchanged, and the strategy reports them, with the regions, to a caller that asks.
+func TestLLMPatchCountsRegionsEqualOurs(t *testing.T) {
+	base := numbered("line", 30)
+	ours := strings.NewReplacer("line 5\n", "o5\n", "line 20\n", "o20\n").Replace(base)
+	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 20\n", "t20\n").Replace(base)
+	p := patchFake(t, func(i int, _ llm.Request) (*llm.Response, error) {
+		if i == 0 {
+			return llmFakeAnswer("o5\n"), nil
+		}
+		return llmFakeAnswer("merged\n"), nil
+	})
+	res, err := ResolveLLM(context.Background(), p, LLMFile{Path: "x.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}, LLMOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Hunks != 2 || res.RegionsEqualOurs != 1 {
+		t.Fatalf("hunks %d, equal to ours %d: want 2 and 1", res.Hunks, res.RegionsEqualOurs)
+	}
+}
+
+// deadlineProvider records how long each call may run, and answers each region with OURS'
+// region; block makes a call wait for its context instead.
+type deadlineProvider struct {
+	left  []time.Duration
+	block bool
+}
+
+func (d *deadlineProvider) Name() string { return "deadline:test" }
+
+func (d *deadlineProvider) Complete(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("a call without a deadline")
+	}
+	d.left = append(d.left, time.Until(dl))
+	if d.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return patchWrapResponse(req, llmFakeAnswer("x\n"), nil)
+}
+
+// TestLLMPatchCallTimeout: every call has its own bound, within the deadline of the file: a call
+// that hangs fails at its bound, not at the file's.
+func TestLLMPatchCallTimeout(t *testing.T) {
+	base := numbered("line", 30)
+	ours := strings.NewReplacer("line 5\n", "o5\n", "line 20\n", "o20\n").Replace(base)
+	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 20\n", "t20\n").Replace(base)
+	f := LLMFile{Path: "x.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	d := &deadlineProvider{}
+	if _, err := ResolveLLM(ctx, d, f, LLMOptions{CallTimeout: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.left) != 2 {
+		t.Fatalf("calls %d, want 2", len(d.left))
+	}
+	for i, left := range d.left {
+		if left <= 0 || left > time.Minute {
+			t.Fatalf("call %d may run %s, want at most the call timeout", i, left)
+		}
+	}
+
+	// The file's deadline stays the outer bound.
+	short, cancelShort := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelShort()
+	d = &deadlineProvider{}
+	if _, err := ResolveLLM(short, d, f, LLMOptions{CallTimeout: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if d.left[0] > 30*time.Second {
+		t.Fatalf("call may run %s, past the file's deadline", d.left[0])
+	}
+
+	// A call that hangs ends at its own bound.
+	d = &deadlineProvider{block: true}
+	start := time.Now()
+	_, err := ResolveLLM(ctx, d, f, LLMOptions{CallTimeout: 50 * time.Millisecond})
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 10*time.Second || len(d.left) != 1 {
+		t.Fatalf("err = %v after %s, calls %d: want the first call to end at its bound", err, time.Since(start), len(d.left))
+	}
+
+	if _, err := ResolveLLM(ctx, d, f, LLMOptions{CallTimeout: -time.Second}); err == nil {
+		t.Fatal("a negative call timeout accepted")
 	}
 }

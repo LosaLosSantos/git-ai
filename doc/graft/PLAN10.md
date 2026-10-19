@@ -643,18 +643,30 @@ strategy; the whole-file mode and the JSON answers are removed):
 * PATCH: THEIRS' change to the region, a unified diff from BASE with 3 context lines (synthmerge's
   default). CODE: OURS' region with the same 3 lines before and after, taken from the file with
   every other conflicting region as OURS. The task: apply the PATCH to the CODE.
-* System message: the worked example, the commit messages of both sides (Federico's decision
-  that both go in the prompt; synthmerge sends the change's message with its commit diff), the other
-  conflicting regions of the file for reference, the directives last. User message: the PATCH,
-  then the CODE.
-* Plain-text answer between BEGIN and END lines carrying the request's random token.
+* System message: the worked example (its sections tagged EXAMPLE ..., so that it never reads as
+  the answer), THEIRS' commit message, as synthmerge sends the change's message with its commit
+  diff, the other conflicting regions of the file for reference, the directives last. User
+  message: the PATCH, then the CODE. (This text first said "both commit messages", citing it as
+  Federico's decision; the record is the PM's answer to Q3, "both commit messages in the prompt by
+  default", not a decision of Federico's. On the PM's ruling R1 sends THEIRS' message only, and
+  both messages come back, if at all, as a measured step of their own.)
+* Plain-text answer between BEGIN and END lines carrying the request's random token; the last such
+  block is read. A "\ No newline at end of ..." note is accepted only as its last line (no final
+  newline); anywhere else it rejects the answer.
 * Validation as synthmerge's: the answer starts and ends with the context lines (blank lines at a
-  boundary are given back, up to the number of context lines less one), holds both, what is between
-  them ends with a newline (unless the region ends a file without a final newline) and does not
-  read as a patch; plus our marker rule and size bound.
+  boundary are given back, up to n-2 of them, n the context lines at that boundary), holds both,
+  what is between them ends with a newline and does not read as a patch; plus our marker rule and
+  size bound.
 * An answer equal to OURS is kept: synthmerge's default (it refuses one only on request, and its
-  bench does not), and the report counts how many answers equal OURS anyway.
+  bench does not), and the report counts how many answers equal OURS anyway, per file and per
+  region (synthmerge's no-change check is per region).
 * No retry in R1 (faithful: synthmerge's retries shrink the context).
+* Each model call has its own bound (call_timeout, 120 s), within the file's bound, which holds
+  max_regions such calls (2400 s in the run's configuration; R0 had 180 s for all the regions of a
+  file), so that a file with many regions does not fail for want of time.
+* Budget: the provider's transport retries of a call share its one booking, so a 5xx answer that
+  was billed and then retried can be billed twice while booked once (rare). To fix before
+  production: book every attempt.
 
 PM's additions:
 1. A file is resolved only when every region is: the first rejected region rejects the file, which
@@ -674,6 +686,8 @@ Deviations, measured or stated:
   content conflicts, 403 regions) the two differ in 18 regions of 17 cases (`bench histogram`).
 * (c) Our worked example is a different snippet, written by us.
 * (d) One model and no consensus, as Federico decided.
+* (e) Leniency: a region at the end of a file may end without a newline when neither side has a
+  final newline; synthmerge requires the newline.
 
 **Measurement.** Luna, effort low, max_tokens 8000, routing pinned to the standard tiers, the same
 300 paired cases (`--sample 300 --seed 1`, the first 300 of the Luna 600), cap $1.20 a run, the
