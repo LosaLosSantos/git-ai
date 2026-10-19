@@ -295,7 +295,12 @@ func RunPraefectServer(
 
 		cancel()
 		<-replMgrDone
-		require.NoError(tb, <-errQ)
+		// A test that stops the server right after starting it may stop it before the goroutine
+		// above calls Serve. Serve then closes the listener and returns ErrServerStopped, the
+		// outcome of the stop, as for newMockDownstream.
+		if err := <-errQ; !errors.Is(err, grpc.ErrServerStopped) {
+			require.NoError(tb, err)
+		}
 		require.NoError(tb, db.Close())
 	}
 
