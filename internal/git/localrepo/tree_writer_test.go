@@ -173,6 +173,41 @@ func TestTreeWriter_matchesWriteEntries(t *testing.T) {
 	}
 }
 
+// TestTreeWriter_panic checks that a panic during a write, while the tree object file exists and
+// the process runs, removes the file, and that Close, as a deferred call runs it on the panic's
+// way out, ends the process.
+func TestTreeWriter_panic(t *testing.T) {
+	t.Parallel()
+
+	ctx, cfg, repo, repoPath := setupTreeWriterRepo(t)
+	blob := gittest.WriteBlob(t, cfg, repoPath, []byte("content\n"))
+
+	writer, err := repo.NewTreeWriter(ctx)
+	require.NoError(t, err)
+	var fileSeen bool
+	writer.SetTestHook(func(point string) {
+		require.Equal(t, "started", point)
+		tempDir, err := repo.StorageTempDir()
+		require.NoError(t, err)
+		entries, err := os.ReadDir(tempDir)
+		require.NoError(t, err)
+		for _, entry := range entries {
+			fileSeen = fileSeen || strings.HasPrefix(entry.Name(), "tree-object-")
+		}
+		require.NotNil(t, writer.cmd)
+		panic("injected")
+	})
+
+	require.PanicsWithValue(t, "injected", func() {
+		defer func() { require.NoError(t, writer.Close()) }()
+		_, _ = writer.write([]*TreeEntry{{Path: "file", Mode: "100644", Type: Blob, OID: blob}})
+	})
+
+	require.True(t, fileSeen, "the hook ran while the tree object file existed")
+	require.Nil(t, writer.cmd)
+	requireNoTreeObjectFiles(t, repo)
+}
+
 // TestTreeEntry_WriteWith checks that WriteWith writes the trees Write writes.
 func TestTreeEntry_WriteWith(t *testing.T) {
 	t.Parallel()

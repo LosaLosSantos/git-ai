@@ -3,6 +3,7 @@ package operations
 import (
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -23,7 +24,7 @@ import (
 )
 
 // TestUserCommitFilesReleasesProcessesAndFiles checks that a UserCommitFiles request, whether it
-// fails or succeeds, gives back its object reader and stops its tree writer, and leaves no
+// fails, panics or succeeds, gives back its object reader and stops its tree writer, and leaves no
 // temporary tree object file in the storage (PLAN9, WP96): once the cache evicts its processes,
 // no cat-file process is left running.
 func TestUserCommitFilesReleasesProcessesAndFiles(t *testing.T) {
@@ -35,9 +36,17 @@ func TestUserCommitFilesReleasesProcessesAndFiles(t *testing.T) {
 	testcfg.BuildGitalyHooks(t, cfg)
 
 	var processCache *catfile.ProcessCache
+	// panicNext makes the next request panic once it holds its object reader.
+	var panicNext atomic.Bool
 	cfg.SocketPath = testserver.RunGitalyServer(t, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
 		processCache = deps.GetCatfileCache().(*catfile.ProcessCache)
-		gitalypb.RegisterOperationServiceServer(srv, NewServer(deps))
+		operationServer := NewServer(deps)
+		operationServer.testHook = func(point string) {
+			if point == "UserCommitFiles: reader taken" && panicNext.CompareAndSwap(true, false) {
+				panic("injected")
+			}
+		}
+		gitalypb.RegisterOperationServiceServer(srv, operationServer)
 		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 		gitalypb.RegisterRepositoryServiceServer(srv, repository.NewServer(deps))
 	})
@@ -54,10 +63,17 @@ func TestUserCommitFilesReleasesProcessesAndFiles(t *testing.T) {
 
 	for _, tc := range []struct {
 		desc        string
+		panics      bool
 		startBranch string
 		requests    []*gitalypb.UserCommitFilesRequest
 		expectedErr string
 	}{
+		{
+			desc:        "a panic while the request holds its object reader",
+			panics:      true,
+			requests:    []*gitalypb.UserCommitFilesRequest{createFileHeaderRequest("file"), actionContentRequest("content\n")},
+			expectedErr: "injected",
+		},
 		{
 			desc:        "a file to delete that does not exist",
 			requests:    []*gitalypb.UserCommitFilesRequest{deleteFileHeaderRequest("missing.txt")},
@@ -80,6 +96,7 @@ func TestUserCommitFilesReleasesProcessesAndFiles(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
+			panicNext.Store(tc.panics)
 			stream, err := client.UserCommitFiles(ctx)
 			require.NoError(t, err)
 			require.NoError(t, stream.Send(headerRequest(repo, gittest.TestUser, "master", []byte("message"), tc.startBranch, "")))

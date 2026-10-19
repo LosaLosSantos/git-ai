@@ -914,6 +914,9 @@ type TreeWriter struct {
 	stderr bytes.Buffer
 	cancel context.CancelFunc
 	err    error
+
+	// testHook, when set by a test, is called at named points of a write.
+	testHook func(point string)
 }
 
 var errTreeWriterClosed = errors.New("tree writer is closed")
@@ -971,6 +974,10 @@ func (w *TreeWriter) write(entries []*TreeEntry) (_ git.ObjectID, returnedErr er
 		if err := w.start(); err != nil {
 			return "", err
 		}
+	}
+	if w.testHook != nil {
+		// The tree object file exists and the process runs.
+		w.testHook("started")
 	}
 
 	if _, err := fmt.Fprintf(w.cmd.Stdin(), "%s\n", file.Name()); err != nil {

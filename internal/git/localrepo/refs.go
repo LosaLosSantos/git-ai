@@ -113,6 +113,63 @@ func (repo *Repo) ResolveRevisionWithReader(ctx context.Context, reader catfile.
 	return info.Oid, nil
 }
 
+// ResolveBranchesExactly returns the commit of each of branches that exists under its exact
+// reference name, read through reader, the request's object reader. A branch that does not exist,
+// or that does not peel to a commit, is left out of the map.
+//
+// git resolves a name with its DWIM rules, so a missing refs/heads/x resolves through
+// refs/refs/heads/x, refs/tags/refs/heads/x or refs/remotes/refs/heads/x when one of them exists.
+// The exact name is the first name git tries, so a branch that reader cannot resolve does not
+// exist exactly either, and costs nothing more. The branches reader resolves are read by their
+// exact names with one for-each-ref, whose values reader then peels.
+func (repo *Repo) ResolveBranchesExactly(ctx context.Context, reader catfile.ObjectInfoReader, branches ...git.ReferenceName) (map[git.ReferenceName]git.ObjectID, error) {
+	wanted := make(map[git.ReferenceName]bool, len(branches))
+	var patterns []string
+	for _, branch := range branches {
+		if wanted[branch] {
+			continue
+		}
+
+		if _, err := repo.ResolveRevisionWithReader(ctx, reader, branch.Revision()+"^{commit}"); err != nil {
+			if errors.Is(err, git.ErrReferenceNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("resolving %q: %w", branch, err)
+		}
+		wanted[branch] = true
+		patterns = append(patterns, branch.String())
+	}
+
+	resolved := make(map[git.ReferenceName]git.ObjectID, len(patterns))
+	if len(patterns) == 0 {
+		return resolved, nil
+	}
+
+	refs, err := gitcmd.GetReferences(ctx, repo, gitcmd.GetReferencesConfig{Patterns: patterns})
+	if err != nil {
+		return nil, fmt.Errorf("reading branches: %w", err)
+	}
+	for _, ref := range refs {
+		// A pattern also matches the references below it, so only exact names count.
+		if !wanted[ref.Name] {
+			continue
+		}
+
+		// The value of the reference itself, as for-each-ref read it, peeled to a commit as
+		// `<branch>^{commit}` is.
+		commit, err := repo.ResolveRevisionWithReader(ctx, reader, git.Revision(ref.Target)+"^{commit}")
+		if err != nil {
+			if errors.Is(err, git.ErrReferenceNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("peeling %q: %w", ref.Name, err)
+		}
+		resolved[ref.Name] = commit
+	}
+
+	return resolved, nil
+}
+
 // GetReference looks up and returns the given reference. Returns a
 // ReferenceNotFound error if the reference was not found.
 func (repo *Repo) GetReference(ctx context.Context, reference git.ReferenceName) (git.Reference, error) {

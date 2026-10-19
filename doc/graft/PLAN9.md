@@ -674,7 +674,7 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
 | | Process | Count | From | Needed? |
 |---|---|---|---|---|
 | A | `rev-parse --verify refs/heads/<branch>^{commit}` | 1 | `commit_files.go:569` | a read: the request's object reader can answer it |
-| B | `for-each-ref --count=1 refs/heads/` (`HasBranches`) | new branch: 1 | `commit_files.go:799` (issue-3294 workaround) | only when the start branch does not resolve |
+| B | `for-each-ref --count=1 refs/heads/` (`HasBranches`) | new branch: 1 | `commit_files.go:799` (issue-3294 workaround) | only when no branch resolves; otherwise one `for-each-ref` reads the resolved branches by their exact names (15.2, item 3) |
 | C | `rev-parse --verify refs/heads/<start>^{commit}` | new branch: 1 | `commit_files.go:829` | a read |
 | D | `rev-parse --verify <oid>^{commit}` (`fetchMissingCommit`) | new branch: 1 | `commit_files.go:843` | redundant: C resolved and peeled it in the same repository |
 | E | `hash-object --stdin -w --path=<path>` | 1 per blob | `commit_files.go:655` | yes: `--path` applies the repository's attributes (clean and eol filters) to the content |
@@ -684,7 +684,7 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
 | I | `ls-tree -z -r -t <tree>:` | 1 | `tree.go:407` | reads the whole tree recursively; only the trees on the changed paths are needed |
 | J | `hash-object -t tree -w --stdin` | 1 per changed tree (depth + 1) | `tree.go:623` | one process can write every tree |
 | K | `commit-tree` | 1 | `commit.go:203` | yes (see 15.2, item 4) |
-| L | `for-each-ref --count=1 refs/heads/` | 1 | `commit_files.go:732` | only for `RepoCreated`, which A or C already decides |
+| L | `for-each-ref --count=1 refs/heads/` | 1 | `commit_files.go:732` | folded into B: `RepoCreated` is decided by the exact read |
 | M | `update-ref -z --stdin` | 1 | `update_with_hooks.go:286` | yes |
 
 ### 15.2 Design
@@ -719,19 +719,29 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
    missing, which today's writer accepts. Probe:
    `m3-work/wp96/probe_mktree2.sh`.) A malformed tree makes the process exit, so the
    request fails as today; the writer is not reused after an error.
-3. **`for-each-ref` only when nothing else decides it.** `RepoCreated` is false when A or
-   C resolved a branch; `HasBranches` runs only when neither did (an orphan commit,
-   possibly into an empty repository). B runs only when the start branch does not
-   resolve, which is where the issue-3294 workaround matters.
+3. **Branches resolve by their exact names, with one `for-each-ref`.** (Amended after
+   review.) git resolves `refs/heads/<x>` with its DWIM rules: when the branch is
+   missing, `refs/refs/heads/<x>`, `refs/tags/refs/heads/<x>` or
+   `refs/remotes/refs/heads/<x>` answers for it, both in `rev-parse` and in `cat-file`
+   (probe: `m3-work/wp96/probe_dwim.sh`). A commit could then silently start from a
+   tag. `ResolveBranchesExactly` asks the reader first; a branch the reader cannot
+   resolve does not exist exactly either, since the exact name is the first name git
+   tries. The branches it resolves (the target, and a local start branch) are read
+   exactly by one `for-each-ref`, whose values the reader peels to commits. So
+   exactly one `for-each-ref` runs per request: the exact read, or, when no branch
+   resolved, `HasBranches` (B, L). `RepoCreated` is false when the target or the
+   start branch exists exactly. A start branch in another repository is still resolved
+   there by `FindCommit`, unchanged.
 4. **Unchanged:** E, one `hash-object --path` per blob: the attributes of the path decide
    the bytes of the blob, and a batched writer cannot apply per-path attributes without a
    `check-attr` process, which costs as much as it saves for one or two files. K, one
    `commit-tree`: the existing `CommitWriter` costs two processes per request (its `git
    config` lookup and its writer) unless it outlives the request. M.
 
-Expected, one created file, any depth, existing or new branch: **5 processes**
-(cat-file, hash-object for the blob, hash-object for the trees, commit-tree, update-ref). n files: 4 + n.
-An orphan commit into an empty repository: 6 (`for-each-ref`).
+Expected, one created file, any depth, existing or new branch, or an orphan commit into an
+empty repository: **6 processes** (cat-file, for-each-ref, hash-object for the blob,
+hash-object for the trees, commit-tree, update-ref). n files: 5 + n. (5 before the exact
+resolution of item 3.)
 
 ### 15.3 What stays identical
 
@@ -745,21 +755,22 @@ An orphan commit into an empty repository: 6 (`for-each-ref`).
 * **Errors:** the same codes and messages for a missing branch, a missing start branch, an
   existing file, a missing file to update, delete or move, and directory conflicts; the
   existing `UserCommitFiles` tests run unchanged.
-* **Two answers decided differently, in one corner.** With the start branch in the same
-  repository, it is now resolved before `HasBranches`, which runs only if it does not
-  resolve; and `RepoCreated` is false without `for-each-ref` when the target or the start
-  branch resolved. Both rely on "a resolved `refs/heads/<x>` is a branch". `get_oid` also
-  tries `refs/refs/heads/<x>`, `refs/tags/refs/heads/<x>` and `refs/remotes/refs/heads/<x>`
-  when `refs/heads/<x>` is absent, so a repository with no branch but such a ref now
-  starts from that ref, where today it starts an orphan commit (probe:
-  `m3-work/wp96/probe_dwim.sh`; `rev-parse --verify` and `cat-file` resolve it alike). Today the same rules
-  already apply to the target branch and, in a repository with branches, to the start
-  branch.
-* **Kept as today, found by the differential test:** a file created below an existing
-  file (`README/x`) walks into the blob entry, which loses its ID; the tree is then
-  malformed and both writers refuse it (`writing tree: exit status 128`, an internal error
-  rather than an index error). WP96 keeps this; making it an index error is a separate
-  change.
+* **Changed on purpose: a missing branch is missing.** Before WP96, a missing target or
+  start branch resolved through a DWIM fallback reference (item 3). The commit then
+  started from it, or `update-ref` refused the request. Now the request behaves as if the
+  branch did not exist: a new branch (an orphan commit when nothing else gives a parent),
+  or a missing start branch.
+* **Changed on purpose: a file below a file.** Creating a file, a directory or a move
+  target below an existing file or submodule (`README/x`) walked into the entry and
+  cleared its ID. The tree was then malformed, the writer refused it, and the request
+  failed with an internal error (`writing tree: exit status 128`). `TreeEntry.Add` now
+  refuses the path (`ErrFileInPath`), and the request fails with the index error "A file
+  with this name already exists" for the path. The differential test found it, and, once
+  it required every sequence to write, the same class in `chmod`: a chmod of a directory
+  gave a tree entry a file's mode (a tree git refuses), and a chmod of a submodule turned
+  the gitlink into a file. `chmod` now applies to files only and answers "A file with this
+  name doesn't exist" otherwise, as `update` does. A chmod of a symlink still turns it
+  into a regular file, as before; that is unchanged.
 * **The object reader goes back to the catfile cache** at the end of the request, on every
   path (a deferred release), as today's `ReadTree` reader does. Its cache key holds the
   quarantine directory, so no other request reuses it, and the cache's TTL ends it.
@@ -770,28 +781,66 @@ An orphan commit into an empty repository: 6 (`for-each-ref`).
 
 ### 15.4 Proof
 
-* `TestUserCommitFilesProcessCount` asserts the processes by subcommand: 5 for the four
-  cases above, 7 for three files (4 + n), 6 for the orphan commit into an empty repository.
-  A process that comes back fails it.
+* `TestUserCommitFilesProcessCount` asserts the processes by subcommand: 6 for the four
+  cases above and for the orphan commit into an empty repository, 8 for three files
+  (5 + n). A process that comes back fails it.
+* `TestUserCommitFilesResolvesBranchesExactly`: with `refs/refs/heads/x`,
+  `refs/tags/refs/heads/x` or `refs/remotes/refs/heads/x` present and `refs/heads/x`
+  absent, in a repository with branches and in one without, a target branch `x` gets an
+  orphan commit on a new branch, and a start branch `x` is not found, or, without
+  branches, gives the orphan commit of the issue-3294 workaround. The decoy's commit is
+  never the parent.
 * `TestApplyActionLazyTreeMatchesRecursiveTree` applies seeded random sequences of the six
   actions to the whole tree with today's writer and to the lazy tree with the tree writer.
-  It asserts the same error for every action, the same tree ID or the same refusal for
-  every sequence, and that every action type succeeds and every index error occurs below
-  the top level. A failure names the seed (`-lazy-tree-seed` replays it). It fails when
-  the lazy read is removed from the walk.
+  It asserts the same error for every action, the same tree ID for every sequence (no
+  action leaves a tree a writer refuses), and that every action type succeeds. It also
+  asserts that every index error occurs below the top level, including a file in the way
+  of a created file, directory or move target. A failure names the seed
+  (`-lazy-tree-seed` replays it). It fails when the lazy read is removed from the walk.
 * `TestTreeWriter_matchesWriteEntries` covers edge names, git's directory order, every
   mode, missing objects (accepted), and duplicate names, file/directory clashes, invalid
   modes and empty IDs (refused with today's error). Writes after a refusal fail, and one
   process writes every tree. `TestReadTreeLazily_matchesReadTree` checks that the walked
   lazy tree equals `ReadTree`. `TestTreeWriter_quarantine` checks objects that exist only
   in the quarantine.
-* `TestUserCommitFilesReleasesProcessesAndFiles` runs failing requests (index error,
-  refused tree, missing start branch) and a successful one. After each, evicting the cache
-  leaves no cat-file process and the storage's temporary directory holds no tree object
-  file. It fails without the deferred release, or without the file removal.
+* `TestUserCommitFilesReleasesProcessesAndFiles` runs failing requests (index errors,
+  missing start branch), a request that panics while it holds its object reader
+  (injected through the server's test hook), and a successful one. After each, evicting
+  the cache leaves no cat-file process and the storage's temporary directory holds no
+  tree object file. It fails without the deferred release, or without the file removal.
+  `TestTreeWriter_panic` panics inside a write while the tree object file exists and the
+  process runs: the file is removed and the deferred `Close` ends the process.
 * The existing operations tests.
 * `UserCommitFiles` latency at 50 agents (graft-bench, as in 2.2), before and after,
-  alternated, in a window the PM grants.
+  alternated, in a window the PM grants. Measured 2026-10-19: before `d584aac`, after
+  `b677dec` (5 processes; without the exact read of 15.2 item 3, one `for-each-ref` less
+  than now). Each run used a fresh server with batching on, `--mode land`, 50 agents of
+  5 changes, conflict rate 0.2 and seed 1. The order was ABBA three times, each run
+  started once the 1-minute load was below 2. Scripts: `m3-work/wp96/window/`.
+
+  | run | lands/min | p50 (ms) | p95 (ms) | p99 (ms) | server mean (ms) |
+  |---|---:|---:|---:|---:|---:|
+  | before 1-1 | 1309 | 577 | 923 | 981 | 540 |
+  | after 1-1 | 1147 | 329 | 1333 | 1919 | 449 |
+  | after 1-2 | 1611 | 290 | 371 | 777 | 272 |
+  | before 1-2 | 1647 | 279 | 408 | 416 | 248 |
+  | before 2-1 | 2014 | 232 | 391 | 409 | 241 |
+  | after 2-1 | 1701 | 171 | 804 | 809 | 282 |
+  | after 2-2 | 1756 | 213 | 293 | 306 | 187 |
+  | before 2-2 | 1592 | 286 | 363 | 371 | 244 |
+  | before 3-1 | 1439 | 375 | 1104 | 1321 | 396 |
+  | after 3-1 | 984 | 385 | 1029 | 1081 | 412 |
+  | after 3-2 | 1948 | 177 | 304 | 320 | 186 |
+  | before 3-2 | 1909 | 200 | 520 | 547 | 266 |
+  | **median before** | 1619 | 282 | 464 | 481 | 257 |
+  | **median after** | 1656 | 251 | 588 | 793 | 277 |
+
+  p50 is lower after (-31 ms in the median, lower in 4 of 6 adjacent before/after pairs)
+  and lands per minute are level. The tail is dominated by whole-run stalls: a run either
+  has a p99 close to its p95 or one above 800 ms. Such stalls hit 3 of 6 runs after and
+  2 of 6 before, and with 250 calls per run that cannot be told apart from noise. A first, back-to-back window
+  without cooldown (load rising from 4.7 to 11.9) gave the same p50 gain and noisier
+  tails.
 
 ### 15.5 Ownership needed
 

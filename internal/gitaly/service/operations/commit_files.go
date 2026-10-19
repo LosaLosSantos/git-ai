@@ -595,16 +595,25 @@ func (s *Server) userCommitFiles(
 		return err
 	}
 	defer cancelReader()
-
-	targetBranchName := git.NewReferenceNameFromBranchName(string(header.GetBranchName()))
-	targetBranchCommit, err := quarantineRepo.ResolveRevisionWithReader(ctx, reader, targetBranchName.Revision()+"^{commit}")
-	if err != nil {
-		if !errors.Is(err, git.ErrReferenceNotFound) {
-			return fmt.Errorf("resolve target branch commit: %w", err)
-		}
-
-		// the branch is being created
+	if s.testHook != nil {
+		s.testHook("UserCommitFiles: reader taken")
 	}
+
+	// The branches are resolved by their exact names: a missing branch never resolves through a
+	// tag or another reference that git's DWIM rules would try after it.
+	targetBranchName := git.NewReferenceNameFromBranchName(string(header.GetBranchName()))
+	branchNames := []git.ReferenceName{targetBranchName}
+	var startBranchName git.ReferenceName
+	if header.GetStartSha() == "" && remoteRepo == nil && len(header.GetStartBranchName()) > 0 {
+		startBranchName = git.NewReferenceNameFromBranchName(string(header.GetStartBranchName()))
+		branchNames = append(branchNames, startBranchName)
+	}
+	branches, err := quarantineRepo.ResolveBranchesExactly(ctx, reader, branchNames...)
+	if err != nil {
+		return fmt.Errorf("resolve branches: %w", err)
+	}
+	// Empty when the branch is being created.
+	targetBranchCommit := branches[targetBranchName]
 
 	var parentCommitOID git.ObjectID
 	// startBranchResolved is whether the start branch resolved in the repository, which then has
@@ -614,10 +623,11 @@ func (s *Server) userCommitFiles(
 		parentCommitOID, startBranchResolved, err = s.resolveParentCommit(
 			ctx,
 			quarantineRepo,
-			reader,
+			branches,
 			remoteRepo,
 			targetBranchName,
 			targetBranchCommit,
+			startBranchName,
 			string(header.GetStartBranchName()),
 		)
 		if err != nil {
@@ -816,14 +826,16 @@ func sameRepository(repoA, repoB *gitalypb.Repository) bool {
 }
 
 // resolveParentCommit returns the parent commit of the new commit, and whether it is the start
-// branch of local, which then has a branch.
+// branch of local, which then has a branch. localBranches holds the commits of the target and
+// start branches of local that exist under their exact names.
 func (s *Server) resolveParentCommit(
 	ctx context.Context,
 	local *localrepo.Repo,
-	localReader catfile.ObjectInfoReader,
+	localBranches map[git.ReferenceName]git.ObjectID,
 	remote *gitalypb.Repository,
 	targetBranch git.ReferenceName,
 	targetBranchCommit git.ObjectID,
+	localStartBranch git.ReferenceName,
 	startBranch string,
 ) (git.ObjectID, bool, error) {
 	if remote == nil && startBranch == "" {
@@ -837,21 +849,25 @@ func (s *Server) resolveParentCommit(
 	refish := branch + "^{commit}"
 
 	if remote == nil {
-		// The start branch is resolved first, through the request's reader: a repository where
-		// it resolves has branches, so the workaround below matters only when it does not.
-		commit, err := local.ResolveRevisionWithReader(ctx, localReader, git.Revision(refish))
-		if err == nil {
+		if commit, ok := localBranches[localStartBranch]; ok {
 			return commit, true, nil
 		}
 
-		if hasBranches, hasBranchesErr := local.HasBranches(ctx); hasBranchesErr != nil {
-			return "", false, fmt.Errorf("has branches: %w", hasBranchesErr)
-		} else if !hasBranches {
+		// A repository whose target branch exists has branches: the workaround below matters
+		// only when it does not.
+		hasBranches := targetBranchCommit != ""
+		if !hasBranches {
+			var err error
+			if hasBranches, err = local.HasBranches(ctx); err != nil {
+				return "", false, fmt.Errorf("has branches: %w", err)
+			}
+		}
+		if !hasBranches {
 			// The first branch is being created: see the workaround below.
 			return targetBranchCommit, false, nil
 		}
 
-		return "", false, fmt.Errorf("resolving refish %q in %T: %w", refish, local, err)
+		return "", false, fmt.Errorf("resolving refish %q in %T: %w", refish, local, git.ErrReferenceNotFound)
 	}
 
 	repo, err := remoterepo.New(ctx, remote, s.conns)
