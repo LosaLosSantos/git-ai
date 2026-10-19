@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/remoterepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
@@ -91,12 +92,40 @@ func TestRepository_ResolveBranch(t *testing.T) {
 	repo, err := remoterepo.New(ctx, repoProto, pool)
 	require.NoError(t, err)
 
+	// A branch below the missing name: x does not exist, it is not ambiguous.
+	gittest.WriteRef(t, cfg, repoPath, "refs/heads/x/below", branchCommit)
+
 	oid, err := repo.ResolveBranch(ctx, "main")
 	require.NoError(t, err)
 	require.Equal(t, branchCommit, oid)
 
 	_, err = repo.ResolveBranch(ctx, "x")
 	require.Equal(t, git.ErrReferenceNotFound, err)
+
+	t.Run("branches that point to other objects", func(t *testing.T) {
+		// update-ref refuses to point a branch to anything but a commit, so only a raw write
+		// of a loose reference makes one, which only the files backend has.
+		backend, err := gitcmd.DetectReferenceBackend(ctx, repoPath)
+		require.NoError(t, err)
+		if backend.Name != "files" {
+			t.Skipf("a branch to a non-commit cannot be written in the %s backend", backend.Name)
+		}
+
+		tag := gittest.WriteTag(t, cfg, repoPath, "annotated", branchCommit.Revision(), gittest.WriteTagConfig{Message: "annotated"})
+		tree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{Path: "f", Mode: "100644", Content: "f\n"}})
+		for name, target := range map[string]git.ObjectID{"tagged": tag, "tree": tree} {
+			require.NoError(t, os.WriteFile(filepath.Join(repoPath, "refs", "heads", name), []byte(target+"\n"), mode.File))
+		}
+
+		// An annotated tag peels to its commit, as `<branch>^{commit}` does.
+		oid, err := repo.ResolveBranch(ctx, "tagged")
+		require.NoError(t, err)
+		require.Equal(t, branchCommit, oid)
+
+		// A tree does not peel to a commit: the branch does not resolve, as before.
+		_, err = repo.ResolveBranch(ctx, "tree")
+		require.Equal(t, git.ErrReferenceNotFound, err)
+	})
 
 	// The DWIM resolution, for contrast, answers with the decoy.
 	oid, err = repo.ResolveRevision(ctx, "refs/heads/x^{commit}")

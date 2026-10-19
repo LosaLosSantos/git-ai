@@ -1,7 +1,9 @@
 package localrepo
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/quarantine"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/helper/text"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 )
@@ -283,6 +286,69 @@ func TestReadTreeLazily_matchesReadTree(t *testing.T) {
 	missing := gittest.DefaultObjectHash.HashData([]byte("missing tree"))
 	_, err = repo.ReadTreeLazily(ctx, reader, missing)
 	require.ErrorContains(t, err, "check object type: object not found")
+}
+
+// TestReadTreeLazily_canonicalModes checks that the lazy tree reads legacy modes, which git no
+// longer writes but still reads, as ls-tree prints them: canonical, as git's canon_mode makes
+// them. Written back, they are then modes the tree writer accepts.
+func TestReadTreeLazily_canonicalModes(t *testing.T) {
+	t.Parallel()
+
+	ctx, cfg, repo, repoPath := setupTreeWriterRepo(t)
+
+	blob := gittest.WriteBlob(t, cfg, repoPath, []byte("content\n"))
+	subtree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{Path: "f", Mode: "100644", OID: blob}})
+	raw := func(oid git.ObjectID) []byte {
+		b, err := oid.Bytes()
+		require.NoError(t, err)
+		return b
+	}
+	var content bytes.Buffer
+	for _, entry := range []struct {
+		mode, name string
+		oid        git.ObjectID
+	}{
+		// In git's order: a directory sorts as its name with a slash.
+		{"100600", "a", blob},
+		{"100664", "b", blob},
+		{"100775", "c", blob},
+		{"120777", "d", blob},
+		{"40755", "e", subtree},
+		{"644", "f", blob},
+	} {
+		fmt.Fprintf(&content, "%s %s\x00", entry.mode, entry.name)
+		content.Write(raw(entry.oid))
+	}
+	root := git.ObjectID(text.ChompBytes(gittest.ExecOpts(t, cfg, gittest.ExecConfig{Stdin: &content},
+		"-C", repoPath, "hash-object", "-t", "tree", "-w", "--literally", "--stdin")))
+
+	expected, err := repo.ReadTree(ctx, root.Revision(), WithRecursive())
+	require.NoError(t, err)
+
+	reader, cancel, err := repo.RequestObjectReader(ctx)
+	require.NoError(t, err)
+	defer cancel()
+	lazy, err := repo.ReadTreeLazily(ctx, reader, root)
+	require.NoError(t, err)
+	require.NoError(t, lazy.Walk(func(string, *TreeEntry) error { return nil }))
+	require.Equal(t, expected, lazy)
+
+	typeNames := map[ObjectType]string{Blob: "blob", Tree: "tree", Submodule: "commit"}
+	var modes []string
+	for _, entry := range lazy.Entries {
+		modes = append(modes, entry.Mode+" "+typeNames[entry.Type]+" "+entry.Path)
+	}
+	require.Equal(t, []string{
+		"100644 blob a", "100644 blob b", "100755 blob c", "120000 blob d", "040000 tree e", "160000 commit f",
+	}, modes)
+
+	// Written back, the tree holds the canonical modes, which the tree writer accepts.
+	lazy.OID = ""
+	writer, err := repo.NewTreeWriter(ctx)
+	require.NoError(t, err)
+	require.NoError(t, lazy.WriteWith(writer))
+	require.NoError(t, writer.Close())
+	require.NotEqual(t, root, lazy.OID)
 }
 
 // TestTreeWriter_quarantine checks that the request's reader and tree writer run on the

@@ -327,6 +327,8 @@ func applyAction(
 				OID:  git.ObjectID(action.OID),
 				Mode: mode,
 				Path: filepath.Base(action.NewPath),
+				// The moved entry is a file: a later action of the request sees it as one.
+				Type: entry.Type,
 			},
 			localrepo.WithOverwriteDirectory(),
 		); err != nil {
@@ -409,6 +411,15 @@ func applyAction(
 // translateLocalrepoError converts errors returned by the `localrepo` package into nice errors that we can return to the caller.
 // Most importantly, these errors will carry metadata that helps to figure out what exactly has gone wrong.
 func translateError(err error, path string) error {
+	// A file in the way of the path: the error names that file, which already exists.
+	var fileInPath localrepo.FileInPathError
+	if errors.As(err, &fileInPath) {
+		return indexError{
+			path:      fileInPath.Path,
+			errorType: errFileExists,
+		}
+	}
+
 	switch {
 	case errors.Is(err, localrepo.ErrEntryNotFound) ||
 		errors.Is(err, localrepo.ErrObjectNotFound):
@@ -431,8 +442,7 @@ func translateError(err error, path string) error {
 			path:      path,
 			errorType: errDirectoryTraversal,
 		}
-	case errors.Is(err, localrepo.ErrEntryExists) ||
-		errors.Is(err, localrepo.ErrFileInPath):
+	case errors.Is(err, localrepo.ErrEntryExists):
 		return indexError{
 			path:      path,
 			errorType: errFileExists,

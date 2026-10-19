@@ -108,8 +108,8 @@ func (t *TreeEntry) ensureLoaded() error {
 	return nil
 }
 
-// read returns the entries of the tree oid as ls-tree describes them: a six-digit mode, the type
-// derived from the mode and the base name. Its subtrees are left to be read on demand.
+// read returns the entries of the tree oid as ls-tree describes them: the canonical mode, the type
+// it implies and the base name. Its subtrees are left to be read on demand.
 func (l *treeLoader) read(oid git.ObjectID) ([]*TreeEntry, error) {
 	object, err := l.reader.Object(l.ctx, oid.Revision())
 	if err != nil {
@@ -141,25 +141,28 @@ func (l *treeLoader) read(oid git.ObjectID) ([]*TreeEntry, error) {
 		}
 		data = rest[rawSize:]
 
-		// As ls-tree prints it: the octal value with six digits, and the type from its format
-		// bits.
 		modeValue, err := strconv.ParseUint(string(mode), 8, 32)
 		if err != nil {
 			return nil, fmt.Errorf("parsing tree %s: invalid mode %q", oid, mode)
 		}
 		entry := &TreeEntry{
 			OID:  entryOID,
-			Mode: fmt.Sprintf("%06o", modeValue),
 			Path: string(name),
 		}
+		// As ls-tree prints it: git's canon_mode, which reading a tree applies, so that a
+		// legacy mode (100664, 120777, 040755) is written back canonical, and six digits.
 		switch modeValue & 0o170000 {
+		case 0o100000:
+			entry.Mode, entry.Type = "100644", Blob
+			if modeValue&0o100 != 0 {
+				entry.Mode = "100755"
+			}
+		case 0o120000:
+			entry.Mode, entry.Type = "120000", Blob
 		case 0o040000:
-			entry.Type = Tree
-			entry.loader = l
-		case 0o160000:
-			entry.Type = Submodule
+			entry.Mode, entry.Type, entry.loader = "040000", Tree, l
 		default:
-			entry.Type = Blob
+			entry.Mode, entry.Type = "160000", Submodule
 		}
 		entries = append(entries, entry)
 	}
@@ -183,8 +186,6 @@ var (
 	ErrEntryNotFound = errors.New("entry not found")
 	// ErrEntryExists indicates an entry already exists.
 	ErrEntryExists = errors.New("entry already exists")
-	// ErrFileInPath indicates that a directory of the path is a file or a submodule.
-	ErrFileInPath = errors.New("file in the way of the path")
 	// ErrPathTraversal indicates a path contains a traversal.
 	ErrPathTraversal = errors.New("path contains traversal")
 	// ErrAbsolutePath indicates the path is an absolute path
@@ -194,6 +195,17 @@ var (
 	// ErrDisallowedPath indicates the path is invalid
 	ErrDisallowedPath = errors.New("disallowed path")
 )
+
+// FileInPathError is returned by Add when a directory of the path is a file or a submodule, so
+// that nothing can be added below it.
+type FileInPathError struct {
+	// Path is the path of the file or submodule in the way.
+	Path string
+}
+
+func (e FileInPathError) Error() string {
+	return fmt.Sprintf("file in the way of the path: %q", e.Path)
+}
 
 func validateFileCreationPath(path string) (string, error) {
 	path = filepath.Clean(path)
@@ -314,7 +326,7 @@ Loop:
 
 			// A file or a submodule is in the way: nothing can be added below it.
 			if entry.Type != Tree {
-				return ErrFileInPath
+				return FileInPathError{Path: filepath.Join(parentDirs, entry.Path)}
 			}
 
 			// We found the next directory to walk into.

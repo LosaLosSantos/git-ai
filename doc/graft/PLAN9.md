@@ -703,8 +703,14 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
      repository, when it is missing, is unchanged; the reader then sees the fetched pack). G is
      dropped (F already answered it).
    * I is replaced by a lazy tree: the root is read with `Object()` and parsed (in
-     `localrepo`, into the entries `ls-tree -r -t` gives: a six-digit mode and the type
-     from the mode's format bits), and a subtree is read only when an action descends into it
+     `localrepo`, into the entries `ls-tree -r -t` gives). Each mode becomes git's
+     `canon_mode`, which every tree read applies and `ls-tree` prints: a regular file
+     becomes `100755` when its mode has `0100`, else `100644`; a symlink becomes `120000`;
+     a directory `040000`; anything else `160000`, a submodule. The type follows the mode.
+     A legacy mode (`100664`, `100600`, `120777`, `40755`) is so written back canonical,
+     as before WP96. (Amended after review: the first version kept the raw mode, and a
+     legacy sibling in a changed directory made the writer refuse the tree; probe:
+     `m3-work/wp96/probe_canon.sh`.) A subtree is read only when an action descends into it
      (create, update, delete, move, chmod and create-dir each address one path).
      Untouched subtrees keep their ID, so `Write` skips them as today. The cost no
      longer grows with the size of the repository's tree.
@@ -731,8 +737,13 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
    exactly one `for-each-ref` runs per request: the exact read, or, when no branch
    resolved, `HasBranches` (B, L). `RepoCreated` is false when the target or the
    start branch exists exactly. A branch resolved in another repository (the request's
-   start repository) is resolved there by its exact name too, with `FindBranch`
-   (`remoterepo.ResolveBranch`) instead of `FindCommit` on `refs/heads/<x>^{commit}`.
+   start repository) is resolved there by its exact name too (`remoterepo.ResolveBranch`),
+   instead of with `FindCommit` on `refs/heads/<x>^{commit}`. `ListRefs` reads the
+   reference, and only the exact name counts, so a branch below the name
+   (`refs/heads/<x>/y`) leaves `<x>` missing, not ambiguous. `FindCommit` then peels the
+   object ID it read to a commit, as `^{commit}` did, so a branch that does not peel to a
+   commit does not resolve, as before. (The first version used `FindBranch`, which
+   answered "ambiguous" in the first case and a different error in the second.)
 4. **Unchanged:** E, one `hash-object --path` per blob: the attributes of the path decide
    the bytes of the blob, and a batched writer cannot apply per-path attributes without a
    `check-attr` process, which costs as much as it saves for one or two files. K, one
@@ -765,18 +776,34 @@ resolution of item 3.)
   target below an existing file or submodule (`README/x`) walked into the entry and
   cleared its ID. The tree was then malformed, the writer refused it, and the request
   failed with an internal error (`writing tree: exit status 128`). `TreeEntry.Add` now
-  refuses the path (`ErrFileInPath`), and the request fails with the index error "A file
-  with this name already exists" for the path. The differential test found it, and, once
+  refuses the path (`FileInPathError`), and the request fails with the index error "A file
+  with this name already exists", which names the file in the way (`README`). The
+  differential test found it, and, once
   it required every sequence to write, the same class in `chmod`: a chmod of a directory
   gave a tree entry a file's mode (a tree git refuses), and a chmod of a submodule turned
   the gitlink into a file. `chmod` now applies to files only and answers "A file with this
-  name doesn't exist" otherwise, as `update` does.
+  name doesn't exist" otherwise, as `update` does. This includes a chmod that clears the
+  executable bit of a directory, which used to succeed and changed nothing: a deliberate
+  compatibility change, accepted in review.
+* **Changed on purpose: a moved file stays a file.** A move added the moved entry without
+  its type, so the actions after it in the same request did not see a file. A chmod of
+  the moved file was refused (since the check above), an update of it was refused
+  ("doesn't exist", since the base import: the update check is that old), and a create
+  onto the moved path replaced it silently (neither "exists" branch of `Add` matched an
+  entry without type). The move now keeps the entry's type: the chmod and the update
+  apply, and the create is refused with "A file with this name already exists".
 * **Known, pre-existing, kept on purpose:** an executable chmod of a symlink (mode
   `120000`) turns it into a regular executable file (`100755`) with the link's target as
   its content. It was so before WP96 and is unchanged; the PM chose to keep it (2026-10-19).
-* **The object reader goes back to the catfile cache** at the end of the request, on every
-  path (a deferred release), as today's `ReadTree` reader does. Its cache key holds the
-  quarantine directory, so no other request reuses it, and the cache's TTL ends it.
+* **Known, pre-existing (review minor 5):** the object reader goes back to the catfile cache
+  at the end of the request, on every path (a deferred release), as the old `ReadTree`
+  reader did, once per request. Its cache key holds the quarantine directory, so no other
+  request reuses it: the entry is useless until the cache's TTL ends it.
+* **Known, pre-existing (review minor 6):** a crash of the server between `os.CreateTemp`
+  and the removal of a tree object file leaves the `tree-object-*` file in the storage's
+  temporary directory, as the commit writer's `commit-object-*` files can be left. The
+  storage's temporary directory cleaner (`internal/tempdir`, `StartCleaning`) removes it
+  once it is older than its maximum age (7 days).
 * **Git features:** `hash-object --stdin-paths` (long-standing, already used by
   `CommitWriter`) and `cat-file --batch-command` (2.36, already used by the object
   reader). The server already needs newer git
@@ -800,8 +827,21 @@ resolution of item 3.)
   It asserts the same error for every action, the same tree ID for every sequence (no
   action leaves a tree a writer refuses), and that every action type succeeds. It also
   asserts that every index error occurs below the top level, including a file in the way
-  of a created file, directory or move target. A failure names the seed
-  (`-lazy-tree-seed` replays it). It fails when the lazy read is removed from the walk.
+  of a created file, directory or move target. Half of its base trees are written with
+  `hash-object --literally` and legacy modes. A failure names the seed
+  (`-lazy-tree-seed` replays it). It fails when the lazy read is removed from the walk,
+  and when the parser keeps raw modes. The two trees share the semantics of the actions,
+  so the following tests check those semantics directly.
+* `TestUserCommitFilesScenarios`: a move then a chmod, an update, or a create of the moved
+  file; a file below a file names the file in the way; a chmod of a directory is refused
+  either way. `TestUserCommitFilesLegacyModes`: a commit into a directory with `100664`,
+  `100600` and `120777` entries writes them back canonical (the reviewer's probe).
+  `TestReadTreeLazily_canonicalModes`: every mode class against `ReadTree`.
+  `TestUserCommitFilesFetchesNestedTrees`: a parent fetched from the start repository
+  after the reader started, with nested trees that the lazy tree then reads.
+  `TestRepository_ResolveBranch`: a branch below the name, a branch to an annotated tag
+  (peeled) and to a tree (not found; files backend only, as update-ref refuses to write
+  one).
 * `TestTreeWriter_matchesWriteEntries` covers edge names, git's directory order, every
   mode, missing objects (accepted), and duplicate names, file/directory clashes, invalid
   modes and empty IDs (refused with today's error). Writes after a refusal fail, and one

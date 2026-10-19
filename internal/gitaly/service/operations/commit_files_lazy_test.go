@@ -1,11 +1,13 @@
 package operations
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,8 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/helper/text"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 )
@@ -96,8 +100,22 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 		return false
 	}
 
+	// The legacy modes that git's canon_mode reads as each canonical mode.
+	legacyModes := map[string][]string{
+		"100644": {"100644", "100664", "100600"},
+		"100755": {"100755", "100775", "100700"},
+		"120000": {"120000", "120777"},
+		"040000": {"40000", "40755"},
+		"160000": {"160000"},
+	}
+	legacyMode := func(entry *localrepo.TreeEntry) string {
+		modes := legacyModes[entry.Mode]
+		return modes[rng.IntN(len(modes))]
+	}
+
 	// writeBaseTree writes a random valid tree with regular, executable, symlink and submodule
-	// entries, through today's writer.
+	// entries: through today's writer, or, for half of the trees, with legacy modes that git no
+	// longer writes but still reads.
 	writeBaseTree := func() git.ObjectID {
 		basePaths = nil
 		root := &localrepo.TreeEntry{Mode: "040000", Type: localrepo.Tree}
@@ -115,12 +133,15 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 				entry.Mode = "100644"
 			}
 			if err := root.Add(path, entry); err != nil {
-				if !errors.Is(err, localrepo.ErrFileInPath) {
+				if !errors.As(err, &localrepo.FileInPathError{}) {
 					require.ErrorIs(t, err, localrepo.ErrEntryExists)
 				}
 				continue
 			}
 			basePaths = append(basePaths, path)
+		}
+		if rng.IntN(2) == 0 {
+			return writeLiteralTree(t, cfg, repoPath, root.Entries, legacyMode)
 		}
 		require.NoError(t, root.Write(ctx, repo))
 		return root.OID
@@ -208,6 +229,32 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 	} {
 		require.Positive(t, outcomes[expected], "seed %d: outcome %q never occurred; outcomes: %v", seed, expected, outcomes)
 	}
+}
+
+// writeLiteralTree writes the tree of entries and the trees below it with `hash-object
+// --literally`, each entry with the mode that mode gives it, and returns the tree's ID. The tree
+// can so hold modes that git no longer writes (100664, 120777, 40755): those of legacy trees,
+// which git still reads, through canon_mode.
+func writeLiteralTree(tb testing.TB, cfg config.Cfg, repoPath string, entries []*localrepo.TreeEntry, mode func(*localrepo.TreeEntry) string) git.ObjectID {
+	tb.Helper()
+
+	sorted := append([]*localrepo.TreeEntry(nil), entries...)
+	sort.Stable(localrepo.TreeEntriesByPath(sorted))
+
+	var content bytes.Buffer
+	for _, entry := range sorted {
+		oid := entry.OID
+		if entry.Type == localrepo.Tree && oid == "" {
+			oid = writeLiteralTree(tb, cfg, repoPath, entry.Entries, mode)
+		}
+		raw, err := oid.Bytes()
+		require.NoError(tb, err)
+		fmt.Fprintf(&content, "%s %s\x00", mode(entry), entry.Path)
+		content.Write(raw)
+	}
+
+	return git.ObjectID(text.ChompBytes(gittest.ExecOpts(tb, cfg, gittest.ExecConfig{Stdin: &content},
+		"-C", repoPath, "hash-object", "-t", "tree", "-w", "--literally", "--stdin")))
 }
 
 // outcome names the outcome of an action: its type, and either ok or its error, with "at depth"

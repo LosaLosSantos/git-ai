@@ -2,7 +2,9 @@ package remoterepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/feder-cr/git-ai/internal/git"
@@ -91,34 +93,44 @@ func (rr *Repo) ResolveRevision(ctx context.Context, revision git.Revision) (git
 }
 
 // ResolveBranch will dial to the remote repository and resolve the branch named branch (without
-// refs/heads/) by its exact reference name to the commit it points to. Unlike ResolveRevision,
-// whose revision git resolves with its DWIM rules, a missing branch never resolves through
-// refs/tags/refs/heads/<branch> or another reference: it returns git.ErrReferenceNotFound.
+// refs/heads/) by its exact reference name to the commit it points to, as
+// `refs/heads/<branch>^{commit}` peels it. Unlike ResolveRevision, whose revision git resolves
+// with its DWIM rules, a missing branch never resolves through refs/tags/refs/heads/<branch> or
+// another reference. It returns git.ErrReferenceNotFound when the branch does not exist (also
+// when branches below its name do, refs/heads/<branch>/x) or does not peel to a commit.
 func (rr *Repo) ResolveBranch(ctx context.Context, branch string) (git.ObjectID, error) {
-	resp, err := gitalypb.NewRefServiceClient(rr.conn).FindBranch(ctx, &gitalypb.FindBranchRequest{
+	name := git.NewReferenceNameFromBranchName(branch)
+
+	// ListRefs matches references below the pattern too: only the exact name counts.
+	stream, err := gitalypb.NewRefServiceClient(rr.conn).ListRefs(ctx, &gitalypb.ListRefsRequest{
 		Repository: rr.Repository,
-		Name:       []byte(branch),
+		Patterns:   [][]byte{[]byte(name)},
 	})
 	if err != nil {
-		return "", fmt.Errorf("find branch: %w", err)
+		return "", fmt.Errorf("list refs: %w", err)
 	}
-
-	oidHex := resp.GetBranch().GetTargetCommit().GetId()
-	if oidHex == "" {
+	var target string
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return "", fmt.Errorf("list refs: %w", err)
+		}
+		for _, ref := range resp.GetReferences() {
+			if git.ReferenceName(ref.GetName()) == name {
+				target = ref.GetTarget()
+			}
+		}
+	}
+	if target == "" {
 		return "", git.ErrReferenceNotFound
 	}
 
-	objectHash, err := rr.ObjectHash(ctx)
-	if err != nil {
-		return "", fmt.Errorf("detecting object hash: %w", err)
-	}
-
-	oid, err := objectHash.FromHex(oidHex)
-	if err != nil {
-		return "", fmt.Errorf("parsing object ID: %w", err)
-	}
-
-	return oid, nil
+	// The object ID read above, peeled as `<branch>^{commit}` is: an object ID is never
+	// resolved through a reference.
+	return rr.ResolveRevision(ctx, git.Revision(target)+"^{commit}")
 }
 
 // HasBranches will dial to the remote repository and check whether the repository has any branches.
