@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net/http"
 	"os"
@@ -124,6 +125,24 @@ func (n *realNode) sibling(t *testing.T) *realNode {
 func (n *realNode) start(t *testing.T, env ...string) {
 	t.Helper()
 
+	n.spawn(t, env...)
+
+	conn := gittest.DialService(t, n.ctx, n.clientCfg)
+	ready, cancel := context.WithTimeout(n.ctx, 2*time.Minute)
+	defer cancel()
+	// Any answer (Unimplemented included) means the server serves.
+	_, err := healthpb.NewHealthClient(conn).Check(ready, &healthpb.HealthCheckRequest{}, grpc.WaitForReady(true))
+	if ready.Err() != nil {
+		t.Fatalf("the server did not start: %v\n%s", err, n.log(t))
+	}
+}
+
+// spawn starts the server process without waiting for it to serve: for a run
+// that is expected to exit by itself (waitExit), which may happen before it
+// serves.
+func (n *realNode) spawn(t *testing.T, env ...string) {
+	t.Helper()
+
 	logFile, err := os.OpenFile(n.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = logFile.Close() })
@@ -148,15 +167,6 @@ func (n *realNode) start(t *testing.T, env ...string) {
 			<-exited
 		}
 	})
-
-	conn := gittest.DialService(t, n.ctx, n.clientCfg)
-	ready, cancel := context.WithTimeout(n.ctx, 2*time.Minute)
-	defer cancel()
-	// Any answer (Unimplemented included) means the server serves.
-	_, err = healthpb.NewHealthClient(conn).Check(ready, &healthpb.HealthCheckRequest{}, grpc.WaitForReady(true))
-	if ready.Err() != nil {
-		t.Fatalf("the server did not start: %v\n%s", err, n.log(t))
-	}
 }
 
 // kill kills the server process with SIGKILL and waits for its end.
@@ -364,15 +374,24 @@ func TestStorageLocalReferencesAfterAKillInTheDurableStep(t *testing.T) {
 	n.kill(t)
 
 	// Restarted with the crash point, the node finds the repository dirty and
-	// idle: its first durable step dies holding the lock.
-	n.start(t, localrefs.CrashEnv+"=durable_step")
+	// idle: its first durable step dies holding the lock. It may die before it
+	// serves, so the test waits for its exit only.
+	n.spawn(t, localrefs.CrashEnv+"=durable_step")
 	require.Equal(t, 75, n.waitExit(t), "the process dies in the durable step")
 	lock := filepath.Join(n.repoPath(rel), "reftable", "tables.list.lock")
-	require.FileExists(t, lock)
+	left, err := os.ReadFile(lock)
+	require.NoError(t, err, "the dead durable step left its lock")
 	require.Len(t, n.markers(t), 1, "the marker is removed only after the lock")
 
+	// The restarted node removes that lock before it serves. Its own durable
+	// step may hold a lock of its own by the time the test looks, which is
+	// another file (another nonce): the one left behind must be gone.
 	n.start(t)
-	require.NoFileExists(t, lock, "the restarted node removes the lock its durable step left")
+	if now, err := os.ReadFile(lock); err == nil {
+		require.NotEqual(t, left, now, "the restarted node removes the lock its durable step left")
+	} else {
+		require.ErrorIs(t, err, fs.ErrNotExist)
+	}
 	n.requireServed(t, rel, written)
 
 	more := writeBranches(t, n.agent(t, rel), n.ctx, base, "after-restart", 2)
