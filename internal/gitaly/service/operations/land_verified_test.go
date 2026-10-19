@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -665,6 +666,39 @@ func TestUserLand_verifiedModelResolution_aTreeThatPassedIsNotVerifiedAgain(t *t
 	require.Equal(t, 1, resolverCalls(t, rdir))
 }
 
+// lateDeadlineContext is a context whose deadline passes when the test says so: Err is then
+// DeadlineExceeded, as for a caller whose own deadline ran out.
+type lateDeadlineContext struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newLateDeadlineContext(parent context.Context) *lateDeadlineContext {
+	c := &lateDeadlineContext{Context: parent, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-parent.Done():
+			c.expire()
+		case <-c.done:
+		}
+	}()
+	return c
+}
+
+func (c *lateDeadlineContext) expire() { c.once.Do(func() { close(c.done) }) }
+
+func (c *lateDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c *lateDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 // TestUserLand_verifiedModelResolution_aCallerThatGivesUpGetsItsCancellation: a caller that cancels while
 // the land verifies, or whose own deadline passes, gets Canceled or DeadlineExceeded from the server, and
 // not the bare "verification not finished" of the internal error, nor a package: the land is not the
@@ -680,9 +714,11 @@ func TestUserLand_verifiedModelResolution_aCallerThatGivesUpGetsItsCancellation(
 			ctx, cancel := context.WithCancel(parent)
 			return ctx, cancel, cancel
 		}},
+		// The deadline passes once the verification runs, not a fixed time after the test starts: under
+		// load a fixed one can pass before the land has even begun to verify.
 		"its own deadline": {codes.DeadlineExceeded, func(parent context.Context) (context.Context, context.CancelFunc, func()) {
-			ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-			return ctx, cancel, func() {}
+			ctx := newLateDeadlineContext(parent)
+			return ctx, func() {}, ctx.expire
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
