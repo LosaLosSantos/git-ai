@@ -197,6 +197,16 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		return landStep{commit: commitID, tip: commitID}, nil
 	}
 
+	// commit_id is not on the branch, but an earlier land may have put it there as a rewritten
+	// commit, whose response was lost. Its record answers, so the change is not landed twice.
+	earlier, err := a.landedEarlier(ctx, req.reference(), tip, commitID)
+	if err != nil {
+		return landStep{}, err
+	}
+	if earlier != nil {
+		return landStep{commit: commitID, tip: tip, alreadyLanded: true, earlier: earlier}, nil
+	}
+
 	newTip, err := a.computeTip(ctx, in, plan, tip, commitID, req.committer)
 	var resolution *landResolution
 	if err != nil {

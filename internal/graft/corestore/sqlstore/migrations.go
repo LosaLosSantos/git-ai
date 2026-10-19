@@ -176,6 +176,24 @@ var sqliteMigrations = []*migrate.Migration{
 			`DROP TRIGGER graft_repositories_tombstone`,
 		},
 	},
+	{
+		// Land identity (doc/graft/PLAN11.md, 4.1): the last changelog entry that landed an
+		// original commit on a branch, written with the entry in the same transaction.
+		Id: "20261020000000_graft_land_identities",
+		Up: []string{
+			`CREATE TABLE graft_land_identities (
+				repo_id         INTEGER NOT NULL REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
+				branch          BLOB    NOT NULL,
+				original_commit TEXT    NOT NULL,
+				log_seq         INTEGER NOT NULL,
+				landed_commit   TEXT    NOT NULL,
+				PRIMARY KEY (repo_id, branch, original_commit)
+			)`,
+		},
+		Down: []string{
+			`DROP TABLE graft_land_identities`,
+		},
+	},
 }
 
 // notOwnedPackKeyMessage is the error of the trigger that refuses a changeset
@@ -353,6 +371,23 @@ var postgresMigrations = []*migrate.Migration{
 			`DROP TABLE graft_gc_allocator_marks`,
 			`DROP TRIGGER graft_repositories_tombstone ON graft_repositories`,
 			`DROP FUNCTION graft_repositories_tombstone()`,
+		},
+	},
+	{
+		// See the SQLite migration of the same ID.
+		Id: "20261020000000_graft_land_identities",
+		Up: []string{
+			`CREATE TABLE graft_land_identities (
+				repo_id         BIGINT NOT NULL REFERENCES graft_repositories (repo_id) ON DELETE CASCADE,
+				branch          BYTEA  NOT NULL,
+				original_commit TEXT   NOT NULL,
+				log_seq         BIGINT NOT NULL,
+				landed_commit   TEXT   NOT NULL,
+				PRIMARY KEY (repo_id, branch, original_commit)
+			)`,
+		},
+		Down: []string{
+			`DROP TABLE graft_land_identities`,
 		},
 	},
 }

@@ -64,8 +64,11 @@ type landStep struct {
 	tip           git.ObjectID
 	rewritten     bool
 	alreadyLanded bool
-	created       bool
-	resolution    *landResolution
+	// earlier is the earlier land of the request that is still on the branch, when it is what
+	// tells that the request is already landed (see landingAttempt.landedEarlier).
+	earlier    *landIdentity
+	created    bool
+	resolution *landResolution
 	// tipIndependent is set with an error that does not depend on the running tip: the commit ID is
 	// unparsable or does not resolve to a commit. Such an error is final wherever the request is.
 	tipIndependent bool
@@ -106,8 +109,11 @@ type landBatchOutcome struct {
 	LandedCommit  git.ObjectID
 	Rewritten     bool
 	AlreadyLanded bool
-	Created       bool
-	Resolution    *landResolution
+	// Earlier is the earlier land that tells that the request is already landed, when the record
+	// of the land tells it rather than the reachability of the commit.
+	Earlier    *landIdentity
+	Created    bool
+	Resolution *landResolution
 	// BatchSize is the number of requests of the batch, the same for every response of the batch.
 	BatchSize int
 	// BatchPosition is the zero-based index of the request in the batch, in submission
@@ -335,6 +341,7 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 		case step.alreadyLanded:
 			outs[pos].LandedCommit = cur
 			outs[pos].AlreadyLanded = true
+			outs[pos].Earlier = step.earlier
 
 			// The answer depends on the tip only while no member precedes the request. A member
 			// that does not reach the branch would take the answer away.

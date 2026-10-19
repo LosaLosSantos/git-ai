@@ -24,7 +24,7 @@ func mergeLand() sdk.LandOptions {
 	return opts
 }
 
-func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
+func TestRepo_Land_RebaseLandsAreRetried(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -33,9 +33,9 @@ func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
 		retry            sdk.UnavailableRetry
 		expectedRequests int
 	}{
-		{desc: "rebase", retry: fastRetry, expectedRequests: 1},
-		{desc: "rebase with conflict resolution", resolve: true, retry: fastRetry, expectedRequests: 1},
-		{desc: "rebase, opted in", retry: sdk.UnavailableRetry{RebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 6},
+		{desc: "rebase", retry: fastRetry, expectedRequests: 6},
+		{desc: "rebase with conflict resolution", resolve: true, retry: fastRetry, expectedRequests: 6},
+		{desc: "rebase, opted out", retry: sdk.UnavailableRetry{SkipRebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 1},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
@@ -223,4 +223,36 @@ func TestRepo_Land_RetriedResolveLandReportsItsOutcome(t *testing.T) {
 	for _, req := range fakes.operations.landRequests {
 		require.True(t, req.GetResolveConflicts(), "every call asks for the resolution")
 	}
+}
+
+func TestRepo_Land_RetriedRebaseReportsTheEarlierLand(t *testing.T) {
+	t.Parallel()
+
+	// The first call rebased the change but its answer was lost to an Unavailable: the retry
+	// answers from the record of that land, with the commit it landed as and the revert after it.
+	fakes := newFakeServices()
+	fakes.operations.landErrs = []error{status.Error(codes.Unavailable, "connection reset")}
+	fakes.operations.landResponse = &gitalypb.UserLandResponse{
+		BranchUpdate:        &gitalypb.OperationBranchUpdate{CommitId: "tip-sha"},
+		LandedCommitId:      "copy-sha",
+		AlreadyLanded:       true,
+		OldTip:              "tip-sha",
+		LandedSequence:      42,
+		RevertedByCommitId:  "revert-sha",
+		AlreadyLandedDetail: "landed as copy-sha at changelog 42; it was reverted later by revert-sha",
+	}
+	repo := dialFake(t, fakes.register).Repo("repo")
+
+	opts := validLand()
+	opts.Strategy = sdk.LandRebase
+	opts.RetryUnavailable = fastRetry
+	result, err := repo.Land(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, result.AlreadyLanded)
+	require.Equal(t, "copy-sha", result.LandedCommitID)
+	require.Equal(t, uint64(42), result.LandedSequence)
+	require.Equal(t, "revert-sha", result.RevertedByCommitID)
+	require.Equal(t, "landed as copy-sha at changelog 42; it was reverted later by revert-sha", result.AlreadyLandedDetail)
+	require.Equal(t, 1, result.UnavailableRetries)
+	require.Len(t, fakes.operations.landRequests, 2)
 }

@@ -1278,14 +1278,21 @@ message UserLandResponse {
   // now at the branch tip.
   OperationBranchUpdate branch_update = 1;
   // landed_commit_id is the commit now at the branch tip: commit_id itself
-  // when fast-forwarded, otherwise the rebased or merge commit.
+  // when fast-forwarded, otherwise the rebased or merge commit. When
+  // already_landed comes from the record of an earlier land (landed_sequence
+  // is set), it is the commit that land put on the branch, which holds the
+  // change.
   string landed_commit_id = 2;
   // rewritten is true if the server rebased or merged.
   bool rewritten = 3;
   // attempts is the number of compare-and-swap attempts used.
   int32 attempts = 4;
-  // already_landed is true if commit_id was already reachable from the tip
-  // and the branch was left unchanged.
+  // already_landed is true if the change is already on the branch and the
+  // branch was left unchanged: commit_id is reachable from the tip, or an
+  // earlier land of commit_id on this branch put a commit on it that is still
+  // reachable from the tip (landed_sequence is then set). Such a change is not
+  // landed again, also when a later commit reverted it: landing it again needs
+  // a new commit.
   bool already_landed = 5;
   // old_tip is the branch tip that was replaced (zero OID if created).
   string old_tip = 6;
@@ -1301,6 +1308,21 @@ message UserLandResponse {
   int32 batch_size = 9;
   // batch_position is the 1-based position of this request in its batch.
   int32 batch_position = 10;
+  // landed_sequence is set when already_landed comes from the record of an
+  // earlier land of commit_id on the branch: the changelog sequence of the
+  // update that landed it as landed_commit_id. Zero otherwise.
+  uint64 landed_sequence = 11;
+  // reverted_by_commit_id is the commit on the branch, after
+  // landed_commit_id, whose message says that it reverts landed_commit_id
+  // ("This reverts commit <landed_commit_id>", as git revert and graft-verify
+  // write it). It is looked for only when landed_sequence is set, and is
+  // empty when no such commit is found.
+  string reverted_by_commit_id = 12;
+  // already_landed_detail explains an already_landed answer that
+  // landed_sequence is set for: "landed as <landed_commit_id> at changelog
+  // <landed_sequence>", followed by "; it was reverted later by
+  // <reverted_by_commit_id>" when that is set. Empty otherwise.
+  string already_landed_detail = 13;
 }
 
 // UserLandError is an error returned by the UserLand RPC in some specific

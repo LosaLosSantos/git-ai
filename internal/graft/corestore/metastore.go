@@ -156,6 +156,12 @@ type MetaStore interface {
 	// ScanChangelog returns up to limit changelog entries with a sequence
 	// greater than after, in ascending order. limit <= 0 means no limit.
 	ScanChangelog(ctx context.Context, repoID int64, after uint64, limit int) ([]changelog.Entry, error)
+	// LookupLand returns the last land of the original commit on the branch
+	// reference that the changelog recorded (changelog.Entry.Lands,
+	// doc/graft/PLAN11.md): the sequence of its entry and the commit it landed
+	// as. found is false when the changelog recorded no such land. The record is
+	// written with its entry, in the same transaction.
+	LookupLand(ctx context.Context, repoID int64, reference, original string) (record changelog.LandRecord, found bool, err error)
 	// ImportHistory brings history written outside the database (shadow mode
 	// writes the file changelog and file reviews) into a tracked repository, in
 	// one transaction (doc/graft/PLAN6.md, LOCK AND HISTORY RULE). The changelog

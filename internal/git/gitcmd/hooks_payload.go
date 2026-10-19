@@ -163,6 +163,12 @@ type ChangelogMeta struct {
 	// MembersTruncated is true when Members lacks information: the resolved paths
 	// were dropped or the list was cut to fit maxChangelogMembersSize.
 	MembersTruncated bool `json:"members_truncated,omitempty"`
+	// LandReference and Lands are the identities of the changes that the updates land on
+	// that branch (see changelog.WithLands and doc/graft/PLAN11.md). They are never cut:
+	// WithLands bounds them by changelog.MaxLandsSize and refuses a land whose identities
+	// do not fit. Only the server builds them from the context, like Members.
+	LandReference string           `json:"land_reference,omitempty"`
+	Lands         []changelog.Land `json:"lands,omitempty"`
 }
 
 // IsZero reports whether m holds no metadata. ChangelogMeta holds slices and
@@ -175,7 +181,9 @@ func (m ChangelogMeta) IsZero() bool {
 		m.Invocation == "" &&
 		m.MVCCCommit == "" &&
 		len(m.Members) == 0 &&
-		!m.MembersTruncated
+		!m.MembersTruncated &&
+		m.LandReference == "" &&
+		len(m.Lands) == 0
 }
 
 // NewChangelogInvocation returns a new random value for ChangelogMeta.Invocation.
@@ -253,6 +261,7 @@ func NewHooksPayload(
 	id, hasIdentity := identity.FromContext(ctx)
 
 	members, membersTruncated := capChangelogMembers(changelog.BatchFromContext(ctx))
+	landReference, lands := changelog.LandsFromContext(ctx)
 
 	return HooksPayload{
 		Repo: &gitalypb.Repository{
@@ -281,6 +290,8 @@ func NewHooksPayload(
 			Rewritten:        changelog.IsRewritten(ctx),
 			Members:          members,
 			MembersTruncated: membersTruncated,
+			LandReference:    landReference,
+			Lands:            lands,
 			MVCCCommit:       mvccCommitHandle(ctx, cfg),
 		},
 	}

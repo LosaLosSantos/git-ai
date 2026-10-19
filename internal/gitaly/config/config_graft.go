@@ -249,6 +249,10 @@ const (
 	DefaultGraftLandBatchWindow = 10 * time.Millisecond
 	// DefaultGraftLandBatchMaxSize is the default GraftLandBatch.MaxSize.
 	DefaultGraftLandBatchMaxSize = 50
+	// MaxGraftLandBatchMaxSize is the largest GraftLandBatch.MaxSize. The update of a batch
+	// records the identity of every member (doc/graft/PLAN11.md) in the hooks payload, which
+	// bounds them (changelog.MaxLandsPerUpdate).
+	MaxGraftLandBatchMaxSize = 100
 )
 
 // WindowOrDefault parses Window, applying the default.
@@ -277,6 +281,9 @@ func (b GraftLandBatch) validate() error {
 	}
 	if b.MaxSize < 0 {
 		return fmt.Errorf("graft land batch: max_size must not be negative")
+	}
+	if b.MaxSize > MaxGraftLandBatchMaxSize {
+		return fmt.Errorf("graft land batch: max_size must not exceed %d", MaxGraftLandBatchMaxSize)
 	}
 	if _, err := b.TargetLatencyOrDefault(); err != nil {
 		return err

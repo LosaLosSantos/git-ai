@@ -92,6 +92,11 @@ type Entry struct {
 	// folded into this update, because the list was cut to fit the size limit that
 	// the hooks payload imposes (see gitcmd.ChangelogMeta).
 	MembersTruncated bool `json:"members_truncated,omitempty"`
+	// Lands are the identities of the changes that the update landed on the branch Reference, in
+	// the order they were landed: every member of a batch, or the one change of a land. They are
+	// recorded on every land path and are never cut (see Land, WithLands and doc/graft/PLAN11.md).
+	// They are empty for updates that are not lands.
+	Lands []Land `json:"lands,omitempty"`
 }
 
 // entryFields is Entry without its JSON methods.
@@ -167,6 +172,11 @@ type Meta struct {
 	// MembersTruncated is true when Members is not the complete list of the changes
 	// folded into the updates, see Entry.MembersTruncated.
 	MembersTruncated bool
+	// LandReference is the branch that Lands landed on. Only the entry of the update of that
+	// branch carries them (see LandsOf).
+	LandReference string
+	// Lands are the identities of the changes that the updates landed, see Entry.Lands.
+	Lands []Land
 }
 
 // Path returns the path of the changeset log of the repository whose git
@@ -466,6 +476,7 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 				Rewritten:        meta.Rewritten,
 				Members:          normalizeMembers(meta.Members),
 				MembersTruncated: meta.MembersTruncated,
+				Lands:            LandsOf(meta, update.Reference),
 			}
 
 			line, err := json.Marshal(entry)

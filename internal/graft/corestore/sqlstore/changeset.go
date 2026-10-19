@@ -255,6 +255,7 @@ func buildChangelogEntries(repo *repoState, meta *changelog.Meta, now time.Time,
 			Rewritten:        meta.Rewritten,
 			Members:          slices.Clone(meta.Members),
 			MembersTruncated: meta.MembersTruncated,
+			Lands:            changelog.LandsOf(*meta, u.Name),
 		})
 	}
 
