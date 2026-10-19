@@ -1179,7 +1179,10 @@ The resolution is bound to the files instead (the PM's correction):
     `tip`, `merge_base` and `messages.tip` are always empty, kept in the protocol for
     compatibility (a test asserts it). A verdict reused at another tip is then correct by
     construction: no resolver, the operator's command strategy included, can read the tip.
-    RESOLVE.md states that an answer must depend on the file only.
+    RESOLVE.md states that an answer must depend on the file only. One exception was made later
+    (15.10): `ours_message`, the intent of OURS for a file, a function of the tip's history of the
+    path. It is a hint and not an input of the verdict: it is not part of the key (the sides are),
+    and a resolver must not decide a verdict on it, only the quality of a proposal.
 * **Pre-resolve before the lane.** UserLand reads the tip T as the lane does and, in a quarantine
   it discards, merges T and the change. Skipped (the lane answers as today) when the branch does
   not exist, the change already landed, or the merge is clean. Otherwise it runs the per-file flow
@@ -1388,13 +1391,24 @@ cases. Each element has an option to switch it off, so that an ablation removes 
 step with all off is R1b byte for byte (the request of every test that pins R1b runs with all three
 off). All are on by default until the measurement says otherwise.
 
+* **The regions are git's** (`git_regions`, default on). The R1b run took its regions from our own
+  line diff, which disagreed with git's merge in 18 of the 244 accepted cases of the benchmark: in 13
+  it found no conflict where git sees one and merged without the model (7 of those 13 are wrong). The
+  regions now come from `git merge-file --diff3` on the three versions, the engine of the server, in a
+  private temporary directory with markers no line of the file can imitate (labels with a random
+  token, a marker size longer than any run of marker characters at the start of a line). Our diff is
+  the fallback when git cannot be run or a side lacks a final newline (a marker line begins a line).
+  The report is attached on every path, also for a file that git merges without the model. The
+  composition check, with these regions, agrees with the frozen prototype in 243 of 244 verdicts.
 * **Symmetric context** (`symmetric_context`). Beside THEIRS' PATCH the request gets OURS' own change
   to the region (OURS CHANGE, the unified diff base -> the CODE with the same three lines of context)
   and the commit message of OURS (`FileConflict.ours_message`: the newest commit between the merge
   base and the tip that touched the path, `git log -1 base..tip -- path`, found by the server, cut to
-  4 KiB; the bench finds it the same way from the case's merge base). Both messages and OURS CHANGE
-  are capped (`max_context_bytes`, default 4096: OURS CHANGE up to the cap, each message up to a
-  quarter), and the request says when it cut. The verdict of a file is still kept by its sides, not by
+  4 KiB; the bench finds it the same way from the case's merge base). OURS CHANGE and OURS' message
+  are capped (`max_context_bytes`, default 4096: OURS CHANGE up to the cap, the message up to a
+  quarter); THEIRS' message keeps the cap it had (4 KiB) with or without the option, so that the
+  ablation of the symmetric context removes OURS' side and changes nothing of THEIRS'. The request
+  says when it cut. The verdict of a file is still kept by its sides, not by
   this message: it is a function of the tip's history of the path, which OURS' blob stands for.
 * **Abstaining** (`abstain`). The model may answer, instead of the patched code, an ABSTAIN block with
   one or two sentences on which lines contradict and why. The last block of either kind in the answer
@@ -1422,11 +1436,10 @@ off). All are on by default until the measurement says otherwise.
   answer the strategy assembles from the base and the regions; `CompositionVerdict` checks a whole file
   for it. NTFS-style folding is not part of this check.
 * **Parity with the prototype.** The check is a port of compose2.py with the regions of this package's
-  line diff, and `CompositionVerdict` is compared with the prototype's verdicts on the 244 accepted
-  answers of R1b (offline, `TestCompositionParity`, GRAFT_COMPOSE_PARITY): 226 of 230 verdicts agree
-  (98.3%), 4 differ (the prototype's drop, duplicate and outside against the port's pass, and one
-  duplicate of "}" that the prototype passes), and for 14 the port finds no conflicting region where
-  git's merge-file finds one (the llm strategy then merges without the model).
+  regions (git's, as above), and `CompositionVerdict` is compared with the prototype's verdicts on the
+  244 accepted answers of R1b (offline, `TestCompositionParity`, GRAFT_COMPOSE_PARITY): 243 agree
+  (99.6%) and 1 differs (the prototype's drop against the port's pass). With the regions of our own
+  line diff it was 226 of 230, and 14 had no region where git's merge sees a conflict.
 * **Measurement.** One step against R1b (all three elements off) on the same 300 cases with Luna, then
   one ablation per element that removes it, only to justify that element. The result goes here when it
   is in.

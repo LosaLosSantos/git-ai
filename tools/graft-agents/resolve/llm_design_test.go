@@ -110,10 +110,13 @@ func TestLLMDesignSymmetricContextIsCapped(t *testing.T) {
 		!strings.Contains(body, "the rest of this diff is cut") {
 		t.Fatalf("OURS CHANGE of %d bytes is not cut:\n%s", len(body), body)
 	}
-	for _, title := range []string{"THEIRS COMMIT MESSAGE", "OURS COMMIT MESSAGE"} {
-		if !strings.Contains(req.System, title+" (cut to the first 256 bytes)") {
-			t.Fatalf("%s not cut and marked:\n%s", title, req.System)
-		}
+	// OURS' message has its own cap; THEIRS' keeps the one it always had, with or without the symmetric
+	// context: the ablation of the symmetric context changes nothing of THEIRS' side.
+	if !strings.Contains(req.System, "OURS COMMIT MESSAGE (cut to the first 256 bytes)") {
+		t.Fatalf("OURS' message not cut and marked:\n%s", req.System)
+	}
+	if !strings.Contains(req.System, "THEIRS COMMIT MESSAGE (cut to the first 4 KiB)") {
+		t.Fatalf("THEIRS' message has its own cap:\n%s", req.System)
 	}
 }
 
@@ -453,6 +456,7 @@ func TestLLMDesignAtTheResolver(t *testing.T) {
 		"symmetric_context": func(o LLMOptions) bool { return o.NoSymmetricContext },
 		"abstain":           func(o LLMOptions) bool { return o.NoAbstain },
 		"repair":            func(o LLMOptions) bool { return o.NoRepair },
+		"git_regions":       func(o LLMOptions) bool { return o.NoGitRegions },
 	} {
 		cfg := strings.Replace(wp19LLMConfig, `paths = ["*.txt", "**/*.txt"]`, "paths = [\"*.txt\"]\n"+key+" = false", 1)
 		s := wp19BuildStrategy(t, cfg)

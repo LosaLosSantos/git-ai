@@ -83,6 +83,9 @@ type LLMOptions struct {
 	NoRepair bool
 	// MaxContextBytes caps the symmetric context of a region. Zero means the default.
 	MaxContextBytes int
+	// NoGitRegions takes the regions from our own line diff and not from git's merge (llmFileRegions).
+	// git merge-file is used by default, and our diff is the fallback when git cannot be run.
+	NoGitRegions bool
 }
 
 func (o LLMOptions) withDefaults() (LLMOptions, error) {

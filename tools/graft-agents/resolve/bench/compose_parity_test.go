@@ -55,6 +55,7 @@ func TestCompositionParity(t *testing.T) {
 
 	ctx := context.Background()
 	same, differ, skipped := 0, 0, 0
+	regionsDiffer, noRegionDiffers := 0, 0
 	matrix := map[string]int{}
 	var lines []string
 	for _, r := range report.Results {
@@ -78,6 +79,12 @@ func TestCompositionParity(t *testing.T) {
 		answer, err := os.ReadFile(answerPath(filepath.Join(dir, "answers"), r.ID))
 		if err != nil {
 			t.Fatal(err)
+		}
+		if g, l := resolve.LLMConflictRegionsBy(sides[0], sides[1], sides[2], true), resolve.LLMConflictRegionsBy(sides[0], sides[1], sides[2], false); g != l {
+			regionsDiffer++
+			if g == 0 || l == 0 {
+				noRegionDiffers++
+			}
 		}
 		got, problems, ok := resolve.CompositionVerdict(sides[0], sides[1], sides[2], answer)
 		if !ok {
@@ -104,6 +111,7 @@ func TestCompositionParity(t *testing.T) {
 		t.Log(l)
 	}
 	t.Logf("same %d, differ %d, port found no region %d", same, differ, skipped)
+	t.Logf("conflict regions: git and our diff differ in %d of the cases, %d of them where one sees none", regionsDiffer, noRegionDiffers)
 	if total := same + differ; total > 0 && differ*20 > total {
 		t.Fatalf("%d of %d verdicts differ from the prototype's", differ, total)
 	}

@@ -238,7 +238,8 @@ Request (server to resolver):
  "files": [{"path": "a/b.go", "kind": "content",
             "base":   {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
             "ours":   {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
-            "theirs": {"oid": "<oid>", "mode": "100644", "content": "<base64>"}}],
+            "theirs": {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
+            "ours_message": "<message of the newest commit of the tip's side that touched the path>"}],
  "limits": {"max_file_bytes": 1048576}}
 ```
 
@@ -249,6 +250,13 @@ Request (server to resolver):
   below), so an answer for a file must depend only on the file: its path, its
   sides and their modes, the change's message and the resolver's own
   configuration, never on the tip.
+- `ours_message` (per file, optional) is the intent of OURS: the commit message
+  of the newest commit between the merge base and the tip that touched the
+  path (at most 4 KiB, untrusted data like the contents). **It is a hint for a
+  resolver that wants to explain OURS' side to a model, and it is not part of
+  the key under which the server keeps a file's answer**: the server reuses an
+  answer when the sides are the same, whatever the message. A resolver must not
+  let its verdict depend on it, only the quality of a proposal.
 - Any side may be `null` when it is absent (for example in an add-add
   conflict the base is `null`).
 - `kind` is one of `content`, `modify-delete`, `add-add`, `mode`.
@@ -279,6 +287,12 @@ Response (resolver to server):
   The name in `resolver` decides nothing: it may be a list joined over
   rounds, or cut to `,+N`, and a name that says `llm` makes no rule's file a
   model's.
+- `report` (per file, optional) is the composition report of a model's
+  resolution: lines of text that say what it keeps, drops and repeats of the
+  two sides' changes. It is a report: nothing in it decides whether anything
+  lands. The server shows it to the agent as the start of the explanation of
+  the file's proposal (cut to 512 bytes). At most 16 lines are produced by
+  graft-resolve.
 - `resolver` names the resolver. It goes into the `Graft-Resolved-By`
   trailer, so it must be 1 to 128 bytes of printable, single-line UTF-8.
   The server answers with one `resolver` for a land it resolved in rounds (the
@@ -819,12 +833,21 @@ own on the `[[strategy]]` table, on by default (PLAN10 15.10):
   the region (OURS CHANGE: a diff from BASE to the CODE) and the commit message
   of OURS (the newest commit of the tip's side that touched the path, found by
   the server). `max_context_bytes` (default 4096) caps OURS CHANGE and, by a
-  quarter each, the two messages; the request says when it cut.
+  quarter, the message of OURS; the message of THEIRS keeps its own cap of 4
+  KiB with or without the option; the request says when it cut.
 - `abstain`: the model may answer that the two changes contradict each other,
   with a reason, instead of the patched code. The file is then abstained: no
   proposal, and the reason goes to the agent in the package.
+- `git_regions`: the regions of the file are those of git's own merge
+  (`git merge-file --diff3` on the three versions), so that "no conflict" means
+  what it means to git and the model is asked what git calls a conflict. Our own
+  line diff is the fallback when git cannot be run or a side lacks a final
+  newline, and with the option set to `false`.
 - `repair`: one repair round per region, driven only by what the deterministic
-  checks found, quoted back in their exact words with the previous answer: a
+  checks found, quoted back in their exact words with the previous answer as the
+  block the model writes (its patched code between its tags; for a region that
+  was valid, with the context lines of the CODE), and only if the request fits
+  `max_prompt_bytes`: a
   rule of an answer that was broken, a change that the answer drops or repeats
   (the composition check), the first syntax error of the file mapped to its
   region. A region is asked again once at most; the repaired answer is kept if

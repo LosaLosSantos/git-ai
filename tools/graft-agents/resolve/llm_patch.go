@@ -34,15 +34,14 @@ type llmPatchRegion struct {
 	oursPatch string
 }
 
-// llmPatchRegions returns the request material of each conflicting region of regions, in order.
-func llmPatchRegions(base []string, regions []llmRegion, contextLines int) []llmPatchRegion {
+// llmPatchRegions returns the request material of each conflicting region of regions (llmFileRegions),
+// in order.
+func llmPatchRegions(regions []llmRegion, contextLines int) []llmPatchRegion {
 	// OURS' file with every conflicting region as OURS, and where each region lies in it.
 	var local []string
 	spans := map[int][2]int{}
-	pos := 0
 	for i := range regions {
 		r := &regions[i]
-		local = append(local, base[pos:r.start]...)
 		start := len(local)
 		if r.clean {
 			local = append(local, llmSplitLines([]byte(r.merged))...)
@@ -50,9 +49,7 @@ func llmPatchRegions(base []string, regions []llmRegion, contextLines int) []llm
 			local = append(local, llmSplitLines([]byte(r.ours))...)
 			spans[i] = [2]int{start, len(local)}
 		}
-		pos = r.end
 	}
-	local = append(local, base[pos:]...)
 
 	var out []llmPatchRegion
 	for i := range regions {
@@ -158,11 +155,9 @@ func llmPatchSystem(f LLMFile, regions []llmPatchRegion, k int, nonce string, op
 
 	if f.TheirsMessage != "" {
 		sb.WriteString("What THEIRS meant to do, in its commit message:\n\n")
-		if symmetric {
-			llmMessageCapped(&sb, nonce, "THEIRS COMMIT MESSAGE", f.TheirsMessage, opt.MaxContextBytes/4)
-		} else {
-			llmMessage(&sb, nonce, "THEIRS COMMIT MESSAGE", f.TheirsMessage)
-		}
+		// THEIRS' message has the cap it always had, with or without the symmetric context: the
+		// ablation of the symmetric context removes OURS' side and changes nothing of THEIRS'.
+		llmMessage(&sb, nonce, "THEIRS COMMIT MESSAGE", f.TheirsMessage)
 	}
 	if symmetric && f.OursMessage != "" {
 		sb.WriteString("What OURS meant to do, in the commit message of its change to this file:\n\n")
@@ -251,13 +246,25 @@ func llmCapDiff(diff string, n int) string {
 	return cut + "... (the rest of this diff is cut to keep the request short)\n"
 }
 
+// llmPreviousAnswer is the previous answer of a repair round as the model writes an answer: the patched
+// code between the tags of its block, whatever triggered the round (the code as it wrote it when a
+// rule of an answer was broken, the head, the region and the tail of the CODE when the region was
+// valid and a check found something in it).
+func llmPreviousAnswer(nonce, body string) string {
+	body = llmClip(body, 16<<10)
+	if body != "" && !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	return fmt.Sprintf("===== BEGIN PATCHED CODE %s =====\n%s===== END PATCHED CODE %s =====\n", nonce, body, nonce)
+}
+
 // llmRepairUser returns the user message of a repair round: the request of the first call, the
 // answer that the checks found fault with, and the findings, quoted exactly as the checks put them.
 // Nothing in it is the model's opinion of itself or a guess: the checks are deterministic.
 func llmRepairUser(r llmPatchRegion, nonce string, opt LLMOptions, previous string, findings []string) string {
 	var sb strings.Builder
 	sb.WriteString(llmPatchUser(r, nonce, opt))
-	llmSection(&sb, nonce, "YOUR PREVIOUS ANSWER", llmClip(previous, 16<<10), false)
+	llmSection(&sb, nonce, "YOUR PREVIOUS ANSWER", previous, false)
 	sb.WriteString("The checks of the server found these problems in your previous answer. They are exact and deterministic. Answer again as before, with the problems fixed and nothing else changed:\n")
 	for _, f := range findings {
 		sb.WriteString("- " + f + "\n")
@@ -411,17 +418,11 @@ type LLMPatch struct {
 // requests with contextLines lines of context, or nil when a diff is too large to compute. The
 // bench compares them with other diff algorithms.
 func LLMPatches(base, ours, theirs []byte, contextLines int) []LLMPatch {
-	b := llmSplitLines(base)
-	oursEdits, err := llmDiff(b, llmSplitLines(ours), defaultLLMMaxDiffCells)
+	regions, err := llmFileRegions(context.Background(), base, ours, theirs, true)
 	if err != nil {
 		return nil
 	}
-	theirsEdits, err := llmDiff(b, llmSplitLines(theirs), defaultLLMMaxDiffCells)
-	if err != nil {
-		return nil
-	}
-	regions := llmRegions(b, oursEdits, theirsEdits)
-	material := llmPatchRegions(b, regions, contextLines)
+	material := llmPatchRegions(regions, contextLines)
 	out := make([]LLMPatch, 0, len(material))
 	k := 0
 	for i := range regions {
@@ -436,19 +437,14 @@ func LLMPatches(base, ours, theirs []byte, contextLines int) []LLMPatch {
 }
 
 // LLMConflictRegions returns the number of regions of a file that the llm strategy sends to the
-// model (the regions both sides changed differently), or -1 when a diff is too large to compute.
+// model (the regions git's merge calls conflicts), or -1 when a diff is too large to compute.
 func LLMConflictRegions(base, ours, theirs []byte) int {
-	b := llmSplitLines(base)
-	oursEdits, err := llmDiff(b, llmSplitLines(ours), defaultLLMMaxDiffCells)
-	if err != nil {
-		return -1
-	}
-	theirsEdits, err := llmDiff(b, llmSplitLines(theirs), defaultLLMMaxDiffCells)
+	regions, err := llmFileRegions(context.Background(), base, ours, theirs, true)
 	if err != nil {
 		return -1
 	}
 	n := 0
-	for _, r := range llmRegions(b, oursEdits, theirsEdits) {
+	for _, r := range regions {
 		if !r.clean {
 			n++
 		}
@@ -492,38 +488,10 @@ func llmParseAnswer(text, nonce string, abstain bool) (patched, reason string, e
 	return patched, "", err
 }
 
-// llmAssembleSpans is llmAssemble, with the lines of each conflicting region's answer in the result:
-// spans[i] is [first, end) in 0-based lines of the file.
-func llmAssembleSpans(base []string, regions []llmRegion) (string, map[int][2]int) {
-	var sb strings.Builder
-	spans := map[int][2]int{}
-	lines := func() int {
-		n := strings.Count(sb.String(), "\n")
-		if s := sb.String(); s != "" && !strings.HasSuffix(s, "\n") {
-			n++
-		}
-		return n
-	}
-	pos := 0
-	for i := range regions {
-		r := &regions[i]
-		sb.WriteString(strings.Join(base[pos:r.start], ""))
-		if r.clean {
-			sb.WriteString(r.merged)
-		} else {
-			first := lines()
-			sb.WriteString(r.answer)
-			spans[i] = [2]int{first, lines()}
-		}
-		pos = r.end
-	}
-	sb.WriteString(strings.Join(base[pos:], ""))
-	return sb.String(), spans
-}
-
 // llmRegionAtLine returns the conflicting region whose answer holds the 1-based line of the result,
-// or the one that ends right before it or starts right after it (a syntax error is often reported at
-// the line that follows the cause). It reports false when no region is that close.
+// or the one whose answer ends on the line right before it or starts on the line right after it (a
+// syntax error is often reported at the line that follows the cause). It reports false when no region
+// is that close.
 func llmRegionAtLine(spans map[int][2]int, line int) (int, bool) {
 	at := line - 1
 	best, found := -1, false
@@ -531,7 +499,7 @@ func llmRegionAtLine(spans map[int][2]int, line int) (int, bool) {
 		if s[0] <= at && at < s[1] {
 			return i, true
 		}
-		if (at >= s[1] && at-s[1] < 2) || (at < s[0] && s[0]-at < 2) {
+		if at == s[1] || at == s[0]-1 {
 			if !found || i < best {
 				best, found = i, true
 			}
@@ -571,9 +539,11 @@ func llmReport(comps []llmComposition, repairs int) []string {
 	return out
 }
 
-// llmResolvePatch resolves the file region by region (see the top of this file). The regions
-// that only one side changed, or both the same way, are merged locally. A file with more than
-// MaxRegions conflicting regions, or a region whose request is over MaxPromptBytes, is declined
+// llmResolvePatch resolves the file region by region (see the top of this file). The regions are
+// those of git's own merge of the three versions (llmFileRegions): a region that git does not call a
+// conflict is merged without the model, and what git calls one is what the model is asked. The
+// regions that only one side changed, or both the same way, are merged locally. A file with more
+// than MaxRegions conflicting regions, or a region whose request is over MaxPromptBytes, is declined
 // before any call. The file is resolved only when every region is: the first rejected region
 // rejects the file, and no partial resolution is returned.
 //
@@ -583,21 +553,16 @@ func llmReport(comps []llmComposition, repairs int) []string {
 // abstained with its reason: no guess), and ONE repair round, driven only by findings of the
 // deterministic checks quoted back exactly: the anchors of the answer, the composition drops and
 // duplicates of the region, and the syntax error of the assembled file, mapped to the region it is
-// in. A region is repaired at most once. The composition report goes with the result.
+// in. A region is repaired at most once, and only if the repair request fits max_prompt_bytes. The
+// composition report goes with the result, on every path.
 //
 // crlf says that the file was CRLF and is sent as LF (ResolveLLM): CRLF in an answer is read as LF.
 // The raw text of a rejected answer goes to the LLMRegionStats of ctx, if any, for audit.
 func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOptions, nonce string, crlf bool) (LLMResult, error) {
-	base := llmSplitLines(f.Base)
-	oursEdits, err := llmDiff(base, llmSplitLines(f.Ours), defaultLLMMaxDiffCells)
+	regions, err := llmFileRegions(ctx, f.Base, f.Ours, f.Theirs, !opt.NoGitRegions)
 	if err != nil {
 		return LLMResult{}, fmt.Errorf("%w: %v", ErrLLMNotApplicable, err)
 	}
-	theirsEdits, err := llmDiff(base, llmSplitLines(f.Theirs), defaultLLMMaxDiffCells)
-	if err != nil {
-		return LLMResult{}, fmt.Errorf("%w: %v", ErrLLMNotApplicable, err)
-	}
-	regions := llmRegions(base, oursEdits, theirsEdits)
 
 	var conflicting []int
 	for i := range regions {
@@ -606,25 +571,28 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		}
 	}
 	if len(conflicting) == 0 {
+		report := []string{"git's merge sees no conflict in the file: it was merged without the model"}
+		if stats := llmRegionStatsFrom(ctx); stats != nil {
+			stats.RecordReport(report)
+		}
 		return LLMResult{
-			Content:     []byte(llmAssemble(base, regions)),
+			Content:     []byte(llmJoin(regions)),
 			Explanation: "no overlapping changes, merged without the model",
 			Model:       p.Name(),
+			Report:      report,
 		}, nil
 	}
 	if len(conflicting) > opt.MaxRegions {
 		return LLMResult{}, fmt.Errorf("%w: %d conflicting regions exceed max_regions %d", ErrLLMNotApplicable, len(conflicting), opt.MaxRegions)
 	}
 
-	material := llmPatchRegions(base, regions, opt.ContextLines)
+	material := llmPatchRegions(regions, opt.ContextLines)
 	// Every request is built before the first call: a region whose request is too large declines
 	// the file without spending calls on the others.
 	type request struct{ system, user string }
 	requests := make([]request, len(material))
 	for k := range material {
 		requests[k] = request{system: llmPatchSystem(f, material, k, nonce, opt), user: llmPatchUser(material[k], nonce, opt)}
-		// A repair round repeats the user message and adds the previous answer and the findings: it must
-		// fit too, or the region is declined before any call rather than half way.
 		if size := len(requests[k].system) + len(requests[k].user); size > opt.MaxPromptBytes {
 			return LLMResult{}, fmt.Errorf("%w: conflicting region %d needs a request of %d bytes, more than %d", ErrLLMNotApplicable, k+1, size, opt.MaxPromptBytes)
 		}
@@ -657,23 +625,24 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		return resp, nil
 	}
 	// evaluate reads one answer for region k: the replacement it holds, why it abstained, or the rule
-	// it broke (an ErrLLMRejected).
-	evaluate := func(k int, resp *llm.Response) (region, abstained string, err error) {
+	// it broke (an ErrLLMRejected). patched is the code of its block as the model wrote it, when it
+	// wrote one: what a repair quotes back.
+	evaluate := func(k int, resp *llm.Response) (region, abstained, patched string, err error) {
 		patched, reason, err := llmParseAnswer(resp.Text, nonce, !opt.NoAbstain)
 		if err != nil || reason != "" {
-			return "", reason, err
+			return "", reason, "", err
 		}
 		if crlf {
 			patched = strings.ReplaceAll(patched, "\r\n", "\n")
 		}
 		r := &regions[conflicting[k]]
 		if region, err = llmCheckPatched(patched, material[k], r.ours, r.theirs); err != nil {
-			return "", "", err
+			return "", "", patched, err
 		}
 		if err := llmCheckAnswer(region, opt); err != nil {
-			return "", "", err
+			return "", "", patched, err
 		}
-		return region, "", nil
+		return region, "", patched, nil
 	}
 	rejected := func(k int, err error, raw ...string) error {
 		err = fmt.Errorf("region %d: %w", k+1, err)
@@ -688,29 +657,34 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		}
 		return &llmAbstainError{region: k + 1, reason: reason}
 	}
-	// repair makes the one repair round of region k: the findings quoted back, the answer read again.
-	// It returns the new replacement, or why it abstained, or the rule it broke.
+	// repair makes the one repair round of region k: the findings quoted back with the previous
+	// answer, always as the block the model writes (the patched code between its tags), and the
+	// answer read again. It reports false, without a call, when the request would not fit
+	// max_prompt_bytes. It returns the new replacement, or why it abstained, or the rule it broke.
 	repaired := map[int]bool{}
-	repair := func(k int, previous string, findings []string) (*llm.Response, string, string, error) {
-		repaired[k] = true
-		repairs++
-		resp, err := ask(requests[k].system, llmRepairUser(material[k], nonce, opt, previous, findings))
-		if err != nil {
-			return nil, "", "", err
+	repair := func(k int, previousBody string, findings []string) (fitted bool, resp *llm.Response, region, reason string, err error) {
+		user := llmRepairUser(material[k], nonce, opt, llmPreviousAnswer(nonce, previousBody), findings)
+		if len(requests[k].system)+len(user) > opt.MaxPromptBytes {
+			return false, nil, "", "", nil
 		}
-		region, reason, err := evaluate(k, resp)
-		return resp, region, reason, err
+		repaired[k] = true
+		resp, err = ask(requests[k].system, user)
+		if err != nil {
+			return true, nil, "", "", err
+		}
+		repairs++
+		region, reason, _, err = evaluate(k, resp)
+		return true, resp, region, reason, err
 	}
 
 	comps := make([]llmComposition, len(conflicting))
-	equalOurs := 0
 	for k, i := range conflicting {
 		r := &regions[i]
 		resp, err := ask(requests[k].system, requests[k].user)
 		if err != nil {
 			return LLMResult{}, err
 		}
-		region, reason, err := evaluate(k, resp)
+		region, reason, patched, err := evaluate(k, resp)
 		switch {
 		case reason != "":
 			return LLMResult{}, abstained(k, reason)
@@ -718,10 +692,17 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 			return LLMResult{}, rejected(k, err, resp.Text)
 		case err != nil:
 			// A rule of an answer was broken (the anchors, the newline, a patch, markers, size): one
-			// repair round, with the rule's own words.
+			// repair round, with the rule's own words, quoting the code of the block as the model wrote
+			// it (the whole answer when it wrote none).
 			finding := strings.TrimPrefix(err.Error(), ErrLLMRejected.Error()+": ")
-			resp2, region2, reason2, err2 := repair(k, resp.Text, []string{finding})
+			previous := patched
+			if previous == "" {
+				previous = llmClip(resp.Text, 16<<10)
+			}
+			fitted, resp2, region2, reason2, err2 := repair(k, previous, []string{finding})
 			switch {
+			case !fitted:
+				return LLMResult{}, rejected(k, err, resp.Text)
 			case err2 != nil && !errors.Is(err2, ErrLLMRejected):
 				return LLMResult{}, err2
 			case reason2 != "":
@@ -736,43 +717,37 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		if !opt.NoRepair && !repaired[k] && len(comps[k].problems) > 0 {
 			// The composition found a drop or a duplicate: one repair round, with the findings. The
 			// repaired answer replaces the first only if it is valid and has fewer findings.
-			_, region2, reason2, err2 := repair(k, region, comps[k].problems)
+			_, _, region2, reason2, err2 := repair(k, material[k].head+region+material[k].tail, comps[k].problems)
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return LLMResult{}, ctxErr
 			}
-			if err2 == nil && reason2 == "" {
+			if err2 == nil && reason2 == "" && region2 != "" {
 				if c2 := llmCompose(r, r.start, region2); len(c2.problems) < len(comps[k].problems) {
 					r.answer, comps[k] = region2, c2
 				}
 			}
 		}
-		if r.answer == r.ours {
-			equalOurs++
-		}
 	}
 
-	// The syntax of the assembled file: the first error, mapped to the region it is in, is quoted back
-	// once to the model if that region has not been answered again. The server runs the same check
-	// after the strategy; this one only gives the model its one chance.
-	assembled, spans := llmAssembleSpans(base, regions)
+	// The syntax of the assembled file: the first error, mapped to the region it is in (the lines of
+	// its answer, the line before them or the line after them), is quoted back once to the model if
+	// that region has not been answered again. The server runs the same check after the strategy;
+	// this one only gives the model its one chance.
+	assembled, spans := llmJoinSpans(regions)
 	if !opt.NoRepair {
 		var se *syntax.Error
 		if _, err := syntax.CheckMerge(ctx, f.Path, []byte(assembled), f.Ours, f.Theirs); errors.As(err, &se) {
 			if i, ok := llmRegionAtLine(spans, se.Line); ok {
 				k := slices.Index(conflicting, i)
 				if k >= 0 && !repaired[k] {
-					finding := se.Error()
-					if lines := strings.Split(assembled, "\n"); se.Line >= 1 && se.Line <= len(lines) {
-						finding += fmt.Sprintf("; line %d of the resolved file reads: %q", se.Line, llmClipLine(strings.TrimSpace(lines[se.Line-1])))
-					}
-					_, region2, reason2, err2 := repair(k, regions[i].answer, []string{finding})
+					_, _, region2, reason2, err2 := repair(k, material[k].head+regions[i].answer+material[k].tail, []string{se.Error()})
 					if ctxErr := ctx.Err(); ctxErr != nil {
 						return LLMResult{}, ctxErr
 					}
-					if err2 == nil && reason2 == "" {
+					if err2 == nil && reason2 == "" && region2 != "" {
 						old := regions[i].answer
 						regions[i].answer = region2
-						trial, _ := llmAssembleSpans(base, regions)
+						trial, _ := llmJoinSpans(regions)
 						if _, err := syntax.CheckMerge(ctx, f.Path, []byte(trial), f.Ours, f.Theirs); err == nil {
 							assembled = trial
 							comps[k] = llmCompose(&regions[i], regions[i].start, region2)
@@ -785,6 +760,12 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		}
 	}
 
+	equalOurs := 0
+	for _, i := range conflicting {
+		if regions[i].answer == regions[i].ours {
+			equalOurs++
+		}
+	}
 	report := llmReport(comps, repairs)
 	if stats != nil {
 		stats.RecordReport(report)

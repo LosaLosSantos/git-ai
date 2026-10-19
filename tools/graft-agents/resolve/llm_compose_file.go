@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"context"
 	"slices"
 	"strings"
 )
@@ -9,50 +10,41 @@ import (
 // measurement did (PLAN10 15.6): "pass" (nothing dropped, nothing repeated), "drops", "duplicates", or
 // "outside" (the result does not keep the clean segments of the merge in order: it changed lines
 // outside the conflicts). ok is false when the merge has no conflicting region to check. The problems
-// are the exact words of the report. The regions are those of this package's line diff, and the
-// bench compares the verdicts with the prototype's, which took git's.
+// are the exact words of the report. The regions are those of git's merge (llmFileRegions), as the
+// prototype's were, and the bench compares the verdicts with the prototype's.
 func CompositionVerdict(base, ours, theirs, result []byte) (verdict string, problems []string, ok bool) {
-	withNL := func(b []byte) []string {
-		lines := llmNormLines(string(b))
-		for i := range lines {
-			lines[i] += "\n"
-		}
-		return lines
-	}
-	bl, ol, tl := withNL(base), withNL(ours), withNL(theirs)
-	oursEdits, err := llmDiff(bl, ol, defaultLLMMaxDiffCells)
-	if err != nil {
-		return "", nil, false
-	}
-	theirsEdits, err := llmDiff(bl, tl, defaultLLMMaxDiffCells)
+	regions, err := llmFileRegions(context.Background(), base, ours, theirs, true)
 	if err != nil {
 		return "", nil, false
 	}
 	var segs [][]string
 	var conflicts []*llmRegion
 	var seg []string
-	pos := 0
-	for _, r := range llmRegions(bl, oursEdits, theirsEdits) {
-		seg = append(seg, bl[pos:r.start]...)
-		pos = r.end
+	for i := range regions {
+		r := &regions[i]
 		if r.clean {
-			seg = append(seg, llmSplitLines([]byte(r.merged))...)
+			seg = append(seg, strings.Split(strings.TrimSuffix(r.merged, "\n"), "\n")...)
+			if r.merged == "" {
+				seg = seg[:len(seg)-1]
+			}
 			continue
 		}
 		segs = append(segs, seg)
 		seg = nil
-		conflicts = append(conflicts, &r)
+		conflicts = append(conflicts, r)
 	}
-	segs = append(segs, append(seg, bl[pos:]...))
+	segs = append(segs, seg)
 	if len(conflicts) == 0 {
 		return "", nil, false
 	}
 	for i := range segs {
-		out := make([]string, len(segs[i]))
-		for j, l := range segs[i] {
-			out[j] = strings.TrimSuffix(l, "\n")
+		for j := range segs[i] {
+			segs[i][j] = strings.TrimRight(segs[i][j], " \t\r\f\v")
 		}
-		segs[i] = out
+	}
+	// Like the lines of the result, the merge drops the blank lines at the end of the file.
+	for last := len(segs) - 1; len(segs[last]) > 0 && segs[last][len(segs[last])-1] == ""; {
+		segs[last] = segs[last][:len(segs[last])-1]
 	}
 	groups := llmSlots(llmNormLines(string(result)), segs)
 	if groups == nil {

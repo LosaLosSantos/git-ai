@@ -36,8 +36,13 @@ func TestLLMDesignRepairOnTheSyntaxOfTheFile(t *testing.T) {
 		t.Fatalf("requests %d, repairs %d", len(p.reqs), res.Repairs)
 	}
 	second := p.reqs[1].Prompt
-	if !strings.Contains(second, "- syntax check: a.go does not parse as go") || !strings.Contains(second, "of the resolved file reads:") {
+	if !strings.Contains(second, "- syntax check: a.go does not parse as go") {
 		t.Fatalf("the syntax finding is not quoted:\n%s", second)
+	}
+	// The previous answer is the block the model wrote, with the context lines of the CODE, as in every repair.
+	nonce := requestNonce(t, p.reqs[1])
+	if got := patchSection(t, second, "YOUR PREVIOUS ANSWER", nonce); !strings.Contains(got, "BEGIN PATCHED CODE "+nonce+" =====\npackage a\n\nfunc f() int {\n\treturn 2 +\n}\n===== END") {
+		t.Fatalf("previous answer %q", got)
 	}
 	if !strings.Contains(string(res.Content), "return 2 + 3") {
 		t.Fatalf("content %q", res.Content)
