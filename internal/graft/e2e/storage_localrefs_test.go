@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,7 +29,6 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
-	"github.com/feder-cr/git-ai/internal/helper/duration"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -500,35 +498,22 @@ func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
 	n.requireServed(t, rel, written)
 }
 
-// TestStorageHousekeepingBackfillsReviewRoots runs the daily housekeeping of
-// the real server in authoritative mode (doc/graft/PLAN7.md, REVIEW ROOTS RULE,
-// the backstop of the daily worker): a review written without the keep-around
-// references of its commits (a review from before the rule) gets them, in the
-// database and on the node, through the ordinary write path.
-func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
+// TestStorageRealNodeBackfillsReviewRoots runs the backstop of the review
+// roots in the real server binary in authoritative mode (doc/graft/PLAN7.md,
+// REVIEW ROOTS RULE): a review written without the keep-around references of
+// its commits (a review from before the rule) gets them, in the database and
+// on the node, through the ordinary write path, and the server counts them.
+// The backstop is the one of the daily housekeeping and of every checkpoint
+// (reviewroots.Sweeper.Housekeep); the test runs it through the operator's
+// checkpoint, which runs it at once, rather than waiting for a minute of the
+// clock. That the daily job runs it before the housekeeping is
+// TestDailyOptimizer (internal/cli/gitaly); the checkpoint's use of it is
+// TestStorageCheckpointBackfillsReviewRoots.
+func TestStorageRealNodeBackfillsReviewRoots(t *testing.T) {
 	t.Parallel()
 
-	// The daily worker starts at a minute of the clock, chosen after the slow
-	// part of the setup (the node's binaries), two minutes ahead: the server
-	// must schedule it before that minute, which is checked below.
 	n := newRealNode(t)
-	start := time.Now().Add(3 * time.Minute).Truncate(time.Minute)
-	n.cfg.DailyMaintenance = config.DailyJob{
-		Hour:     uint(start.Hour()),
-		Minute:   uint(start.Minute()),
-		Duration: duration.Duration(5 * time.Minute),
-		Storages: []string{n.cfg.Storages[0].Name},
-	}
-	n.cfgPath = testcfg.WriteTemporaryGitalyConfigFile(t, n.cfg)
 	n.start(t)
-	require.Eventually(t, func() bool {
-		data, err := os.ReadFile(n.logPath)
-		require.NoError(t, err)
-		return bytes.Contains(data, []byte("maintenance: daily scheduled"))
-	}, time.Minute, 100*time.Millisecond, "the server schedules its daily maintenance")
-	require.True(t, time.Now().Before(start),
-		"the server scheduled its daily maintenance after %s, the minute the test chose, so for tomorrow: it started slower than the test's two-minute margin",
-		start.Format(time.TimeOnly))
 
 	rel := n.createRepository(t)
 	onA := n.agent(t, rel)
@@ -549,16 +534,21 @@ func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
 	require.NoError(t, err)
 
 	roots := []string{corestore.KeepAroundRef(head), corestore.KeepAroundRef(base)}
-	require.Eventually(t, func() bool {
-		refs, _, err := meta.Refs(n.ctx, state.RepositoryID)
-		require.NoError(t, err)
-		for _, root := range roots {
-			if refs[root].Absent() {
-				return false
-			}
-		}
-		return true
-	}, time.Until(start)+3*time.Minute, time.Second, "the daily housekeeping backfills the roots")
+	refs, _, err := meta.Refs(n.ctx, state.RepositoryID)
+	require.NoError(t, err)
+	for _, root := range roots {
+		require.True(t, refs[root].Absent(), "the review has no roots yet: %s", root)
+	}
+
+	// The checkpoint runs the backstop before it reads the reference snapshot.
+	_, err = n.operator(t, rel).StorageCheckpoint(n.ctx)
+	require.NoError(t, err)
+
+	refs, _, err = meta.Refs(n.ctx, state.RepositoryID)
+	require.NoError(t, err)
+	for _, root := range roots {
+		require.False(t, refs[root].Absent(), "the backstop wrote %s", root)
+	}
 	require.GreaterOrEqual(t, n.counter(t, "graft_review_roots_backfilled_total"), float64(len(roots)))
 	for _, root := range roots {
 		require.NotEmpty(t, n.git(t, rel, "rev-parse", "--verify", root), "the node has %s", root)
