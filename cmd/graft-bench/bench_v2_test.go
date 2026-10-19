@@ -268,12 +268,13 @@ func TestAggregateBatchAndAttemptsStats(t *testing.T) {
 		t.Parallel()
 
 		samples := []Sample{
-			{Landed: true, Outcome: LandOutcome{Attempts: 1, BatchSize: 2}},
-			{Landed: true, Outcome: LandOutcome{Attempts: 3, BatchSize: 4}},
+			{Landed: true, Outcome: LandOutcome{Attempts: 1, BatchSize: 2, UnavailableRetries: 2}},
+			{Landed: true, Outcome: LandOutcome{Attempts: 3, BatchSize: 4, UnavailableRetries: 1}},
 			{Err: errors.New("x"), Outcome: LandOutcome{Attempts: 5, BatchSize: 9}},
 		}
 		res := aggregate(baseConfig(), samples, time.Second)
 
+		require.Equal(t, 3, res.UnavailableRetries, "the client retries of Unavailable are reported")
 		require.InDelta(t, 3, res.BatchSizeMean, 1e-9, "a failed change is not part of a landed batch")
 		require.Equal(t, 4, res.BatchSizeMax)
 		require.Equal(t, int64(9), res.Attempts)

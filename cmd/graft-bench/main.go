@@ -259,6 +259,7 @@ func writeResult(w io.Writer, format string, res Result) error {
 		{"attempts", fmt.Sprintf("%d over all changes (%.2f per landed change, max %d)", res.Attempts, res.AttemptsPerLand, res.MaxAttempts)},
 		{"attempts histogram", formatHistogram(res.AttemptsHistogram) + " (landed changes)"},
 		{"failed attempts histogram", formatHistogram(res.FailedAttemptsHistogram) + " (failed changes)"},
+		{"unavailable retries", fmt.Sprintf("%d (client retries of Unavailable, landed changes)", res.UnavailableRetries)},
 		{"batch size", fmt.Sprintf("mean %.2f, max %d", res.BatchSizeMean, res.BatchSizeMax)},
 		{"batch size histogram", formatHistogram(res.BatchSizeHistogram)},
 		{"duration", fmt.Sprintf("%.2fs", res.DurationSeconds)},

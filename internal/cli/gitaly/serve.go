@@ -899,18 +899,17 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 		shutdownWorkers, err := maintenance.StartWorkers(
 			ctx,
 			logger,
-			maintenance.DailyOptimizationWorker(cfg, maintenance.OptimizerFunc(func(ctx context.Context, logger log.Logger, repo storage.Repository) error {
-				local := localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
-				// Graft: the backstop of the review roots, in every mode, before the
-				// housekeeping that prunes unreferenced objects (doc/graft/PLAN7.md,
-				// REVIEW ROOTS RULE): the commits of an open review written without
-				// its keep-around references are referenced before a prune could
-				// take them.
-				if err := housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo); err != nil {
-					return err
-				}
-				return housekeepingManager.OptimizeRepository(ctx, local)
-			})),
+			maintenance.DailyOptimizationWorker(cfg, dailyOptimizer(
+				func(logger log.Logger, repo storage.Repository) *localrepo.Repo {
+					return localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
+				},
+				func(ctx context.Context, logger log.Logger, local *localrepo.Repo, repo storage.Repository) error {
+					return housekeepReviewRoots(ctx, logger, storageCore, storageSyncer, local, repo)
+				},
+				func(ctx context.Context, local *localrepo.Repo) error {
+					return housekeepingManager.OptimizeRepository(ctx, local)
+				},
+			)),
 		)
 		if err != nil {
 			return fmt.Errorf("initialize auxiliary workers: %w", err)
@@ -949,6 +948,25 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	gitalyServerFactory.Stop()
 
 	return waitErr
+}
+
+// dailyOptimizer is the job of the daily maintenance for one repository: the backstop of the
+// review roots, in every mode, then the housekeeping that prunes unreferenced objects
+// (doc/graft/PLAN7.md, REVIEW ROOTS RULE). The commits of an open review written without its
+// keep-around references are referenced before a prune could take them, so a failed backstop
+// skips the housekeeping of the repository.
+func dailyOptimizer(
+	newLocal func(log.Logger, storage.Repository) *localrepo.Repo,
+	backstop func(context.Context, log.Logger, *localrepo.Repo, storage.Repository) error,
+	optimize func(context.Context, *localrepo.Repo) error,
+) maintenance.Optimizer {
+	return maintenance.OptimizerFunc(func(ctx context.Context, logger log.Logger, repo storage.Repository) error {
+		local := newLocal(logger, repo)
+		if err := backstop(ctx, logger, local, repo); err != nil {
+			return err
+		}
+		return optimize(ctx, local)
+	})
 }
 
 // housekeepReviewRoots runs the backstop of the review roots before the daily
