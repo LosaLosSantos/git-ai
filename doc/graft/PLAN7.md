@@ -451,18 +451,36 @@ guarded nor swept).
   `gitops.IsReachable`. `CheckpointInput` has no root set, and the checkpoint
   build reads no reviews.
 * **LOCK ORDER (PM check 3).** Every transaction that must serialize with a
-  changeset, a review write that requires its roots, or a checkpoint commit
-  takes the repository row (`SELECT ... FOR UPDATE` on Postgres; SQLite's
-  immediate transaction holds the database write lock from `BEGIN`) **as its
-  first statement**, before it reads or writes any child table:
-  `CommitChangeset`, `RegisterRepository`, `ImportHistory`, `InsertReview`,
-  `UpdateReview` with `requireRoots`, `CreateCheckpoint` and the lease methods.
-  Transactions that touch only child rows without changing their `repo_id`
-  (`UpdateReview` without `requireRoots`, `ReportApplied`, the orphan
-  observations, `DeleteCheckpoint`) never lock the repository row and never
-  upgrade a lock, so they cannot form a cycle with the first group.
-  Insert-only child transactions take Postgres's implicit `KEY SHARE` on the
-  parent and nothing after it. Tested with `-race` on Postgres and SQLite
+  changeset, or with a review write that requires its roots, takes the
+  repository row **as its first statement**, before it reads or writes any
+  child table. On Postgres that is `SELECT ... FOR NO KEY UPDATE`; SQLite's
+  immediate transaction holds the database write lock from `BEGIN`. The
+  transactions: `CommitChangeset`, `RegisterRepository`, `ImportHistory`,
+  `InsertReview`, `UpdateReview` with `requireRoots`, and the lease methods.
+  * Transactions that touch only child rows without changing their `repo_id`
+    never lock the repository row and never upgrade a lock, so they cannot form
+    a cycle with the first group: `UpdateReview` without `requireRoots`,
+    `ReportApplied`, the orphan observations, `DeleteCheckpoint`, and since the
+    integrated review `CreateCheckpoint`.
+  * Insert-only child transactions take Postgres's implicit `KEY SHARE` on the
+    parent and nothing after it. `FOR NO KEY UPDATE` does not conflict with
+    `KEY SHARE`, so they never hold up a writer. Deleting the repository still
+    waits for them.
+  * **Changed by the integrated review (M4).** `CreateCheckpoint` used to lock
+    the row and insert its snapshot one statement per reference. At 100k
+    references on Postgres a writer of the repository waited 38–46 s, locally.
+  * It now reads the row without locking it, and writes the snapshot 1000
+    references per statement. Nothing in it needs the writers excluded:
+    * the head only grows;
+    * the primary key makes one checkpoint per sequence: a concurrent build of
+      the same sequence inserts nothing (`ON CONFLICT DO NOTHING`) and returns
+      the one that committed;
+    * a checkpoint below a newer one is never the newest, so no seed reads it.
+  * Measured at 100k references (`TestCheckpointOfManyReferences`):
+    * Postgres: the record takes 1.6–1.7 s, while about 500 changesets commit,
+      the longest in 15–20 ms;
+    * SQLite: 0.23–0.27 s, before 0.63–0.70 s. SQLite has one write lock for
+      the whole database, so a writer waits for that. Tested with `-race` on Postgres and SQLite
   (`TestLockOrderConcurrentWriters`): concurrent lands, review creations and
   head moves (requiring their roots), a sweeper that deletes keep-around
   references until the writers are done, comments, checkpoint commits and

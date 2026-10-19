@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 )
+
+// checkpointRefBatch is how many snapshot references one INSERT of
+// CreateCheckpoint writes: 5000 parameters, far below the limits of both
+// dialects (SQLite 32766, Postgres 65535).
+const checkpointRefBatch = 1000
 
 // CreateCheckpoint implements corestore.MetaStore.
 func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore.CheckpointInput) (corestore.Checkpoint, bool, error) {
@@ -25,9 +31,16 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 	err := s.withTx(ctx, nil, func(tx *sql.Tx) error {
 		cp, created = corestore.Checkpoint{}, false
 
-		// LOCK ORDER (doc/graft/PLAN7.md): the repository row first, which
-		// serializes the checkpoint with changesets.
-		repo, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, true)
+		// The repository row is read, not locked (integrated review M4): the
+		// record of a large snapshot would hold up every writer of the
+		// repository. Nothing here needs the writers excluded:
+		// * the head only grows, so a sequence at or below it stays so;
+		// * the primary key makes one checkpoint per sequence;
+		// * a checkpoint below a newer one is never the newest, so no seed reads
+		//   it;
+		// * a concurrent deletion of the repository fails this insert (its
+		//   foreign key) or waits for it.
+		repo, err := s.selectRepository(ctx, tx, "repo_id = ?", []any{repoID}, false)
 		if err != nil {
 			return err
 		}
@@ -57,11 +70,29 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 			return err
 		}
 
-		if _, err := tx.ExecContext(ctx, s.bind(`
+		// Another build of the same sequence may commit first (the repository
+		// is not locked): its checkpoint is kept and returned, as one found
+		// above.
+		res, err := tx.ExecContext(ctx, s.bind(`
 			INSERT INTO graft_checkpoints (repo_id, seq, pack_key, pack_bytes, created_at)
 			VALUES (?, ?, ?, ?, ?)
-		`), repoID, int64(in.Seq), in.PackKey, in.PackBytes, s.timeArg(now)); err != nil {
+			ON CONFLICT (repo_id, seq) DO NOTHING
+		`), repoID, int64(in.Seq), in.PackKey, in.PackBytes, s.timeArg(now))
+		if err != nil {
 			return fmt.Errorf("insert checkpoint: %w", err)
+		}
+		if inserted, err := res.RowsAffected(); err != nil {
+			return fmt.Errorf("insert checkpoint: %w", err)
+		} else if inserted == 0 {
+			existing, found, err := s.checkpointAt(ctx, tx, repoID, in.Seq)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return fmt.Errorf("storage core: checkpoint at changeset %d of repository %d conflicts with one that is not visible", in.Seq, repoID)
+			}
+			cp = existing
+			return nil
 		}
 
 		names := make([]string, 0, len(in.Refs))
@@ -69,12 +100,21 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		for ordinal, name := range names {
-			if _, err := tx.ExecContext(ctx, s.bind(`
-				INSERT INTO graft_checkpoint_refs (repo_id, seq, ordinal, name, target)
-				VALUES (?, ?, ?, ?, ?)
-			`), repoID, int64(in.Seq), ordinal, bytesArg([]byte(name)), string(in.Refs[name])); err != nil {
-				return fmt.Errorf("insert checkpoint reference: %w", err)
+		// The snapshot is written in batches, one statement each: a statement
+		// per reference made the transaction grow with the round trips (tens of
+		// seconds at 100k references on a networked database).
+		for start := 0; start < len(names); start += checkpointRefBatch {
+			end := min(start+checkpointRefBatch, len(names))
+			values := make([]string, 0, end-start)
+			args := make([]any, 0, 5*(end-start))
+			for ordinal := start; ordinal < end; ordinal++ {
+				values = append(values, "(?, ?, ?, ?, ?)")
+				args = append(args, repoID, int64(in.Seq), ordinal, bytesArg([]byte(names[ordinal])), string(in.Refs[names[ordinal]]))
+			}
+			if _, err := tx.ExecContext(ctx, s.bind(
+				"INSERT INTO graft_checkpoint_refs (repo_id, seq, ordinal, name, target) VALUES "+strings.Join(values, ", ")),
+				args...); err != nil {
+				return fmt.Errorf("insert checkpoint references: %w", err)
 			}
 		}
 

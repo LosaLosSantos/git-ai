@@ -31,10 +31,18 @@ const repoColumns = "repo_id, storage, relative_path, object_format, head_seq, l
 // locks the row until the end of the transaction, which serializes the
 // changesets of the repository. SQLite needs no such clause: the immediate
 // transaction already holds the write lock.
+//
+// The lock is FOR NO KEY UPDATE: the lockers update only columns that no
+// foreign key references (head_seq, log_seq, next_review_id), and two of them
+// still exclude each other. Unlike FOR UPDATE it does not wait for the key-share
+// locks that inserts into the tables referencing the repository take: a
+// checkpoint record, which inserts its snapshot without the repository lock,
+// does not hold up the writers (integrated review M4). Deleting the repository
+// still waits for those inserts.
 func (s *Store) selectRepository(ctx context.Context, q querier, where string, args []any, lock bool) (repoState, error) {
 	query := "SELECT " + repoColumns + " FROM graft_repositories WHERE " + where
 	if lock && s.dialect == Postgres {
-		query += " FOR UPDATE"
+		query += " FOR NO KEY UPDATE"
 	}
 
 	r, err := scanRepoState(q.QueryRowContext(ctx, s.bind(query), args...).Scan)
