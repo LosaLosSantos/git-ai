@@ -274,6 +274,8 @@ func TestLandOutcome(t *testing.T) {
 	batched := landOutcome(&sdk.LandResult{Batch: sdk.BatchInfo{Size: 7, Position: 3}})
 	require.Equal(t, 7, batched.BatchSize)
 	require.Equal(t, 3, batched.BatchPosition)
+
+	require.Equal(t, 2, landOutcome(&sdk.LandResult{UnavailableRetries: 2}).UnavailableRetries)
 }
 
 func TestParseOptions(t *testing.T) {

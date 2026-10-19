@@ -478,7 +478,20 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
   branch still race on the reference, as before.
 - The lane lives in memory. Requests queued when a Gitaly process stops are not
   landed. When the lane registry is closed, queued requests fail with
-  `Unavailable`, and callers retry.
+  `Unavailable`, and callers retry. The SDK does this for `Land` with
+  `LandOptions.RetryUnavailable`: up to 5 retries of `Unavailable` only, with
+  an exponential backoff from 100 ms to 2 s with full jitter, stopped by the
+  context, reported in `LandResult.UnavailableRetries`. A client that does not
+  use the SDK must do the same: retry `Unavailable`, and only `Unavailable`, with
+  a bounded backoff, and only for the lands below.
+  - Merge and fast-forward lands are retried by default. The response of a call
+    can be lost after the change landed; the change itself is then on the
+    branch, and the retry reports it as already landed.
+  - Rebase lands, with or without conflict resolution, are not retried by
+    default (`RebaseLands` turns it on). The branch holds a rebased copy of the
+    change, and the server cannot yet tell that this change landed: a retry
+    replays it, and a change that a later commit reverted in between (for
+    example graft-verify reverting the culprit) would land again.
 - A land that arrives alone waits up to `window` before its batch runs. Set
   `window = "0s"` to remove the wait, or `disabled = true` to remove batching.
 - Requests that do not qualify (see *When a land is batched*) run unbatched and

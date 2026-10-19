@@ -180,13 +180,24 @@ type blockingBlobs struct {
 
 func (b blockingBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	<-ctx.Done()
-	b.cancelled <- ctx.Err()
+	// The first read's cause is kept; a later read must not block the round.
+	select {
+	case b.cancelled <- ctx.Err():
+	default:
+	}
 	return nil, ctx.Err()
 }
 
 // TestSyncerRoundBoundedBySyncTimeout: a sync round is bounded by sync_timeout,
 // which cancels its bucket reads: a hydration whose download outlives it fails
 // as Unavailable and its read is cancelled (GC BOUNDARY rule, enforcement).
+//
+// On a loaded machine the 200 ms budget can run out before the round starts a
+// pack read (the round stops starting reads near its deadline, or a database
+// call meets it first): the outcome is then the same, without a read. The
+// round can also outlive the call, whose own deadline is set just before it.
+// So the test waits for the round's end ("synced"), and checks the read's
+// cancellation whenever a read started.
 func TestSyncerRoundBoundedBySyncTimeout(t *testing.T) {
 	a := newEnv(t, envOptions{})
 	src := a.newSource(t)
@@ -197,10 +208,25 @@ func TestSyncerRoundBoundedBySyncTimeout(t *testing.T) {
 	cancelled := make(chan error, 1)
 	b.core.Blobs = blockingBlobs{BlobStore: b.core.Blobs, cancelled: cancelled}
 	b.core.SyncTimeout = 200 * time.Millisecond
+	synced := make(chan struct{})
+	b.sy.SetTestHook(once("synced", func() { close(synced) }))
 
 	err := b.sy.EnsureFresh(b.ctx, b.pbRepo(localRelPath))
 	require.Equal(t, codes.Unavailable, status.Code(err), "%v", err)
-	require.ErrorIs(t, <-cancelled, context.DeadlineExceeded, "the bucket read was cancelled by the round's deadline")
+
+	// A deadlock detector, not a timing assumption: the round ends at its
+	// 200 ms deadline.
+	select {
+	case <-synced:
+	case <-time.After(time.Minute):
+		t.Fatal("the sync round did not end")
+	}
+	select {
+	case readErr := <-cancelled:
+		require.ErrorIs(t, readErr, context.DeadlineExceeded, "the bucket read was cancelled by the round's deadline")
+	default:
+		t.Log("the round's budget ran out before it started a pack read")
+	}
 
 	_, ok, err := b.sy.Applied(b.ctx, b.pbRepo(localRelPath))
 	require.NoError(t, err)

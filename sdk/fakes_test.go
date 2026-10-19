@@ -300,6 +300,9 @@ type fakeOperations struct {
 	landResponse *gitalypb.UserLandResponse
 	// landErr, if set, is returned by UserLand instead of landResponse.
 	landErr error
+	// landErrs are returned by the first calls of UserLand, one per call, before landErr or
+	// landResponse.
+	landErrs []error
 }
 
 type recordedAction struct {
@@ -348,8 +351,15 @@ func (f *fakeOperations) UserCommitFiles(stream gitalypb.OperationService_UserCo
 func (f *fakeOperations) UserLand(_ context.Context, req *gitalypb.UserLandRequest) (*gitalypb.UserLandResponse, error) {
 	f.mu.Lock()
 	f.landRequests = append(f.landRequests, req)
+	var next error
+	if len(f.landErrs) > 0 {
+		next, f.landErrs = f.landErrs[0], f.landErrs[1:]
+	}
 	f.mu.Unlock()
 
+	if next != nil {
+		return nil, next
+	}
 	if f.landErr != nil {
 		return nil, f.landErr
 	}

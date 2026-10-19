@@ -213,5 +213,7 @@ func landOutcome(res *sdk.LandResult) LandOutcome {
 		Resolved:      len(res.ResolvedPaths),
 		BatchSize:     int(res.Batch.Size),
 		BatchPosition: int(res.Batch.Position),
+
+		UnavailableRetries: res.UnavailableRetries,
 	}
 }

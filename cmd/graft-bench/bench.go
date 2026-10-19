@@ -226,6 +226,9 @@ type LandOutcome struct {
 	// server does not batch.
 	BatchSize     int
 	BatchPosition int
+	// UnavailableRetries is the number of Unavailable answers the client
+	// retried before the land succeeded (sdk.UnavailableRetry).
+	UnavailableRetries int
 }
 
 // Sample is the measurement of one change.
@@ -289,6 +292,9 @@ type Result struct {
 	Conflicts     int   `json:"conflicts"`
 	Resolutions   int   `json:"resolutions"`
 	Attempts      int64 `json:"attempts"`
+	// UnavailableRetries counts the Unavailable answers that the client
+	// retried, over the landed changes (a failed land reports none).
+	UnavailableRetries int `json:"unavailable_retries"`
 
 	// Contention. ObservedConflictRate is the share of the changes that
 	// failed on a merge conflict.
@@ -502,6 +508,7 @@ func aggregate(cfg Config, samples []Sample, elapsed time.Duration) Result {
 		}
 		res.Attempts += int64(s.Outcome.Attempts)
 		res.Resolutions += s.Outcome.Resolved
+		res.UnavailableRetries += s.Outcome.UnavailableRetries
 		if s.Outcome.Attempts > res.MaxAttempts {
 			res.MaxAttempts = s.Outcome.Attempts
 		}

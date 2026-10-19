@@ -2,6 +2,8 @@ package sdk
 
 import (
 	"context"
+	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -56,6 +58,104 @@ type LandOptions struct {
 	// resolver is disabled, refuses a file or fails, the landing fails with a
 	// merge conflict as without this option.
 	ResolveConflicts bool
+	// RetryUnavailable is how Land retries a call that the server answers
+	// with Unavailable (see UnavailableRetry). It is on by default for
+	// LandMerge and LandFastForwardOnly, and off for LandRebase.
+	RetryUnavailable UnavailableRetry
+}
+
+// UnavailableRetry is the client side of the server's contract for
+// Unavailable: a node that cannot serve a land right now (its storage core
+// sync ran out of sync_timeout, its land lane was closed) answers Unavailable,
+// and the client retries later (doc/graft/LAND-BATCHING.md, Limits). Land
+// retries only codes.Unavailable, never another code, with an exponential
+// backoff with full jitter: before retry n it waits a random time between zero
+// and min(Cap, Base x 2^(n-1)). A context that ends stops the waiting.
+//
+// The response of a call can be lost after the server landed the change. With
+// LandMerge and LandFastForwardOnly, Commit is then reachable from the tip, and
+// the retry is reported as AlreadyLanded: these lands are retried by default.
+// With LandRebase, ResolveConflicts included (a land without conflicts is a
+// plain rebase), the branch holds a rebased copy, not Commit itself, and the
+// server cannot tell yet that the change landed: the retry replays the change
+// onto the tip. Every commit of it comes out empty and is dropped, unless a
+// later commit reverted the change in between, for example graft-verify
+// reverting the culprit: the retry would then land the change again. Rebase
+// lands are therefore not retried unless RebaseLands is set by a caller that
+// accepts this. A retried land with ResolveConflicts may run the conflict
+// resolver again, a model included, for the same conflict; LandResult reports
+// the retries (UnavailableRetries), so that this cost is visible.
+type UnavailableRetry struct {
+	// Disabled turns the retries off: Land returns Unavailable at once.
+	Disabled bool
+	// RebaseLands also retries LandRebase lands, which a retry after a lost
+	// response may land again when the change was reverted in between.
+	RebaseLands bool
+	// MaxRetries bounds the retries after the first call. Zero means 5.
+	MaxRetries int
+	// Base is the backoff of the first retry. Zero means 100ms.
+	Base time.Duration
+	// Cap bounds the backoff of every retry. Zero means 2s.
+	Cap time.Duration
+}
+
+// UnavailableRetriesError is the error of a land that failed after the SDK
+// retried Unavailable answers: the error of the last call, or of the context
+// that ended while Land waited to retry. It carries the status of that error,
+// so Code, LandError and the Is* helpers read it as they read the error itself.
+type UnavailableRetriesError struct {
+	// Retries is the number of Unavailable answers that were retried.
+	Retries int
+	// LastUnavailable is the message of the last of them.
+	LastUnavailable string
+	// Err is the error the land failed with.
+	Err error
+}
+
+func (e *UnavailableRetriesError) Error() string {
+	return fmt.Sprintf("%v (after %d retries of Unavailable, the last: %s)", e.Err, e.Retries, e.LastUnavailable)
+}
+
+// Unwrap returns the error the land failed with.
+func (e *UnavailableRetriesError) Unwrap() error { return e.Err }
+
+// GRPCStatus returns the status of the error the land failed with.
+func (e *UnavailableRetriesError) GRPCStatus() *status.Status { return status.Convert(e.Err) }
+
+// Defaults of UnavailableRetry.
+const (
+	defaultUnavailableRetries = 5
+	defaultUnavailableBase    = 100 * time.Millisecond
+	defaultUnavailableCap     = 2 * time.Second
+)
+
+// backoff returns the random wait before retry n (n >= 1).
+func (r UnavailableRetry) backoff(n int) time.Duration {
+	base, maxBackoff := r.Base, r.Cap
+	if base <= 0 {
+		base = defaultUnavailableBase
+	}
+	if maxBackoff <= 0 {
+		maxBackoff = defaultUnavailableCap
+	}
+	limit := base
+	for i := 1; i < n && limit < maxBackoff; i++ {
+		limit *= 2
+	}
+	limit = min(limit, maxBackoff)
+	return time.Duration(rand.Int64N(int64(limit) + 1))
+}
+
+// maxRetries returns the retries of a land with the given strategy.
+func (r UnavailableRetry) maxRetries(strategy LandStrategy) int {
+	switch {
+	case r.Disabled, strategy == LandRebase && !r.RebaseLands:
+		return 0
+	case r.MaxRetries > 0:
+		return r.MaxRetries
+	default:
+		return defaultUnavailableRetries
+	}
 }
 
 // LandResult describes the outcome of a successful Land call.
@@ -84,6 +184,12 @@ type LandResult struct {
 	// Batch is the land batch the change was part of. A change that landed
 	// alone has Size 1 and Position 1, see BatchInfo.
 	Batch BatchInfo
+	// UnavailableRetries is the number of calls the server answered with
+	// Unavailable before this one succeeded (see UnavailableRetry).
+	UnavailableRetries int
+	// LastUnavailable is the message of the last of those answers, empty
+	// without retries.
+	LastUnavailable string
 }
 
 // oldTip maps the zero object ID that the server reports for a created branch
@@ -100,6 +206,10 @@ func oldTip(oid string) string {
 // concurrent updates, so many writers can land changes on the same branch
 // without a merge queue.
 //
+// An Unavailable answer is retried as opts.RetryUnavailable says. A land that
+// fails after retries returns an *UnavailableRetriesError, with the retries and
+// the status of the last error.
+//
 // Failures carry structured details: use IsMergeConflict, IsNotAncestor,
 // IsReferenceUpdateConflict, IsRejectedByHook or LandError.
 func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) {
@@ -110,6 +220,8 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		return nil, status.Error(codes.InvalidArgument, "commit is required")
 	case opts.MaxAttempts < 0:
 		return nil, status.Error(codes.InvalidArgument, "max attempts must not be negative")
+	case opts.RetryUnavailable.MaxRetries < 0, opts.RetryUnavailable.Base < 0, opts.RetryUnavailable.Cap < 0:
+		return nil, status.Error(codes.InvalidArgument, "the retries of Unavailable must not be negative")
 	}
 
 	req := &gitalypb.UserLandRequest{
@@ -127,8 +239,32 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		req.Timestamp = timestamppb.New(opts.Timestamp)
 	}
 
-	resp, err := r.client.operations.UserLand(ctx, req)
+	var (
+		resp            *gitalypb.UserLandResponse
+		err             error
+		retries         int
+		lastUnavailable string
+	)
+	for {
+		resp, err = r.client.operations.UserLand(ctx, req)
+		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy) {
+			break
+		}
+		retries++
+		lastUnavailable = status.Convert(err).Message()
+
+		timer := time.NewTimer(opts.RetryUnavailable.backoff(retries))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, &UnavailableRetriesError{Retries: retries, LastUnavailable: lastUnavailable, Err: status.FromContextError(ctx.Err()).Err()}
+		case <-timer.C:
+		}
+	}
 	if err != nil {
+		if retries > 0 {
+			return nil, &UnavailableRetriesError{Retries: retries, LastUnavailable: lastUnavailable, Err: err}
+		}
 		return nil, err
 	}
 
@@ -147,5 +283,8 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		ResolvedPaths:  resolvedPaths,
 		Resolver:       resp.GetResolver(),
 		Batch:          batchOf(resp),
+
+		UnavailableRetries: retries,
+		LastUnavailable:    lastUnavailable,
 	}, nil
 }
