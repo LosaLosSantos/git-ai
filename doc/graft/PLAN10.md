@@ -873,36 +873,40 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |                               branch moved / change already landed -> skipped (lane answers)
    |                               review: exact paths, modes, markers, pointer lines, size
    |                               resolver check (syntax + operator checks), bounded slots
-   |                                 |
-   v                                 v
- LANE (one per branch) ---------- landWithResolution: tip moved -> refuse, fresh PACKAGE
-   |                                 applies the precheck's verdicts; any failure -> PACKAGE
-   |                                 operator verify.command on the merged tree; fails -> PACKAGE
-   |                                 all good -> LAND as agent/<actor> (+ Graft-Checked-By)
+   |
+   |-- resolve_conflicts? --yes--> PRE-RESOLVE, before the lane, in a discarded quarantine (15.8)
+   |                               tip T read as the lane reads it; no branch / already landed /
+   |                               the merge of T and the change is clean -> skipped (lane answers)
+   |                               agent may not update the branch (policy) -> PermissionDenied
+   |                               conflicting files -> one VERDICT per file (15.2), bounded slots
+   |                               decideLand (15.4):
+   |                                 not landable -> proposals kept (14) and PACKAGE now: the lane
+   |                                                 is not entered
+   |                                 landable ----> the pre-resolution goes to the lane, for T
    v
- 3-way merge of tip and commit
+ LANE (one per branch)
+   |-- a resolution -----> landWithResolution: tip moved -> refuse, fresh PACKAGE
+   |                         applies the precheck's verdicts; any failure -> PACKAGE
+   |                         operator verify.command on the merged tree; fails -> PACKAGE
+   |                         all good -> LAND as agent/<actor> (+ Graft-Checked-By)
+   v
+ 3-way merge (rebase or merge) of the tip and the change
    |-- clean -------------------------------------------------------------> LAND
    |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
-   |-- conflicts, resolve_conflicts
-         |
-         v
-       list the conflicting files (bounded) -> one VERDICT per file (15.2)
-         |
-         v
-       agent may not update the branch (policy) -> PermissionDenied, nothing resolved
-       decide: LAND only if every file is resolved by an operator rule (15.4)
-         |-- yes -> operator verify.command; passes -> merge commit signed by the rules -> LAND
-         |                                   fails  -> PACKAGE (every file REJECTED, reason)
-         |-- no  -> PACKAGE to the agent (merge_conflict detail): sides by OID, hunks,
-                    per-file outcome + reason, per-file proposal (+ its report, planned),
-                    the proposals kept under refs/graft/proposals/ (14), or, when they
-                    cannot be stored, "proposal not stored: <cause>" on each file
+   |-- conflicts, a landable pre-resolution for this tip
+   |       -> operator verify.command; passes -> merge commit signed by the rules -> LAND
+   |                                   fails  -> PACKAGE (every file REJECTED, reason)
+   |-- conflicts, none for this tip (the tip moved since T, or the pre-resolution was skipped)
+           -> TIP MOVED, out of the lane: PRE-RESOLVE again against the new tip, once; if the
+              branch moved again -> merge_conflict, "the branch kept moving during resolution"
+ The resolver is never called inside the lane.
+
+ PACKAGE to the agent (merge_conflict detail): sides by OID, hunks, per-file outcome + reason,
+   per-file proposal (+ its report, planned), the proposals kept under refs/graft/proposals/ (14),
+   or, when they cannot be stored, "proposal not stored: <cause>" on each file
+     -> the agent resolves (takes, edits or replaces the proposals) and re-lands with resolution
  every request and response of an agent: the refs/graft/ visibility filter (agentrefs);
  git upload-pack / receive-pack of an agent: refs/graft/ hidden
-                      |
-                      v
-                    the agent resolves (takes, edits or replaces the proposals) and
-                    re-lands with resolution (top of this diagram)
 ```
 
 ### 15.2 Per file
@@ -965,7 +969,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 ### 15.4 The one decision point
 
 ```
- decideLand (resolveLandConflicts calls it; landAnswerProposes is its guard)
+ decideLand, before the lane (the pre-resolution calls it; landAnswerProposes is its guard)
    every file resolved by an operator rule ...... LAND (then verify.command)
    anything else, including any model answer .... PACKAGE (the model's files are proposals)
  No other code path lands a model's resolution. No check disables itself: a configuration that
@@ -1069,3 +1073,37 @@ GitButler's AI resolve is described here from the PM's account of it; its code w
   only, our own wording and example). The evidence on scope (ConflictAgent, Shen 2026, MIT; Rover,
   CC BY) and on intent (GitWand, Copilot, MIT) informed the planned symmetric context. The design,
   the composition report and its measurement are gitai's.
+
+### 15.8 Design delta: the resolution goes out of the lane (m6, PM-approved)
+
+Today a land with resolve_conflicts calls the resolver inside the branch's lane, so the branch is
+held for the resolver's whole call: seconds, minutes for a file with 20 regions at ~13 s each, and
+~97 ms more to keep the proposals. The change mirrors the precheck of an agent's resolution:
+
+* **Pre-resolve before the lane.** UserLand reads the tip T as the lane does and, in a quarantine
+  it discards, merges T and the change. Skipped (the lane answers as today) when the branch does
+  not exist, the change already landed, or the merge is clean. Otherwise the pre-resolution runs
+  the whole per-file flow of 15.2 against T: the policy first, the classification, the resolver
+  call, the validation, decideLand. The resolver's requests take the same slots as its checks
+  (check_concurrency now bounds every request to the resolver of the process) and run within the
+  resolver's timeout, the wait included.
+* **Not landable: no lane at all.** The land fails anyway, so the proposals are kept (and pruned)
+  and the package is returned for T without entering the lane. If the branch moved meanwhile, the
+  agent's re-land against T is refused with a fresh package, as for any resolution.
+* **Landable: applied in the lane, only for T.** The lane gets the pre-resolution with the tip it
+  was made for; when the lane's tip is T and the merge conflicts, the lane writes the resolver's
+  answer into the merge commit (and runs verify.command); the resolver is not called again.
+* **The tip moved.** When the lane's tip is not T, or the merge conflicts without a
+  pre-resolution, the lane returns "tip moved" without resolving. UserLand then pre-resolves once
+  more against the new tip, out of the lane; if the branch moved again, the land fails with the
+  merge conflict and the reason "the branch kept moving during resolution". The one retry bounds
+  the resolver calls a land can cause to two. In a batch, a pre-resolved member that comes after
+  another finds the tip moved and is pre-resolved again: resolutions do not chain inside a batch.
+* **Still in the lane, stated:** verify.command, the operator's tests on the merged tree, runs in
+  the lane for the rules' resolutions and for agents' resolutions alike. It is the next candidate
+  to move out, as its own step.
+* **Tests.** The resolver is never called with the lane held (a resolver that blocks while another
+  land of the branch proceeds); a not-landable answer never enters the lane; a moved tip
+  re-resolves once and then fails with the reason; a batch member is re-resolved; the slots bound
+  resolutions and checks together.
+
