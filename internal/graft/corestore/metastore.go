@@ -250,6 +250,10 @@ type MetaStore interface {
 	// DeleteRemovedRepository removes a tombstone; a missing one is success.
 	DeleteRemovedRepository(ctx context.Context, repoID int64) error
 
+	// CheckpointsBelow returns the number of checkpoints of the repository
+	// below seq.
+	CheckpointsBelow(ctx context.Context, repoID int64, seq uint64) (int, error)
+
 	// ObserveAllocator reads the repository ID allocator and the
 	// reconciliation cursor and, unless dryRun, records the observation
 	// (AllocatorView.Now, Position) and drops the observations older than the

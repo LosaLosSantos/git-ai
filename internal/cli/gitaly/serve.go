@@ -641,6 +641,12 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			for _, s := range cfg.Storages {
 				storageNames = append(storageNames, s.Name)
 			}
+			// The build directories of hydrations of a process that died are
+			// removed; those of a process that runs (the old one of a graceful
+			// upgrade) hold their lock and are kept.
+			if err := syncer.CleanBuilds(ctx, storageNames); err != nil {
+				return err
+			}
 			stopLocalReferences, err := syncer.StartLocalReferences(ctx, storageNames)
 			if err != nil {
 				return err
@@ -648,6 +654,9 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			// Deferred here, so it runs after the servers stopped: a last durable step
 			// settles every repository whose writes ended.
 			defer stopLocalReferences()
+			// Runs before it (deferred later): the seeds in the background end
+			// before the last durable step.
+			defer syncer.StopSeeds()
 
 			if cfg.Graft.Storage.MaintenanceAuto() {
 				stopMaintenance, err := startStorageMaintenance(ctx, cfg, storageCore, syncer, locator, localrepoFactory, logger, storageNames)

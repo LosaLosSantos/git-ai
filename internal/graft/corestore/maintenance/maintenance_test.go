@@ -268,6 +268,47 @@ func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
 	require.Equal(t, before+1, e.metric("graft_storage_maintenance_skipped_total", "nothing_due"))
 }
 
+// TestRunOnceDropsALateLowerCheckpoint: a checkpoint of an older sequence
+// recorded after the superseded ones were dropped (a build that committed
+// after a newer one: CreateCheckpoint does not lock the repository) is dropped
+// by the next run, without C_gc moving (final minor 5).
+func TestRunOnceDropsALateLowerCheckpoint(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.Collect = false
+	e := newEnv(t, coretest.Options{}, cfg)
+
+	var built []corestore.Checkpoint
+	for i := 0; i < 2; i++ {
+		e.advance(1)
+		e.fresh()
+		require.NoError(t, e.runner.RunOnce(ctx))
+		cp, ok := e.newestCheckpoint()
+		require.True(t, ok)
+		built = append(built, cp)
+	}
+	e.ageCheckpoints()
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1)
+
+	// The late build: a checkpoint below C_gc, recorded now.
+	late := built[0]
+	content := []byte("the pack of a late build")
+	lateKey := corestore.NewPackKey(e.repo.ID, sha256.Sum256(content))
+	require.NoError(t, e.core.Blobs.Put(ctx, lateKey, bytes.NewReader(content)))
+	e.exec("INSERT INTO graft_checkpoints (repo_id, seq, pack_key, pack_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
+		e.repo.ID, int64(late.Seq), lateKey, len(content), e.past(0))
+	require.Len(t, e.checkpoints(), 2)
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1, "the late checkpoint below C_gc is dropped")
+	require.Equal(t, built[1].Seq, e.checkpoints()[0].Seq)
+	exists, err := e.core.Blobs.Exists(ctx, lateKey)
+	require.NoError(t, err)
+	require.False(t, exists, "and its pack")
+}
+
 // TestRunOnceReconcilesLeaks: with the collection on, a run reconciles the
 // bucket before it collects the removed repositories, and its metrics count
 // the leaks found and tombstoned and the IDs ahead of the allocator.

@@ -146,6 +146,13 @@ type Syncer struct {
 	reported map[int64]time.Time
 	// seeds are the running seed jobs, keyed by corestore.RepoKey.String().
 	seeds map[string]*seedJob
+	// seedsStopped is set by StopSeeds: no seed starts after it.
+	seedsStopped bool
+	// seedsCtx ends the seed jobs when StopSeeds calls stopSeeds;
+	// seedsRunning counts them.
+	seedsCtx     context.Context
+	stopSeeds    context.CancelFunc
+	seedsRunning sync.WaitGroup
 
 	syncTotal      *prometheus.CounterVec
 	syncSeconds    prometheus.Histogram
@@ -176,7 +183,10 @@ var (
 
 // New returns the syncer of core.
 func New(core *corestore.Core, logger log.Logger, locator storage.Locator, repoFactory localrepo.Factory, gitCmdFactory gitcmd.CommandFactory) *Syncer {
+	seedsCtx, stopSeeds := context.WithCancel(context.Background())
 	s := &Syncer{
+		seedsCtx:      seedsCtx,
+		stopSeeds:     stopSeeds,
 		core:          core,
 		logger:        logger,
 		locator:       locator,
@@ -1535,6 +1545,9 @@ type build struct {
 	path   string
 	tmpDir string
 	repo   *localrepo.Repo
+	// lock is the flock of the build directory (buildLockName), held until it
+	// is removed.
+	lock *os.File
 }
 
 // newBuild creates an empty bare repository to hydrate in the temporary
@@ -1556,6 +1569,10 @@ func (s *Syncer) newBuild(ctx context.Context, repo *gitalypb.Repository, r core
 		return nil, structerr.NewInternal("storage core: create hydration directory: %w", err)
 	}
 	b := &build{dir: dir, path: filepath.Join(dir, "repo.git"), tmpDir: tmpDir}
+	if b.lock, err = lockBuild(dir); err != nil {
+		b.remove()
+		return nil, structerr.NewInternal("storage core: lock the hydration directory: %w", err)
+	}
 	if err := gitops.InitBare(ctx, s.gitCmdFactory, b.path, r.ObjectFormat); err != nil {
 		b.remove()
 		return nil, structerr.NewInternal("storage core: init repository: %w", err)
@@ -1570,7 +1587,12 @@ func (s *Syncer) newBuild(ctx context.Context, repo *gitalypb.Repository, r core
 }
 
 // remove deletes what is left of the build (nothing once it was installed).
-func (b *build) remove() { _ = os.RemoveAll(b.dir) }
+func (b *build) remove() {
+	_ = os.RemoveAll(b.dir)
+	if b.lock != nil {
+		_ = b.lock.Close()
+	}
+}
 
 // finishBuild sets the references of the build, writes its watermark at seq
 // and installs it at path (install, with boundary).
@@ -1659,9 +1681,19 @@ func (s *Syncer) startSeed(ctx context.Context, key corestore.RepoKey, repo *git
 	}
 
 	j := &seedJob{cp: cp, done: make(chan struct{})}
+	if s.seedsStopped {
+		j.err = structerr.NewUnavailable("storage core: the server is stopping: %s is not seeded", key)
+		close(j.done)
+		return j
+	}
 	s.seeds[key.String()] = j
+	// Detached from the request, ended at the deadline or by StopSeeds.
 	jobCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), readAt.Add(s.core.WriteDeadline()))
+	stopOnShutdown := context.AfterFunc(s.seedsCtx, cancel)
+	s.seedsRunning.Add(1)
 	go func() {
+		defer s.seedsRunning.Done()
+		defer stopOnShutdown()
 		defer cancel()
 		err := s.runSeed(jobCtx, repo, r, hash, path, cp)
 		if err != nil && !errors.Is(err, errSeedSuperseded) {
@@ -1677,9 +1709,65 @@ func (s *Syncer) startSeed(ctx context.Context, key corestore.RepoKey, repo *git
 	return j
 }
 
+// errSeedDeadline ends a seed that ran past its deadline on the database
+// clock: the checkpoint it read may be collected from then on.
+var errSeedDeadline = errors.New("seed deadline passed")
+
+// errSeedRepositoryGone ends a seed whose repository was removed, or removed
+// and created again under a new ID, while it ran.
+var errSeedRepositoryGone = errors.New("the repository was removed during the seed")
+
 // runSeed seeds a build from the checkpoint cp and installs it at path with
-// the watermark cp.Seq.
+// the watermark cp.Seq. A seed that failed after its deadline on the database
+// clock, or whose repository went meanwhile, fails as that: what it ran into
+// (a pack collected after the deadline looks like a missing pack, a removed
+// repository like a missing record) is a consequence.
 func (s *Syncer) runSeed(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository, hash git.ObjectHash, path string, cp corestore.Checkpoint) error {
+	err := s.seedAndInstall(ctx, repo, r, hash, path, cp)
+	if err == nil || errors.Is(err, errSeedSuperseded) || errors.Is(err, errSeedDeadline) || errors.Is(err, errSeedRepositoryGone) {
+		return err
+	}
+	if s.seedsCtx.Err() != nil {
+		// StopSeeds cancelled it: the server is stopping.
+		return structerr.NewUnavailable("storage core: the server is stopping: the seed of %s from checkpoint %d is cancelled (%v)", r.Key, cp.Seq, err)
+	}
+	if checkErr := s.checkSeedDeadline(context.WithoutCancel(ctx), r, cp); checkErr != nil {
+		// The cause is reported as text: the code is that of checkErr.
+		return fmt.Errorf("%w (the seed failed with: %v)", checkErr, err)
+	}
+	return err
+}
+
+// checkSeedDeadline reads the repository record again: on the database clock
+// the seed must be before r.ReadAt + W (Core.WriteDeadline), the bound under
+// which the checkpoint, the newest when r was read, cannot be collected; and
+// the repository must still be r. The job's context ends at the same bound on
+// this host's monotonic clock, which stops while the host is suspended; the
+// database clock does not (as for the writers, final minor 2).
+func (s *Syncer) checkSeedDeadline(ctx context.Context, r corestore.Repository, cp corestore.Checkpoint) error {
+	if r.ReadAt.IsZero() {
+		return structerr.NewInternal("storage core: seed of %s: the record carries no database read time", r.Key)
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.syncTimeout())
+	defer cancel()
+
+	current, err := s.core.Meta.GetRepository(ctx, r.Key)
+	switch {
+	case errors.Is(err, corestore.ErrRepositoryNotFound) || (err == nil && current.ID != r.ID):
+		return structerr.NewUnavailable("storage core: seeding %s from checkpoint %d: %w; the next request starts from its current state", r.Key, cp.Seq, errSeedRepositoryGone)
+	case err != nil:
+		return structerr.NewUnavailable("storage core: seeding %s: read the repository record: %w", r.Key, err)
+	}
+	deadline := r.ReadAt.Add(s.core.WriteDeadline())
+	if !current.ReadAt.Before(deadline) {
+		return structerr.NewUnavailable("storage core: seeding %s from checkpoint %d: %w at %s on the database clock (%s): the checkpoint may be collected; the next request seeds from the newest",
+			r.Key, cp.Seq, errSeedDeadline, deadline.UTC().Format(time.RFC3339Nano), current.ReadAt.UTC().Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+// seedAndInstall is runSeed without the mapping of its failures.
+func (s *Syncer) seedAndInstall(ctx context.Context, repo *gitalypb.Repository, r corestore.Repository, hash git.ObjectHash, path string, cp corestore.Checkpoint) error {
 	b, err := s.newBuild(ctx, repo, r)
 	if err != nil {
 		return err
@@ -1690,6 +1778,10 @@ func (s *Syncer) runSeed(ctx context.Context, repo *gitalypb.Repository, r cores
 	if err != nil {
 		return err
 	}
+	// A seed that indexed the whole pack holds every object of the
+	// checkpoint, verified against its key, so it may be installed after its
+	// deadline; what the deadline protects is the changeset packs after the
+	// checkpoint, which C_sync below covers.
 	boundary, err := s.syncBoundary(ctx, r.ID)
 	if err != nil {
 		return err

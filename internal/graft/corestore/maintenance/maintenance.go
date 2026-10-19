@@ -83,10 +83,6 @@ type Runner struct {
 	// so that two processes of one node (a graceful upgrade) do not both hold a
 	// lease.
 	holder string
-	// dropped is, per repository ID, the C_gc below which this runner dropped
-	// the superseded checkpoints. Only the runs read and write it, one at a
-	// time.
-	dropped map[int64]uint64
 
 	runs        *prometheus.CounterVec
 	checkpoints prometheus.Counter
@@ -129,7 +125,6 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 		cfg:       cfg,
 		storages:  storages,
 		holder:    LeaseHolder(core),
-		dropped:   map[int64]uint64{},
 		runs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_runs_total",
 			Help: "Runs of the background maintenance of the storage core, by result (ok, error: at least one step failed).",
@@ -282,16 +277,24 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 	if err != nil {
 		return stepCheckpoint, err
 	}
-	var boundary uint64
+	dropDue := false
 	if r.cfg.Checkpoints {
 		// C_gc: the newest checkpoint at least gc_grace old on the database
-		// clock. The checkpoints below it are superseded; a C_gc that this
-		// runner dropped below already has none left.
-		if boundary, err = r.core.Meta.SyncBoundary(ctx, record.ID, r.core.GCGrace); err != nil {
+		// clock. The checkpoints below it are superseded. They are counted, not
+		// remembered: a build of an older sequence that committed after a newer
+		// one (CreateCheckpoint does not lock the repository) is below C_gc too.
+		boundary, err := r.core.Meta.SyncBoundary(ctx, record.ID, r.core.GCGrace)
+		if err != nil {
 			return stepCheckpoint, err
 		}
+		if boundary > 0 {
+			below, err := r.core.Meta.CheckpointsBelow(ctx, record.ID, boundary)
+			if err != nil {
+				return stepCheckpoint, err
+			}
+			dropDue = below > 0
+		}
 	}
-	dropDue := boundary > 0 && boundary != r.dropped[record.ID]
 	if !due && !dropDue && !r.cfg.Collect {
 		r.skipped.WithLabelValues("nothing_due").Inc()
 		return "", nil
@@ -340,7 +343,6 @@ func (r *Runner) maintain(ctx context.Context, record corestore.Repository) (str
 	if err != nil {
 		return stepCollect, err
 	}
-	r.dropped[record.ID] = report.Boundary
 	r.count(report)
 	return "", nil
 }

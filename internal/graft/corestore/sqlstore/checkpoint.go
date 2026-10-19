@@ -69,22 +69,24 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 			return nil
 		}
 
+		// A deadline already passed fails before the snapshot is written; it is
+		// checked again as the last statement.
 		if err := s.checkPackDeadline(ctx, tx, in.PackDeadline); err != nil {
 			return err
 		}
-		now, err := s.wallTime(ctx, tx)
+		provisional, err := s.wallTime(ctx, tx)
 		if err != nil {
 			return err
 		}
 
 		// Another build of the same sequence may commit first (the repository
 		// is not locked): its checkpoint is kept and returned, as one found
-		// above.
+		// above. created_at is set again at the end.
 		res, err := tx.ExecContext(ctx, s.bind(`
 			INSERT INTO graft_checkpoints (repo_id, seq, pack_key, pack_bytes, created_at)
 			VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT (repo_id, seq) DO NOTHING
-		`), repoID, int64(in.Seq), in.PackKey, in.PackBytes, s.timeArg(now))
+		`), repoID, int64(in.Seq), in.PackKey, in.PackBytes, s.timeArg(provisional))
 		if err != nil {
 			return fmt.Errorf("insert checkpoint: %w", err)
 		}
@@ -125,6 +127,24 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 			}
 		}
 
+		// The last statements (integrated review, final minor 1): the age of a
+		// checkpoint (C_gc, C_sync) counts from created_at, and the pack's
+		// deadline bounds the commit, so both are read on the database clock
+		// after the snapshot, however long it took to write: the time between
+		// created_at and the commit is that of one statement, not of the
+		// snapshot, and does not lean on gc_margin.
+		if err := s.checkPackDeadline(ctx, tx, in.PackDeadline); err != nil {
+			return err
+		}
+		now, err := s.wallTime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.bind("UPDATE graft_checkpoints SET created_at = ? WHERE repo_id = ? AND seq = ?"),
+			s.timeArg(now), repoID, int64(in.Seq)); err != nil {
+			return fmt.Errorf("stamp checkpoint: %w", err)
+		}
+
 		cp = corestore.Checkpoint{
 			RepoID:    repoID,
 			Seq:       in.Seq,
@@ -140,6 +160,19 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 	}
 
 	return cp, created, nil
+}
+
+// CheckpointsBelow implements corestore.MetaStore.
+func (s *Store) CheckpointsBelow(ctx context.Context, repoID int64, seq uint64) (int, error) {
+	if seq > math.MaxInt64 {
+		seq = math.MaxInt64
+	}
+	var n int
+	if err := s.readDB.QueryRowContext(ctx, s.bind("SELECT COUNT(*) FROM graft_checkpoints WHERE repo_id = ? AND seq < ?"),
+		repoID, int64(seq)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count checkpoints: %w", err)
+	}
+	return n, nil
 }
 
 // validateCheckpoint checks a checkpoint before anything is read.

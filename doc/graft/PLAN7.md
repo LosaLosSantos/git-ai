@@ -1414,7 +1414,15 @@ Binding order:
    (`Internal`), never a partial pack.
 4. Re-read the record (`t_r`), `Core.UploadPack`. `//! after_upload`.
 5. `CreateCheckpoint(repoID, {Seq: N, Refs: refs, PackKey, PackBytes})` under the
-   upload's `CommitContext`. `//! after_commit`.
+   upload's `CommitContext`. `//! after_commit`. In its transaction the last
+   statements, after the snapshot is written, check the pack's deadline on the
+   database clock and stamp `created_at` with the database time (final minor 1):
+   the age of a checkpoint (C_gc, C_sync) counts from a time one statement
+   before the commit, whatever the size of the snapshot, so the visibility lag
+   does not grow with the number of references or lean on `gc_margin`. Tests:
+   `TestCheckpointOfManyReferences` (created_at after the snapshot, 100k
+   references), `TestCheckpointDeadlineIsCheckedAfterTheSnapshot` (a deadline
+   that passes during the snapshot fails the record, nothing recorded).
 
 A crash after 3 leaves the pack as an orphan (reclaimed by the orphan protocol); a
 re-run starts over from the head at that time. The build holds no reference lock
@@ -1728,6 +1736,30 @@ leaves it:
   catches up and every reference matches.
 * Bench with a checkpoint pack of hundreds of MB: requested in a window (see
   the final report).
+* **Deadline on the database clock (final minor 2).** The job's context ends
+  at `readAt + W` on the host's monotonic clock, which stops while the host is
+  suspended. A seed that fails is checked against the database clock
+  (`checkSeedDeadline`: the record read again, `r.ReadAt + W`): past it, the
+  failure is `Unavailable` "seed deadline passed", whatever the seed ran into
+  (a checkpoint pack collected after the deadline reads as a missing pack,
+  which would otherwise be reported as corruption). A seed that indexed the
+  whole pack is installed even past its deadline: it holds every object of the
+  checkpoint, verified against its key, and the changeset packs after it are
+  covered by the C_sync check right before the install (`errSeedSuperseded`).
+* **Removed mid-seed (final minor 3).** The same check finds a repository
+  removed, or removed and registered again under a new ID: `Unavailable` "the
+  repository was removed during the seed", nothing installed; the next request
+  starts from the current state.
+* **Lifecycle (final minor 3).** `StopSeeds` (deferred by `gitaly serve` after
+  its servers, before the last durable step) cancels the seed jobs, waits for
+  them, and refuses new ones ("the server is stopping"). Every build directory
+  (`hydrate-*`) holds a flock on its `build.lock` until it is removed;
+  `CleanBuilds`, at startup before the listeners, removes those whose lock is
+  free (their process died) or that have none and are older than a minute,
+  and keeps those of a process that runs (the old one of a graceful upgrade).
+* Tests: `TestSeedSupersededByANewerCheckpoint`, `TestSeedPastItsDeadline`,
+  `TestSeedOfARepositoryRemovedAndCreatedAgain`, `TestStopSeedsEndsTheSeedJobs`,
+  `TestCleanBuildsRemovesOnlyDeadBuilds`.
 
 **Tests.** `TestSyncerResumesAHydrationAcrossRounds`: rounds of 4 changesets
 on a 10-changeset repository give Unavailable at 4 and at 8, with the
@@ -1809,10 +1841,14 @@ shutdown.
     the same `C_gc` rule: no reader uses a checkpoint below `C_gc`, whether the
     covered changeset packs are collected or not.
   * m8: what is due is decided by reads, before the lease: `checkpointDue` and
-    `C_gc` = `SyncBoundary(gc_grace)`. The runner remembers, per repository, the
-    `C_gc` it dropped below. A repository with nothing due is skipped
-    (`nothing_due`) without a write.
-  * Test: `TestRunOnceDropsSupersededCheckpointsWithGCOff`.
+    `C_gc` = `SyncBoundary(gc_grace)`, and the count of checkpoints below it
+    (`CheckpointsBelow`). A repository with nothing due is skipped
+    (`nothing_due`) without a write. (Final minor 5: the runner first
+    remembered the `C_gc` it dropped below; a build of an older sequence that
+    committed after a newer one, which `CreateCheckpoint` allows since it does
+    not lock the repository, then stayed until `C_gc` moved. The count sees it.)
+  * Tests: `TestRunOnceDropsSupersededCheckpointsWithGCOff`,
+    `TestRunOnceDropsALateLowerCheckpoint`.
 * **Database openers (audit).** Only `gitaly serve` opens the storage database
   (`corestoreopen.Open`, one `sqlstore.Store` per process). The `graft` CLI and
   every other binary reach it through gRPC. Two Stores on one SQLite file exist
@@ -2277,6 +2313,11 @@ path: the voter is m3's; the land paths call it unchanged.
     repository row lock.
 26. **One upload path**: every production upload goes through `Core.UploadPack`, and
     every row that references an upload is committed under its `CommitContext`.
+    Enforced by `TestUploadPackIsTheOnlyUploader` (`internal/graft/corestore`): in
+    the non-test code that can reach a `*corestore.Core`, `Blobs.Put` is called in
+    `core.go` only and `Blobs` is never taken as a value outside the core's wiring
+    (`core.go`, `open/open.go`). It is invariant U of the reconciliation
+    ("Removed repositories").
 27. **Local references are a cache of the database**: in authoritative mode a local
     reference write without fsync happens only after its repository has a durable
     dirty marker; a marker is removed only after the stack is durable, under git's

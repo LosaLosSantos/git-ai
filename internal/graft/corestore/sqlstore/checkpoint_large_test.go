@@ -74,5 +74,48 @@ func TestCheckpointOfManyReferences(t *testing.T) {
 		got, err := s.CheckpointRefs(ctx, repo.ID, 1)
 		require.NoError(t, err)
 		require.Equal(t, refs, got)
+
+		// created_at is stamped after the snapshot (final minor 1): it is not
+		// the time the record began. The database runs on this host, so its
+		// clock is the test's.
+		cp, ok, err := s.NewestCheckpoint(ctx, repo.ID)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.True(t, cp.CreatedAt.After(began.Add(took/2)),
+			"created_at %s, record from %s for %s", cp.CreatedAt, began, took)
+	})
+}
+
+// TestCheckpointDeadlineIsCheckedAfterTheSnapshot: a deadline that passes
+// while a large snapshot is written fails the record, and nothing is recorded
+// (final minor 1).
+func TestCheckpointDeadlineIsCheckedAfterTheSnapshot(t *testing.T) {
+	const references = 100_000
+
+	forEachDialect(t, func(t *testing.T, ctx context.Context, s *sqlstore.Store) {
+		repo, _ := headRepo(t, ctx, s, "deadline during the snapshot", 1)
+		refs := make(map[string]corestore.Target, references)
+		for i := 0; i < references; i++ {
+			refs[fmt.Sprintf("refs/heads/branch-%06d", i)] = oid(i + 1)
+		}
+
+		// How long the snapshot takes here, then a deadline at a tenth of it:
+		// open at the first check, passed at the last.
+		began := time.Now()
+		_, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
+			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "measure"), PackDeadline: time.Now().Add(time.Hour), PackBytes: 1,
+		})
+		took := time.Since(began)
+		require.NoError(t, err)
+		require.True(t, created)
+
+		next, _ := headRepo(t, ctx, s, "deadline during the snapshot, again", 1)
+		_, _, err = s.CreateCheckpoint(ctx, next.ID, corestore.CheckpointInput{
+			Seq: 1, Refs: refs, PackKey: ownedKey(next.ID, "late"), PackDeadline: time.Now().Add(took / 10), PackBytes: 1,
+		})
+		require.ErrorIs(t, err, corestore.ErrPackDeadline, "the record took %s", took)
+		_, ok, err := s.NewestCheckpoint(ctx, next.ID)
+		require.NoError(t, err)
+		require.False(t, ok, "nothing is recorded")
 	})
 }
