@@ -1443,3 +1443,73 @@ off). All are on by default until the measurement says otherwise.
 * **Measurement.** One step against R1b (all three elements off) on the same 300 cases with Luna, then
   one ablation per element that removes it, only to justify that element. The result goes here when it
   is in.
+
+### 15.11 Design step 2 (planned, nothing built): the strategy chooses first, the server assembles
+
+Federico's idea, as the PM framed it: a model that WRITES a resolution can write a line nobody had, or drift
+whitespace; a model that CHOOSES cannot. The same llm strategy gets a first step. This section fixes the
+constraints and the pre-registered gate BEFORE any paid arm; it changes no product code, and nothing here
+goes into the product without Federico's decision after the measurement.
+
+* **One strategy, a first step.** For each region of the file (git's, 15.10) the model picks one token from a
+  fixed vocabulary: `OURS`, `THEIRS`, `OURS+THEIRS`, `THEIRS+OURS`, `NEEDS-MERGE`, in plain text inside the
+  nonce tags, with the same context as the writer's request (sides, base, both changes, both messages). If
+  every region is a pick, the server assembles the file deterministically from the sides and the clean
+  segments of the merge: the answer holds no line that no side has and no whitespace of the model's. If any
+  region says NEEDS-MERGE, the file goes to today's writer path (15.10) and becomes a proposal as now. The
+  origin stays "model" (15.9), and the single landing rule of `decideLand` is unchanged: a resolution lands
+  only through the verification on the exact tree. Nothing else lands.
+* **The gate is fixed before it is measured.** "Every region picked identically by all N cross-family models,
+  plus the verification." N and the model set are tuned on the corpus OUTSIDE the 300 (a family-stratified
+  subsample of it: the corpus is 48% one repository, see below, and a plain sample would be tuned on that
+  repository) and confirmed once on the 300, held out. The target of at most 5% wrong among what lands is
+  reported as met only if the Wilson 95% upper bound of the wrong rate is at most 5%, under BOTH judges:
+  the strict one (the human's file after normalization) and judge A (the reference-based LLM judge adapted
+  from ConflictAgent's rubric, MIT, measured offline; it tolerates whitespace, order and equivalent phrasing). Under neither is the point
+  estimate enough.
+* **Concatenations are measured, not assumed.** `OURS+THEIRS` and `THEIRS+OURS` stay in the vocabulary only if
+  the data shows they are safe: their precision is reported separately from the single-side picks, and if it
+  is clearly worse they are dropped from the vocabulary (those regions become NEEDS-MERGE), not special-cased.
+* **The report applies to assembled files too.** A pick of one side can "drop the other side's change at base
+  a-b" (15.3): the composition report of 15.10 is computed on the assembled file and goes to the agent with
+  the proposal. It is honest information, not a gate.
+* **Never sent stays never sent.** Lockfiles, generated, minified, binary and large files keep their paths
+  (3.4); the chooser only replaces the writer's first step for files the llm strategy already receives.
+
+**Free numbers that bound it** (`ceiling.py`, `ceiling2.py`; no model, no network; git's regions; the human's
+resolution matched region by region against the four picks after the judge's normalization, groups of regions
+with no clean line between them matched together). The mined corpus has 2,935 content files (plus 237
+modify-delete / add-add files, not region-based):
+
+| | files | every region a side-pick | of which concatenation only | "always THEIRS" whole file |
+|---|---|---|---|---|
+| corpus | 2935 | 1614 = 55.0% [53.2-56.8] | 179 | 1357 = 46.2% |
+| corpus without spring-boot | 1518 | 316 = 20.8% | | 75 = 4.9% |
+| the 300 | 288 | 118 = 41.0% [35.4-46.7] | | 72 = 25.0% |
+| outside the 300 | 2647 | 1496 = 56.5% [54.6-58.4] | | 1285 = 48.5% |
+| go / python / rust-java / ts-js (corpus) | 447 / 92 / 1440 / 956 | 21.9% / 37.0% / 90.4% / 18.8% | | 4.7% / 9.8% / 89.0% / 4.7% |
+
+* The ceiling is **41% of the files of the 300 and 21% outside spring-boot**. spring-boot is 1,417 of the 2,935
+  files, and there the human takes THEIRS in 90% of the files (why was not investigated); a
+  constant policy "always THEIRS" is already right for 89% of the java files of the corpus and for
+  almost nothing elsewhere (4.7% in go and ts-js). A chooser must therefore be measured **outside spring-boot
+  and against this constant policy**, or its number is the repository's, not the model's.
+* In go and ts-js a region is a pure side-pick in about 30% of the cases (go 30% of 628 regions, ts-js 32% of
+  1,080); in 70% the human wrote something that is none of the four, and the file goes to the writer.
+* The human's choice is **constant within a file** in 1,599 of the 1,614 all-pick files (99%): one pick for the
+  whole file. A per-file pick would lose almost nothing against a per-region pick on the corpus; the
+  per-region vocabulary is kept because the model sees regions, and the free number says it does not need more.
+* Concatenations: 263 of the 1,933 side-pick regions of the corpus (14%) are `OURS+THEIRS` or `THEIRS+OURS`, but
+  outside java they are the common case: go 85 of 187 (45%), ts-js 141 of 350 (40%), python 19 of 62 (31%), java
+  18 of 1,334 (1%). 179 of the 1,614 all-pick files are all-pick only through one. Dropping the concatenations
+  would cost most of the ceiling in go and ts-js, which is why their precision is measured, not assumed.
+* Files whose human resolution changed lines outside the conflicts ("outside": 365 of the 2,935, 41 of the 288
+  of the 300) cannot be assembled from the sides by any chooser: they are wrong for it by construction.
+* By path: test files 71% all-pick, source 49%; java 94%, ts 20%, go 19%, js 8%, py 36%. The corpus has no lockfile and
+  two generated-path files (those rules apply first).
+
+**Measurement plan (each paid arm needs the PM's OK and has its own cap of $0.50, the chooser's total $1.50).**
+The chooser prompt is our own wording. First on a family-stratified 100 outside the 300 (tuning), with Luna
+and two cheap screened models; per pick and per file: precision under both judges, coverage, the share of
+NEEDS-MERGE, agreement-gated precision (2 of 3 and 3 of 3 agree), and cost. Then once on the 300 for the
+chosen gate. The result goes here when it is in.
