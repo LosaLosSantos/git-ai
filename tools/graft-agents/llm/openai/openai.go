@@ -371,7 +371,7 @@ type chatResponse struct {
 	Model string `json:"model"`
 	// Provider is the provider that served the call, as OpenRouter reports it.
 	Provider string `json:"provider"`
-	Choices []struct {
+	Choices  []struct {
 		Message struct {
 			Content *string `json:"content"`
 			Refusal *string `json:"refusal"`
