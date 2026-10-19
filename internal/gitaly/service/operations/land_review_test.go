@@ -2,8 +2,10 @@ package operations
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +13,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // Tests of the review of m6 (9586fd2).
@@ -139,4 +144,46 @@ func TestUserLand_aConflictWithoutAConflictingFileAtTheLanesTip(t *testing.T) {
 	require.Contains(t, pkg.GetReason(), "conflicts without a conflicting file")
 	require.Equal(t, 1, resolverCalls(t, dir), "no round was repeated")
 	requireBranchAt(t, fx.cfg, fx.repoPath, "main", split)
+}
+
+// TestLandKeptMoving: a land that gave up because the branch kept moving is handed back to be verified
+// again when it is a model's resolution (the same cause as a tip that moved), and fails as before when
+// it is not.
+func TestLandKeptMoving(t *testing.T) {
+	t.Parallel()
+
+	in := &gitalypb.UserLandRequest{Branch: []byte("main"), CommitId: strings.Repeat("c", 40)}
+	conflict := landConflict{reference: "refs/heads/main", oldOID: git.ObjectID(strings.Repeat("1", 40)), newOID: git.ObjectID(strings.Repeat("2", 40))}
+	model := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}}}}
+	rules := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule}}}}
+	unmarked := &landPreResolution{verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a"}}}}
+
+	for name, pre := range map[string]*landPreResolution{"a model's verdict": model, "a verdict that says nothing": unmarked} {
+		var need *landNeedsResolution
+		require.ErrorAs(t, landKeptMoving(in, pre, conflict, 20), &need, name)
+		require.True(t, need.moved, name)
+		require.Equal(t, strings.Repeat("c", 40), need.commit.String(), name)
+		require.Equal(t, "could not verify before the branch moved again", landStoppedReason(need, time.Minute), name)
+	}
+	for name, pre := range map[string]*landPreResolution{"rules only": rules, "no pre-resolution": nil, "no verdict": {}} {
+		err := landKeptMoving(in, pre, conflict, 20)
+		var need *landNeedsResolution
+		require.False(t, errors.As(err, &need), name)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err), name)
+		require.ErrorContains(t, err, "kept moving", name)
+	}
+
+	// A member of a batch that ran out of rebuilds is the same: the cause is a conflict of the update.
+	req := &landBatchRequest{in: in, preResolution: model}
+	var need *landNeedsResolution
+	require.ErrorAs(t, landBatchGiveUp(req, conflict, 4), &need)
+	require.ErrorContains(t, landBatchGiveUp(&landBatchRequest{in: in, preResolution: rules}, conflict, 4), "kept moving")
+}
+
+func TestLandStoppedReason(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "could not verify before the branch moved again", landStoppedReason(&landNeedsResolution{unverified: "tree"}, time.Minute))
+	require.Equal(t, "the files changed again before they could be resolved", landStoppedReason(&landNeedsResolution{paths: []string{"a"}}, time.Minute))
+	require.Equal(t, "the time ran out before the conflicts were resolved (deadline of 2m0s)", landStoppedReason(nil, 2*time.Minute))
 }

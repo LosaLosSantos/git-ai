@@ -1253,15 +1253,32 @@ and the tree it verifies depends on the tip.
 * **Tip moved: out again, no resolver call.** When the tree is not a verified one, the lane does not
   land. The land goes back out, rebuilds the tree from the same verdicts (the resolver is called only
   for files whose sides changed, as in 15.8), verifies the new tree, and enters the lane again. Each
-  round costs one verification; the progress argument is the one of 15.8 (a round is lost only when
-  another land landed on the branch), and the rounds are bounded by the deadline of the land.
+  round costs one verification.
+* **Liveness, stated plainly: the progress argument of 15.8 does not carry over.** In 15.8 a round is
+  lost only when another land changed the file, so the lands that contend for a file all land. Here a
+  round is lost when ANY land moved the branch, because any land changes the tree that was verified,
+  whatever file it touched. On a busy branch a verified AI land therefore mostly ends as proposals
+  within one verification (the deadline holds a verification's time and little more), and that is the
+  designed, safe outcome: the agent gets the proposal and decides. A verified AI land is opportunistic.
+  Two bounds keep it from costing more than that: a per-repository cap on the verifications at once
+  (verify_per_repository, default 1, inside verify_concurrency), so that one busy repository cannot take
+  the whole pool, and the deadline of the land. A land that waits for its repository's turn holds
+  nothing of the pool, and a wait that outlasts the deadline ends in proposals like the rest.
 * **Deadline: a proposal, not a failure.** The deadline of the land is the resolver's timeout plus
   verify.timeout when a verify.command is configured. A verified AI land is opportunistic: when the
   deadline ends before a tree could be verified and landed, the land does not fail for the agent. The
   model's files become PROPOSED with the reason "could not verify before the branch moved again" (or
   "before the deadline of <t>" when the verification itself was cut), the proposals are kept (14), and
-  the package goes to the agent. This final pass verifies nothing and calls no resolver. A caller that
-  gives up is not a deadline: it gets its cancellation.
+  the package goes to the agent. This final pass verifies nothing and calls no resolver. It is the end
+  of every land that had a conflict and could not go on, not only of a model's: the deadline wherever it
+  fell (the listing, the tree, the resolution, the verification), the cap on the rounds, and a land that
+  the lane or its batch kept handing back (a model's resolution whose batch ran out of rebuilds is
+  handed back as a land that needs its new tree verified, not failed with "kept moving"). The files
+  that have a verdict are reported with it (a model's PROPOSED, a rule's RESOLVED, their proposals
+  kept); the files that changed under the land and have none are NOT_ATTEMPTED, with the reason. With
+  nothing known yet it is the merge conflict with its package and no proposals, with the reason. A
+  land that had a conflict never returns a bare deadline to the agent: only a caller that gives up
+  gets its cancellation.
 * **A verification that fails** (non-zero exit, or its own timeout) is a verdict, not a deadline: the
   files stay PROPOSED and carry "verification failed: exit status N: <the first 4 KiB of the
   output>" (the package cuts a reason to 512 bytes). Nothing is verified for a land that cannot land

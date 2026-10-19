@@ -768,23 +768,38 @@ func TestAcquireResolveSlot_boundsTheResolutionsAtOnce(t *testing.T) {
 	require.ErrorIs(t, err, ErrDisabled)
 }
 
-// TestAcquireVerifySlot_boundsTheVerificationsAtOnce: at most verify_concurrency slots are held at
-// once; a wait counts against the caller's deadline; a released slot frees its place once; the pool
-// is apart from the checks' and the resolutions'.
+// timedOut reports whether acquiring a verify slot of repo gives up at once: the wait counts against
+// the context, so a short one ends it.
+func timedOut(t *testing.T, client *Client, repo string) error {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(testhelper.Context(t), 50*time.Millisecond)
+	defer cancel()
+	slot, err := client.AcquireVerifySlot(ctx, repo)
+	if err == nil {
+		slot.Release()
+	}
+	return err
+}
+
+// TestAcquireVerifySlot_boundsTheVerificationsAtOnce: at most verify_concurrency slots are held at once
+// in the process, whatever the repositories; a wait counts against the deadline of the caller; a
+// released slot frees its place once; the pool is apart from the checks' and the resolutions'.
 func TestAcquireVerifySlot_boundsTheVerificationsAtOnce(t *testing.T) {
 	cfg := commandConfig([]string{"/bin/true"})
-	cfg.VerifyConcurrency = 1
+	cfg.VerifyConcurrency = 2
 	cfg.CheckConcurrency = 1
 	cfg.ResolveConcurrency = 1
 	client := newClient(t, cfg)
 	ctx := testhelper.Context(t)
 
-	first, err := client.AcquireVerifySlot(ctx)
+	a, err := client.AcquireVerifySlot(ctx, "a")
+	require.NoError(t, err)
+	b, err := client.AcquireVerifySlot(ctx, "b")
 	require.NoError(t, err)
 
-	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
-	_, err = client.AcquireVerifySlot(waitCtx)
+	// Two repositories hold the two slots: a third waits until its deadline, then fails.
+	err = timedOut(t, client, "c")
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.ErrorContains(t, err, "waiting for a verify slot of the resolver")
 
@@ -798,23 +813,91 @@ func TestAcquireVerifySlot_boundsTheVerificationsAtOnce(t *testing.T) {
 	checkSlot.Release()
 	resolveSlot.Release()
 
-	first.Release()
-	first.Release()
-	second, err := client.AcquireVerifySlot(ctx)
+	// A slot released twice frees one place only.
+	a.Release()
+	a.Release()
+	require.NoError(t, timedOut(t, client, "c"))
+	c, err := client.AcquireVerifySlot(ctx, "c")
 	require.NoError(t, err)
-	waitCtx2, cancel2 := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel2()
-	_, err = client.AcquireVerifySlot(waitCtx2)
-	require.ErrorIs(t, err, context.DeadlineExceeded, "a second release must not free a second place")
-	second.Release()
+	require.ErrorIs(t, timedOut(t, client, "d"), context.DeadlineExceeded, "a second release must not free a second place")
+	b.Release()
+	c.Release()
 
 	var none *VerifySlot
 	none.Release()
 	var disabled *Client
-	_, err = disabled.AcquireVerifySlot(ctx)
+	_, err = disabled.AcquireVerifySlot(ctx, "a")
 	require.ErrorIs(t, err, ErrDisabled)
 
 	require.Equal(t, config.DefaultGraftResolverVerifyConcurrency, cap(newClient(t, commandConfig([]string{"/bin/true"})).verifySlots))
+}
+
+// TestAcquireVerifySlot_oneRepositoryCannotTakeThePool: at most verify_per_repository verifications run
+// at once for one repository (one by default), so that a busy repository, whose every land builds a tree
+// of its own to verify, leaves slots to the others. A land that waits for its repository holds nothing of
+// the pool, and nothing is left of a repository when its last holder and waiter are gone.
+func TestAcquireVerifySlot_oneRepositoryCannotTakeThePool(t *testing.T) {
+	cfg := commandConfig([]string{"/bin/true"})
+	cfg.VerifyConcurrency = 2
+	client := newClient(t, cfg)
+	ctx := testhelper.Context(t)
+	require.Equal(t, config.DefaultGraftResolverVerifyPerRepository, client.verifyPerRepo)
+
+	first, err := client.AcquireVerifySlot(ctx, "busy")
+	require.NoError(t, err)
+
+	// A second verification of the same repository waits, though the pool has a free slot...
+	err = timedOut(t, client, "busy")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "waiting for a verify slot of the repository")
+
+	// ...and takes nothing of the pool while it waits: another repository gets the free slot, even
+	// while a land waits for the busy one.
+	waiting := make(chan error, 1)
+	go func() {
+		slot, err := client.AcquireVerifySlot(ctx, "busy")
+		if err == nil {
+			slot.Release()
+		}
+		waiting <- err
+	}()
+	require.Eventually(t, func() bool {
+		client.verifyMu.Lock()
+		defer client.verifyMu.Unlock()
+		return client.verifyRepos["busy"] != nil && client.verifyRepos["busy"].users == 2
+	}, 5*time.Second, 5*time.Millisecond, "the second land never waited")
+	other, err := client.AcquireVerifySlot(ctx, "other")
+	require.NoError(t, err, "a land that waits for its repository holds nothing of the pool")
+
+	// The release of the first lets the waiter through.
+	first.Release()
+	require.NoError(t, <-waiting)
+	other.Release()
+
+	client.verifyMu.Lock()
+	require.Empty(t, client.verifyRepos, "nothing is kept of a repository without holder or waiter")
+	client.verifyMu.Unlock()
+
+	// A waiter that gave up leaves no trace either.
+	held, err := client.AcquireVerifySlot(ctx, "gone")
+	require.NoError(t, err)
+	require.Error(t, timedOut(t, client, "gone"))
+	held.Release()
+	client.verifyMu.Lock()
+	require.Empty(t, client.verifyRepos)
+	client.verifyMu.Unlock()
+
+	// Configured, the cap is the number of verifications of one repository at once.
+	cfg.VerifyPerRepository = 2
+	cfg.VerifyConcurrency = 3
+	wide := newClient(t, cfg)
+	one, err := wide.AcquireVerifySlot(ctx, "r")
+	require.NoError(t, err)
+	two, err := wide.AcquireVerifySlot(ctx, "r")
+	require.NoError(t, err)
+	require.ErrorContains(t, timedOut(t, wide, "r"), "of the repository")
+	one.Release()
+	two.Release()
 }
 
 // TestResolveSlots_apartFromTheCheckSlots: the resolutions and the checks have pools of their own
@@ -854,9 +937,10 @@ func TestAcquireResolveSlot_defaultConcurrency(t *testing.T) {
 // negative check_concurrency is.
 func TestNew_refusesNegativePools(t *testing.T) {
 	for name, set := range map[string]func(*config.GraftResolver){
-		"resolve_concurrency": func(c *config.GraftResolver) { c.ResolveConcurrency = -1 },
-		"verify_concurrency":  func(c *config.GraftResolver) { c.VerifyConcurrency = -1 },
-		"resolve_rounds":      func(c *config.GraftResolver) { c.ResolveRounds = -1 },
+		"resolve_concurrency":   func(c *config.GraftResolver) { c.ResolveConcurrency = -1 },
+		"verify_concurrency":    func(c *config.GraftResolver) { c.VerifyConcurrency = -1 },
+		"verify_per_repository": func(c *config.GraftResolver) { c.VerifyPerRepository = -1 },
+		"resolve_rounds":        func(c *config.GraftResolver) { c.ResolveRounds = -1 },
 	} {
 		cfg := commandConfig([]string{"/bin/true"})
 		set(&cfg)

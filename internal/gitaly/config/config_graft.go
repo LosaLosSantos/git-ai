@@ -332,6 +332,10 @@ type GraftResolver struct {
 	// lands only if it passes. It is a pool of its own, as the command takes minutes. Zero means
 	// DefaultGraftResolverVerifyConcurrency.
 	VerifyConcurrency int `json:"verify_concurrency" toml:"verify_concurrency,omitempty"`
+	// VerifyPerRepository bounds the verifications that run at once for one repository, inside
+	// VerifyConcurrency, so that one repository cannot take the whole pool: every land of its busy
+	// branches builds a tree of its own to verify. Zero means DefaultGraftResolverVerifyPerRepository.
+	VerifyPerRepository int `json:"verify_per_repository" toml:"verify_per_repository,omitempty"`
 	// ResolveRounds is a safety cap on the rounds of a land whose conflicting files keep changing
 	// while it is resolved (PLAN10 15.8). The rounds are bounded by the resolver's timeout; the cap
 	// is set well above realistic contention and is no contract. Zero means
@@ -523,8 +527,8 @@ func (r GraftResolver) validate() error {
 	if _, err := r.ProposalTTLOrDefault(); err != nil {
 		return err
 	}
-	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 || r.ResolveConcurrency < 0 || r.VerifyConcurrency < 0 || r.ResolveRounds < 0 {
-		return fmt.Errorf("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency, verify_concurrency and resolve_rounds must not be negative")
+	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 || r.ResolveConcurrency < 0 || r.VerifyConcurrency < 0 || r.VerifyPerRepository < 0 || r.ResolveRounds < 0 {
+		return fmt.Errorf("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency, verify_concurrency, verify_per_repository and resolve_rounds must not be negative")
 	}
 	// The check of an agent's resolution sends a file's three sides and its resolution in one
 	// request, which must fit its bound.
@@ -590,6 +594,17 @@ func (r GraftResolver) CheckConcurrencyOrDefault() int {
 		return r.CheckConcurrency
 	}
 	return DefaultGraftResolverCheckConcurrency
+}
+
+// DefaultGraftResolverVerifyPerRepository is the default of GraftResolver.VerifyPerRepository.
+const DefaultGraftResolverVerifyPerRepository = 1
+
+// VerifyPerRepositoryOrDefault returns VerifyPerRepository or its default.
+func (r GraftResolver) VerifyPerRepositoryOrDefault() int {
+	if r.VerifyPerRepository > 0 {
+		return r.VerifyPerRepository
+	}
+	return DefaultGraftResolverVerifyPerRepository
 }
 
 // DefaultGraftResolverVerifyConcurrency is the default of GraftResolver.VerifyConcurrency.

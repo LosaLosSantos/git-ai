@@ -79,7 +79,7 @@ func TestUserLand_relandRobustness(t *testing.T) {
 		client, err := resolver.New(s.resolveCfg)
 		require.NoError(t, err)
 		s.conflictResolver = client
-		s.landCheckBatchHook = func() { panic("a batch failed") }
+		s.landCheckBatchHook = func(context.Context) { panic("a batch failed") }
 
 		require.PanicsWithValue(t, "a batch failed", func() { _, _ = s.landPrecheckResolution(fx.ctx, req, fx.repo) })
 

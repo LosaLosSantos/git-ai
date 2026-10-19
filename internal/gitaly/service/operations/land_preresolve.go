@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // A land with resolve_conflicts is resolved out of the branch's lane (PLAN10 15.8): the resolver
@@ -66,6 +69,20 @@ func newLandPreResolution() *landPreResolution {
 	return &landPreResolution{verdicts: landVerdicts{}, verified: map[git.ObjectID]bool{}}
 }
 
+// hasModel reports whether a verdict of the land is a model's: the land is a model's resolution
+// that only a verified tree lands.
+func (p *landPreResolution) hasModel() bool {
+	if p == nil {
+		return false
+	}
+	for _, v := range p.verdicts {
+		if v.file.FromModel() {
+			return true
+		}
+	}
+	return false
+}
+
 // markVerified records that verify.command passed on tree.
 func (p *landPreResolution) markVerified(tree git.ObjectID) {
 	if p.verified == nil {
@@ -87,9 +104,16 @@ type landNeedsResolution struct {
 	tip, commit git.ObjectID
 	paths       []string
 	unverified  git.ObjectID
+	// moved says that the branch moved under the batch that was landing a model's resolution until
+	// the batch ran out of attempts: the tree it was about to land is another one, and the land goes
+	// out again as it does for an unverified tree.
+	moved bool
 }
 
 func (e *landNeedsResolution) Error() string {
+	if e.moved {
+		return fmt.Sprintf("the branch moved while the resolution of the land at tip %s was being landed", e.tip)
+	}
 	if e.unverified != "" {
 		return fmt.Sprintf("the tree %s of the land at tip %s was not verified", e.unverified, e.tip)
 	}
@@ -182,9 +206,12 @@ func (s *Server) landPreResolve(ctx context.Context, in *gitalypb.UserLandReques
 // The rounds are bounded by the deadline of the land, the resolver's timeout plus the verification's
 // when one is configured, and by resolve_rounds, a safety cap. A round is lost only when another
 // land changed the files or the tip, so the lands that contend for a file all land, one per round.
-// A land that runs out of its deadline fails with the merge conflict naming the files that kept
-// changing; but a model's resolution that could not be verified in time does not fail the agent: its
-// files become proposals, with the reason, in the package (landUnverified).
+//
+// A land that had a conflict never ends on a bare deadline: whatever stopped it, the deadline, the
+// cap on the rounds or a lane that kept handing it back, it ends with the merge conflict and its
+// package (landFinalPass): the proposals for what is known, a model's files PROPOSED with the
+// reason, and NOT_ATTEMPTED with the reason for the files that changed under it. Only a caller that
+// gives up gets its cancellation.
 func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
 	timeout, err := s.resolveCfg.TimeoutOrDefault()
 	if err != nil {
@@ -207,25 +234,18 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 		return ctx.Err() == nil && errors.Is(resolveCtx.Err(), context.DeadlineExceeded)
 	}
 	until := fmt.Sprintf("until the deadline of %s", timeout)
-	// giveUp ends a land that cannot go on: a model's resolution that was not verified in time goes
-	// to the agent as proposals; anything else is the merge conflict of files that kept changing.
-	giveUp := func(when, unverifiedReason string) (*gitalypb.UserLandResponse, error) {
-		if unverifiedReason != "" {
-			return s.landUnverified(ctx, in, committer, pre, unverifiedReason, need, when)
-		}
-		return nil, need.keptChanging(when)
-	}
 	rounds := s.resolveCfg.ResolveRoundsOrDefault()
 	for round := 1; round <= rounds; round++ {
 		if err := s.landPreResolve(resolveCtx, in, committer, pre); err != nil {
-			var unfinished *landVerifyUnfinishedError
-			switch {
-			case errors.As(err, &unfinished) && deadline():
-				return s.landUnverified(ctx, in, committer, pre, fmt.Sprintf("could not verify before the deadline of %s", timeout), need, until)
-			case need != nil && deadline():
-				// A land that lost a round to its files or its tip changing, and then ran out of its
-				// deadline while it resolved or verified again, failed because they kept changing.
-				return giveUp(until, landNotVerifiedReason(need))
+			// The deadline ended a step of the round: the listing, the tree, the resolution or the
+			// verification. A refusal of the policy is not a deadline.
+			if deadline() && status.Code(err) != codes.PermissionDenied {
+				var unfinished *landVerifyUnfinishedError
+				reason := landStoppedReason(need, timeout)
+				if errors.As(err, &unfinished) {
+					reason = fmt.Sprintf("could not verify before the deadline of %s", timeout)
+				}
+				return s.landFinalPass(ctx, in, committer, pre, reason, need, until)
 			}
 			return nil, err
 		}
@@ -234,29 +254,34 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 			return resp, err
 		}
 		if deadline() {
-			return giveUp(until, landNotVerifiedReason(need))
+			return s.landFinalPass(ctx, in, committer, pre, landStoppedReason(need, timeout), need, until)
 		}
 	}
-	return giveUp(fmt.Sprintf("after %d rounds", rounds), landNotVerifiedReason(need))
+	return s.landFinalPass(ctx, in, committer, pre, landStoppedReason(need, timeout), need, fmt.Sprintf("after %d rounds", rounds))
 }
 
-// landNotVerifiedReason is why a model's files become proposals when the lane handed the land back
-// for a tree that was not verified: the branch moved on after the verification. It is empty when the
-// lane asked for files to be resolved.
-func landNotVerifiedReason(need *landNeedsResolution) string {
-	if need != nil && need.unverified != "" {
+// landStoppedReason is why the land could not go on, as the files it leaves say: the tree it was
+// about to land was not verified before the branch moved again, the files changed again before they
+// could be resolved, or the time ran out before the conflicts were resolved at all.
+func landStoppedReason(need *landNeedsResolution, timeout time.Duration) string {
+	switch {
+	case need != nil && (need.unverified != "" || need.moved):
 		return "could not verify before the branch moved again"
+	case need != nil:
+		return "the files changed again before they could be resolved"
 	}
-	return ""
+	return fmt.Sprintf("the time ran out before the conflicts were resolved (deadline of %s)", timeout)
 }
 
-// landUnverified ends a land whose model resolution could not be verified in time. A verified AI
-// land is opportunistic, and losing the race is harmless: the agent gets the proposals. It
-// pre-resolves once more, with the request's context, in a new quarantine, verifying nothing and
-// calling no resolver (the verdicts are kept): the files of the model are PROPOSED with the reason,
-// the proposals are kept, and the land fails with the package. need, when set, is the state the
-// lane handed back, for the merge conflict if the land cannot be reported as proposals after all.
-func (s *Server) landUnverified(
+// landFinalPass ends a land that could not go on (landResolving): the agent gets the package, not
+// a deadline. A verified AI land is opportunistic, and losing the race is harmless. It pre-resolves
+// once more with the request's context, in a new quarantine, verifying nothing and calling no
+// resolver: the verdicts that are kept give the proposals (a model's files PROPOSED with the reason,
+// the rules' files RESOLVED), the files without a verdict are NOT_ATTEMPTED with the reason, and the
+// land fails with the package. When there is nothing to report as a conflict after all (the change
+// landed, the merge is clean, or every file has a verdict a rule made), the lane answers; need and
+// when name the files for the merge conflict if even that hands the land back.
+func (s *Server) landFinalPass(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
 	committer git.Signature,
@@ -277,8 +302,6 @@ func (s *Server) landUnverified(
 	case err != nil:
 		return nil, err
 	}
-	// The land is no longer a conflict to resolve (the change landed, or the merge is clean): the
-	// lane answers it.
 	resp, err := s.landOnce(ctx, in, committer, nil, pre)
 	if errors.As(err, &needs) {
 		return nil, needs.keptChanging(when)

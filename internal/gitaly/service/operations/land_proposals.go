@@ -46,6 +46,10 @@ var landProposalWriteErrors = promauto.NewCounter(prometheus.CounterOpts{
 // not follows it (landNoVerifyReason, the output of the verification, or why it could not run).
 const landProposedReason = "a model resolved the file: it is proposed (see proposal), and lands by itself only after verify.command passed on the merged tree; land it, edited or not, as your own resolution"
 
+// landVerifyDisabledReason follows landProposedReason when a verify.command is configured and
+// verify.enabled is false.
+const landVerifyDisabledReason = "verification is disabled (verify.enabled is false), so nothing verifies a model's resolution"
+
 // landNoVerifyReason follows landProposedReason when no verify.command is configured.
 const landNoVerifyReason = "no verify.command is configured, so nothing verifies a model's resolution"
 

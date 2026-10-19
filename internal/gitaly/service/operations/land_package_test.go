@@ -413,20 +413,48 @@ func TestUserLand_reland(t *testing.T) {
 	t.Run("the whole check has one deadline", func(t *testing.T) {
 		t.Parallel()
 
-		// Each check request takes 0.7 s and the deadline of the whole check is 1 s: the second
-		// request runs out of time, and the check fails closed.
+		// No clock decides this test. The check is made of two batches. Every batch must run under the
+		// same deadline, which is set once when the check starts and is the resolver's timeout from
+		// then (so the second request has what the first left, not a timeout of its own), and a check
+		// that ends in its second batch fails closed with the verdicts of the first. The test ends the
+		// check from the hook of the second batch, an event; the deadline itself is read from the
+		// context of each batch.
 		_, argv := perCallChecker(t, checkAnswer("graft-resolve", "a", true, ""), checkAnswer("graft-resolve", "b", true, ""))
-		slow := append([]string{"sh", "-c", `sleep 0.7; exec "$0"`}, argv...)
-		fx, s, req := batchedReland(t, slow)
-		s.resolveCfg.Timeout = "1s"
+		fx, s, req := batchedReland(t, argv)
+		s.resolveCfg.Timeout = "1h"
 		client, err := resolver.New(s.resolveCfg)
 		require.NoError(t, err)
 		s.conflictResolver = client
 
-		start := time.Now()
-		pre, err := s.landPrecheckResolution(fx.ctx, req, fx.repo)
+		callerCtx, cancel := context.WithCancel(fx.ctx)
+		defer cancel()
+		var mu sync.Mutex
+		var deadlines []time.Time
+		var withoutDeadline int
+		// The hook only records: a failed assertion inside it would leave the check stuck with its slot
+		// instead of failing the test.
+		s.landCheckBatchHook = func(ctx context.Context) {
+			deadline, ok := ctx.Deadline()
+			mu.Lock()
+			defer mu.Unlock()
+			if !ok {
+				withoutDeadline++
+			}
+			deadlines = append(deadlines, deadline)
+			if len(deadlines) == 2 {
+				cancel()
+			}
+		}
+
+		before := time.Now()
+		pre, err := s.landPrecheckResolution(callerCtx, req, fx.repo)
+		after := time.Now()
 		require.NoError(t, err)
-		require.Less(t, time.Since(start), 2*time.Second, "the check stops at its deadline")
+		require.Zero(t, withoutDeadline, "a batch runs under the deadline of the check")
+		require.Len(t, deadlines, 2, "the check ran two batches")
+		require.Equal(t, deadlines[0], deadlines[1], "one deadline for the whole check")
+		require.False(t, deadlines[0].Before(before.Add(time.Hour)), "set when the check started, not before")
+		require.False(t, after.Add(time.Hour).Before(deadlines[0]), "set when the check started, not later")
 		_, err = s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
 		pkg := builtUnresolved(t, fx, err)
 		require.Contains(t, pkg.GetReason(), "the resolution could not be checked")

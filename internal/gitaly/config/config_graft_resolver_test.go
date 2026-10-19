@@ -116,6 +116,9 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 		"negative verify_concurrency": {
 			GraftResolver{Command: []string{"graft-resolve"}, VerifyConcurrency: -1}, "must not be negative",
 		},
+		"negative verify_per_repository": {
+			GraftResolver{Command: []string{"graft-resolve"}, VerifyPerRepository: -1}, "must not be negative",
+		},
 		"negative resolve_rounds": {
 			GraftResolver{Command: []string{"graft-resolve"}, ResolveRounds: -1}, "must not be negative",
 		},
@@ -140,6 +143,8 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 	require.Equal(t, 4, GraftResolver{ResolveConcurrency: 4}.ResolveConcurrencyOrDefault())
 	require.Equal(t, DefaultGraftResolverVerifyConcurrency, GraftResolver{}.VerifyConcurrencyOrDefault())
 	require.Equal(t, 3, GraftResolver{VerifyConcurrency: 3}.VerifyConcurrencyOrDefault())
+	require.Equal(t, DefaultGraftResolverVerifyPerRepository, GraftResolver{}.VerifyPerRepositoryOrDefault())
+	require.Equal(t, 3, GraftResolver{VerifyPerRepository: 3}.VerifyPerRepositoryOrDefault())
 	require.Equal(t, DefaultGraftResolverResolveRounds, GraftResolver{}.ResolveRoundsOrDefault())
 	require.Equal(t, 7, GraftResolver{ResolveRounds: 7}.ResolveRoundsOrDefault())
 }

@@ -135,27 +135,65 @@ var verifySlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
 })
 
+// repoVerifySlots are the verify slots of one repository: its verifications at once, and the
+// number of those holding or waiting for one, which keeps the entry in the map.
+type repoVerifySlots struct {
+	slots chan struct{}
+	users int
+}
+
 // VerifySlot is the right to run one verification at a time: the client runs at most
-// verify_concurrency of them at once (AcquireVerifySlot), in a pool apart from the checks' and the
-// resolutions'. Release it when the verification is done.
+// verify_concurrency of them at once, and at most verify_per_repository for one repository
+// (AcquireVerifySlot), in a pool apart from the checks' and the resolutions'. Release it when the
+// verification is done.
 type VerifySlot struct {
 	c        *Client
+	repo     string
 	released bool
 }
 
-// AcquireVerifySlot waits for a verify slot. The wait counts against the deadline of ctx: when ctx
-// ends first, it fails, and the land cannot be verified in time.
-func (c *Client) AcquireVerifySlot(ctx context.Context) (*VerifySlot, error) {
+// AcquireVerifySlot waits for a verify slot of repo (a key of the repository: its storage and
+// relative path) and then for one of the pool. The wait counts against the deadline of ctx: when ctx
+// ends first, it fails, and the land cannot be verified in time. The slot of the repository is taken
+// first, so that a land that waits for its repository holds nothing of the pool.
+func (c *Client) AcquireVerifySlot(ctx context.Context, repo string) (*VerifySlot, error) {
 	if c == nil {
 		return nil, ErrDisabled
 	}
 	start := time.Now()
+	observe := func() { verifySlotWait.Observe(time.Since(start).Seconds()) }
+
+	c.verifyMu.Lock()
+	r, ok := c.verifyRepos[repo]
+	if !ok {
+		r = &repoVerifySlots{slots: make(chan struct{}, c.verifyPerRepo)}
+		c.verifyRepos[repo] = r
+	}
+	r.users++
+	c.verifyMu.Unlock()
+	leave := func() {
+		c.verifyMu.Lock()
+		defer c.verifyMu.Unlock()
+		if r.users--; r.users == 0 {
+			delete(c.verifyRepos, repo)
+		}
+	}
+
+	select {
+	case r.slots <- struct{}{}:
+	case <-ctx.Done():
+		observe()
+		leave()
+		return nil, fmt.Errorf("waiting for a verify slot of the repository: %w", ctx.Err())
+	}
 	select {
 	case c.verifySlots <- struct{}{}:
-		verifySlotWait.Observe(time.Since(start).Seconds())
-		return &VerifySlot{c: c}, nil
+		observe()
+		return &VerifySlot{c: c, repo: repo}, nil
 	case <-ctx.Done():
-		verifySlotWait.Observe(time.Since(start).Seconds())
+		observe()
+		<-r.slots
+		leave()
 		return nil, fmt.Errorf("waiting for a verify slot of the resolver: %w", ctx.Err())
 	}
 }
@@ -167,6 +205,14 @@ func (s *VerifySlot) Release() {
 	}
 	s.released = true
 	<-s.c.verifySlots
+
+	s.c.verifyMu.Lock()
+	defer s.c.verifyMu.Unlock()
+	r := s.c.verifyRepos[s.repo]
+	<-r.slots
+	if r.users--; r.users == 0 {
+		delete(s.c.verifyRepos, s.repo)
+	}
 }
 
 // Check sends one check request with the slot (Client.check).

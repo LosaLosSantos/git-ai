@@ -38,9 +38,9 @@ type Server struct {
 	// checkBatchBytes, when set, replaces the bound of the file data of one check request
 	// (landCheckBatchBytes); only tests set it.
 	checkBatchBytes int64
-	// landCheckBatchHook, when set, runs in every check batch while it holds its slot; only tests
-	// set it.
-	landCheckBatchHook func()
+	// landCheckBatchHook, when set, runs in every check batch while it holds its slot, with the
+	// context of the batch; only tests set it.
+	landCheckBatchHook func(ctx context.Context)
 	// landResolveHook, when set, runs in every resolver call while it holds its resolve slot; only
 	// tests set it.
 	landResolveHook func()

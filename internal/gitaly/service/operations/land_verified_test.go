@@ -7,7 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -195,7 +197,7 @@ func TestUserLand_verifiedModelResolution(t *testing.T) {
 		require.Equal(t, 1, verifyRuns(t, vdir), "once, out of the lane")
 	})
 
-	t.Run("a verification that times out is a failure with its reason", func(t *testing.T) {
+	t.Run("a verification that times out leaves the files PROPOSED, with its reason", func(t *testing.T) {
 		t.Parallel()
 
 		rdir, rargv := resolverScript(t, "")
@@ -209,6 +211,27 @@ func TestUserLand_verifiedModelResolution(t *testing.T) {
 		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome())
 		require.Contains(t, f.GetReason(), "the command did not finish within 300ms")
 		require.Equal(t, 1, verifyRuns(t, vdir))
+	})
+
+	t.Run("with a verify.command that is disabled the reason says so", func(t *testing.T) {
+		t.Parallel()
+
+		rdir, rargv := resolverScript(t, "")
+		writeAnswer(t, rdir, modelAnswer())
+		vdir, vargv := countingVerify(t, "exit 0")
+		rcfg := withVerify(enabledResolver(rargv), vargv, "")
+		rcfg.Verify.Enabled = false
+		fx := newResolveFixture(t, rcfg)
+
+		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+		requireMergeConflict(t, err)
+		for _, p := range []string{"a", "b"} {
+			f := packageFile(t, landConflictDetail(err), p)
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
+			require.Contains(t, f.GetReason(), "verification is disabled (verify.enabled is false)", p)
+			require.NotContains(t, f.GetReason(), "no verify.command is configured", p)
+		}
+		require.Equal(t, 0, verifyRuns(t, vdir))
 	})
 
 	t.Run("without a verify.command a model's resolution is a proposal", func(t *testing.T) {
@@ -431,8 +454,9 @@ fi`)
 	require.Equal(t, 1, resolverCalls(t, rdir))
 }
 
-// TestUserLand_verifiedModelResolution_poolBoundsVerifications: with verify_concurrency 1, two lands
-// at once never run the operator's command at once.
+// TestUserLand_verifiedModelResolution_poolBoundsVerifications: two lands of one repository at once
+// never run the operator's command at once, though the pool has room for four: one repository takes one
+// slot (verify_per_repository). The bound of the pool itself is tested in the resolver package.
 func TestUserLand_verifiedModelResolution_poolBoundsVerifications(t *testing.T) {
 	t.Parallel()
 
@@ -446,7 +470,7 @@ fi
 sleep 0.3
 rmdir "$DIR/lock"`)
 	rcfg := withVerify(enabledResolver(rargv), vargv, "")
-	rcfg.VerifyConcurrency = 1
+	rcfg.VerifyConcurrency = 4
 	graft := batchingGraft()
 	graft.Land.Resolver = rcfg
 	fx := newResolveFixtureIn(t, graft,
@@ -534,12 +558,15 @@ func TestUserLand_verifiedRulesKeepTheirVerificationInTheLane(t *testing.T) {
 	require.Equal(t, 1, verifyRuns(t, failingDir))
 }
 
-// TestUserLand_verifiedModelResolution_policyAndCancellation: a land whose caller gives up while it
-// verifies fails with the caller's cancellation, and not as proposals.
+// TestUserLand_verifiedModelResolution_callerGivesUp: a land whose caller gives up while it verifies
+// ends with the caller's cancellation, and what the SERVER does with it is as asserted here: the
+// operator's command is killed (it does not run on for a land nobody waits for), nothing is kept as a
+// proposal, and the branch is not touched. The Canceled on the client side proves none of it.
 func TestUserLand_verifiedModelResolution_callerGivesUp(t *testing.T) {
 	t.Parallel()
 
-	fx, _, vdir := verifiedFixture(t, modelAnswer(), "sleep 30", func(r *config.GraftResolver) { r.Verify.Timeout = "1m" })
+	fx, _, vdir := verifiedFixture(t, modelAnswer(), `echo $$ > "$DIR/pid"
+sleep 60`, func(r *config.GraftResolver) { r.Verify.Timeout = "1m" })
 	ctx, cancel := context.WithCancel(fx.ctx)
 	req := fx.request("Land")
 	done := make(chan error, 1)
@@ -547,14 +574,70 @@ func TestUserLand_verifiedModelResolution_callerGivesUp(t *testing.T) {
 		_, err := fx.client.UserLand(ctx, req)
 		done <- err
 	}()
-	require.Eventually(t, func() bool { return verifyRuns(t, vdir) == 1 }, 30*time.Second, 10*time.Millisecond)
+	var pid int
+	require.Eventually(t, func() bool {
+		raw, err := os.ReadFile(filepath.Join(vdir, "pid"))
+		if err != nil {
+			return false
+		}
+		pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+		return err == nil
+	}, 30*time.Second, 10*time.Millisecond, "the verification never started")
+	require.NoError(t, syscall.Kill(pid, 0), "the verification is running")
+
 	cancel()
 	select {
 	case err := <-done:
 		require.Error(t, err)
 		require.Equal(t, codes.Canceled, status.Code(err), "%v", err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(60 * time.Second):
 		require.FailNow(t, "the land did not end when its caller gave up")
 	}
+	// The server's side: the command is gone, nothing was kept or landed.
+	require.Eventually(t, func() bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) },
+		30*time.Second, 20*time.Millisecond, "the verification still runs for a land nobody waits for")
+	require.Empty(t, proposalRefTarget(t, fx), "a land that was cancelled keeps no proposal")
 	requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+}
+
+// TestUserLand_verifiedModelResolution_aBusyRepositoryEndsInProposals: at most one verification runs
+// for a repository (verify_per_repository). A land whose turn does not come before its deadline is not
+// an error for the agent: it ends with the package, the model's files PROPOSED, and says why. The
+// operator's command did not run for it.
+func TestUserLand_verifiedModelResolution_aBusyRepositoryEndsInProposals(t *testing.T) {
+	t.Parallel()
+
+	rdir, rargv := resolverScript(t, "")
+	writeAnswer(t, rdir, modelAnswer())
+	vdir, vargv := countingVerify(t, "exit 0")
+	rcfg := withVerify(enabledResolver(rargv), vargv, "1s")
+	rcfg.Timeout = "1s"
+	fx := newResolveFixture(t, rcfg)
+	s := fx.server(t, rcfg)
+	s.locator = config.NewLocator(fx.cfg) // the land quarantines the objects it makes
+
+	// Another land of the repository is being verified: its slot is the repository's.
+	busy, err := s.conflictResolver.AcquireVerifySlot(fx.ctx, landVerifyRepoKey(fx.repoProto))
+	require.NoError(t, err)
+
+	_, err = s.landResolving(fx.ctx, fx.request("Land"), fx.committer())
+	requireMergeConflict(t, err)
+	pkg := landConflictDetail(err)
+	require.NotNil(t, pkg, "the package, not a deadline")
+	require.NotEmpty(t, pkg.GetProposalRef())
+	for _, p := range []string{"a", "b"} {
+		f := packageFile(t, pkg, p)
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
+		require.Contains(t, f.GetReason(), "could not verify before the deadline of 2s", p)
+		require.NotNil(t, f.GetProposal(), p)
+	}
+	require.Equal(t, 0, verifyRuns(t, vdir), "the command did not run for the land that waited")
+	require.Equal(t, 1, resolverCalls(t, rdir))
+	requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+	busy.Release()
+
+	// Another repository is not held back by the first one's.
+	other, err := s.conflictResolver.AcquireVerifySlot(fx.ctx, landVerifyRepoKey(&gitalypb.Repository{StorageName: "default", RelativePath: "another.git"}))
+	require.NoError(t, err)
+	other.Release()
 }

@@ -223,7 +223,7 @@ func landBatchGiveUp(req *landBatchRequest, cause error, attempts int) error {
 		return structerr.NewInternal("updating ref with hooks: %w", cause)
 	}
 
-	return landKeptMovingError(req.in, conflict, attempts)
+	return landKeptMoving(req.in, req.preResolution, conflict, attempts)
 }
 
 // serverLandBatchStepper implements landBatchStepper on one batch attempt: the landing attempt that

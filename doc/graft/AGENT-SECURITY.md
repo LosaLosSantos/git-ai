@@ -213,6 +213,21 @@ Two known limits, accepted:
 
 ## Resolution and verification are opt-in
 
+**A model's resolution can land, and the verification is what lets it.** With a
+server AI and a `verify.command`, a resolution that the model made lands if the
+command passes on the merged tree (see [RESOLVE](RESOLVE.md)). That makes the
+command a code execution path: it runs code a model wrote, derived from
+repository content that agents control. A hostile agent can plant text for the
+model to read (a prompt injection), and the model's answer is then executed by
+your tests, as the gitaly user on the server. The tree the command sees is the
+whole tree (no `export-ignore` hides anything from it), so a planted file is
+there for it as well. Run the command inside an isolation boundary, always when
+the AI lands: a container with `--network=none`, the checkout read-only, no
+credentials, resource limits (the example in RESOLVE.md is the default to
+start from), and a separate unprivileged user. The post-merge test command of
+`graft-verify` ([VERIFY](VERIFY.md)) runs the same kind of code on the tip and
+has the same advice. Without a `verify.command` nothing of a model's lands.
+
 - Automatic conflict resolution is off by default and can be limited to
   specific actors and paths (see [RESOLVE](RESOLVE.md)).
 - The verifier writes the green ref and reverts with the operator credential,

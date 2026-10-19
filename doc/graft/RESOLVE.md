@@ -47,8 +47,10 @@ actors = ["builder", "planner"]
   on the rounds of a land whose files keep changing (see "Out of the lane"
   below); the rounds are bounded by `timeout`, and the cap is no contract.
 - `verify_concurrency` (default 2): the verifications of a model's resolution
-  that run at once in the Gitaly process, in a pool of their own (see "Optional
-  verification of a resolution").
+  that run at once in the Gitaly process, in a pool of their own, and
+  `verify_per_repository` (default 1) the ones of one repository, so that a busy
+  repository cannot take the whole pool (see "Optional verification of a
+  resolution").
 - A configuration the server could not use is a startup error (see
   [CONFIGURATION](CONFIGURATION.md)). A configured resolver is never treated
   as no resolver: if it cannot be built later, every land that needs it fails
@@ -454,6 +456,18 @@ exec docker run --rm --network=none --read-only --tmpfs /tmp \
   --user 65534:65534 --memory 2g --pids-limit 512 \
   -v "$PWD":/src:ro -w /src golang:1.26 go build ./...
 ```
+
+**Since a model's resolution can land through it, the command now runs code
+that a model wrote, from conflicts in repository content that agents control.**
+A hostile agent can put text in a file (a comment, a string, a README) that is
+written for the model to read, a prompt injection, and what the model returns
+is then run by your tests. Treat the command as running untrusted code: for any
+setup where the AI lands (a server AI and a `verify.command`), use the
+container wrapper above as the default, not as an example: `--network=none`,
+the checkout mounted read-only, no credentials in its environment or on its
+file system, resource limits, and a separate unprivileged user. A command that
+needs the network or a secret to pass is a command a model can steer into
+leaking it.
 
 It also costs time on every resolution, which is why it is off by default;
 the trailers and `graft-verify` remain the safety net.
@@ -1006,7 +1020,7 @@ in blank lines only, and the accepted results that got no syntax verdict.
 | check answer | 64 KiB + 8 KiB per file | server |
 | checks of agents' resolutions at once | 2 | `check_concurrency` |
 | resolutions at once | 2 | `resolve_concurrency` |
-| verifications of a model's resolution at once | 2 | `verify_concurrency` |
+| verifications of a model's resolution at once; of one repository | 2; 1 | `verify_concurrency`; `verify_per_repository` |
 | rounds of a land whose files keep changing | 32 (a safety cap; `timeout` bounds the land) | `resolve_rounds` |
 | verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |

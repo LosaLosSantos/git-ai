@@ -198,10 +198,17 @@ func TestCreateBundleFromRefList_refusesPatternsThatAreMoreThanOneLine(t *testin
 			require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Repository: repo, Patterns: [][]byte{[]byte("master")}}))
 			require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Patterns: [][]byte{[]byte(pattern)}}))
 			require.NoError(t, stream.CloseSend())
-			for _, err = stream.Recv(); err == nil; _, err = stream.Recv() {
+			// The data of the patterns that were read before the invalid one may have been sent: the
+			// bundle is not finished, and the answer is the error. What must never be in it is a
+			// reference the invalid pattern would have named, which never reached git.
+			var data []byte
+			var resp *gitalypb.CreateBundleFromRefListResponse
+			for resp, err = stream.Recv(); err == nil; resp, err = stream.Recv() {
+				data = append(data, resp.GetData()...)
 			}
 			require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
 			require.ErrorContains(t, err, "a revision can't contain a line break or NUL")
+			require.NotContains(t, string(data), "refs/graft/green/main", "the invalid pattern reached git")
 		})
 	}
 

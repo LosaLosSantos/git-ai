@@ -18,6 +18,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // This file is the optional verification of a resolution ([graft.land.resolver.verify], PLAN10
@@ -109,12 +110,17 @@ func (e *landVerifyUnfinishedError) Error() string {
 
 func (e *landVerifyUnfinishedError) Unwrap() error { return e.err }
 
+// landVerifyRepoKey is the key of a repository in the verify pool: its storage and relative path.
+func landVerifyRepoKey(repository *gitalypb.Repository) string {
+	return repository.GetStorageName() + "\x00" + repository.GetRelativePath()
+}
+
 // landVerifyOutOfLane runs the verification of a model's resolution out of the lane (PLAN10 15.9),
 // with a slot of the verify pool. It returns a *landVerifyError when the command fails or times
 // out, a *landVerifyUnfinishedError when ctx ended first, and another error when the verification
 // could not be run.
-func (s *Server) landVerifyOutOfLane(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID) error {
-	slot, err := s.conflictResolver.AcquireVerifySlot(ctx)
+func (s *Server) landVerifyOutOfLane(ctx context.Context, repository *gitalypb.Repository, repo *localrepo.Repo, tree git.ObjectID) error {
+	slot, err := s.conflictResolver.AcquireVerifySlot(ctx, landVerifyRepoKey(repository))
 	if err != nil {
 		if ctx.Err() != nil {
 			return &landVerifyUnfinishedError{err: err}

@@ -381,7 +381,7 @@ func TestUserLand_resolveRounds(t *testing.T) {
 		require.Equal(t, "merged-b\n", fx.blobAt(t, landed, "b"))
 	})
 
-	t.Run("files that keep changing fail after resolve_rounds, by name", func(t *testing.T) {
+	t.Run("files that keep changing give the package after resolve_rounds: what is known, and what is not", func(t *testing.T) {
 		t.Parallel()
 
 		dir, argv := resolverScript(t, answerByCall)
@@ -396,22 +396,34 @@ func TestUserLand_resolveRounds(t *testing.T) {
 			gittest.WithTreeEntries(entries("a", "ours-2\n", "b", "ours\n", "c", "c\n")...))
 		writeMoves(t, dir, fx, w1, w2)
 
+		// The hot file a changed under every round; b did not. The agent gets the package, not a bare
+		// "files kept changing": b with the rules' answer (RESOLVED, and its proposal kept), a as not
+		// attempted, with why, and the tip it was last seen at.
 		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
 		requireMergeConflict(t, err)
-		require.ErrorContains(t, err, "files kept changing while the land was resolved, after 2 rounds: a")
 		conflict := landErrorDetail(t, err).GetMergeConflict()
-		require.Equal(t, [][]byte{[]byte("a")}, conflict.GetConflictingFiles())
 		require.Equal(t, []string{w2.String(), fx.commit.String()}, conflict.GetConflictingCommitIds())
-		require.Equal(t, 2, resolverCalls(t, dir))
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg, "the package, not a bare conflict")
+		require.Equal(t, w2.String(), pkg.GetTip())
+		hot := packageFile(t, pkg, "a")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, hot.GetOutcome())
+		require.Contains(t, hot.GetReason(), "changed again before they could be resolved")
+		require.Nil(t, hot.GetProposal())
+		known := packageFile(t, pkg, "b")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, known.GetOutcome())
+		require.Equal(t, "merged-b\n", string(gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "cat-file", "blob", known.GetProposal().GetOid())))
+		require.NotEmpty(t, pkg.GetProposalRef())
+		require.Equal(t, 2, resolverCalls(t, dir), "the final pass calls no resolver")
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, w2)
 	})
 
-	t.Run("files that keep changing fail at the deadline, by name", func(t *testing.T) {
+	t.Run("files that keep changing give the package at the deadline", func(t *testing.T) {
 		t.Parallel()
 
 		// A writer changes a and b while every round is resolved, more often than the land can
-		// keep up with: the land fails at the resolver's deadline, however many rounds the cap
-		// would allow, and says why.
+		// keep up with: the land ends at the resolver's deadline, however many rounds the cap
+		// would allow, with the package that says why: no file has an answer for the tip it ends at.
 		dir, argv := resolverScript(t, "sleep 0.2\n"+answerByCall)
 		writeAnswer(t, dir, validAnswer())
 		rcfg := enabledResolver(argv)
@@ -427,12 +439,18 @@ func TestUserLand_resolveRounds(t *testing.T) {
 		}
 		writeMoves(t, dir, fx, writers...)
 
+		// The bound only says that the land ends: how many rounds fit in 3 s is the speed of the machine.
 		start := time.Now()
 		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+		require.Less(t, time.Since(start), 3*time.Minute)
 		requireMergeConflict(t, err)
-		require.ErrorContains(t, err, "files kept changing while the land was resolved, until the deadline of 3s: a, b")
-		require.Less(t, time.Since(start), 30*time.Second)
-		require.GreaterOrEqual(t, resolverCalls(t, dir), 2)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg, "the package, not a bare deadline")
+		for _, p := range []string{"a", "b"} {
+			f := packageFile(t, pkg, p)
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, f.GetOutcome(), p)
+			require.NotEmpty(t, f.GetReason(), p)
+		}
 		require.Less(t, resolverCalls(t, dir), len(writers), "the deadline ended it, not the writers")
 	})
 
@@ -472,8 +490,11 @@ func TestUserLand_resolveRounds(t *testing.T) {
 					continue
 				}
 				requireMergeConflict(t, r.err)
-				require.True(t, strings.Contains(r.err.Error(), "files kept changing") || strings.Contains(r.err.Error(), "deadline"),
-					"land %d fails with its reason: %v", i, r.err)
+				pkg := landConflictDetail(r.err)
+				require.NotNil(t, pkg, "land %d ends with the package: %v", i, r.err)
+				for _, f := range pkg.GetFiles() {
+					require.NotEmpty(t, f.GetReason(), "land %d, %s", i, f.GetPath())
+				}
 				timedOut++
 			case <-time.After(60 * time.Second):
 				require.FailNow(t, "a land hangs", "land %d", i)

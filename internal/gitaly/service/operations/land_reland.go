@@ -471,7 +471,7 @@ func (s *Server) landCheckSlotted(
 		}
 	}()
 	if s.landCheckBatchHook != nil {
-		s.landCheckBatchHook()
+		s.landCheckBatchHook(ctx)
 	}
 	checked, resp, err := s.landCheckBatch(ctx, in, repo, l, actor, resolved, batch, cache, slot, unchecked)
 	return checked, resp, "checking", err

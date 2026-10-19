@@ -148,22 +148,21 @@ func (s *Server) landResolveAt(
 		if !f.sent() {
 			continue
 		}
-		mine = append(mine, f)
 		if v, ok := pre.verdicts[landKeyOf(f.conflict)]; ok {
+			mine = append(mine, f)
 			reused[f.conflict.path] = v.file
 			reusedNames = append(reusedNames, v.resolver)
 			f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
 			continue
 		}
-		sent = append(sent, landRequestFile(f))
-	}
-	// Past its deadline a land only reports what it has: the resolver is not called.
-	if pre.unverifiable != "" && len(sent) > 0 {
-		paths := make([]string, 0, len(sent))
-		for _, f := range sent {
-			paths = append(paths, f.Path)
+		if pre.unverifiable != "" {
+			// The land is being ended (landFinalPass): the resolver is not called, and a file with no
+			// verdict at this tip is reported as not attempted, with why.
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, pre.unverifiable
+			continue
 		}
-		return l, nil, &landNeedsResolution{tip: tip, commit: commitID, paths: paths}
+		mine = append(mine, f)
+		sent = append(sent, landRequestFile(f))
 	}
 
 	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
@@ -226,6 +225,8 @@ func (s *Server) landResolveAt(
 		switch {
 		case pre.unverifiable != "":
 			landAnnotateProposed(files, pre.unverifiable)
+		case !s.resolveCfg.Verify.Enabled && len(s.resolveCfg.Verify.Command) > 0:
+			landAnnotateProposed(files, landVerifyDisabledReason)
 		case !s.resolveCfg.Verify.Enabled:
 			landAnnotateProposed(files, landNoVerifyReason)
 		case landAllAnswered(files):
@@ -234,7 +235,7 @@ func (s *Server) landResolveAt(
 				return l, nil, err
 			}
 			var verifyErr *landVerifyError
-			switch err := s.landVerifyOutOfLane(ctx, repo, tree); {
+			switch err := s.landVerifyOutOfLane(ctx, in.GetRepository(), repo, tree); {
 			case err == nil:
 				verified = tree
 				pre.markVerified(tree)

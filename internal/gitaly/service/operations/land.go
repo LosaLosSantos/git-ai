@@ -154,7 +154,7 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 		}
 
 		if attempt >= maxAttempts || snapshotPinned {
-			return nil, landKeptMovingError(in, conflict, attempt)
+			return nil, landKeptMoving(in, pre, conflict, attempt)
 		}
 
 		if err := waitLandBackoff(ctx, attempt); err != nil {
@@ -400,6 +400,18 @@ func landMergeConflictError(tip, commitID git.ObjectID, conflictingFiles [][]byt
 			},
 		},
 	})
+}
+
+// landKeptMoving is the error of a landing that gave up because the branch kept moving. A model's
+// resolution is handed back instead, as a land that needs its new tree verified (it is the same
+// cause: the branch moved on): UserLand goes out again, and at its deadline the agent gets the
+// proposals, not an error about a branch it has nothing to do with. The others get
+// landKeptMovingError.
+func landKeptMoving(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempts int) error {
+	if pre.hasModel() {
+		return &landNeedsResolution{tip: conflict.newOID, commit: git.ObjectID(in.GetCommitId()), moved: true}
+	}
+	return landKeptMovingError(in, conflict, attempts)
 }
 
 // landKeptMovingError returns the FailedPrecondition error for a landing that lost the
