@@ -14,6 +14,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
@@ -245,6 +246,78 @@ func TestSyncerUntrustedRepositoryIsNeverSettled(t *testing.T) {
 
 	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
 	e.verifySynced(t, repo)
+}
+
+// failReferences returns a sync function that fails the fsyncs of reference
+// files while failing is set: the writes of the references were lost, the rest
+// of the disk is fine.
+func failReferences(failing *atomic.Bool) func(f *os.File) error {
+	return func(f *os.File) error {
+		if failing.Load() && strings.Contains(f.Name(), "/reftable") {
+			return errors.New("input/output error")
+		}
+		return f.Sync()
+	}
+}
+
+// TestSyncerUntrustedRepositoryAcrossAProcessRestart is a failed fsync whose
+// move aside fails, followed by a restart of the process in the same boot:
+// the restarted process's fsyncs succeed, and the repository is moved aside
+// all the same, never settled.
+func TestSyncerUntrustedRepositoryAcrossAProcessRestart(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+	e, repo, _ := caughtUpDirty(t, localrefs.WithSync(failReferences(&failing)))
+	tmpDir, err := e.locator.TempDir(e.storageName)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpDir, 0o700))
+
+	failing.Store(true)
+	require.NoError(t, os.Chmod(tmpDir, 0o500))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.NoError(t, os.Chmod(tmpDir, 0o700))
+	failing.Store(false)
+	require.DirExists(t, e.localPath(), "the move aside failed")
+
+	// The process restarts in the same boot.
+	coretest.EnableLocalRefs(t, e.core, e.cfg)
+	e.sy = syncer.New(e.core, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
+	require.NoError(t, e.sy.RecoverLocalReferences(e.ctx, []string{e.storageName}))
+
+	require.NoDirExists(t, e.localPath(), "an untrusted repository is moved aside at the restart")
+	require.Empty(t, e.markers(t))
+	require.Equal(t, float64(1), e.untrusted(t, localrefs.ReasonSyncFailed))
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.verifySynced(t, repo)
+}
+
+// TestSyncerUntrustedRepositoryWithShadowHistoryIsKept verifies that an
+// untrusted repository whose local copy holds history written in shadow mode
+// and not imported yet (the guard of a sync's hydration) is moved aside but
+// not deleted: it is never served, and the history is not lost.
+func TestSyncerUntrustedRepositoryWithShadowHistoryIsKept(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+	e, _, c2 := caughtUpDirty(t, localrefs.WithSync(failReferences(&failing)))
+	_, err := changelog.Append(e.localPath(), changelog.Meta{Operation: "push", Actor: "alice"}, []changelog.Update{
+		{Reference: "refs/heads/shadow", OldOID: gittest.DefaultObjectHash.ZeroOID.String(), NewOID: c2.String()},
+	})
+	require.NoError(t, err)
+
+	failing.Store(true)
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	failing.Store(false)
+
+	require.NoDirExists(t, e.localPath(), "never served")
+	kept, err := filepath.Glob(filepath.Join(e.storagePath, syncer.KeptDirName, "*", "repo.git"))
+	require.NoError(t, err)
+	require.Len(t, kept, 1, "the copy with the shadow history is kept")
+	last, err := changelog.LastSequence(kept[0])
+	require.NoError(t, err)
+	require.Positive(t, last)
+	require.Empty(t, e.markers(t))
 }
 
 // TestSyncerUntrustedRepositoryThatIsGoneLosesItsMarker verifies that an

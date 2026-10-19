@@ -470,9 +470,13 @@ or re-import the repository from scratch (see
     from then on the repository's marker is never removed: if the move aside
     fails, it is retried every second. Other errors of the step (a file that
     cannot be opened for a moment) are retried every second and counted.
-  - *Process restart*: the markers found are kept for 20 s (twice git's
-    reference lock timeout) before they can be removed, in case a git process of
-    the previous process is still finishing.
+  - *Process restart*: a marker found is kept while the repository's reftable
+    directory holds a git lock or a table being written (a git process of the
+    previous process may still be finishing), and for 2 s at least. A
+    repository the previous process had found untrusted is moved aside.
+  - A repository moved aside that holds shadow-mode history not imported yet
+    goes to `<storage>/+gitaly/graft-untrusted/` and stays there: import what
+    it holds, or remove it.
   - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
     repository durable and removes its marker, so a clean reboot hydrates
     nothing.

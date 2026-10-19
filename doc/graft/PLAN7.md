@@ -610,9 +610,22 @@ repository-wide lock.
    * *Write failure.* Only a failed fsync means the kernel may have dropped
      writes, and the kernel reports a failed writeback once: a later fsync of the
      same file succeeds.
-     * So the first failed fsync makes the repository *untrusted* for good.
+     * So the first failed fsync makes the repository *untrusted* for good. The
+       marker is rewritten durably with that failure, so a restart of the
+       process in the same boot keeps it untrusted too.
      * An untrusted repository's marker is never cleared; only the move aside is
        retried, until it succeeds. Then the hydrated repository starts clean.
+     * If even rewriting the marker fails, the disk is failing; the state of the
+       process still keeps the repository untrusted until it stops.
+     * A repository moved aside (`Forget`) while a git process of the owner
+       that writes without fsync still runs stays dirty with a plain marker
+       until that process exited and a durable step settled it. git names the
+       repository by its path, so the process's later writes land in what is
+       there now, the hydrated repository say.
+     * A copy that holds shadow-mode history not imported yet (the
+       `checkReplaceable` guard of a sync's hydration) is moved into
+       `<storage>/+gitaly/graft-untrusted/` instead of being deleted: it is
+       never served, and the history is not lost.
      * The repository is moved aside at once, under the repository lock: the
        move (both directories and the new entry) is made durable, then the
        marker removed.
@@ -638,13 +651,32 @@ repository-wide lock.
        whose local copy may be the only one (an import that is not complete).
      * A marker of the same boot is a process restart: the page cache kept
        every write, so the repository stays dirty to be settled.
-       * It is settled no earlier than the recovery grace (twice
-         `reftable.lockTimeout`): a git process of the previous owner that
-         outlived it (killed with it, not reaped yet) may still be committing
-         for that long.
-       * The git children get no parent-death signal: the command package is
-         shared and not in m3's grant. The grace bounds their life instead,
-         since a killed parent closes their stdin and git then aborts.
+       * A git process of the previous owner that outlived it (killed with it,
+         not reaped yet) may still be committing. So the marker stays while the
+         repository's reftable directory holds a git lock or a table being
+         written, which a writing git process always has: `tables.list.lock`
+         (prepare to commit), `<table>.lock` (the tables a compaction merges),
+         `*.temp.*` (a table being written). On top of that there is a floor
+         of 2 s (`RecoveryGrace`), for the instant between a commit's rename
+         and the start of its auto-compaction.
+       * A marker that records an untrusted repository is handled like a
+         marker of another boot: the repository is moved aside if it is a
+         cache, and its marker is never settled otherwise.
+       * Why the grace bound holds: when the previous owner dies, the stdin
+         of its `update-ref --stdin` children closes.
+         * A child that has not been sent `commit` aborts at end of input and
+           writes nothing.
+         * A child that has been sent `commit` already holds the reference lock
+           (taken in `prepare`). It only writes its table and list and
+           compacts, which takes milliseconds.
+         * A child still waiting for the lock writes nothing afterwards: the
+           next thing it reads is the end of its input.
+         * A child that is committing is not bounded in time. Hence the rule
+           on git's lock and temporary files above, and only a short floor.
+       * No parent-death signal (`Pdeathsig`) instead, deliberately (PM).
+         Go's `Pdeathsig` fires when the OS thread that created the child exits,
+         not the process, unless the spawn is pinned with `LockOSThread`. In the
+         shared command package that is easy to get subtly wrong.
      * The ownership is taken in two steps. The locks come first; the recovery
        runs; only then are the process's writes deferred (`Activate`). So no
        writer of the new owner writes a marker that the recovery could take for
@@ -706,6 +738,16 @@ repository-wide lock.
       symbolic split;
     * a failed fsync then a successful one; and the same with a failed move
       aside.
+* Third review (of 18e152a):
+  * M-A: the untrusted state is in the marker and survives a process restart.
+  * m-1: Forget keeps a repository with a live git process dirty.
+  * m-2: recovered markers wait for git's lock and temporary files, with a 2 s
+    floor.
+  * m-3: the cache check applies the sync's shadow-history guard; such copies
+    are kept, not deleted.
+  * m-4: a test proves the end of a deferred process runs after it exited. The
+    mutation that swaps the two defers fails it.
+  * Clean states are dropped; MarkDirty takes its state from the map again.
 
 **Tests.**
 * `localrefs`:

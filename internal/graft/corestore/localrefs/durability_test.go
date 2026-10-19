@@ -39,12 +39,14 @@ type syncRecorder struct {
 	mu       sync.Mutex
 	paths    []string
 	failWith error
+	// failOnly, when set, limits the failures to the paths that contain it.
+	failOnly string
 }
 
 func (s *syncRecorder) sync(f *os.File) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.failWith != nil {
+	if s.failWith != nil && strings.Contains(f.Name(), s.failOnly) {
 		return s.failWith
 	}
 	s.paths = append(s.paths, f.Name())
@@ -401,6 +403,115 @@ func TestSettleReportsAFailedWriteAsUntrusted(t *testing.T) {
 	require.NoFileExists(t, f.markerPath(t, d))
 	require.Empty(t, d.Dirty())
 	require.Equal(t, 0.0, testutil.ToFloat64(d.dirty))
+}
+
+// TestUntrustedSurvivesAProcessRestart verifies that the untrusted state is in
+// the marker: a restart of the process in the same boot, whose fsyncs then
+// succeed, finds the repository untrusted and never settles it.
+func TestUntrustedSurvivesAProcessRestart(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+
+	before := f.durability(t, "boot-a", 0)
+	require.NoError(t, before.MarkDirty(f.ctx, f.repo, f.path))
+	// The writes of the references were lost; the marker's directory is fine.
+	f.synced.mu.Lock()
+	f.synced.failOnly = "/reftable"
+	f.synced.mu.Unlock()
+	f.synced.fail(errors.New("input/output error"))
+	require.ErrorIs(t, before.Settle(f.path, false), ErrUntrusted)
+	f.synced.fail(nil)
+	content, err := os.ReadFile(f.markerPath(t, before))
+	require.NoError(t, err)
+	require.Contains(t, string(content), `"untrusted":"fsync: input/output error"`)
+	require.NoError(t, before.Close())
+
+	after := f.durability(t, "boot-a", 0)
+	found, err := after.Recover(f.ctx, []string{f.repo.Storage})
+	require.NoError(t, err)
+	require.Equal(t, []Recovered{{Repo: f.repo, Path: f.path, Untrusted: true}}, found)
+	err = after.Settle(f.path, true)
+	require.ErrorIs(t, err, ErrUntrusted)
+	require.FileExists(t, f.markerPath(t, after))
+}
+
+// TestForgetKeepsARepositoryWithALiveGitProcess verifies that moving a
+// repository aside while a git process that writes without fsync is still
+// running keeps the repository dirty: that process names the repository by its
+// path, so its later writes land in what is there now.
+func TestForgetKeepsARepositoryWithALiveGitProcess(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	d := f.durability(t, "boot-a", 0)
+
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+	end := d.Begin(f.path)
+	f.synced.fail(errors.New("input/output error"))
+	require.ErrorIs(t, d.Settle(f.path, false), ErrUntrusted)
+	f.synced.fail(nil)
+
+	require.NoError(t, d.Forget(f.ctx, f.repo, f.path))
+	require.FileExists(t, f.markerPath(t, d))
+	content, err := os.ReadFile(f.markerPath(t, d))
+	require.NoError(t, err)
+	require.NotContains(t, string(content), "untrusted", "what is at the path now is not the untrusted repository")
+	require.Equal(t, []string{f.path}, d.Dirty())
+	require.NoError(t, d.Settle(f.path, true))
+	require.FileExists(t, f.markerPath(t, d), "the git process is still running")
+
+	end()
+	require.NoError(t, d.Settle(f.path, false))
+	require.NoFileExists(t, f.markerPath(t, d))
+}
+
+// TestRecoveredMarkerWaitsForGit verifies that a marker found at the
+// recovery stays while git's lock or a table being written is in the
+// repository: a git process of the previous owner may still be writing.
+func TestRecoveredMarkerWaitsForGit(t *testing.T) {
+	t.Parallel()
+
+	for _, leftover := range []string{"tables.list.lock", "0x000000000009-0x000000000009-abcdef01.ref.lock", "0x000000000009-0x000000000009-abcdef01.ref.temp.XyZ123"} {
+		t.Run(leftover, func(t *testing.T) {
+			t.Parallel()
+			f := setupDurability(t)
+
+			old := f.durability(t, "boot-a", 0)
+			require.NoError(t, old.MarkDirty(f.ctx, f.repo, f.path))
+			require.NoError(t, old.Close())
+
+			file := filepath.Join(f.path, "reftable", leftover)
+			require.NoError(t, os.WriteFile(file, []byte("0x000000000001-0x000000000003-abcdef01.ref\n"), 0o666))
+
+			next := f.durability(t, "boot-a", 0)
+			_, err := next.Recover(f.ctx, []string{f.repo.Storage})
+			require.NoError(t, err)
+			require.NoError(t, next.Settle(f.path, true))
+			require.FileExists(t, f.markerPath(t, next), "git may still be writing")
+
+			require.NoError(t, os.Remove(file))
+			require.NoError(t, next.Settle(f.path, true))
+			require.NoFileExists(t, f.markerPath(t, next))
+		})
+	}
+}
+
+// TestSettleDropsTheStateOfACleanRepository verifies that the states do not
+// grow with every repository ever written, and that a writer after the drop
+// marks the repository again.
+func TestSettleDropsTheStateOfACleanRepository(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	d := f.durability(t, "boot-a", 0)
+
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+	require.NoError(t, d.Settle(f.path, false))
+	d.mu.Lock()
+	require.Empty(t, d.repos)
+	d.mu.Unlock()
+
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+	require.FileExists(t, f.markerPath(t, d))
+	require.Equal(t, []string{f.path}, d.Dirty())
 }
 
 // TestSettleTransientErrorIsNotUntrusted verifies that a failure to read the
