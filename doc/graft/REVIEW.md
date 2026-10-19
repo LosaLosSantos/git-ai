@@ -255,6 +255,28 @@ approvals = 1
 That is, code and configuration changes need one approval by someone other
 than the author; comment-only, docs, tests and generated changes need none.
 
+## Configuration: `[graft.review] max_open_reviews`
+
+```toml
+[graft.review]
+max_open_reviews = 1000   # default when unset or 0; negative is rejected
+```
+
+Every open review keeps its head and base commits by hidden references
+(`refs/keep-around/review/<commit>`, see [STORAGE.md](STORAGE.md)), in every
+mode, storage core on or off. `max_open_reviews` bounds the open reviews of one
+repository, and so those references and the objects they keep. `CreateReview`
+refuses a review beyond it with `ResourceExhausted` ("the repository has N
+open reviews, the limit is N; close or land an open review first, or raise
+[graft.review] max_open_reviews") and writes nothing. The bound holds against
+concurrent creates, on one node and, in authoritative mode, across nodes: the
+store counts the open reviews and records the review under one lock (the file
+lock, or the repository row in the database). Landed and closed reviews do not
+count; closing one makes room. Reviews brought in by `graft storage import`
+are not bounded: they exist already. Counting reads every review of the
+repository in the files store (it has no index of the open ones), as listing
+does.
+
 ## Storage
 
 Reviews live in the repository's git directory, under `graft/reviews/`:

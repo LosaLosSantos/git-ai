@@ -306,3 +306,95 @@ func TestReviewRootsOutsideAuthoritativeMode(t *testing.T) {
 		require.True(t, hasObject(t, cfg, repoPath, head))
 	})
 }
+
+// localKeepArounds returns the keep-around references of the local repository.
+func localKeepArounds(t *testing.T, cfg config.Cfg, repoPath string) []string {
+	t.Helper()
+	out := strings.TrimSpace(string(gittest.Exec(t, cfg, "-C", repoPath, "for-each-ref", "--format=%(refname)", corestore.KeepAroundPrefix)))
+	if out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// TestCreateReviewIsBoundedByMaxOpenReviews: a repository with
+// max_open_reviews open reviews refuses another with ResourceExhausted before
+// it writes any reference, in every store; closing one makes room
+// (integrated review m2).
+func TestCreateReviewIsBoundedByMaxOpenReviews(t *testing.T) {
+	for _, mode := range []corestore.Mode{corestore.ModeShadow, corestore.ModeAuthoritative} {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx, cfg, core, client := setupWithConfig(t, mode, func(cfg *config.Cfg) { cfg.Graft.Review.MaxOpenReviews = 2 })
+			repo, repoPath := createLocalRepository(t, ctx, cfg)
+			base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
+			heads := make([]git.ObjectID, 3)
+			for i := range heads {
+				heads[i] = gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage(fmt.Sprint("head ", i)), gittest.WithParents(base), gittest.WithBranch(fmt.Sprint("feature-", i)))
+			}
+			tracked := importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{})
+
+			create := func(head git.ObjectID) (*gitalypb.CreateReviewResponse, error) {
+				return client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
+			}
+			first, err := create(heads[0])
+			require.NoError(t, err)
+			_, err = create(heads[1])
+			require.NoError(t, err)
+
+			headSeq := func() uint64 {
+				record, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repo))
+				require.NoError(t, err)
+				return record.HeadSeq
+			}
+			before := headSeq()
+			_, err = create(heads[2])
+			require.Equal(t, codes.ResourceExhausted, status.Code(err), "%v", err)
+			require.Equal(t, before, headSeq(), "the refusal writes no reference transaction")
+			require.ErrorContains(t, err, "the repository has 2 open reviews, the limit is 2")
+			require.ErrorContains(t, err, "max_open_reviews")
+			require.Len(t, listStoredReviews(t, ctx, client, repo, true), 2, "nothing is recorded")
+			require.Equal(t, keepAroundOf(heads[0], heads[1], base), keepArounds(t, ctx, core, tracked.ID), "no reference is written")
+			require.NotContains(t, localKeepArounds(t, cfg, repoPath), corestore.KeepAroundRef(heads[2].String()))
+
+			_, err = client.CloseReview(ctx, &gitalypb.CloseReviewRequest{Repository: repo, Id: first.GetReview().GetId()})
+			require.NoError(t, err)
+			_, err = create(heads[2])
+			require.NoError(t, err, "closing a review makes room")
+			require.Equal(t, keepAroundOf(heads[1], heads[2], base), keepArounds(t, ctx, core, tracked.ID))
+		})
+	}
+}
+
+// TestCreateReviewPastTheLimitReleasesItsRoots: a create that passes the
+// service's check, and that a concurrent create then puts past the limit, is
+// refused by the store, atomically, and its keep-around references, written
+// already, are released.
+func TestCreateReviewPastTheLimitReleasesItsRoots(t *testing.T) {
+	var (
+		core    *corestore.Core
+		tracked corestore.Repository
+		other   git.ObjectID
+	)
+	ctx, cfg, core, client := setupWithConfig(t, corestore.ModeAuthoritative,
+		func(cfg *config.Cfg) { cfg.Graft.Review.MaxOpenReviews = 1 },
+		func(s *server) {
+			s.rootsProtected = func(ctx context.Context, _ *localrepo.Repo, _ store.ReviewStore) {
+				// The concurrent create: recorded between the check and the write.
+				_, err := core.Meta.InsertReview(ctx, tracked.ID, func(id string) (*gitalypb.Review, error) {
+					return &gitalypb.Review{Id: id, TargetBranch: []byte("main"), HeadCommitId: other.String(), BaseCommitId: other.String()}, nil
+				}, corestore.ReviewInsert{})
+				require.NoError(t, err)
+			}
+		})
+	repo, repoPath := createLocalRepository(t, ctx, cfg)
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"), gittest.WithBranch("main"))
+	head := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("head"), gittest.WithParents(base), gittest.WithBranch("feature"))
+	other = gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("other"), gittest.WithParents(base), gittest.WithBranch("other"))
+	tracked = importRepository(t, cfg, core, repo, repoPath, coretest.ImportOptions{})
+
+	_, err := client.CreateReview(ctx, &gitalypb.CreateReviewRequest{Repository: repo, TargetBranch: []byte("main"), HeadCommitId: head.String()})
+	require.Equal(t, codes.ResourceExhausted, status.Code(err), "%v", err)
+	require.Len(t, listStoredReviews(t, ctx, client, repo, true), 1, "only the concurrent review is recorded")
+	require.Empty(t, keepArounds(t, ctx, core, tracked.ID), "the references of the refused review are released")
+	require.Empty(t, localKeepArounds(t, cfg, repoPath))
+}

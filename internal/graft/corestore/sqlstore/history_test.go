@@ -85,7 +85,7 @@ func TestImportHistory(t *testing.T) {
 
 		inserted, err := s.InsertReview(ctx, repo.ID, func(id string) (*gitalypb.Review, error) {
 			return newReview("next", "main", gitalypb.Review_STATE_OPEN_UNSPECIFIED), nil
-		}, false)
+		}, corestore.ReviewInsert{})
 		require.NoError(t, err)
 		require.Equal(t, "8", inserted.GetId(), "the next review ID follows the largest imported one")
 

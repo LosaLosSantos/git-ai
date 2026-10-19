@@ -432,6 +432,22 @@ guarded nor swept).
     missing from the repository is logged; the checkpoint cannot hold it.
     Test: `TestStorageCheckpointBackfillsReviewRoots` (e2e; a mutant without
     step 0 fails it on both dialects).
+  * **Bound (integrated review m2).** The references are written in every
+    mode, so an unbounded number of open reviews would be an unbounded number
+    of references and kept objects, with the storage core off too.
+    `[graft.review] max_open_reviews` (default 1000) bounds the open reviews of
+    a repository. `CreateReview` checks it before it writes any reference
+    (`ResourceExhausted`, nothing written, no reference transaction); the store
+    checks it again atomically with the record (`store.Store` under its file
+    lock, `InsertReview` under the repository row lock with
+    `ReviewInsert.MaxOpen`), so concurrent creates never pass it. A create that
+    passed the first check and lost the second has written its references:
+    the service releases them as a close does (sweep of those commits unless
+    another open review uses them; the backstop otherwise). Imports are not
+    bounded. Tests: `TestCreateIsBoundedByTheOpenReviews` (both stores, twelve
+    concurrent creates from two handles), `TestCreateReviewIsBoundedByMaxOpenReviews`,
+    `TestCreateReviewPastTheLimitReleasesItsRoots`; mutants without either
+    check fail them.
   * A sweep may skip references younger than `gc_grace` to make the
     creation/sweep race rare. That is an efficiency measure only; correctness
     comes from the invariant and the bounded retry.

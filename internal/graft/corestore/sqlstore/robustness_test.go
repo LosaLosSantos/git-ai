@@ -79,7 +79,7 @@ func TestWritesHonourDeadlineWhileLocked(t *testing.T) {
 				call: func(ctx context.Context) error {
 					_, err := s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 						return newReview("t", "refs/heads/main", gitalypb.Review_STATE_OPEN_UNSPECIFIED), nil
-					}, false)
+					}, corestore.ReviewInsert{})
 					return err
 				},
 			},

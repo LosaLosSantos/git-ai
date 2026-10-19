@@ -514,7 +514,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 
 		_, err := a.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 			return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(oid(500))}, nil
-		}, false)
+		}, corestore.ReviewInsert{})
 		require.NoError(t, err)
 
 		const (
@@ -599,7 +599,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 					if err := writeRoots(s, head, func() error {
 						_, err := s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 							return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: head}, nil
-						}, true)
+						}, corestore.ReviewInsert{RequireRoots: true})
 						return err
 					}); err != nil {
 						recordUnexpected(fmt.Errorf("insert review: %w", err))

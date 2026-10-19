@@ -162,7 +162,7 @@ func TestStorageCheckpointBackfillsReviewRoots(t *testing.T) {
 		repoID := a.record(t, rel).ID
 		_, err = a.core.Meta.InsertReview(a.ctx, repoID, func(id string) (*gitalypb.Review, error) {
 			return &gitalypb.Review{Id: id, TargetBranch: []byte("main"), HeadCommitId: head, BaseCommitId: base, Title: []byte("before the rule")}, nil
-		}, false)
+		}, corestore.ReviewInsert{})
 		require.NoError(t, err)
 
 		cp, err := a.operator(t, rel).StorageCheckpoint(a.ctx)

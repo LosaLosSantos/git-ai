@@ -89,7 +89,25 @@ type CheckpointInput struct {
 	PackDeadline time.Time
 }
 
+// ReviewInsert are the conditions under which MetaStore.InsertReview writes a
+// review; the zero value has none.
+type ReviewInsert struct {
+	// RequireRoots requires the keep-around reference (KeepAroundRef) of the
+	// review's head and base commits to exist with that value, else
+	// ErrReviewRootsMissing and nothing is written (doc/graft/PLAN7.md, REVIEW
+	// ROOTS RULE). Together with CommitChangeset's refusal to delete such a
+	// reference, every open review written so has its commits referenced.
+	RequireRoots bool
+	// MaxOpen, when positive, refuses an open review with
+	// ErrTooManyOpenReviews when the repository has MaxOpen open reviews
+	// already, and nothing is written.
+	MaxOpen int
+}
+
 var (
+	// ErrTooManyOpenReviews is returned by InsertReview for an open review
+	// beyond ReviewInsert.MaxOpen.
+	ErrTooManyOpenReviews = errors.New("storage core: too many open reviews")
 	// ErrReviewNotFound is returned for an unknown review ID.
 	ErrReviewNotFound = errors.New("storage core: review not found")
 	// ErrReviewVersionConflict is returned by UpdateReview when the review
@@ -156,13 +174,9 @@ type MetaStore interface {
 	// with it and stores the returned review (version 1), atomically. build runs
 	// inside the write transaction and must not call the MetaStore.
 	//
-	// With requireRoots the transaction locks the repository row first and
-	// requires the keep-around reference (KeepAroundRef) of the review's head and
-	// base commits to exist with that value, else ErrReviewRootsMissing and
-	// nothing is written (doc/graft/PLAN7.md, REVIEW ROOTS RULE). Together with
-	// CommitChangeset's refusal to delete such a reference, every open review
-	// written so has its commits referenced.
-	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), requireRoots bool) (*gitalypb.Review, error)
+	// The transaction locks the repository row first, so the conditions of
+	// opts hold against every concurrent insert (ReviewInsert).
+	InsertReview(ctx context.Context, repoID int64, build func(id string) (*gitalypb.Review, error), opts ReviewInsert) (*gitalypb.Review, error)
 	// GetReview returns the review and its version, ErrReviewNotFound if unknown.
 	GetReview(ctx context.Context, repoID int64, id string) (*gitalypb.Review, int64, error)
 	// ListReviews returns the reviews of the repository newest first

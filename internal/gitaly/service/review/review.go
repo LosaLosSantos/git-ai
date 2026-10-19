@@ -80,6 +80,18 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 		return nil, structerr.NewInternal("%w", err)
 	}
 
+	// A repository at its limit refuses here, before the keep-around
+	// references are written. The store refuses again, atomically, a create
+	// that a concurrent one put past the limit.
+	maxOpen := s.deps.GetCfg().Graft.Review.MaxOpenReviewsOrDefault()
+	open, err := st.List("", false, 0)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	if len(open) >= maxOpen {
+		return nil, toStatus(fmt.Errorf("%w: the repository has %d open reviews, the limit is %d", store.ErrTooManyOpenReviews, len(open), maxOpen))
+	}
+
 	var stored *gitalypb.Review
 	err = s.writeRoots(ctx, repo, st, func(st store.ReviewStore, protect rootsProtect) error {
 		if err := protect("", head, base); err != nil {
@@ -99,6 +111,10 @@ func (s *server) CreateReview(ctx context.Context, req *gitalypb.CreateReviewReq
 		})
 		return err
 	})
+	if errors.Is(err, store.ErrTooManyOpenReviews) {
+		// The references were written for a review that was not recorded.
+		s.releaseRoots(ctx, repo, st, reviewCommits(head, base))
+	}
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -523,6 +539,9 @@ func hasFile(r *gitalypb.Review, path []byte) bool {
 func toStatus(err error) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return structerr.NewNotFound("review not found")
+	}
+	if errors.Is(err, store.ErrTooManyOpenReviews) {
+		return structerr.NewResourceExhausted("%w; close or land an open review first, or raise [graft.review] max_open_reviews", err)
 	}
 	if _, ok := status.FromError(err); ok {
 		return err

@@ -19,7 +19,7 @@ func insertReview(t *testing.T, ctx context.Context, s *sqlstore.Store, repoID i
 
 	inserted, err := s.InsertReview(ctx, repoID, func(id string) (*gitalypb.Review, error) {
 		return r, nil
-	}, false)
+	}, corestore.ReviewInsert{})
 	require.NoError(t, err)
 	return inserted
 }

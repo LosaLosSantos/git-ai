@@ -30,10 +30,18 @@ import (
 // server before it serves.
 func setupWithStorageCore(t *testing.T, mode corestore.Mode, configure ...func(*server)) (context.Context, config.Cfg, *corestore.Core, gitalypb.ReviewServiceClient) {
 	t.Helper()
+	return setupWithConfig(t, mode, func(*config.Cfg) {}, configure...)
+}
+
+// setupWithConfig is setupWithStorageCore with adjust applied to the
+// configuration before the server starts.
+func setupWithConfig(t *testing.T, mode corestore.Mode, adjust func(*config.Cfg), configure ...func(*server)) (context.Context, config.Cfg, *corestore.Core, gitalypb.ReviewServiceClient) {
+	t.Helper()
 
 	ctx := testhelper.Context(t)
 	cfg := testcfg.Build(t)
 	cfg.Graft.Standalone = true
+	adjust(&cfg)
 	// The service writes keep-around references through the
 	// reference-transaction hook.
 	testcfg.BuildGitalyHooks(t, cfg)

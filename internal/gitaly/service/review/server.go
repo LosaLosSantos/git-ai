@@ -52,7 +52,7 @@ func newServer(deps *service.Dependencies) *server {
 
 // openRepo returns the repository and its review store. In authoritative mode
 // the reviews live in the storage core's database; otherwise they are the files
-// of the repository.
+// of the repository. The store's Create is bounded by max_open_reviews.
 func (s *server) openRepo(ctx context.Context, repoProto *gitalypb.Repository) (*localrepo.Repo, store.ReviewStore, error) {
 	repo := s.deps.GetRepositoryFactory().Build(repoProto)
 
@@ -61,9 +61,10 @@ func (s *server) openRepo(ctx context.Context, repoProto *gitalypb.Repository) (
 		return nil, nil, structerr.NewInternal("repository path: %w", err)
 	}
 
+	maxOpen := s.deps.GetCfg().Graft.Review.MaxOpenReviewsOrDefault()
 	core := s.deps.GetGraftStorage()
 	if !core.Authoritative() {
-		return repo, store.Open(path), nil
+		return repo, store.Open(path).WithMaxOpen(maxOpen), nil
 	}
 
 	tracked, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repoProto))
@@ -74,7 +75,7 @@ func (s *server) openRepo(ctx context.Context, repoProto *gitalypb.Repository) (
 		return nil, nil, structerr.NewUnavailable("storage core: %w", err)
 	}
 
-	return repo, dbreview.New(ctx, core.Meta, tracked.ID), nil
+	return repo, dbreview.New(ctx, core.Meta, tracked.ID).(*dbreview.Store).WithMaxOpen(maxOpen), nil
 }
 
 // withRequirements sets the requirements and approval of r from the configured

@@ -538,7 +538,7 @@ func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
 	t.Cleanup(func() { _ = meta.Close() })
 	_, err = meta.InsertReview(n.ctx, state.RepositoryID, func(id string) (*gitalypb.Review, error) {
 		return &gitalypb.Review{Id: id, TargetBranch: []byte("main"), HeadCommitId: head, BaseCommitId: base, Title: []byte("before the rule")}, nil
-	}, false)
+	}, corestore.ReviewInsert{})
 	require.NoError(t, err)
 
 	roots := []string{corestore.KeepAroundRef(head), corestore.KeepAroundRef(base)}

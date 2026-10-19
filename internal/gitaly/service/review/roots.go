@@ -75,14 +75,15 @@ func (s *server) writeRoots(ctx context.Context, repo *localrepo.Repo, st store.
 }
 
 // releaseRoots deletes the keep-around references of the commits of a review
-// that was just closed, unless another open review uses them. The close is
-// already recorded, so a failure is not the request's: it is logged and counted
+// that was just closed, or that was refused after they were written, unless
+// another open review uses them. The close (or the refusal) is the request's
+// outcome already, so a failure is not the request's: it is logged and counted
 // (graft_review_roots_sweep_failures_total{trigger="close"}), and the reference
 // only keeps its objects alive until the housekeeping backstop deletes it
 // (reviewroots.Sweeper.Housekeep, which runs in every mode).
 func (s *server) releaseRoots(ctx context.Context, repo *localrepo.Repo, st store.ReviewStore, commits []git.ObjectID) {
 	if _, err := reviewroots.DefaultSweeper.Sweep(ctx, repo, st, commits, reviewroots.TriggerClose); err != nil {
 		s.deps.GetLogger().WithError(err).WithField("commits", commits).WarnContext(ctx,
-			"review: the keep-around references of a closed review were not deleted; the housekeeping backstop deletes them")
+			"review: the keep-around references of a closed or refused review were not deleted; the housekeeping backstop deletes them")
 	}
 }

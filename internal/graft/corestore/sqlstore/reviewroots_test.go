@@ -38,22 +38,22 @@ func TestReviewWritesRequireRootReferences(t *testing.T) {
 			require.Len(t, reviews, n)
 		}
 
-		_, err := s.InsertReview(ctx, repo.ID, build(head, base), true)
+		_, err := s.InsertReview(ctx, repo.ID, build(head, base), corestore.ReviewInsert{RequireRoots: true})
 		require.ErrorIs(t, err, corestore.ErrReviewRootsMissing, "no reference at all")
 		keepAround(t, ctx, s, repo.ID, head)
-		_, err = s.InsertReview(ctx, repo.ID, build(head, base), true)
+		_, err = s.InsertReview(ctx, repo.ID, build(head, base), corestore.ReviewInsert{RequireRoots: true})
 		require.ErrorIs(t, err, corestore.ErrReviewRootsMissing, "the base has none")
 		requireReviews(0)
 
 		// A keep-around reference with another value does not protect the commit.
 		_, err = commit(ctx, s, repo.ID, create(corestore.KeepAroundRef(string(base)), oid(12)))
 		require.NoError(t, err)
-		_, err = s.InsertReview(ctx, repo.ID, build(head, base), true)
+		_, err = s.InsertReview(ctx, repo.ID, build(head, base), corestore.ReviewInsert{RequireRoots: true})
 		require.ErrorIs(t, err, corestore.ErrReviewRootsMissing)
 		_, err = commit(ctx, s, repo.ID, update(corestore.KeepAroundRef(string(base)), oid(12), base))
 		require.NoError(t, err)
 
-		created, err := s.InsertReview(ctx, repo.ID, build(head, base), true)
+		created, err := s.InsertReview(ctx, repo.ID, build(head, base), corestore.ReviewInsert{RequireRoots: true})
 		require.NoError(t, err)
 		requireReviews(1)
 
@@ -72,14 +72,14 @@ func TestReviewWritesRequireRootReferences(t *testing.T) {
 
 		// Writes that do not require the roots are not conditioned: imports and
 		// comments.
-		_, err = s.InsertReview(ctx, repo.ID, build(oid(14), ""), false)
+		_, err = s.InsertReview(ctx, repo.ID, build(oid(14), ""), corestore.ReviewInsert{})
 		require.NoError(t, err)
 		r.Title = []byte("a comment")
 		require.NoError(t, s.UpdateReview(ctx, repo.ID, created.GetId(), version+1, r, false))
 
 		// A required write of a removed repository finds no repository row.
 		gone, _ := headRepo(t, ctx, s, "root-refs-gone", 1)
-		_, err = s.InsertReview(ctx, gone.ID, build(oid(15), ""), false)
+		_, err = s.InsertReview(ctx, gone.ID, build(oid(15), ""), corestore.ReviewInsert{})
 		require.NoError(t, err)
 		removed, err := s.DeleteRepository(ctx, gone.Key)
 		require.NoError(t, err)
@@ -101,11 +101,11 @@ func TestOpenReviewRootsCannotBeReleased(t *testing.T) {
 		}
 		open, err := s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 			return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(head), BaseCommitId: string(base)}, nil
-		}, true)
+		}, corestore.ReviewInsert{RequireRoots: true})
 		require.NoError(t, err)
 		_, err = s.InsertReview(ctx, repo.ID, func(string) (*gitalypb.Review, error) {
 			return &gitalypb.Review{TargetBranch: []byte("main"), HeadCommitId: string(closed), State: gitalypb.Review_STATE_CLOSED}, nil
-		}, true)
+		}, corestore.ReviewInsert{RequireRoots: true})
 		require.NoError(t, err)
 
 		before, seq, err := s.Refs(ctx, repo.ID)

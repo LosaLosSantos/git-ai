@@ -100,7 +100,9 @@ maintenance). Where they differ, PLAN7.md is the later decision.
   references reach), in checkpoints and through garbage collection. A review of
   a commit that only the serving node has works: the reference write uploads it.
   Closing a review deletes the references that no other open review uses; a
-  closed or landed review keeps nothing. Clients never see these references over
+  closed or landed review keeps nothing. The open reviews of a repository are
+  bounded by `[graft.review] max_open_reviews` (default 1000, see
+  [REVIEW.md](REVIEW.md)). Clients never see these references over
   the git protocols and cannot push or delete them. In authoritative mode the
   database enforces the rule: a review write requires the references, and no
   write (`DeleteRefs`, `WriteRef`, `UpdateReferences`, a push) can delete or
@@ -133,7 +135,7 @@ repository's object hash, and every pack against the SHA-256 in its key.
 
 | Mode | Source of truth | What the storage core does |
 |---|---|---|
-| `off` (default, also empty) | local git | Nothing. No database or bucket is opened. |
+| `off` (default, also empty) | local git | No database or bucket is opened. What milestone 3 adds outside the storage core still applies: open reviews keep their commits by `refs/keep-around/review/<commit>` references (bounded by `[graft.review] max_open_reviews`, see [REVIEW.md](REVIEW.md)), and the daily housekeeping backfills and sweeps them. |
 | `shadow` | local git | Every reference transaction of an imported repository is also committed to the database, with its pack. The database never rejects a write: a compare-and-swap mismatch is recorded as a forced changeset and counted as a divergence. Any storage core error, timeout or panic is logged and counted, and the git write proceeds. Reads, the file changelog and the file review store are unchanged. Works with or without Praefect. |
 | `authoritative` | database | A reference transaction commits only if its database compare-and-swap succeeds. Every request first catches the local repository up. The changelog and the reviews are served from the database. Requires `[graft] standalone = true`. |
 
