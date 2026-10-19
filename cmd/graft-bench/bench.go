@@ -238,6 +238,31 @@ type Sample struct {
 	// Agent is the agent that made the change. Multi-node runs group the
 	// samples by the node that serves the agent.
 	Agent int
+	// CommitLatency is the time of the Commit call, one UserCommitFiles, and
+	// Committed reports that it succeeded. LandLatency is the time of the Land
+	// call, one UserLand, without the wait of queue mode; it is zero when the
+	// change did not get to land.
+	CommitLatency time.Duration
+	Committed     bool
+	LandLatency   time.Duration
+}
+
+// The RPCs whose latency a run reports (Result.RPCs).
+const (
+	rpcCommitFiles = "commit_files"
+	rpcLand        = "land"
+)
+
+// RPCLatency is the latency of one RPC of a run, as the client measures it
+// around each call.
+type RPCLatency struct {
+	Calls  int `json:"calls"`
+	Failed int `json:"failed"`
+	// P50MS, P95MS and P99MS are the latency percentiles of the calls that
+	// succeeded.
+	P50MS float64 `json:"p50_ms"`
+	P95MS float64 `json:"p95_ms"`
+	P99MS float64 `json:"p99_ms"`
 }
 
 // Result is the aggregated outcome of a run. Its JSON form is the output of
@@ -303,6 +328,10 @@ type Result struct {
 	P99MS float64 `json:"p99_ms"`
 	// FailedP95MS is the p95 latency of the failed changes, zero if none failed.
 	FailedP95MS float64 `json:"failed_p95_ms"`
+	// RPCs holds the latency of each RPC of the run by name: commit_files (the
+	// UserCommitFiles of every change) and land (the UserLand of every change
+	// that was committed).
+	RPCs map[string]RPCLatency `json:"rpcs,omitempty"`
 
 	// FailureClasses counts the failed changes by the kind of their failure
 	// message, with the object IDs removed (see errorKind).
@@ -407,8 +436,9 @@ func runChange(ctx context.Context, cfg Config, be Backend, c Change, base strin
 	began := time.Now()
 
 	commit, err := be.Commit(ctx, c, base)
+	commitLatency := time.Since(began)
 	if err != nil {
-		return Sample{Latency: time.Since(began), Err: fmt.Errorf("commit: %w", err), Agent: c.Agent}
+		return Sample{Latency: commitLatency, CommitLatency: commitLatency, Err: fmt.Errorf("commit: %w", err), Agent: c.Agent}
 	}
 
 	if cfg.Mode == ModeQueue {
@@ -416,7 +446,9 @@ func runChange(ctx context.Context, cfg Config, be Backend, c Change, base strin
 		defer queueMu.Unlock()
 	}
 
+	landStart := time.Now()
 	outcome, err := be.Land(ctx, cfg, c, commit)
+	landLatency := time.Since(landStart)
 	if cfg.Mode == ModeQueue && cfg.TestDuration > 0 && err == nil {
 		// The simulated test runs while the queue is still held.
 		timer := time.NewTimer(cfg.TestDuration)
@@ -427,7 +459,14 @@ func runChange(ctx context.Context, cfg Config, be Backend, c Change, base strin
 		}
 	}
 
-	s := Sample{Latency: time.Since(began), Outcome: outcome, Agent: c.Agent}
+	s := Sample{
+		Latency:       time.Since(began),
+		Outcome:       outcome,
+		Agent:         c.Agent,
+		CommitLatency: commitLatency,
+		Committed:     true,
+		LandLatency:   landLatency,
+	}
 	switch {
 	case err != nil:
 		s.Err = fmt.Errorf("land: %w", err)
@@ -454,8 +493,13 @@ func aggregate(cfg Config, samples []Sample, elapsed time.Duration) Result {
 	var landedMS, failedMS []float64
 	var batchSum, batchCount int
 	seen := map[string]bool{}
+	rpcs := map[string]*rpcSamples{rpcCommitFiles: {}, rpcLand: {}}
 	for _, s := range samples {
 		ms := float64(s.Latency) / float64(time.Millisecond)
+		rpcs[rpcCommitFiles].add(s.CommitLatency, s.Committed)
+		if s.Committed {
+			rpcs[rpcLand].add(s.LandLatency, s.Landed)
+		}
 		res.Attempts += int64(s.Outcome.Attempts)
 		res.Resolutions += s.Outcome.Resolved
 		if s.Outcome.Attempts > res.MaxAttempts {
@@ -519,7 +563,43 @@ func aggregate(cfg Config, samples []Sample, elapsed time.Duration) Result {
 	res.P99MS = percentile(landedMS, 99)
 	res.FailedP95MS = percentile(failedMS, 95)
 
+	for name, r := range rpcs {
+		if r.calls == 0 {
+			continue
+		}
+		if res.RPCs == nil {
+			res.RPCs = map[string]RPCLatency{}
+		}
+		res.RPCs[name] = RPCLatency{
+			Calls:  r.calls,
+			Failed: r.failed,
+			P50MS:  percentile(r.succeededMS, 50),
+			P95MS:  percentile(r.succeededMS, 95),
+			P99MS:  percentile(r.succeededMS, 99),
+		}
+	}
+
 	return res
+}
+
+// rpcSamples collects the calls of one RPC of a run.
+type rpcSamples struct {
+	calls, failed int
+	succeededMS   []float64
+}
+
+func (r *rpcSamples) add(latency time.Duration, succeeded bool) {
+	r.calls++
+	if !succeeded {
+		r.failed++
+		return
+	}
+	r.succeededMS = append(r.succeededMS, float64(latency)/float64(time.Millisecond))
+}
+
+// formatRPCLatency formats the latency of an RPC of a run for a report.
+func formatRPCLatency(r RPCLatency) string {
+	return fmt.Sprintf("p50 %.1fms, p95 %.1fms, p99 %.1fms (%d calls, %d failed)", r.P50MS, r.P95MS, r.P99MS, r.Calls, r.Failed)
 }
 
 // objectIDPattern matches a SHA-1 or SHA-256 object ID as a whole word.

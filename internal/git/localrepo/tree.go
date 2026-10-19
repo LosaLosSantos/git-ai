@@ -1,15 +1,20 @@
 package localrepo
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -72,6 +77,97 @@ type TreeEntry struct {
 	Type ObjectType
 	// Entries is a slice of this tree's entries.
 	Entries []*TreeEntry
+
+	// loader, set on a tree that ReadTreeLazily read without its entries, reads them when an
+	// operation first descends into the tree. Nil once they are read, and for every tree of
+	// ReadTree.
+	loader *treeLoader
+}
+
+// treeLoader reads the entries of the trees of a tree read by ReadTreeLazily through the object
+// reader of the request (PLAN9, WP96): only the trees that the operations descend into are read.
+type treeLoader struct {
+	ctx        context.Context
+	reader     catfile.ObjectContentReader
+	objectHash git.ObjectHash
+}
+
+// ensureLoaded reads the entries of t if it is a tree of ReadTreeLazily whose entries were not read
+// yet. It does nothing for any other entry.
+func (t *TreeEntry) ensureLoaded() error {
+	if t.loader == nil {
+		return nil
+	}
+
+	entries, err := t.loader.read(t.OID)
+	if err != nil {
+		return err
+	}
+	t.Entries = entries
+	t.loader = nil
+	return nil
+}
+
+// read returns the entries of the tree oid as ls-tree describes them: the canonical mode, the type
+// it implies and the base name. Its subtrees are left to be read on demand.
+func (l *treeLoader) read(oid git.ObjectID) ([]*TreeEntry, error) {
+	object, err := l.reader.Object(l.ctx, oid.Revision())
+	if err != nil {
+		return nil, fmt.Errorf("reading tree %s: %w", oid, err)
+	}
+	// The object must be consumed fully before the reader serves another request.
+	data, err := io.ReadAll(object)
+	if err != nil {
+		return nil, fmt.Errorf("reading tree %s: %w", oid, err)
+	}
+	if object.Type != "tree" {
+		return nil, fmt.Errorf("reading tree %s: %w", oid, ErrNotTreeish)
+	}
+
+	rawSize := l.objectHash.EncodedLen() / 2
+	var entries []*TreeEntry
+	for len(data) > 0 {
+		mode, rest, ok := bytes.Cut(data, []byte{' '})
+		if !ok {
+			return nil, fmt.Errorf("parsing tree %s: no mode", oid)
+		}
+		name, rest, ok := bytes.Cut(rest, []byte{0})
+		if !ok || len(rest) < rawSize {
+			return nil, fmt.Errorf("parsing tree %s: truncated entry", oid)
+		}
+		entryOID, err := l.objectHash.FromHex(hex.EncodeToString(rest[:rawSize]))
+		if err != nil {
+			return nil, fmt.Errorf("parsing tree %s: %w", oid, err)
+		}
+		data = rest[rawSize:]
+
+		modeValue, err := strconv.ParseUint(string(mode), 8, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parsing tree %s: invalid mode %q", oid, mode)
+		}
+		entry := &TreeEntry{
+			OID:  entryOID,
+			Path: string(name),
+		}
+		// As ls-tree prints it: git's canon_mode, which reading a tree applies, so that a
+		// legacy mode (100664, 120777, 040755) is written back canonical, and six digits.
+		switch modeValue & 0o170000 {
+		case 0o100000:
+			entry.Mode, entry.Type = "100644", Blob
+			if modeValue&0o100 != 0 {
+				entry.Mode = "100755"
+			}
+		case 0o120000:
+			entry.Mode, entry.Type = "120000", Blob
+		case 0o040000:
+			entry.Mode, entry.Type, entry.loader = "040000", Tree, l
+		default:
+			entry.Mode, entry.Type = "160000", Submodule
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
 }
 
 // IsBlob returns whether or not the TreeEntry is a blob.
@@ -99,6 +195,17 @@ var (
 	// ErrDisallowedPath indicates the path is invalid
 	ErrDisallowedPath = errors.New("disallowed path")
 )
+
+// FileInPathError is returned by Add when a directory of the path is a file or a submodule, so
+// that nothing can be added below it.
+type FileInPathError struct {
+	// Path is the path of the file or submodule in the way.
+	Path string
+}
+
+func (e FileInPathError) Error() string {
+	return fmt.Sprintf("file in the way of the path: %q", e.Path)
+}
 
 func validateFileCreationPath(path string) (string, error) {
 	path = filepath.Clean(path)
@@ -179,6 +286,11 @@ func (t *TreeEntry) Add(
 
 Loop:
 	for {
+		// A tree of ReadTreeLazily is read when the walk first reaches it.
+		if err := currentTree.ensureLoaded(); err != nil {
+			return err
+		}
+
 		// loop through each layer of the tree based on the directory
 		// structure specified by path.
 		// firstComponent is the current directory name, and secondComponent is the rest
@@ -210,6 +322,11 @@ Loop:
 				currentTree.Entries[i] = &newEntry
 
 				return nil
+			}
+
+			// A file or a submodule is in the way: nothing can be added below it.
+			if entry.Type != Tree {
+				return FileInPathError{Path: filepath.Join(parentDirs, entry.Path)}
 			}
 
 			// We found the next directory to walk into.
@@ -259,6 +376,11 @@ func (t *TreeEntry) recurse(
 
 	currentTree := t
 	for {
+		// A tree of ReadTreeLazily is read when the walk first reaches it.
+		if err := currentTree.ensureLoaded(); err != nil {
+			return err
+		}
+
 		// Loop through each layer of the tree based on the directory
 		// structure specified by path.
 		// firstComponent is the current directory name, and secondComponent is the rest
@@ -538,6 +660,9 @@ func (t *TreeEntry) walk(dirPath string, callback func(path string, entry *TreeE
 		return err
 	}
 
+	if err := t.ensureLoaded(); err != nil {
+		return err
+	}
 	for _, entry := range t.Entries {
 		if err := entry.walk(nextDirPath, callback); err != nil {
 			return err
@@ -550,6 +675,9 @@ func (t *TreeEntry) walk(dirPath string, callback func(path string, entry *TreeE
 // Walk will walk the whole tree structure and call callback on every entry of
 // the tree in a depth-first like fashion.
 func (t *TreeEntry) Walk(callback func(path string, entry *TreeEntry) error) error {
+	if err := t.ensureLoaded(); err != nil {
+		return err
+	}
 	for _, e := range t.Entries {
 		if err := e.walk(t.Path, callback); err != nil {
 			return err
@@ -588,9 +716,8 @@ func (t *TreeEntry) Write(
 	return nil
 }
 
-// writeTreeEntries writes a new tree object from a slice of entries. This function does not verify whether OIDs
-// referred to by tree entries actually exist in the repository.
-func (repo *Repo) writeEntries(ctx context.Context, entries []*TreeEntry) (git.ObjectID, error) {
+// treeContent returns the content of the tree object of entries, which it sorts in git's order.
+func treeContent(entries []*TreeEntry) (*bytes.Buffer, error) {
 	var tree bytes.Buffer
 
 	sort.Stable(TreeEntriesByPath(entries))
@@ -601,16 +728,27 @@ func (repo *Repo) writeEntries(ctx context.Context, entries []*TreeEntry) (git.O
 
 		oidBytes, err := entry.OID.Bytes()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 
 		if _, err := tree.WriteString(formattedEntry); err != nil {
-			return "", err
+			return nil, err
 		}
 
 		if _, err := tree.Write(oidBytes); err != nil {
-			return "", err
+			return nil, err
 		}
+	}
+
+	return &tree, nil
+}
+
+// writeTreeEntries writes a new tree object from a slice of entries. This function does not verify whether OIDs
+// referred to by tree entries actually exist in the repository.
+func (repo *Repo) writeEntries(ctx context.Context, entries []*TreeEntry) (git.ObjectID, error) {
+	tree, err := treeContent(entries)
+	if err != nil {
+		return "", err
 	}
 
 	options := []gitcmd.Option{
@@ -627,7 +765,7 @@ func (repo *Repo) writeEntries(ctx context.Context, entries []*TreeEntry) (git.O
 		},
 		gitcmd.WithStdout(&stdout),
 		gitcmd.WithStderr(&stderr),
-		gitcmd.WithStdin(&tree),
+		gitcmd.WithStdin(tree),
 	); err != nil {
 		return "", structerr.New("%w", err).WithMetadata("stderr", stderr.String())
 	}
@@ -736,4 +874,231 @@ func (repo *Repo) ReadTree(ctx context.Context, treeish git.Revision, options ..
 	}
 
 	return rootEntry, nil
+}
+
+// ReadTreeLazily returns the tree treeOID with its direct entries read through reader, the object
+// reader of the request. Its subtrees are read only when an operation (Add, Delete, Get, Modify,
+// Walk) descends into them, through the same reader, so a request that changes a few paths reads
+// a few trees instead of the whole tree (PLAN9, WP96). The entries are those ReadTree with
+// WithRecursive gives, for every tree that is read. reader must stay open while the tree is used.
+func (repo *Repo) ReadTreeLazily(ctx context.Context, reader catfile.ObjectReader, treeOID git.ObjectID) (*TreeEntry, error) {
+	objectHash, err := repo.ObjectHash(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("detecting object hash: %w", err)
+	}
+
+	obj, err := reader.Info(ctx, treeOID.Revision())
+	if err != nil {
+		return nil, fmt.Errorf("check object type: %w", err)
+	}
+	if obj.Type != "tree" {
+		return nil, ErrNotTreeish
+	}
+
+	root := &TreeEntry{
+		OID:    treeOID,
+		Type:   Tree,
+		Mode:   "040000",
+		loader: &treeLoader{ctx: ctx, reader: reader, objectHash: objectHash},
+	}
+	if err := root.ensureLoaded(); err != nil {
+		return nil, err
+	}
+
+	return root, nil
+}
+
+// TreeWriter writes the tree objects of one request through a single `git hash-object -t tree -w
+// --stdin-paths` process, started on the first write: today's tree writer, with the same input and
+// the same format checks, without a process per tree (PLAN9, WP96). The content of each tree is
+// written to a file of the storage's temporary directory (created exclusively, mode 0600, removed
+// after the write, whatever happened), whose path the process reads. A write that fails stops the
+// process and makes every later write fail: a tree the process refused ends the request, as
+// today. Close must be called on every path.
+type TreeWriter struct {
+	repo       *Repo
+	ctx        context.Context
+	tempDir    string
+	objectHash git.ObjectHash
+
+	cmd    *command.Command
+	stdout *bufio.Reader
+	stderr bytes.Buffer
+	cancel context.CancelFunc
+	err    error
+
+	// testHook, when set by a test, is called at named points of a write.
+	testHook func(point string)
+}
+
+var errTreeWriterClosed = errors.New("tree writer is closed")
+
+// NewTreeWriter returns the tree writer of a request on repo. Its process runs under ctx.
+func (repo *Repo) NewTreeWriter(ctx context.Context) (*TreeWriter, error) {
+	tempDir, err := repo.StorageTempDir()
+	if err != nil {
+		return nil, fmt.Errorf("getting temporary directory: %w", err)
+	}
+	objectHash, err := repo.ObjectHash(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("detecting object hash: %w", err)
+	}
+
+	return &TreeWriter{repo: repo, ctx: ctx, tempDir: tempDir, objectHash: objectHash}, nil
+}
+
+// write writes the tree of entries and returns its object ID.
+func (w *TreeWriter) write(entries []*TreeEntry) (_ git.ObjectID, returnedErr error) {
+	if w.err != nil {
+		return "", w.err
+	}
+	defer func() {
+		if returnedErr != nil {
+			w.err = returnedErr
+			w.stop()
+		}
+	}()
+
+	content, err := treeContent(entries)
+	if err != nil {
+		return "", err
+	}
+
+	// os.CreateTemp opens the file with O_CREATE|O_EXCL and mode 0600.
+	file, err := os.CreateTemp(w.tempDir, "tree-object-*")
+	if err != nil {
+		return "", fmt.Errorf("creating tree object file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) && returnedErr == nil {
+			returnedErr = fmt.Errorf("removing tree object file: %w", err)
+		}
+	}()
+	if _, err := file.Write(content.Bytes()); err != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("writing tree object file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("closing tree object file: %w", err)
+	}
+
+	if w.cmd == nil {
+		if err := w.start(); err != nil {
+			return "", err
+		}
+	}
+	if w.testHook != nil {
+		// The tree object file exists and the process runs.
+		w.testHook("started")
+	}
+
+	if _, err := fmt.Fprintf(w.cmd.Stdin(), "%s\n", file.Name()); err != nil {
+		return "", w.processError(fmt.Errorf("sending tree object path: %w", err))
+	}
+	line, err := w.stdout.ReadString('\n')
+	if err != nil {
+		return "", w.processError(fmt.Errorf("reading tree object ID: %w", err))
+	}
+
+	oid, err := w.objectHash.FromHex(strings.TrimSuffix(line, "\n"))
+	if err != nil {
+		return "", fmt.Errorf("parsing tree object ID: %w", err)
+	}
+	return oid, nil
+}
+
+// start starts the hash-object process.
+func (w *TreeWriter) start() error {
+	processCtx, cancel := context.WithCancel(w.ctx)
+	cmd, err := w.repo.Exec(processCtx,
+		gitcmd.Command{
+			Name: "hash-object",
+			Flags: []gitcmd.Option{
+				gitcmd.ValueFlag{Name: "-t", Value: "tree"},
+				gitcmd.Flag{Name: "-w"},
+				gitcmd.Flag{Name: "--stdin-paths"},
+			},
+		},
+		gitcmd.WithSetupStdin(),
+		gitcmd.WithSetupStdout(),
+		gitcmd.WithStderr(&w.stderr),
+	)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("starting hash-object: %w", err)
+	}
+
+	w.cmd = cmd
+	w.stdout = bufio.NewReader(cmd)
+	w.cancel = cancel
+	return nil
+}
+
+// processError reaps the process, which stopped answering, and returns why: its exit status with
+// what it printed on stderr, as today's writer reports a refused tree, or err if it exited
+// cleanly. Wait closes its stdin first.
+func (w *TreeWriter) processError(err error) error {
+	waitErr := w.cmd.Wait()
+	w.cmd = nil
+	w.cancel()
+	if waitErr != nil {
+		err = waitErr
+	}
+	return structerr.New("%w", err).WithMetadata("stderr", w.stderr.String())
+}
+
+// stop kills and reaps the process, if any.
+func (w *TreeWriter) stop() {
+	if w.cmd == nil {
+		return
+	}
+	w.cancel()
+	// The process was killed, so its exit status carries no information.
+	_ = w.cmd.Wait()
+	w.cmd = nil
+}
+
+// Close ends the process: it reads the end of its input and exits, so every tree it wrote is in the
+// object directory when Close returns. Close is idempotent, later calls return nil, and it is safe
+// after a failed write, whose process is already reaped. Writes fail after Close.
+func (w *TreeWriter) Close() error {
+	if w.err == nil {
+		w.err = errTreeWriterClosed
+	}
+	if w.cmd == nil {
+		return nil
+	}
+	defer w.cancel()
+
+	cmd := w.cmd
+	w.cmd = nil
+	// Wait closes the process's stdin first.
+	if err := cmd.Wait(); err != nil {
+		return structerr.New("waiting for tree writer: %w", err).WithMetadata("stderr", w.stderr.String())
+	}
+	return nil
+}
+
+// WriteWith is Write through the request's tree writer: the same trees, written depth first when
+// their OID is empty, by one process.
+func (t *TreeEntry) WriteWith(w *TreeWriter) error {
+	if t.OID != "" {
+		return nil
+	}
+
+	for _, e := range t.Entries {
+		if e.Type == Tree && e.OID == "" {
+			if err := e.WriteWith(w); err != nil {
+				return err
+			}
+		}
+	}
+
+	treeOID, err := w.write(t.Entries)
+	if err != nil {
+		return fmt.Errorf("writing tree: %w", err)
+	}
+
+	t.OID = treeOID
+	return nil
 }

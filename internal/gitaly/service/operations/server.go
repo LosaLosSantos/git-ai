@@ -46,6 +46,8 @@ type Server struct {
 	// storageSync catches up the local repository from the storage core before a land is retried,
 	// see doc/graft/STORAGE.md. It does nothing unless the storage core is authoritative.
 	storageSync corestore.Freshener
+	// testHook, when set by a test, is called at named points of a request.
+	testHook func(point string)
 }
 
 // NewServer creates a new instance of a grpc OperationServiceServer
