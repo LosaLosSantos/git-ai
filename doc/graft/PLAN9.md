@@ -883,7 +883,39 @@ resolution of item 3.)
   p50 is lower after (-31 ms in the median, lower in 4 of 6 adjacent before/after pairs)
   and lands per minute are level. The tail is dominated by whole-run stalls: a run either
   has a p99 close to its p95 or one above 800 ms. Such stalls hit 3 of 6 runs after and
-  2 of 6 before, and with 250 calls per run that cannot be told apart from noise. A first, back-to-back window
+  2 of 6 before, and with 250 calls per run that cannot be told apart from noise.
+
+  The window of record, to settle the tail: before `d584aac`, after `9db0ac7` (6
+  processes), 50 agents of **20** changes (1000 `UserCommitFiles` calls per run), ABBA
+  twice, the rest as above; the machine otherwise idle (load 0.4 at the start).
+
+  | run | lands/min | p50 (ms) | p95 (ms) | p99 (ms) | server mean (ms) |
+  |---|---:|---:|---:|---:|---:|
+  | before 1-1 | 2199 | 208 | 367 | 514 | 215 |
+  | after 1-1 | 2345 | 167 | 278 | 324 | 167 |
+  | after 1-2 | 2222 | 176 | 377 | 447 | 186 |
+  | before 1-2 | 2070 | 226 | 427 | 459 | 236 |
+  | before 2-1 | 1768 | 240 | 549 | 1184 | 282 |
+  | after 2-1 | 2080 | 189 | 410 | 441 | 200 |
+  | after 2-2 | 2147 | 177 | 340 | 553 | 187 |
+  | before 2-2 | 2233 | 209 | 545 | 685 | 237 |
+  | **median before** | 2134 | 217 | 486 | 600 | 237 |
+  | **median after** | 2185 | 177 | 358 | 444 | 186 |
+
+  Each of the four adjacent before/after pairs is lower after in p50, p95 and p99. In
+  the medians, p50 is -40 ms (-18 %), p95 -128 ms, p99 -156 ms, the server mean -51 ms,
+  and lands per minute +2 %. Where the server time goes, per call, from the scrapes
+  (git real time by subcommand, `m3-work/wp96/window/phases.py`):
+  * `rev-parse` (32-37 ms) and `ls-tree` (7-8 ms) are gone;
+  * `hash-object` is 59-70 ms instead of 74-92 ms (one tree process instead of one per
+    tree);
+  * `for-each-ref` is unchanged at 5 ms (one before, `HasBranches`; one after, the exact
+    read);
+  * `update-ref` (23-35 ms, with its hooks) and the changeset ticket wait (10-17 ms) are
+    the same on both sides.
+
+  The short window's tail was noise of 250-call runs; at 1000 calls the tail is lower
+  after. A first, back-to-back window
   without cooldown (load rising from 4.7 to 11.9) gave the same p50 gain and noisier
   tails.
 
