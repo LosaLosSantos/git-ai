@@ -100,8 +100,8 @@ func validAnswer() resolver.Response {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")},
+			{Origin: resolver.OriginRule, Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")},
 		},
 	}
 }
@@ -412,7 +412,7 @@ func TestResolveLandConflicts_pathEncoding(t *testing.T) {
 			Version:  resolver.ProtocolVersion,
 			Resolver: "graft-resolve/fake",
 			Files: []resolver.ResponseFile{
-				{Path: strings.ToValidUTF8(p, "�"), Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+				{Origin: resolver.OriginRule, Path: strings.ToValidUTF8(p, "�"), Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 			},
 		}
 		writeAnswer(t, dir, answer)
@@ -433,7 +433,7 @@ func TestResolveLandConflicts_pathEncoding(t *testing.T) {
 			Version:  resolver.ProtocolVersion,
 			Resolver: "graft-resolve/fake",
 			Files: []resolver.ResponseFile{
-				{Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+				{Origin: resolver.OriginRule, Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 			},
 		})
 		fx := newResolveFixtureWith(t, config.GraftResolver{}, entries(p, "base\n"), entries(p, "ours\n"), entries(p, "theirs\n"))
@@ -477,7 +477,7 @@ func TestResolveLandConflicts_rejectedAnswers(t *testing.T) {
 	}{
 		{desc: "unsupported version", mutate: func(r *resolver.Response) { r.Version = 2 }},
 		{desc: "path that did not conflict", mutate: func(r *resolver.Response) {
-			r.Files = append(r.Files, resolver.ResponseFile{Path: "c", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("x\n")})
+			r.Files = append(r.Files, resolver.ResponseFile{Origin: resolver.OriginRule, Path: "c", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("x\n")})
 		}},
 		{desc: "path answered twice", mutate: func(r *resolver.Response) {
 			r.Files = append(r.Files, r.Files[0])
@@ -558,7 +558,7 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 			writeAnswer(t, dir, resolver.Response{
 				Version:  resolver.ProtocolVersion,
 				Resolver: "graft-resolve/fake",
-				Files:    []resolver.ResponseFile{{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")}},
+				Files:    []resolver.ResponseFile{{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")}},
 			})
 			s := fx.server(t, tc.rcfg(enabledResolver(argv)))
 

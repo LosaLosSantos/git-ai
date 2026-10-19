@@ -43,7 +43,7 @@ func TestResolveLandConflicts_renameOnCommitSide(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 
@@ -90,7 +90,7 @@ func TestResolveLandConflicts_renameOnTipSide(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 
@@ -171,7 +171,7 @@ func TestUserLand_renameFromDeniedPathIsNotResolved(t *testing.T) {
 				Version:  resolver.ProtocolVersion,
 				Resolver: "graft-resolve/fake",
 				Files: []resolver.ResponseFile{
-					{Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+					{Origin: resolver.OriginRule, Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 				},
 			})
 			rcfg := enabledResolver(argv)
@@ -214,7 +214,7 @@ func TestUserLand_renameBetweenAllowedPathsIsResolved(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 	rcfg := enabledResolver(argv)

@@ -151,11 +151,20 @@ type ResolvedFile struct {
 	Action  string `json:"action"`
 	Mode    string `json:"mode,omitempty"`
 	Content []byte `json:"content"`
-	// Proposal marks a resolution made by a model (the llm strategy): the server lands it only if
-	// verify.command passed on the tree that lands, and otherwise proposes it to the agent
-	// (PLAN10 14, 15.9).
+	// Origin says what made the resolution: OriginRule for an operator's rule (trivial, union,
+	// rerere, command), OriginModel for a model (the llm strategy). The server lands a resolution
+	// without the operator's verification only if it is marked as a rule's: a file without an origin
+	// is a model's (PLAN10 14, 15.9).
+	Origin string `json:"origin,omitempty"`
+	// Proposal is the older mark of a model's resolution, still sent with OriginModel.
 	Proposal bool `json:"proposal,omitempty"`
 }
+
+// The origins of a resolved file (see ResolvedFile.Origin).
+const (
+	OriginRule  = "rule"
+	OriginModel = "model"
+)
 
 // ErrorResponse is the body of an HTTP 422 (unresolvable) or other error.
 type ErrorResponse struct {

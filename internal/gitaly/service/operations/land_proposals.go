@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"path"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -50,28 +49,27 @@ const landProposedReason = "a model resolved the file: it is proposed (see propo
 // landNoVerifyReason follows landProposedReason when no verify.command is configured.
 const landNoVerifyReason = "no verify.command is configured, so nothing verifies a model's resolution"
 
-// landAnswerFlagsProposals reports whether a file of the answer is marked as a proposal.
-func landAnswerFlagsProposals(answer *resolver.Response) bool {
-	for _, f := range answer.Files {
-		if f.Proposal {
-			return true
+// landNormalizeOrigins gives each file of an answer its origin, as the server reads it: OriginRule
+// only for a file that says it is a rule's and is not marked as a proposal, OriginModel for any
+// other. It is done when the answer arrives, so that the answers kept by their keys and the rounds
+// that reuse them never depend on how a resolver spelled the mark, nor on its name.
+func landNormalizeOrigins(answer *resolver.Response) {
+	for i := range answer.Files {
+		if answer.Files[i].FromModel() {
+			answer.Files[i].Origin = resolver.OriginModel
+		} else {
+			answer.Files[i].Origin = resolver.OriginRule
 		}
 	}
-	return false
 }
 
-// landAnswerProposes reports whether a resolver's answer holds a model's resolution: a file marked
-// as a proposal, or, should a resolver omit the mark, a resolver that names the llm strategy.
+// landAnswerProposes reports whether a resolver's answer holds a model's resolution: a file that is
+// not marked as a rule's. The name of the resolver decides nothing: a list of names joined over
+// rounds, cut to ",+N", or spelled in a way nobody foresaw, can neither hide a model's file nor
+// make a rule's one a model's. This is fail-safe: a file that says nothing is a model's.
 func landAnswerProposes(answer *resolver.Response) bool {
-	if landAnswerFlagsProposals(answer) {
-		return true
-	}
-	name := answer.Resolver
-	if i := strings.IndexByte(name, '/'); i >= 0 {
-		name = name[i+1:]
-	}
-	for _, strategy := range strings.Split(name, ",") {
-		if strings.TrimSpace(strategy) == "llm" {
+	for _, f := range answer.Files {
+		if f.FromModel() {
 			return true
 		}
 	}

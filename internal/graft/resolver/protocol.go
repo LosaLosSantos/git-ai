@@ -204,14 +204,35 @@ type Response struct {
 	Explanation string         `json:"explanation"`
 }
 
+// The origins of a resolved file: what made the resolution.
+const (
+	// OriginRule: an operator's rule (trivial, union, rerere, command) made it. Only a file marked
+	// as a rule lands without the operator's verification of the tree.
+	OriginRule = "rule"
+	// OriginModel: a model made it. It lands only if verify.command passed on the tree that lands
+	// (PLAN10 14, 15.9), and is otherwise proposed to the agent.
+	OriginModel = "model"
+)
+
 // ResponseFile is the resolution of one conflicting path. Content is base64
-// on the wire and is only meaningful for ActionWrite. Proposal marks a
-// resolution made by a model: the server lands it only if verify.command passed
-// on the tree that lands, and otherwise proposes it to the agent (PLAN10 14, 15.9).
+// on the wire and is only meaningful for ActionWrite.
+//
+// Origin says what made the resolution: OriginRule or OriginModel. It is fail-safe: a file is a
+// rule's only when it says so, and a file without an origin, or with one that is none of the two,
+// is a model's, which lands only through the operator's verification. Proposal is the older mark of
+// a model's resolution, still read: it means OriginModel, whatever Origin says. The name of the
+// resolver decides nothing.
 type ResponseFile struct {
 	Path     string `json:"path"`
 	Action   string `json:"action"`
 	Mode     string `json:"mode,omitempty"`
 	Content  []byte `json:"content,omitempty"`
+	Origin   string `json:"origin,omitempty"`
 	Proposal bool   `json:"proposal,omitempty"`
+}
+
+// FromModel reports whether the file is a model's resolution: anything that is not marked as a
+// rule's, and anything marked as a proposal.
+func (f ResponseFile) FromModel() bool {
+	return f.Proposal || f.Origin != OriginRule
 }

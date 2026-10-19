@@ -171,10 +171,13 @@ A model's resolution lands only through the operator's verification
 (PLAN10 14 and 15.9): when `verify.command` is configured and passes, out of
 the lane, on the exact tree that would land (see "Optional verification of a
 resolution"). Without a `verify.command` the server never lands what a model
-resolved: the agent decides. graft-resolve marks every file its `llm` strategy
-resolved as a proposal (`"proposal": true`), and the server treats an answer as
-proposing when a file is marked, or when the resolver names the `llm` strategy
-without marking any. A land of such an answer that does not land (no
+resolved: the agent decides. Every resolved file says what made it, in `origin`
+(see "Response"): `rule` or `model`. The check is fail-safe: a file is a rule's
+only when it says so, and anything else is a model's, whatever the name of the
+resolver. graft-resolve marks the files of trivial, union, rerere and the
+command strategies as `rule` and those of its `llm` strategy as `model` (with
+the older `"proposal": true`). A land of an answer that holds a model's file and
+does not land (no
 `verify.command`, a verification that failed, or none finished in time) fails
 with the package: the model's files are
 `PROPOSED`, the files the rules resolved keep `RESOLVED`, and every file the
@@ -253,11 +256,22 @@ Response (resolver to server):
 
 ```json
 {"version": 1, "resolver": "graft-resolve/trivial",
- "files": [{"path": "a/b.go", "action": "write", "mode": "100644", "content": "<base64>"}],
+ "files": [{"path": "a/b.go", "action": "write", "mode": "100644", "content": "<base64>", "origin": "rule"}],
  "explanation": "free text"}
 ```
 
 - `action` is `write` (with `mode` and `content`) or `delete`.
+- `origin` says what made the file: `rule` (an operator's rule: trivial, union,
+  rerere, command) or `model` (a model). **It is fail-safe, and a change for
+  resolvers that do not set it: a file without `origin`, or with any other
+  value, is a model's.** Only a file marked `rule` lands without the
+  operator's verification of the tree (see "Optional verification of a
+  resolution"); a model's file lands only if `verify.command` passed on the
+  tree that lands, and is otherwise proposed. `"proposal": true` is the older
+  mark of a model's file, still read: it means `model` whatever `origin` says.
+  The name in `resolver` decides nothing: it may be a list joined over
+  rounds, or cut to `,+N`, and a name that says `llm` makes no rule's file a
+  model's.
 - `resolver` names the resolver. It goes into the `Graft-Resolved-By`
   trailer, so it must be 1 to 128 bytes of printable, single-line UTF-8.
   The server answers with one `resolver` for a land it resolved in rounds (the
@@ -384,8 +398,14 @@ command = ["/usr/local/bin/graft-check-build"]
 timeout = "5m"
 ```
 
-The server archives the merged tree (the resolution included) into a
-temporary directory and runs `command` there, with a minimal environment
+The server writes the merged tree (the resolution included) into a
+temporary directory byte for byte, from the entries of `git ls-tree -r` and the
+contents of `git cat-file --batch`, with their modes, the symbolic links as
+links and the submodules as empty directories. No attribute is applied: not
+`export-ignore`, which would hide a file from the command (`git archive`
+honours it), nor `export-subst`, `eol`, a filter or a smudge. The directory is
+read back and compared with the listing, and a difference fails the checkout
+closed. It then runs `command` there, with a minimal environment
 (`PATH`, and `HOME` and `TMPDIR` in a directory of their own). A non-zero exit or a
 timeout rejects the resolution: the land fails, every file of the package is
 `REJECTED`, and the reason is `verification failed:` with the exit status and

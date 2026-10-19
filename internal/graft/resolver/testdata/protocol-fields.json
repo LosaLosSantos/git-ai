@@ -7,7 +7,7 @@
   "side": ["content", "mode", "oid"],
   "limits": ["max_file_bytes"],
   "response": ["explanation", "files", "resolver", "version"],
-  "response_file": ["action", "content", "mode", "path", "proposal"],
+  "response_file": ["action", "content", "mode", "origin", "path", "proposal"],
   "error_response": ["error", "files"],
   "file_outcome": ["outcome", "path", "reason"],
   "check_response": ["files", "operation", "resolver", "version"],

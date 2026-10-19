@@ -140,7 +140,7 @@ cat "$DIR/answer.json"
 func answerOfPaths(paths ...string) resolver.Response {
 	resp := resolver.Response{Version: resolver.ProtocolVersion, Resolver: "graft-resolve/bench"}
 	for _, p := range paths {
-		resp.Files = append(resp.Files, resolver.ResponseFile{
+		resp.Files = append(resp.Files, resolver.ResponseFile{Origin: resolver.OriginRule,
 			Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-" + p + "\n"),
 		})
 	}

@@ -458,11 +458,16 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 		if !proposal {
 			r.record(ctx, f, res)
 		}
+		origin := protocol.OriginRule
+		if proposal {
+			origin = protocol.OriginModel
+		}
 		return protocol.ResolvedFile{
 			Path:     f.Path,
 			Action:   res.Action,
 			Mode:     modeOf(res),
 			Content:  contentOf(res),
+			Origin:   origin,
 			Proposal: proposal,
 		}, b.Name, nil, nil
 	}

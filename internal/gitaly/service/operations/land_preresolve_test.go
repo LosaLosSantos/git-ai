@@ -59,7 +59,7 @@ func writeMoves(t *testing.T, dir string, fx resolveFixture, moves ...git.Object
 func answerOf(paths ...string) resolver.Response {
 	resp := resolver.Response{Version: resolver.ProtocolVersion, Resolver: "graft-resolve/fake"}
 	for _, p := range paths {
-		resp.Files = append(resp.Files, resolver.ResponseFile{
+		resp.Files = append(resp.Files, resolver.ResponseFile{Origin: resolver.OriginRule,
 			Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-" + p + "\n"),
 		})
 	}
@@ -266,6 +266,7 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 		// runs out of the lane too, while the lane is held.
 		proposal := answerOf("b")
 		proposal.Resolver = "graft-resolve/llm"
+		proposal.Files[0].Origin = resolver.OriginModel
 		writeAnswerN(t, h.dir, 2, proposal)
 		require.NoError(t, os.WriteFile(filepath.Join(h.vdir, "fail"), nil, 0o600))
 

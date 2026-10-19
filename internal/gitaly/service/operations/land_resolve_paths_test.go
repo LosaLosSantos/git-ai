@@ -134,7 +134,7 @@ func TestUserLand_pathStartingWithDashIsResolved(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "-a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
+			{Origin: resolver.OriginRule, Path: "-a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
 		},
 	})
 	fx := newResolveFixtureWith(t, enabledResolver(argv),

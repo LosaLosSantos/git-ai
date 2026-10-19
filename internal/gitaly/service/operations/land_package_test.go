@@ -208,7 +208,7 @@ func TestUserLand_conflictPackage(t *testing.T) {
 		writeAnswer(t, dir, resolver.Response{
 			Version:  resolver.ProtocolVersion,
 			Resolver: "graft-resolve/fake",
-			Files:    []resolver.ResponseFile{{Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")}},
+			Files:    []resolver.ResponseFile{{Origin: resolver.OriginRule, Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")}},
 		})
 		fx := newResolveFixtureWith(t, enabledResolver(argv),
 			[]gittest.TreeEntry{{Mode: "100644", Path: "a", Content: "base\n"}, {Mode: "100644", Path: "go.sum", Content: "base\n"}},

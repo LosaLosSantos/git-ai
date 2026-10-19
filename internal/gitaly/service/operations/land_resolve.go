@@ -198,6 +198,7 @@ func (s *Server) landResolveAt(
 			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
 		default:
 			answer = resp
+			landNormalizeOrigins(answer)
 		}
 	}
 
@@ -270,24 +271,24 @@ func (s *Server) landResolveAt(
 }
 
 // landSetOutcomes sets the outcome of each of files from the answer that covers them: RESOLVED, or
-// REJECTED when the resolution writes a mode no side has, or PROPOSED when a model made the file.
-// A resolver that names the llm strategy but marks no file is taken to have proposed every file:
-// the mark may be missing, never the other way round. The lane sets them the same way from the
-// verdicts it applies, so that both ask decideLand the same question.
+// REJECTED when the resolution writes a mode no side has, or PROPOSED when a model made the file,
+// that is when the file is not marked as a rule's (the mark may be missing, never the other way
+// round). The lane sets them the same way from the verdicts it applies, so that both ask decideLand
+// the same question.
 func landSetOutcomes(answer *resolver.Response, files []*landFileState) {
-	proposes := landAnswerProposes(answer)
-	flagged := landAnswerFlagsProposals(answer)
 	written := make(map[string]resolver.ResponseFile, len(answer.Files))
 	for _, rf := range answer.Files {
 		written[rf.Path] = rf
 	}
 	for _, f := range files {
-		rf := written[f.conflict.path]
+		rf, ok := written[f.conflict.path]
 		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_RESOLVED, ""
 		switch err := landModeOfSides(f.conflict, rf); {
+		case !ok:
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_FAILED, "the resolver gave no answer for the file"
 		case err != nil:
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
-		case rf.Proposal || (proposes && !flagged):
+		case rf.FromModel():
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
 		}
 	}

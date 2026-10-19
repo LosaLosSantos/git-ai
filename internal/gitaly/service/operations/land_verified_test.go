@@ -120,6 +120,42 @@ func TestUserLand_verifiedModelResolution(t *testing.T) {
 		require.Empty(t, proposalRefTarget(t, fx), "nothing was proposed")
 	})
 
+	// A file that says nothing about what made it is a model's (fail-safe): whatever the name of the
+	// resolver, it lands only through the verification.
+	for desc, name := range map[string]string{
+		"a plain name":     "graft-resolve/trivial",
+		"joined names":     "graft-resolve/trivial,graft-resolve/llm",
+		"a list cut to +N": "graft-resolve/trivial,+1",
+	} {
+		t.Run("an answer that says nothing about its files lands only if the verification passes, "+desc, func(t *testing.T) {
+			t.Parallel()
+
+			unmarked := validAnswer()
+			unmarked.Resolver = name
+			for i := range unmarked.Files {
+				unmarked.Files[i].Origin = ""
+			}
+
+			passing, _, passingDir := verifiedFixture(t, unmarked, "exit 0", nil)
+			resp, err := passing.client.UserLand(passing.ctx, passing.request("Land"))
+			require.NoError(t, err)
+			commit, _ := landedCommit(t, passing, resp)
+			require.Equal(t, 1, verifyRuns(t, passingDir))
+			require.Contains(t, string(commit.GetBody()), "Graft-Checked-By: verify:verify.sh\n")
+
+			failing, _, failingDir := verifiedFixture(t, unmarked, `echo "tests failed"; exit 3`, nil)
+			_, err = failing.client.UserLand(failing.ctx, failing.request("Land"))
+			requireMergeConflict(t, err)
+			for _, p := range []string{"a", "b"} {
+				f := packageFile(t, landConflictDetail(err), p)
+				require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
+				require.Contains(t, f.GetReason(), "verification failed: exit status 3: tests failed", p)
+			}
+			require.Equal(t, 1, verifyRuns(t, failingDir))
+			requireBranchAt(t, failing.cfg, failing.repoPath, git.DefaultBranch, failing.tip)
+		})
+	}
+
 	t.Run("a model's file next to a rule's file lands when the tree passes", func(t *testing.T) {
 		t.Parallel()
 

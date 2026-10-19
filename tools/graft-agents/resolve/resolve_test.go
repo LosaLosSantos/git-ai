@@ -597,8 +597,8 @@ func (*proposingStrategy) proposes() {}
 var _ proposer = (*llmStrategy)(nil)
 
 // TestProposalsAreMarkedAndNotRecorded: a model's answer is marked as a proposal, which the server
-// never lands, and no Recorder learns it, so that it can never come back as a rule's answer; a
-// rule's answer is not marked, and is recorded.
+// lands only after verification, and no Recorder learns it, so that it can never come back as a rule's answer; a
+// rule's answer is marked as a rule's, and is recorded.
 func TestProposalsAreMarkedAndNotRecorded(t *testing.T) {
 	model := &proposingStrategy{fakeStrategy{fn: answer(protocol.ModeFile, "proposed\n")}}
 	rec := &recordingStrategy{fakeStrategy: fakeStrategy{fn: decline}}
@@ -607,8 +607,8 @@ func TestProposalsAreMarkedAndNotRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Files) != 1 || !resp.Files[0].Proposal {
-		t.Fatalf("files %+v, want one proposal", resp.Files)
+	if len(resp.Files) != 1 || !resp.Files[0].Proposal || resp.Files[0].Origin != protocol.OriginModel {
+		t.Fatalf("files %+v, want one proposal of origin %q", resp.Files, protocol.OriginModel)
 	}
 	if len(rec.recorded) != 0 {
 		t.Fatalf("a proposal was recorded: %+v", rec.recorded)
@@ -622,5 +622,9 @@ func TestProposalsAreMarkedAndNotRecorded(t *testing.T) {
 	}
 	if resp.Files[0].Proposal || len(rule.recorded) != 1 {
 		t.Fatalf("rule answer: proposal %v, recorded %d", resp.Files[0].Proposal, len(rule.recorded))
+	}
+	// The server lands a file without the operator's verification only if it says it is a rule's.
+	if resp.Files[0].Origin != protocol.OriginRule {
+		t.Fatalf("rule answer: origin %q, want %q", resp.Files[0].Origin, protocol.OriginRule)
 	}
 }

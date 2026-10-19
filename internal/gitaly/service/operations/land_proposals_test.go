@@ -35,6 +35,7 @@ func modelAnswer() resolver.Response {
 	answer.Resolver = "graft-resolve/llm"
 	answer.Explanation = "patched by the model"
 	for i := range answer.Files {
+		answer.Files[i].Origin = resolver.OriginModel
 		answer.Files[i].Proposal = true
 	}
 	return answer
@@ -92,23 +93,56 @@ func TestUserLand_proposals(t *testing.T) {
 		}
 	})
 
-	t.Run("an answer of the llm strategy without the mark is proposed too", func(t *testing.T) {
-		t.Parallel()
+	// The origin of a file decides, never the name of the resolver (PLAN10 15.9): a file lands without
+	// the operator's verification only if it says it is a rule's. Anything else is a model's, and
+	// with no verify.command it is proposed. The names are the joined and the cut ones a resolver
+	// gives after rounds, which a test of the names could not tell from a rule's.
+	for desc, tc := range map[string]struct {
+		resolverName string
+		origin       string
+		proposal     bool
+		lands        bool
+	}{
+		"nothing says what made the files, a plain name":     {"graft-resolve/trivial", "", false, false},
+		"nothing says what made the files, joined names":     {"graft-resolve/trivial,graft-resolve/llm", "", false, false},
+		"nothing says what made the files, a list cut to +N": {"graft-resolve/trivial,+1", "", false, false},
+		"nothing says what made the files, other names":      {"acme/union,acme/llm", "", false, false},
+		"an origin nobody knows":                             {"graft-resolve/trivial", "wizard", false, false},
+		"the files are marked as a model's":                  {"graft-resolve/trivial", resolver.OriginModel, false, false},
+		"the files are marked as rules and as proposals":     {"graft-resolve/trivial", resolver.OriginRule, true, false},
+		"rules' files under joined names that say llm":       {"graft-resolve/trivial,graft-resolve/llm", resolver.OriginRule, false, true},
+		"rules' files under a list cut to +N":                {"graft-resolve/trivial,+1", resolver.OriginRule, false, true},
+		"rules' files under a plain name":                    {"graft-resolve/trivial", resolver.OriginRule, false, true},
+	} {
+		t.Run("the origin decides, not the name: "+desc, func(t *testing.T) {
+			t.Parallel()
 
-		dir, argv := resolverScript(t, "")
-		answer := validAnswer()
-		answer.Resolver = "graft-resolve/trivial,llm"
-		writeAnswer(t, dir, answer)
-		fx := newResolveFixture(t, enabledResolver(argv))
+			dir, argv := resolverScript(t, "")
+			answer := validAnswer()
+			answer.Resolver = tc.resolverName
+			for i := range answer.Files {
+				answer.Files[i].Origin = tc.origin
+				answer.Files[i].Proposal = tc.proposal
+			}
+			writeAnswer(t, dir, answer)
+			fx := newResolveFixture(t, enabledResolver(argv))
 
-		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
-		requireMergeConflict(t, err)
-		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
-		pkg := landConflictDetail(err)
-		for _, p := range []string{"a", "b"} {
-			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, packageFile(t, pkg, p).GetOutcome(), p)
-		}
-	})
+			resp, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+			if tc.lands {
+				require.NoError(t, err)
+				requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, git.ObjectID(resp.GetLandedCommitId()))
+				return
+			}
+			requireMergeConflict(t, err)
+			requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+			pkg := landConflictDetail(err)
+			for _, p := range []string{"a", "b"} {
+				f := packageFile(t, pkg, p)
+				require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
+				require.Contains(t, f.GetReason(), "no verify.command is configured", p)
+			}
+		})
+	}
 
 	t.Run("a file the rules resolved keeps its outcome and gets its proposal", func(t *testing.T) {
 		t.Parallel()
@@ -116,6 +150,7 @@ func TestUserLand_proposals(t *testing.T) {
 		dir, argv := resolverScript(t, "")
 		answer := modelAnswer()
 		answer.Resolver = "graft-resolve/trivial,llm"
+		answer.Files[1].Origin = resolver.OriginRule
 		answer.Files[1].Proposal = false
 		writeAnswer(t, dir, answer)
 		fx := newResolveFixture(t, enabledResolver(argv))
@@ -277,20 +312,32 @@ func TestUserLand_proposals(t *testing.T) {
 func TestLandAnswerProposes(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct {
-		resolver string
-		flagged  bool
-		want     bool
+	rule := resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule}
+	model := resolver.ResponseFile{Path: "b", Origin: resolver.OriginModel}
+	for desc, tc := range map[string]struct {
+		files []resolver.ResponseFile
+		want  bool
 	}{
-		{"graft-resolve/trivial", false, false},
-		{"graft-resolve/trivial,union", false, false},
-		{"graft-resolve/llm", false, true},
-		{"graft-resolve/trivial, llm", false, true},
-		{"graft-resolve/llm-ish", false, false},
-		{"graft-resolve/trivial", true, true},
+		"a rule's file":                         {[]resolver.ResponseFile{rule}, false},
+		"two rules' files":                      {[]resolver.ResponseFile{rule, {Path: "c", Origin: resolver.OriginRule}}, false},
+		"a model's file":                        {[]resolver.ResponseFile{model}, true},
+		"a rule's and a model's":                {[]resolver.ResponseFile{rule, model}, true},
+		"a file that says nothing":              {[]resolver.ResponseFile{{Path: "a"}}, true},
+		"a rule's and one that says nothing":    {[]resolver.ResponseFile{rule, {Path: "b"}}, true},
+		"an origin nobody knows":                {[]resolver.ResponseFile{{Path: "a", Origin: "wizard"}}, true},
+		"the origin in another case":            {[]resolver.ResponseFile{{Path: "a", Origin: "Rule"}}, true},
+		"a rule's mark with the older proposal": {[]resolver.ResponseFile{{Path: "a", Origin: resolver.OriginRule, Proposal: true}}, true},
+		"the older proposal mark alone":         {[]resolver.ResponseFile{{Path: "a", Proposal: true}}, true},
+		"no file":                               {nil, false},
 	} {
-		answer := &resolver.Response{Resolver: tc.resolver, Files: []resolver.ResponseFile{{Path: "a", Proposal: tc.flagged}}}
-		require.Equal(t, tc.want, landAnswerProposes(answer), "%s, flagged %v", tc.resolver, tc.flagged)
+		// The name of the resolver decides nothing, whatever it says.
+		for _, name := range []string{
+			"graft-resolve/trivial", "graft-resolve/llm", "graft-resolve/trivial,graft-resolve/llm",
+			"acme/union,acme/llm", "graft-resolve/trivial,+1", "graft-resolve/trivial, llm", "",
+		} {
+			answer := &resolver.Response{Resolver: name, Files: tc.files}
+			require.Equal(t, tc.want, landAnswerProposes(answer), "%s, resolver %q", desc, name)
+		}
 	}
 }
 
@@ -302,7 +349,9 @@ func TestDecideLand(t *testing.T) {
 	resolved := func() []*landFileState {
 		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}}
 	}
-	rules := &resolver.Response{Resolver: "graft-resolve/trivial,union", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
+	rules := &resolver.Response{Resolver: "graft-resolve/trivial,union", Files: []resolver.ResponseFile{
+		{Path: "a", Origin: resolver.OriginRule}, {Path: "b", Origin: resolver.OriginRule},
+	}}
 	require.True(t, decideLand(rules, resolved(), "", ""), "rules resolved every file")
 	require.True(t, decideLand(rules, resolved(), "t1", "t2"), "rules land whatever tree was verified: their verification stays in the lane")
 	require.False(t, decideLand(nil, resolved(), "t1", "t1"), "no answer")
@@ -319,12 +368,14 @@ func TestDecideLand(t *testing.T) {
 
 	// THE rule (PLAN10 15.9): a file that proposes may land only if verify.command passed on the exact
 	// tree that lands, compared by object ID.
-	flagged := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b", Proposal: true}}}
-	named := &resolver.Response{Resolver: "graft-resolve/trivial,llm", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
+	flagged := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{
+		{Path: "a", Origin: resolver.OriginRule}, {Path: "b", Origin: resolver.OriginRule, Proposal: true},
+	}}
+	unmarked := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{{Path: "a", Origin: resolver.OriginRule}, {Path: "b"}}}
 	proposing := func() []*landFileState {
 		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_PROPOSED}}
 	}
-	for desc, answer := range map[string]*resolver.Response{"a flagged file": flagged, "the llm strategy by name": named} {
+	for desc, answer := range map[string]*resolver.Response{"a file marked as a proposal": flagged, "a file that says nothing": unmarked} {
 		require.True(t, decideLand(answer, proposing(), "tree-1", "tree-1"), "%s: verified on this very tree", desc)
 		require.False(t, decideLand(answer, proposing(), "tree-1", ""), "%s: nothing verified", desc)
 		require.False(t, decideLand(answer, proposing(), "tree-1", "tree-2"), "%s: verified on another tree (the tip moved)", desc)

@@ -760,8 +760,10 @@ flag.
 
 * **Protocol (additive).** A ResponseFile gains `"proposal": true`; graft-resolve sets it on every
   file whose result came from the llm strategy, and only there. The server treats an answer with any
-  proposal file as not landable; it also refuses to land any answer whose resolver names the llm
-  strategy, should the flag be missing.
+  proposal file as not landable. *The name-based fallback this item had (an answer whose resolver
+  names the llm strategy) is removed by the review of f404a71: it read only the first "x/" of a name,
+  so a list joined over rounds, a list cut to ",+N" or another vendor's name missed it. Replaced by
+  the fail-safe origin of 15.9.*
 * **Server.** With resolve_conflicts, a resolution by rules alone lands as today. When a file is a
   proposal, the land fails with the LandConflict package: proposal files get OUTCOME_PROPOSED,
   files that rules resolved keep OUTCOME_RESOLVED, and nothing lands partially. Every file with
@@ -1267,6 +1269,21 @@ and the tree it verifies depends on the tip.
 * **Rules are unchanged.** A resolution made by rules alone lands after verify.command, which runs in
   the lane, as before; so does an agent's resolution. Moving them onto the same out-of-lane mechanism
   is the next step, measured on its own, so that in the end there is one verification mechanism.
+* **What is a model's resolution: the origin of each file, fail-safe.** Each resolved file carries
+  `origin`, `rule` or `model` (the older `proposal: true` means `model` and is still read). A file
+  is a rule's only when it says so; a file without an origin, or with an unknown one, is a model's.
+  It lands without verification only if it is marked `rule`; otherwise decideLand's one rule
+  applies. The name of the resolver decides nothing (a joined list, a list cut to ",+N", another
+  vendor's name). The server normalizes the origin when the answer arrives, so the answers kept by
+  their keys carry it and the rounds that reuse them never depend on a name. Third-party resolvers
+  that do not set `origin` no longer land without the operator's verification: that is the change.
+* **What the verification sees: the tree, byte for byte.** git-archive(1) honours the attributes of
+  the tree itself: export-ignore hides a file from the command, and a .gitattributes written by an
+  agent or by a model could therefore decide what the operator's tests see. The checkout is written
+  from git-ls-tree(1) -r and git-cat-file(1) --batch, which apply no attribute (no export-*, eol,
+  filter or smudge), with modes, symbolic links as links and gitlinks as empty directories, and is
+  read back and compared with the listing; a difference fails the checkout closed. The same function
+  serves the verification of rules and of agents' resolutions.
 * **Tests.** A model's resolution that passes lands, signed, with the command run once (so not in
   the lane); one that fails gives a proposal and the output; without a verify.command it is a
   proposal; a tip that moved gets its new tree verified and lands, with no resolver call; a tip that
