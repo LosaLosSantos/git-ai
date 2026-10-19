@@ -82,7 +82,7 @@ func TestReportByLanguageAndKind(t *testing.T) {
 	if err := rep.WriteMarkdown(&b); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"| language | cases", "| rust (low n) | 1 |", "| kind | cases", "| content (low n) | 2 | 1 (0) | 1 |", "| modify-delete (low n) | 1 |"} {
+	for _, want := range []string{"| language | cases", "| rust (low n) | 1 |", "| kind | cases", "| content (low n) | 2 | 1 (0) | 1 |", "| modify-delete (low n) | 1 |", "By language: java 0 of 1 accepted, rust 0 of 1 accepted."} {
 		if !strings.Contains(b.String(), want) {
 			t.Fatalf("markdown lacks %q:\n%s", want, b.String())
 		}
@@ -135,7 +135,7 @@ func TestReportCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(b.String(), "| total | 4 | 1 (1) | 1 | 1 | 1 |") || !strings.Contains(b.String(), "blank lines only (counted as wrong): 1 (go 1, python 0)") ||
-		!strings.Contains(b.String(), "does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): 1 (go 1, python 0)") {
+		!strings.Contains(b.String(), "does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): 1 of 2.") {
 		t.Fatalf("markdown:\n%s", b.String())
 	}
 }

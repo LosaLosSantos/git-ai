@@ -183,8 +183,21 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	}
 	fmt.Fprintf(&b, "\nWrong results that differ from the human resolution in blank lines only (counted as wrong): %d (%s).\n",
 		rep.Total.BlankLinesOnly, perFamily(func(c Counts) int { return c.BlankLinesOnly }))
-	fmt.Fprintf(&b, "\nAccepted results the syntax check gave no verdict on, because a side does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): %d (%s).\n",
-		rep.Total.SyntaxUnchecked, perFamily(func(c Counts) int { return c.SyntaxUnchecked }))
+	languages := make([]string, 0, len(rep.Languages))
+	for l := range rep.Languages {
+		languages = append(languages, l)
+	}
+	sort.Strings(languages)
+	var unchecked []string
+	for _, l := range languages {
+		c := rep.Languages[l]
+		if l == "" {
+			continue
+		}
+		unchecked = append(unchecked, fmt.Sprintf("%s %d of %d accepted", l, c.SyntaxUnchecked, c.Accepted()))
+	}
+	fmt.Fprintf(&b, "\nAccepted results the syntax check gave no verdict on, because a side does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): %d of %d. By language: %s.\n",
+		rep.Total.SyntaxUnchecked, rep.Total.Accepted(), strings.Join(unchecked, ", "))
 	if len(rep.NotSent) > 0 {
 		reasons := make([]string, 0, len(rep.NotSent))
 		for r := range rep.NotSent {
