@@ -3,6 +3,7 @@ package git
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 type validateRevisionConfig struct {
@@ -130,4 +131,16 @@ func hasControlCharacter(b []byte) bool {
 		}
 	}
 	return false
+}
+
+// ValidateStdinRevision checks a revision that is about to be written to the standard input of a
+// git command that reads revisions one per line (git-rev-list(1) --stdin): whatever its caller
+// validated, a revision with a line feed or a carriage return is more than one revision, and one
+// with a NUL is read only up to it. Every writer of such a stdin calls it for each revision, and a
+// test lists the writers (stdin_writers_test.go).
+func ValidateStdinRevision(revision string) error {
+	if strings.ContainsAny(revision, "\n\r\x00") {
+		return fmt.Errorf("revision %q: a revision can't contain a line break or NUL", revision)
+	}
+	return nil
 }
