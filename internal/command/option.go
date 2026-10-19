@@ -11,6 +11,7 @@ import (
 
 type config struct {
 	stdin       io.Reader
+	stdinFilter func(io.Reader) io.Reader
 	stdout      io.Writer
 	stderr      io.Writer
 	dir         string
@@ -48,6 +49,14 @@ func WithStdin(stdin io.Reader) Option {
 func WithSetupStdin() Option {
 	return func(cfg *config) {
 		cfg.stdin = stdinSentinel{}
+	}
+}
+
+// WithStdinFilter makes the command read its stdin through filter: the reader given with
+// WithStdin, or what is written to the command when it was set up with WithSetupStdin.
+func WithStdinFilter(filter func(io.Reader) io.Reader) Option {
+	return func(cfg *config) {
+		cfg.stdinFilter = filter
 	}
 }
 

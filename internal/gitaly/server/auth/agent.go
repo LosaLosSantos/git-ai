@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -13,6 +14,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	gitalycfgauth "github.com/feder-cr/git-ai/internal/gitaly/config/auth"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/graft/agentrefs"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
 	grpcmwauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"google.golang.org/grpc"
@@ -222,6 +224,12 @@ func loadAgentCredentials(sharedToken string, agents []config.GraftAgent) ([]age
 		}
 		if agent.Name == sharedTokenIdentityName {
 			return nil, fmt.Errorf("graft agent %d: name %q is reserved", i, agent.Name)
+		}
+		// The workspace's temporary branches of an agent are graft/<name>/..., and an agent may not
+		// name graft/<namespace>/... for a namespace of the server (agentrefs): an agent named after
+		// one could not use its own branches.
+		if slices.Contains(agentrefs.ServerNamespaces, agent.Name) {
+			return nil, fmt.Errorf("graft agent %d: name %q is reserved for the server's references under %s", i, agent.Name, agentrefs.HiddenPrefix)
 		}
 		if _, ok := names[agent.Name]; ok {
 			return nil, fmt.Errorf("graft agent %q: duplicate name", agent.Name)

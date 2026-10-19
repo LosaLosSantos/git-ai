@@ -401,6 +401,16 @@ func TestLoadAgentCredentials(t *testing.T) {
 			wantErr: "is reserved",
 		},
 		{
+			desc:    "reserved name of the proposals",
+			agents:  []config.GraftAgent{{Name: "proposals", Token: "tok"}},
+			wantErr: "is reserved for the server's references under refs/graft/",
+		},
+		{
+			desc:    "reserved name of the green references",
+			agents:  []config.GraftAgent{{Name: "green", Token: "tok"}},
+			wantErr: "is reserved for the server's references under refs/graft/",
+		},
+		{
 			desc:    "duplicate name",
 			agents:  []config.GraftAgent{{Name: "a", Token: "one"}, {Name: "a", Token: "two"}},
 			wantErr: "duplicate name",

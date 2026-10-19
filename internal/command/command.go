@@ -388,14 +388,23 @@ func New(ctx context.Context, logger log.Logger, nameAndArgs []string, opts ...O
 	// If requested, we will set up the command such that `Write()` can be called on it directly. Otherwise,
 	// we simply pass as stdin whatever the user has asked us to set up. If no `stdin` was set up, the command
 	// will implicitly read from `/dev/null`.
-	if _, ok := cfg.stdin.(stdinSentinel); ok {
+	switch _, ok := cfg.stdin.(stdinSentinel); {
+	case ok && cfg.stdinFilter != nil:
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("creating stdin pipe: %w", err)
+		}
+		command.writer = filteredStdin(pipe, cfg.stdinFilter)
+	case ok:
 		pipe, err := cmd.StdinPipe()
 		if err != nil {
 			return nil, fmt.Errorf("creating stdin pipe: %w", err)
 		}
 
 		command.writer = pipe
-	} else {
+	case cfg.stdin != nil && cfg.stdinFilter != nil:
+		cmd.Stdin = cfg.stdinFilter(cfg.stdin)
+	default:
 		cmd.Stdin = cfg.stdin
 	}
 
@@ -822,6 +831,26 @@ func (c *Command) exitStatus() (int, syscall.Signal) {
 	}
 
 	return state.ExitCode(), 0
+}
+
+// filteredStdin returns the writer of a command's stdin that reaches pipe, the stdin of the
+// process, through filter. A goroutine copies the filtered stream into pipe and closes pipe when
+// the writer is closed. When the process stops reading, the copy fails, and the writes after that
+// fail with its error, as writes to pipe itself would: a writer never blocks on a process that is
+// gone.
+func filteredStdin(pipe io.WriteCloser, filter func(io.Reader) io.Reader) io.WriteCloser {
+	r, w := io.Pipe()
+	go func() {
+		_, err := io.Copy(pipe, filter(r))
+		if closeErr := pipe.Close(); err == nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = io.ErrClosedPipe
+		}
+		r.CloseWithError(err)
+	}()
+	return w
 }
 
 type stdinSentinel struct{}

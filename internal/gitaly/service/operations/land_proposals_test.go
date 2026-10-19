@@ -1,9 +1,12 @@
 package operations
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -15,7 +18,9 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
 	gitalycfg "github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"github.com/feder-cr/git-ai/internal/graft/proposals"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
@@ -226,7 +231,10 @@ func TestUserLand_proposals(t *testing.T) {
 			f := packageFile(t, pkg, p)
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
 			require.Nil(t, f.GetProposal(), p)
-			require.Contains(t, f.GetReason(), "proposal not stored: ", p)
+			// The class of the failure, not git's words, which name the references.
+			require.Contains(t, f.GetReason(), "proposal not stored: reference update conflict", p)
+			require.NotContains(t, f.GetReason(), "refs/", p)
+			require.NotContains(t, f.GetReason(), fx.repoPath, p)
 		}
 	})
 
@@ -335,4 +343,19 @@ func TestResolveLandConflicts_policyFirst(t *testing.T) {
 	var unresolved *landUnresolvedError
 	require.ErrorAs(t, err, &unresolved)
 	require.NotEmpty(t, proposalRefTarget(t, fx))
+}
+
+// TestLandProposalWriteCause: a failed write of proposals is reported by its class.
+func TestLandProposalWriteCause(t *testing.T) {
+	t.Parallel()
+
+	for want, err := range map[string]error{
+		"reference update conflict": fmt.Errorf("updating x: %w", updateref.MismatchingStateError{ReferenceName: "refs/graft/proposals/x"}),
+		"storage unavailable":       fmt.Errorf("writing: %w", &os.PathError{Op: "write", Path: "/storage/@hashed/ab", Err: syscall.ENOSPC}),
+		"write failed":              errors.New("exit status 128: fatal: unable to write /storage/@hashed/ab"),
+	} {
+		require.Equal(t, want, landProposalWriteCause(err))
+	}
+	require.Equal(t, "storage unavailable", landProposalWriteCause(storage.NewRepositoryNotFoundError("default", "x.git")))
+	require.Equal(t, "reference update conflict", landProposalWriteCause(updateref.AlreadyLockedError{ReferenceName: "refs/graft/proposals/x"}))
 }

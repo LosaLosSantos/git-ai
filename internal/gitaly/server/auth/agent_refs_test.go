@@ -18,10 +18,11 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
-// TestAgentRefFields_everyAllowedRPCIsClassified: every string or bytes field of the requests and
-// responses of every RPC agents may call by default, at any depth, is classified by the exact table
-// of agentRefField, as a reference or not. A new RPC or field fails here until it is classified, so
-// the filter cannot miss it.
+// TestAgentRefFields_everyAllowedRPCIsClassified: every string, bytes, bool or enum field of the
+// requests and responses of every RPC agents may call by default, at any depth, is classified by
+// the exact table of agentRefField, by message and field: as a reference or not, or as a flag that
+// walks every reference. A new RPC or field fails here until it is classified, so the filter cannot
+// miss it, nor a new field that a generic name would have passed.
 func TestAgentRefFields_everyAllowedRPCIsClassified(t *testing.T) {
 	t.Parallel()
 
@@ -44,8 +45,8 @@ func TestAgentRefFields_everyAllowedRPCIsClassified(t *testing.T) {
 				for i := 0; i < m.Fields().Len(); i++ {
 					fd := m.Fields().Get(i)
 					switch fd.Kind() {
-					case protoreflect.StringKind, protoreflect.BytesKind:
-						if _, exact := agentRefField(m, fd); !exact {
+					case protoreflect.StringKind, protoreflect.BytesKind, protoreflect.BoolKind, protoreflect.EnumKind:
+						if _, exact := agentRefField(fd); !exact {
 							unclassified = append(unclassified, string(m.FullName())+"."+string(fd.Name())+" ("+method+")")
 						}
 					case protoreflect.MessageKind, protoreflect.GroupKind:
@@ -59,7 +60,7 @@ func TestAgentRefFields_everyAllowedRPCIsClassified(t *testing.T) {
 		}
 	}
 	sort.Strings(unclassified)
-	require.Empty(t, unclassified, "string or bytes fields of agent RPCs that agentRefField does not classify")
+	require.Empty(t, unclassified, "fields of agent RPCs that agentRefField does not classify")
 }
 
 func agentContext() context.Context {
@@ -190,16 +191,54 @@ func TestAgentRefFilter_throughTheInterceptors(t *testing.T) {
 	require.Equal(t, "refs/heads/main", strings.Join(names, ","))
 }
 
-// TestAgentRefNameFields_messagesExist: every message the classification of "name" names exists and
-// has a field "name", so that a typo cannot leave a field unclassified.
-func TestAgentRefNameFields_messagesExist(t *testing.T) {
+// TestAgentRefFields_entriesExist: every field the exact table classifies exists, so that a typo
+// cannot leave a field unclassified; a reference is a string or bytes field, and a walk of every
+// reference a bool.
+func TestAgentRefFields_entriesExist(t *testing.T) {
 	t.Parallel()
 
-	for name := range agentRefNameFields {
+	for name, kind := range agentRefFields {
 		d, err := protoregistry.GlobalFiles.FindDescriptorByName(name)
 		require.NoError(t, err, name)
-		md, ok := d.(protoreflect.MessageDescriptor)
+		fd, ok := d.(protoreflect.FieldDescriptor)
 		require.True(t, ok, name)
-		require.NotNil(t, md.Fields().ByName("name"), name)
+		switch kind {
+		case isRef, isBranchName:
+			require.Contains(t, []protoreflect.Kind{protoreflect.StringKind, protoreflect.BytesKind}, fd.Kind(), name)
+		case walksAllRefs:
+			require.Equal(t, protoreflect.BoolKind, fd.Kind(), name)
+		}
 	}
+}
+
+// TestAgentRefField_byMessage: a field is classified by its message, not its name: the same name
+// in two messages may differ, and a field an operator's RPC adds falls back to the conservative
+// rule by name.
+func TestAgentRefField_byMessage(t *testing.T) {
+	t.Parallel()
+
+	field := func(message, name string) protoreflect.FieldDescriptor {
+		d, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(message))
+		require.NoError(t, err, message)
+		fd := d.(protoreflect.MessageDescriptor).Fields().ByName(protoreflect.Name(name))
+		require.NotNil(t, fd, message+"."+name)
+		return fd
+	}
+
+	kind, exact := agentRefField(field("gitaly.FindBranchRequest", "name"))
+	require.True(t, exact)
+	require.Equal(t, isBranchName, kind)
+	kind, exact = agentRefField(field("gitaly.User", "name"))
+	require.True(t, exact)
+	require.Equal(t, notRef, kind)
+	kind, exact = agentRefField(field("gitaly.FindCommitsRequest", "all"))
+	require.True(t, exact)
+	require.Equal(t, walksAllRefs, kind)
+
+	// CountCommitsRequest is no RPC agents call by default: its fields are judged by name.
+	kind, exact = agentRefField(field("gitaly.CountCommitsRequest", "revision"))
+	require.False(t, exact)
+	require.Equal(t, isRef, kind)
+	_, exact = agentRefField(field("gitaly.CountCommitsRequest", "all"))
+	require.False(t, exact)
 }

@@ -8,15 +8,20 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/git/updateref"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/log"
 )
 
 const (
@@ -97,11 +102,18 @@ func Update(ctx context.Context, repo *localrepo.Repo, ops []Op) error {
 	return nil
 }
 
+// pruneSkipped counts the proposal references that Prune left because they point to no commit.
+var pruneSkipped = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "graft_proposal_prune_skipped_total",
+	Help: "Proposal references left by the pruning because they point to no commit.",
+})
+
 // Prune deletes, among the proposal references under dir (a branch's BranchDir, or RefPrefix for
 // every branch), those older than ttl, those beyond the newest MaxPerBranch of each branch, and
 // drop when it is set. The age is the committer date of the proposals' commit, which the server
 // writes with its own clock (never the request's). Each deletion expects the target it read. It
-// returns the number of references deleted.
+// returns the number of references deleted. A reference to no commit is left, logged and counted
+// (graft_proposal_prune_skipped_total), and does not stop the pruning of the others.
 func Prune(ctx context.Context, repo *localrepo.Repo, dir string, ttl time.Duration, drop git.ReferenceName, now time.Time) (int, error) {
 	if !strings.HasPrefix(dir, RefPrefix) {
 		return 0, fmt.Errorf("pruning proposals: %q is not under %s", dir, RefPrefix)
@@ -130,6 +142,14 @@ func Prune(ctx context.Context, repo *localrepo.Repo, dir string, ttl time.Durat
 			continue
 		}
 		c, err := repo.ReadCommit(ctx, git.Revision(r.Target))
+		if errors.Is(err, localrepo.ErrObjectNotFound) {
+			// A reference to no commit was not written by Update: it is left as it is, and the
+			// others are pruned.
+			pruneSkipped.Inc()
+			log.FromContext(ctx).WithField("reference", r.Name.String()).WarnContext(ctx,
+				"graft: a proposal reference points to no commit; it is not pruned")
+			continue
+		}
 		if err != nil {
 			return 0, fmt.Errorf("reading %s: %w", r.Name, err)
 		}

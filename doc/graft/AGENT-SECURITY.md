@@ -65,11 +65,33 @@ reference under it (including the short forms `graft/proposals/...` and
 `graft/green/...`, which git completes to the server's namespaces; other
 `graft/...` short names, such as the workspace's temporary branches, are
 branches), and removes such references from every response; git upload-pack and
-receive-pack hide the prefix from agents. A test classifies every string or
-bytes field of every RPC agents may call by default, so a new field cannot
-escape the filter; RPCs added with `graft.agent_rpcs` are checked by field
-name. Other callers still see graft-verify's green references, which are
-documented for consumers.
+receive-pack hide the prefix from agents. Git's pseudo references reach every
+reference without naming one, so every git command of an agent that walks them
+(`rev-list`, `log`, `show`, `rev-parse`, `bundle`, `fast-export`,
+`format-patch`) gets `--exclude-hidden=uploadpack` before each `--all` and
+`--glob`, in its arguments and on its stdin, with `uploadpack.hideRefs` set to
+`refs/graft/`: `--all` and `--glob=refs/*` in `ListCommits` or `ListBlobs`,
+`FindCommits` with `all`, or any other RPC or field that asks for such a walk,
+leave the namespace out (`internal/git/gitcmd/agent_walk.go`). `--alternate-refs`
+walks the references of the object pool, which mirrors the member's references,
+`refs/graft/` included: for an agent it walks only the pool's branches and tags
+(`core.alternateRefsPrefixes`). A test classifies,
+by message and field, every string, bytes, bool and enum field of every RPC
+agents may call by default, so a new field cannot escape the filter; RPCs added
+with `graft.agent_rpcs` are checked by field name. Other callers still see
+graft-verify's green references, which are documented for consumers.
+
+What the hiding covers, and what it does not: it covers the reference **names**
+under `refs/graft/` and the reachability that goes through them. An agent can
+neither address those references nor walk to their objects through them, so it
+can neither depend on a proposal reference nor learn of one from a listing. It
+does **not** make the objects secret. A proposal's commits and blobs are
+ordinary objects of the repository: `ListAllBlobs` and `ListAllLFSPointers`
+enumerate every blob, `GetObjects` reads any object by its ID, and an agent with
+access to the repository can read their content, a proposal's message included. The goal is
+that agents can neither address nor depend on `refs/graft/`, not object
+confidentiality; anything that must stay secret from an agent must not be
+written into a repository the agent can read.
 
 Whatever the RPC and whatever the policy says, an agent never creates,
 updates or deletes a reference under `refs/graft/`: the reference-transaction
@@ -136,6 +158,17 @@ Policy covers the `HEAD` symbolic ref as well, so an agent cannot repoint
 A denial by policy is a `PermissionDenied` error. Standalone denial messages
 do not start with `GitLab:`, so they are not mistaken for a GitLab hook
 rejection.
+
+Two known limits, accepted:
+
+- A land with `resolve_conflicts` is checked against the standalone policy
+  before the resolver is called, so an actor the policy denies gets nothing
+  resolved. A shared-token caller whose GitLab user the GitLab pre-receive
+  check would deny is not stopped there: that check runs when the references
+  are updated, so the resolver is called, and the land is then refused.
+- A branch that is a symbolic reference is judged by its own name, not by the
+  name of the branch it points to. Creating a symbolic branch needs the rights
+  of an operator.
 
 ## Resolution and verification are opt-in
 

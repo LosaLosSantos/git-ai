@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/feder-cr/git-ai/internal/git"
@@ -107,6 +108,32 @@ func TestPrune(t *testing.T) {
 
 	_, err = Prune(ctx, repo, "refs/heads/", time.Hour, "", now)
 	require.ErrorContains(t, err, "is not under")
+}
+
+// TestPrune_skipsAReferenceToNoCommit: a proposal reference that points to a blob, which Update
+// never writes, is left and counted, and the pruning of the others goes on.
+func TestPrune_skipsAReferenceToNoCommit(t *testing.T) {
+	t.Parallel()
+
+	repo, _, commit, list := setup(t)
+	ctx := testhelper.Context(t)
+	now := time.Now()
+	zero := gittest.DefaultObjectHash.ZeroOID
+	blob, err := repo.WriteBlob(ctx, strings.NewReader("not a commit"), localrepo.WriteBlobConfig{})
+	require.NoError(t, err)
+	stray := git.ReferenceName(fmt.Sprintf("%s%040x", BranchDir("main"), 1))
+	old := git.ReferenceName(fmt.Sprintf("%s%040x", BranchDir("main"), 2))
+	require.NoError(t, Update(ctx, repo, []Op{
+		{Name: stray, NewOID: blob, OldOID: zero},
+		{Name: old, NewOID: commit(now.Add(-8 * 24 * time.Hour)), OldOID: zero},
+	}))
+
+	before := testutil.ToFloat64(pruneSkipped)
+	n, err := Prune(ctx, repo, RefPrefix, 7*24*time.Hour, "", now)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "the old proposal is pruned")
+	require.Equal(t, []string{stray.String()}, list(BranchDir("main")))
+	require.GreaterOrEqual(t, testutil.ToFloat64(pruneSkipped)-before, 1.0)
 }
 
 // TestUpdate_compareAndSwap: a deletion that expects a target the reference no longer has fails,

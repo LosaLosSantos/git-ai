@@ -18,12 +18,14 @@ import (
 //     names refs/graft/ (agentrefs.RevisionHidden);
 //   - a response loses every reference under refs/graft/ it lists: a list element that is such a
 //     name, or a message that names one in a reference field.
-// Which fields name references is decided by agentRefField: an exact table for the messages of
-// the RPCs agents may call by default (a test fails on any string or bytes field that the table
-// does not classify), and a conservative rule by field name for the RPCs an operator adds with
-// [graft] agent_rpcs.
+// Which fields name references is decided by agentRefField: an exact table, by message and field,
+// for the messages of the RPCs agents may call by default (a test fails on any string, bytes, bool
+// or enum field of theirs that the table does not classify), and a conservative rule by field name
+// for the RPCs an operator adds with [graft] agent_rpcs. A flag that makes git walk every reference
+// (walksAllRefs) is not checked here: gitcmd leaves the hidden references out of every walk of an
+// agent's command (gitcmd/agent_walk.go), whatever asked for it.
 
-// refFieldKind is what a string or bytes field of a request or a response holds.
+// refFieldKind is what a field of a request or a response holds, or does.
 type refFieldKind int
 
 const (
@@ -33,62 +35,445 @@ const (
 	// isBranchName: a branch name the server completes under refs/heads/ when it is short; only a
 	// full name under refs/graft/ is refused (no revision rule completes it to refs/graft/).
 	isBranchName
+	// walksAllRefs: a flag that makes git walk every reference (git's --all); the walk of an agent
+	// leaves out the hidden references (gitcmd).
+	walksAllRefs
 )
 
-// agentRefFieldsByName classifies a field by its name alone.
-var agentRefFieldsByName = map[protoreflect.Name]refFieldKind{
-	// Revisions, references and patterns of requests, and references of responses.
-	"commit": isRef, "commit_id": isRef, "commit_ids": isRef, "commit_revision": isRef, "commits": isRef,
-	"expected_head_commit_id": isRef, "expected_old_oid": isRef, "head_commit_id": isRef, "base_commit_id": isRef,
-	"include_referenced_by": isRef, "left_commit_id": isRef, "right_commit_id": isRef,
-	"left_tree_revision": isRef, "right_tree_revision": isRef, "new_revision": isRef, "old_revision": isRef,
-	"oid": isRef, "oids": isRef, "parent_commit_revisions": isRef, "patterns": isRef, "pointing_at_oids": isRef,
-	"ref_names": isRef, "ref_patterns": isRef, "resume_oid": isRef, "revision": isRef, "revisions": isRef,
-	"start_point": isRef, "start_sha": isRef, "tag_ids": isRef, "tag_revisions": isRef, "tip": isRef,
-	"tree_oid": isRef, "blob_ids": isRef, "refs": isRef, "ref_name": isRef, "reference": isRef,
-	"referenced_by": isRef, "branch_names": isRef, "tag_names": isRef, "target": isRef,
-	// Branch and tag names: the server completes them under refs/heads/ and refs/tags/, so they
-	// cannot name refs/graft/; and fields that hold no reference.
-	"branch": notRef, "branch_name": notRef, "start_branch_name": notRef, "target_branch": notRef,
-	"merged_branches": notRef, "tag_name": notRef, "remote_name": notRef, "exclude_patterns": notRef,
-	"author": notRef, "body": notRef, "commit_author_email": notRef, "commit_author_name": notRef,
-	"commit_message": notRef, "commit_message_patterns": notRef, "content": notRef, "description": notRef,
-	"email": notRef, "file_path": notRef, "git_alternate_object_directories": notRef,
-	"git_object_directory": notRef, "gl_id": notRef, "gl_project_path": notRef, "gl_repository": notRef,
-	"gl_username": notRef, "id": notRef, "merge_message": notRef, "message_regex": notRef, "mode": notRef,
-	"page_token": notRef, "path": notRef, "paths": notRef, "previous_path": notRef, "query": notRef,
-	"relative_path": notRef, "sort_field": notRef, "storage_name": notRef, "timezone": notRef, "title": notRef,
-	"actor": notRef, "commit_oid": notRef, "data": notRef, "encoding": notRef, "file_oid": notRef,
-	"filesystem_id": notRef, "flat_path": notRef, "following_lines": notRef, "fs_type": notRef,
-	"git_version": notRef, "index_error": notRef, "key": notRef, "landed_commit_id": notRef, "line": notRef,
-	"message": notRef, "new_blob_id": notRef, "new_oid": notRef, "next_cursor": notRef, "old_blob_id": notRef,
-	"old_oid": notRef, "old_path": notRef, "old_tip": notRef, "operation": notRef, "original_commit_id": notRef,
-	"parent_ids": notRef, "patch_id": notRef, "path_bytes": notRef, "peeled_target": notRef,
-	"pre_receive_error": notRef, "preceding_lines": notRef, "reason": notRef, "resolved_paths": notRef,
-	"resolver": notRef, "rule": notRef, "server_version": notRef, "signature": notRef, "signed_text": notRef,
-	"subject": notRef, "tag_id": notRef, "tree_id": notRef, "value": notRef,
+// agentRefFields classifies, by message and field, the string, bytes, bool and enum fields of the
+// requests and responses of the RPCs agents may call by default (builtinAgentRPCs), at any depth.
+// Numeric fields name no reference and select no walk, and are not listed.
+var agentRefFields = map[protoreflect.FullName]refFieldKind{
+	"gitaly.AddReviewCommentRequest.body": notRef,
+	"gitaly.AddReviewCommentRequest.id":   notRef,
+	"gitaly.AddReviewCommentRequest.path": notRef,
+
+	"gitaly.BlameRequest.path":     notRef,
+	"gitaly.BlameRequest.revision": isRef,
+
+	"gitaly.BlameResponse.Line.commit_id": isRef,
+	"gitaly.BlameResponse.Line.content":   notRef,
+
+	"gitaly.BlameResponse.commit_id": isRef,
+
+	"gitaly.Branch.name": isRef,
+
+	"gitaly.ChangedPaths.commit_id":   isRef,
+	"gitaly.ChangedPaths.new_blob_id": notRef,
+	"gitaly.ChangedPaths.old_blob_id": notRef,
+	"gitaly.ChangedPaths.old_path":    notRef,
+	"gitaly.ChangedPaths.path":        notRef,
+	"gitaly.ChangedPaths.status":      notRef,
+
+	"gitaly.Changeset.actor":     notRef,
+	"gitaly.Changeset.new_oid":   notRef,
+	"gitaly.Changeset.old_oid":   notRef,
+	"gitaly.Changeset.operation": notRef,
+	"gitaly.Changeset.reference": isRef,
+	"gitaly.Changeset.rewritten": notRef,
+
+	"gitaly.ChangesetMember.actor":              notRef,
+	"gitaly.ChangesetMember.commit_id":          isRef,
+	"gitaly.ChangesetMember.original_commit_id": notRef,
+	"gitaly.ChangesetMember.resolved_paths":     notRef,
+	"gitaly.ChangesetMember.rewritten":          notRef,
+
+	"gitaly.CloseReviewRequest.id":     notRef,
+	"gitaly.CloseReviewRequest.landed": notRef,
+
+	"gitaly.CommitAuthor.email":    notRef,
+	"gitaly.CommitAuthor.name":     notRef,
+	"gitaly.CommitAuthor.timezone": notRef,
+
+	"gitaly.CommitTrailer.key":   notRef,
+	"gitaly.CommitTrailer.value": notRef,
+
+	"gitaly.CreateReviewRequest.base_commit_id": isRef,
+	"gitaly.CreateReviewRequest.description":    notRef,
+	"gitaly.CreateReviewRequest.head_commit_id": isRef,
+	"gitaly.CreateReviewRequest.target_branch":  notRef,
+	"gitaly.CreateReviewRequest.title":          notRef,
+
+	"gitaly.DiffStats.old_path": notRef,
+	"gitaly.DiffStats.path":     notRef,
+
+	"gitaly.DiffStatsRequest.left_commit_id":     isRef,
+	"gitaly.DiffStatsRequest.right_commit_id":    isRef,
+	"gitaly.DiffStatsRequest.whitespace_changes": notRef,
+
+	"gitaly.FindAllBranchesRequest.merged_branches": notRef,
+	"gitaly.FindAllBranchesRequest.merged_only":     notRef,
+
+	"gitaly.FindAllBranchesResponse.Branch.name": isRef,
+
+	"gitaly.FindAllRemoteBranchesRequest.remote_name": notRef,
+
+	"gitaly.FindAllTagsRequest.SortBy.direction": notRef,
+	"gitaly.FindAllTagsRequest.SortBy.key":       notRef,
+
+	"gitaly.FindBranchRequest.name": isBranchName,
+
+	"gitaly.FindChangedPathsRequest.Request.CommitRequest.commit_revision":         isRef,
+	"gitaly.FindChangedPathsRequest.Request.CommitRequest.parent_commit_revisions": isRef,
+
+	"gitaly.FindChangedPathsRequest.Request.TreeRequest.left_tree_revision":  isRef,
+	"gitaly.FindChangedPathsRequest.Request.TreeRequest.right_tree_revision": isRef,
+
+	"gitaly.FindChangedPathsRequest.commits":                isRef,
+	"gitaly.FindChangedPathsRequest.diff_filters":           notRef,
+	"gitaly.FindChangedPathsRequest.find_renames":           notRef,
+	"gitaly.FindChangedPathsRequest.merge_commit_diff_mode": notRef,
+
+	"gitaly.FindCommitRequest.revision": isRef,
+	"gitaly.FindCommitRequest.trailers": notRef,
+
+	"gitaly.FindCommitsRequest.all":                   walksAllRefs,
+	"gitaly.FindCommitsRequest.author":                notRef,
+	"gitaly.FindCommitsRequest.disable_walk":          notRef,
+	"gitaly.FindCommitsRequest.first_parent":          notRef,
+	"gitaly.FindCommitsRequest.follow":                notRef,
+	"gitaly.FindCommitsRequest.include_referenced_by": isRef,
+	"gitaly.FindCommitsRequest.include_shortstat":     notRef,
+	"gitaly.FindCommitsRequest.message_regex":         notRef,
+	"gitaly.FindCommitsRequest.order":                 notRef,
+	"gitaly.FindCommitsRequest.paths":                 notRef,
+	"gitaly.FindCommitsRequest.revision":              isRef,
+	"gitaly.FindCommitsRequest.skip_merges":           notRef,
+	"gitaly.FindCommitsRequest.trailers":              notRef,
+
+	"gitaly.FindDefaultBranchNameRequest.head_only": notRef,
+
+	"gitaly.FindDefaultBranchNameResponse.name": isRef,
+
+	"gitaly.FindLocalBranchesRequest.exclude_patterns": notRef,
+	"gitaly.FindLocalBranchesRequest.sort_by":          notRef,
+
+	"gitaly.FindRefsByOIDRequest.oid":          isRef,
+	"gitaly.FindRefsByOIDRequest.ref_patterns": isRef,
+	"gitaly.FindRefsByOIDRequest.sort_field":   notRef,
+
+	"gitaly.FindRefsByOIDResponse.refs": isRef,
+
+	"gitaly.FindTagRequest.tag_name": notRef,
+
+	"gitaly.GetBlobRequest.oid": isRef,
+
+	"gitaly.GetBlobResponse.data": notRef,
+	"gitaly.GetBlobResponse.oid":  isRef,
+
+	"gitaly.GetBlobsRequest.RevisionPath.path":     notRef,
+	"gitaly.GetBlobsRequest.RevisionPath.revision": isRef,
+
+	"gitaly.GetBlobsResponse.data":         notRef,
+	"gitaly.GetBlobsResponse.is_submodule": notRef,
+	"gitaly.GetBlobsResponse.oid":          isRef,
+	"gitaly.GetBlobsResponse.path":         notRef,
+	"gitaly.GetBlobsResponse.revision":     isRef,
+	"gitaly.GetBlobsResponse.type":         notRef,
+
+	"gitaly.GetCommitMessagesRequest.commit_ids": isRef,
+
+	"gitaly.GetCommitMessagesResponse.commit_id": isRef,
+	"gitaly.GetCommitMessagesResponse.message":   notRef,
+
+	"gitaly.GetCommitSignaturesRequest.commit_ids": isRef,
+
+	"gitaly.GetCommitSignaturesResponse.commit_id":   isRef,
+	"gitaly.GetCommitSignaturesResponse.signature":   notRef,
+	"gitaly.GetCommitSignaturesResponse.signed_text": notRef,
+	"gitaly.GetCommitSignaturesResponse.signer":      notRef,
+
+	"gitaly.GetLFSPointersRequest.blob_ids": isRef,
+
+	"gitaly.GetObjectsRequest.oids":       isRef,
+	"gitaly.GetObjectsRequest.resume_oid": isRef,
+
+	"gitaly.GetObjectsResponse.data":    notRef,
+	"gitaly.GetObjectsResponse.missing": notRef,
+	"gitaly.GetObjectsResponse.oid":     isRef,
+	"gitaly.GetObjectsResponse.type":    notRef,
+
+	"gitaly.GetPatchIDRequest.context_free":    notRef,
+	"gitaly.GetPatchIDRequest.new_revision":    isRef,
+	"gitaly.GetPatchIDRequest.old_revision":    isRef,
+	"gitaly.GetPatchIDRequest.whole_diff_hash": notRef,
+
+	"gitaly.GetPatchIDResponse.patch_id": notRef,
+
+	"gitaly.GetReviewRequest.id": notRef,
+
+	"gitaly.GetTagMessagesRequest.tag_ids": isRef,
+
+	"gitaly.GetTagMessagesResponse.message": notRef,
+	"gitaly.GetTagMessagesResponse.tag_id":  notRef,
+
+	"gitaly.GetTagSignaturesRequest.tag_revisions": isRef,
+
+	"gitaly.GetTagSignaturesResponse.TagSignature.content":   notRef,
+	"gitaly.GetTagSignaturesResponse.TagSignature.signature": notRef,
+	"gitaly.GetTagSignaturesResponse.TagSignature.tag_id":    notRef,
+
+	"gitaly.GetTreeEntriesRequest.path":             notRef,
+	"gitaly.GetTreeEntriesRequest.recursive":        notRef,
+	"gitaly.GetTreeEntriesRequest.revision":         isRef,
+	"gitaly.GetTreeEntriesRequest.skip_flat_paths":  notRef,
+	"gitaly.GetTreeEntriesRequest.sort":             notRef,
+	"gitaly.GetTreeEntriesRequest.with_last_commit": notRef,
+
+	"gitaly.GetTreeRequest.include_sizes": notRef,
+	"gitaly.GetTreeRequest.path":          notRef,
+	"gitaly.GetTreeRequest.recursive":     notRef,
+	"gitaly.GetTreeRequest.revision":      isRef,
+	"gitaly.GetTreeRequest.tree_oid":      isRef,
+
+	"gitaly.GetTreeResponse.Entry.oid":  isRef,
+	"gitaly.GetTreeResponse.Entry.path": notRef,
+	"gitaly.GetTreeResponse.Entry.type": notRef,
+
+	"gitaly.GetTreeResponse.tree_oid": isRef,
+
+	"gitaly.GitCommit.body":           notRef,
+	"gitaly.GitCommit.encoding":       notRef,
+	"gitaly.GitCommit.id":             notRef,
+	"gitaly.GitCommit.parent_ids":     notRef,
+	"gitaly.GitCommit.referenced_by":  isRef,
+	"gitaly.GitCommit.signature_type": notRef,
+	"gitaly.GitCommit.subject":        notRef,
+	"gitaly.GitCommit.tree_id":        notRef,
+
+	"gitaly.GlobalOptions.literal_pathspecs": notRef,
+
+	"gitaly.LFSPointer.data":     notRef,
+	"gitaly.LFSPointer.file_oid": notRef,
+	"gitaly.LFSPointer.oid":      isRef,
+
+	"gitaly.LandResolution.commit": isRef,
+	"gitaly.LandResolution.tip":    isRef,
+
+	"gitaly.LandResolvedFile.action":  notRef,
+	"gitaly.LandResolvedFile.content": notRef,
+	"gitaly.LandResolvedFile.mode":    notRef,
+	"gitaly.LandResolvedFile.path":    notRef,
+
+	"gitaly.ListAllBlobsResponse.Blob.data": notRef,
+	"gitaly.ListAllBlobsResponse.Blob.oid":  isRef,
+
+	"gitaly.ListBlobsRequest.revisions":  isRef,
+	"gitaly.ListBlobsRequest.with_paths": notRef,
+
+	"gitaly.ListBlobsResponse.Blob.data": notRef,
+	"gitaly.ListBlobsResponse.Blob.oid":  isRef,
+	"gitaly.ListBlobsResponse.Blob.path": notRef,
+
+	"gitaly.ListBranchNamesContainingCommitRequest.commit_id": isRef,
+
+	"gitaly.ListBranchNamesContainingCommitResponse.branch_names": isRef,
+
+	"gitaly.ListCommitsByOidRequest.oid": isRef,
+
+	"gitaly.ListCommitsByRefNameRequest.ref_names": isRef,
+
+	"gitaly.ListCommitsByRefNameResponse.CommitForRef.ref_name": isRef,
+
+	"gitaly.ListCommitsRequest.author":                  notRef,
+	"gitaly.ListCommitsRequest.commit_message_patterns": notRef,
+	"gitaly.ListCommitsRequest.disable_walk":            notRef,
+	"gitaly.ListCommitsRequest.first_parent":            notRef,
+	"gitaly.ListCommitsRequest.follow":                  notRef,
+	"gitaly.ListCommitsRequest.ignore_case":             notRef,
+	"gitaly.ListCommitsRequest.order":                   notRef,
+	"gitaly.ListCommitsRequest.paths":                   notRef,
+	"gitaly.ListCommitsRequest.reverse":                 notRef,
+	"gitaly.ListCommitsRequest.revisions":               isRef,
+	"gitaly.ListCommitsRequest.trailers":                notRef,
+
+	"gitaly.ListFilesRequest.revision": isRef,
+
+	"gitaly.ListFilesResponse.paths": notRef,
+
+	"gitaly.ListLFSPointersRequest.revisions": isRef,
+
+	"gitaly.ListLastCommitsForTreeRequest.literal_pathspec": notRef,
+	"gitaly.ListLastCommitsForTreeRequest.path":             notRef,
+	"gitaly.ListLastCommitsForTreeRequest.revision":         isRef,
+
+	"gitaly.ListLastCommitsForTreeResponse.CommitForTree.path_bytes": notRef,
+
+	"gitaly.ListRefsRequest.SortBy.direction": notRef,
+	"gitaly.ListRefsRequest.SortBy.key":       notRef,
+
+	"gitaly.ListRefsRequest.exclude_patterns":    notRef,
+	"gitaly.ListRefsRequest.head":                notRef,
+	"gitaly.ListRefsRequest.ignore_case":         notRef,
+	"gitaly.ListRefsRequest.include_tagger_date": notRef,
+	"gitaly.ListRefsRequest.patterns":            isRef,
+	"gitaly.ListRefsRequest.peel_tags":           notRef,
+	"gitaly.ListRefsRequest.pointing_at_oids":    isRef,
+
+	"gitaly.ListRefsResponse.Reference.name":          isRef,
+	"gitaly.ListRefsResponse.Reference.peeled_target": notRef,
+	"gitaly.ListRefsResponse.Reference.target":        isRef,
+
+	"gitaly.ListReviewsRequest.include_closed": notRef,
+	"gitaly.ListReviewsRequest.target_branch":  notRef,
+
+	"gitaly.ListTagNamesContainingCommitRequest.commit_id": isRef,
+
+	"gitaly.ListTagNamesContainingCommitResponse.tag_names": isRef,
+
+	"gitaly.OperationBranchUpdate.branch_created": notRef,
+	"gitaly.OperationBranchUpdate.commit_id":      isRef,
+	"gitaly.OperationBranchUpdate.repo_created":   notRef,
+
+	"gitaly.PaginationCursor.next_cursor": notRef,
+
+	"gitaly.PaginationParameter.page_token": notRef,
+
+	"gitaly.PathHistoryRequest.path":     notRef,
+	"gitaly.PathHistoryRequest.revision": isRef,
+
+	"gitaly.Repository.git_alternate_object_directories": notRef,
+	"gitaly.Repository.git_object_directory":             notRef,
+	"gitaly.Repository.gl_project_path":                  notRef,
+	"gitaly.Repository.gl_repository":                    notRef,
+	"gitaly.Repository.relative_path":                    notRef,
+	"gitaly.Repository.storage_name":                     notRef,
+
+	"gitaly.RepositoryExistsResponse.exists": notRef,
+
+	"gitaly.Review.approved":       notRef,
+	"gitaly.Review.author":         notRef,
+	"gitaly.Review.base_commit_id": isRef,
+	"gitaly.Review.description":    notRef,
+	"gitaly.Review.head_commit_id": isRef,
+	"gitaly.Review.id":             notRef,
+	"gitaly.Review.state":          notRef,
+	"gitaly.Review.target_branch":  notRef,
+	"gitaly.Review.title":          notRef,
+
+	"gitaly.ReviewComment.actor":     notRef,
+	"gitaly.ReviewComment.body":      notRef,
+	"gitaly.ReviewComment.commit_id": isRef,
+	"gitaly.ReviewComment.id":        notRef,
+	"gitaly.ReviewComment.path":      notRef,
+
+	"gitaly.ReviewFile.class":  notRef,
+	"gitaly.ReviewFile.path":   notRef,
+	"gitaly.ReviewFile.reason": notRef,
+
+	"gitaly.ReviewRequirement.description": notRef,
+	"gitaly.ReviewRequirement.paths":       notRef,
+	"gitaly.ReviewRequirement.rule":        notRef,
+	"gitaly.ReviewRequirement.satisfied":   notRef,
+
+	"gitaly.ReviewVerdict.actor":     notRef,
+	"gitaly.ReviewVerdict.body":      notRef,
+	"gitaly.ReviewVerdict.commit_id": isRef,
+	"gitaly.ReviewVerdict.current":   notRef,
+	"gitaly.ReviewVerdict.kind":      notRef,
+
+	"gitaly.SearchCodeRequest.case_sensitive": notRef,
+	"gitaly.SearchCodeRequest.paths":          notRef,
+	"gitaly.SearchCodeRequest.query":          notRef,
+	"gitaly.SearchCodeRequest.regex":          notRef,
+	"gitaly.SearchCodeRequest.revision":       isRef,
+
+	"gitaly.SearchCodeResponse.Match.following_lines": notRef,
+	"gitaly.SearchCodeResponse.Match.line":            notRef,
+	"gitaly.SearchCodeResponse.Match.path":            notRef,
+	"gitaly.SearchCodeResponse.Match.preceding_lines": notRef,
+
+	"gitaly.SearchCodeResponse.commit_id": isRef,
+	"gitaly.SearchCodeResponse.truncated": notRef,
+
+	"gitaly.ServerInfoResponse.StorageStatus.filesystem_id": notRef,
+	"gitaly.ServerInfoResponse.StorageStatus.fs_type":       notRef,
+	"gitaly.ServerInfoResponse.StorageStatus.readable":      notRef,
+	"gitaly.ServerInfoResponse.StorageStatus.storage_name":  notRef,
+	"gitaly.ServerInfoResponse.StorageStatus.writeable":     notRef,
+
+	"gitaly.ServerInfoResponse.git_version":    notRef,
+	"gitaly.ServerInfoResponse.server_version": notRef,
+
+	"gitaly.SubmitReviewVerdictRequest.body":           notRef,
+	"gitaly.SubmitReviewVerdictRequest.head_commit_id": isRef,
+	"gitaly.SubmitReviewVerdictRequest.id":             notRef,
+	"gitaly.SubmitReviewVerdictRequest.kind":           notRef,
+
+	"gitaly.Tag.id":             notRef,
+	"gitaly.Tag.message":        notRef,
+	"gitaly.Tag.name":           isRef,
+	"gitaly.Tag.signature_type": notRef,
+
+	"gitaly.TreeEntry.commit_oid": notRef,
+	"gitaly.TreeEntry.flat_path":  notRef,
+	"gitaly.TreeEntry.oid":        isRef,
+	"gitaly.TreeEntry.path":       notRef,
+	"gitaly.TreeEntry.type":       notRef,
+
+	"gitaly.TreeEntryRequest.path":     notRef,
+	"gitaly.TreeEntryRequest.revision": isRef,
+
+	"gitaly.TreeEntryResponse.data": notRef,
+	"gitaly.TreeEntryResponse.oid":  isRef,
+	"gitaly.TreeEntryResponse.type": notRef,
+
+	"gitaly.UpdateReviewRequest.expected_head_commit_id": isRef,
+	"gitaly.UpdateReviewRequest.head_commit_id":          isRef,
+	"gitaly.UpdateReviewRequest.id":                      notRef,
+
+	"gitaly.User.email":       notRef,
+	"gitaly.User.gl_id":       notRef,
+	"gitaly.User.gl_username": notRef,
+	"gitaly.User.name":        notRef,
+	"gitaly.User.timezone":    notRef,
+
+	"gitaly.UserCommitFilesAction.content": notRef,
+
+	"gitaly.UserCommitFilesActionHeader.action":           notRef,
+	"gitaly.UserCommitFilesActionHeader.base64_content":   notRef,
+	"gitaly.UserCommitFilesActionHeader.execute_filemode": notRef,
+	"gitaly.UserCommitFilesActionHeader.file_path":        notRef,
+	"gitaly.UserCommitFilesActionHeader.infer_content":    notRef,
+	"gitaly.UserCommitFilesActionHeader.previous_path":    notRef,
+
+	"gitaly.UserCommitFilesRequestHeader.branch_name":         notRef,
+	"gitaly.UserCommitFilesRequestHeader.commit_author_email": notRef,
+	"gitaly.UserCommitFilesRequestHeader.commit_author_name":  notRef,
+	"gitaly.UserCommitFilesRequestHeader.commit_message":      notRef,
+	"gitaly.UserCommitFilesRequestHeader.expected_old_oid":    isRef,
+	"gitaly.UserCommitFilesRequestHeader.force":               notRef,
+	"gitaly.UserCommitFilesRequestHeader.sign":                notRef,
+	"gitaly.UserCommitFilesRequestHeader.start_branch_name":   notRef,
+	"gitaly.UserCommitFilesRequestHeader.start_sha":           isRef,
+
+	"gitaly.UserCommitFilesResponse.index_error":       notRef,
+	"gitaly.UserCommitFilesResponse.pre_receive_error": notRef,
+
+	"gitaly.UserCreateBranchRequest.branch_name": notRef,
+	"gitaly.UserCreateBranchRequest.start_point": isRef,
+
+	"gitaly.UserDeleteBranchRequest.branch_name":      notRef,
+	"gitaly.UserDeleteBranchRequest.expected_old_oid": isRef,
+
+	"gitaly.UserLandRequest.branch":            notRef,
+	"gitaly.UserLandRequest.commit_id":         isRef,
+	"gitaly.UserLandRequest.create_branch":     notRef,
+	"gitaly.UserLandRequest.merge_message":     notRef,
+	"gitaly.UserLandRequest.resolve_conflicts": notRef,
+	"gitaly.UserLandRequest.strategy":          notRef,
+
+	"gitaly.UserLandResponse.already_landed":   notRef,
+	"gitaly.UserLandResponse.landed_commit_id": notRef,
+	"gitaly.UserLandResponse.old_tip":          notRef,
+	"gitaly.UserLandResponse.resolved_paths":   notRef,
+	"gitaly.UserLandResponse.resolver":         notRef,
+	"gitaly.UserLandResponse.rewritten":        notRef,
 }
 
-// agentRefNameFields classifies the field "name", whose meaning depends on its message.
-var agentRefNameFields = map[protoreflect.FullName]refFieldKind{
-	"gitaly.FindBranchRequest":              isBranchName,
-	"gitaly.Branch":                         isRef,
-	"gitaly.FindAllBranchesResponse.Branch": isRef,
-	"gitaly.FindDefaultBranchNameResponse":  isRef,
-	"gitaly.ListRefsResponse.Reference":     isRef,
-	"gitaly.Tag":                            isRef,
-	"gitaly.User":                           notRef,
-	"gitaly.CommitAuthor":                   notRef,
-}
-
-// agentRefField returns what a string or bytes field holds, and whether the exact table knows it.
-func agentRefField(md protoreflect.MessageDescriptor, fd protoreflect.FieldDescriptor) (refFieldKind, bool) {
-	if fd.Name() == "name" {
-		kind, ok := agentRefNameFields[md.FullName()]
-		if ok {
-			return kind, true
-		}
-	} else if kind, ok := agentRefFieldsByName[fd.Name()]; ok {
+// agentRefField returns what a field holds, and whether the exact table knows it.
+func agentRefField(fd protoreflect.FieldDescriptor) (refFieldKind, bool) {
+	if kind, ok := agentRefFields[fd.FullName()]; ok {
 		return kind, true
 	}
 	// A field of an RPC an operator added: a name that may hold a revision, a reference or a
@@ -133,8 +518,8 @@ func findHiddenRef(m protoreflect.Message) (protoreflect.FullName, string, bool)
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch fd.Kind() {
 		case protoreflect.StringKind, protoreflect.BytesKind:
-			kind, _ := agentRefField(m.Descriptor(), fd)
-			if kind == notRef {
+			kind, _ := agentRefField(fd)
+			if kind != isRef && kind != isBranchName {
 				return true
 			}
 			for _, s := range scalarStrings(fd, v) {
@@ -183,7 +568,7 @@ func filterMessage(m protoreflect.Message, top bool) bool {
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 		switch fd.Kind() {
 		case protoreflect.StringKind, protoreflect.BytesKind:
-			if kind, _ := agentRefField(m.Descriptor(), fd); kind == notRef {
+			if kind, _ := agentRefField(fd); kind != isRef && kind != isBranchName {
 				return true
 			}
 			if fd.IsList() {

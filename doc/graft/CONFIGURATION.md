@@ -112,7 +112,7 @@ The policy is read at startup. A change needs a restart.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | required | Identity of the agent. It is the identity the token maps to, the actor the policy decides on for the token's requests, the actor that the changeset log records for the token's updates and, in standalone mode, the user ID (`gl_id`, `gl_username`) of every request made with the token, whatever the client sent. The name `shared` is reserved for the shared token. |
+| `name` | string | required | Identity of the agent. It is the identity the token maps to, the actor the policy decides on for the token's requests, the actor that the changeset log records for the token's updates and, in standalone mode, the user ID (`gl_id`, `gl_username`) of every request made with the token, whatever the client sent. The name `shared` is reserved for the shared token, and `proposals` and `green` for the server's references under `refs/graft/`: the workspace's temporary branches of an agent are `graft/<name>/...`, which for those names an agent may not use. |
 | `token` | string | — | The secret. Set either `token` or `token_file`. |
 | `token_file` | string | — | Path to a file that holds the secret, surrounding whitespace removed. Read at startup. |
 

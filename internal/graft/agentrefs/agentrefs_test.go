@@ -22,6 +22,10 @@ func TestRevisionHidden(t *testing.T) {
 		"refs/heads/graft/x":                    false,
 		"main":                                  false,
 		"refs/*":                                false,
+		"--glob=refs/graft/*":                   true, // a pattern after =
+		"--glob=graft/proposals/*":              true,
+		"--glob=refs/*":                         false, // gitcmd leaves refs/graft/ out of the walk
+		"--all":                                 false, // likewise
 		"0123456789abcdef0123456789abcdef01234": false,
 		"main:refs/notes/graft":                 false,
 		"main:graft/x.go":                       false, // a path, not a reference

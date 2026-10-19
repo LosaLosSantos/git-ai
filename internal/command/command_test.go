@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/cgroups"
@@ -217,6 +218,56 @@ func TestNew_setupStdin(t *testing.T) {
 
 	require.NoError(t, cmd.Wait())
 	require.Equal(t, stdin, buf.String())
+}
+
+// TestNew_stdinFilter: the command reads its stdin through the filter, both a reader given to it
+// and what is written to it; a writer whose process stopped reading gets an error and never blocks.
+func TestNew_stdinFilter(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	upper := func(r io.Reader) io.Reader {
+		raw, err := io.ReadAll(r)
+		if err != nil {
+			return iotest.ErrReader(err)
+		}
+		return strings.NewReader(strings.ToUpper(string(raw)))
+	}
+
+	var buf bytes.Buffer
+	cmd, err := New(ctx, testhelper.SharedLogger(t), []string{"cat"}, WithStdin(strings.NewReader("given")), WithStdinFilter(upper), WithStdout(&buf))
+	require.NoError(t, err)
+	require.NoError(t, cmd.Wait())
+	require.Equal(t, "GIVEN", buf.String())
+
+	buf.Reset()
+	cmd, err = New(ctx, testhelper.SharedLogger(t), []string{"cat"}, WithSetupStdin(), WithStdinFilter(upper), WithStdout(&buf))
+	require.NoError(t, err)
+	_, err = fmt.Fprintf(cmd, "written")
+	require.NoError(t, err)
+	require.NoError(t, cmd.Wait())
+	require.Equal(t, "WRITTEN", buf.String())
+
+	// A process that exits without reading: the writes fail once the copy into its stdin failed.
+	passThrough := func(r io.Reader) io.Reader { return r }
+	cmd, err = New(ctx, testhelper.SharedLogger(t), []string{"true"}, WithSetupStdin(), WithStdinFilter(passThrough))
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() {
+		chunk := bytes.Repeat([]byte("x"), 1<<16)
+		var err error
+		for i := 0; i < 1<<10 && err == nil; i++ {
+			_, err = cmd.Write(chunk)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "the writes blocked on a process that exited")
+	}
+	require.NoError(t, cmd.Wait())
 }
 
 func TestCommand_closeStdin(t *testing.T) {

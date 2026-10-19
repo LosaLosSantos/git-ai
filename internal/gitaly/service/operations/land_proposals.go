@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/git/updateref"
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/proposals"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -224,12 +227,36 @@ func landProposalsNotStored(files []*landFileState, answer *resolver.Response, c
 			continue
 		}
 		f.proposal = nil
-		note := "proposal not stored: " + cause.Error()
+		note := "proposal not stored: " + landProposalWriteCause(cause)
 		if f.reason == "" {
 			f.reason = note
 		} else {
 			f.reason += "; " + note
 		}
+	}
+}
+
+// landProposalWriteCause is what the package says of a failed write of the proposals: a class of
+// the failure, never the error itself, whose git output may name references or the paths of the
+// storage. The error is logged where the write failed.
+func landProposalWriteCause(err error) string {
+	var (
+		locked    updateref.AlreadyLockedError
+		mismatch  updateref.MismatchingStateError
+		exists    updateref.ReferenceAlreadyExistsError
+		directory updateref.FileDirectoryConflictError
+		inTx      updateref.InTransactionConflictError
+		multiple  updateref.MultipleUpdatesError
+	)
+	switch {
+	case errors.As(err, &locked), errors.As(err, &mismatch), errors.As(err, &exists), errors.As(err, &directory),
+		errors.As(err, &inTx), errors.As(err, &multiple), errors.Is(err, updateref.ErrPackedRefsLocked):
+		return "reference update conflict"
+	case errors.Is(err, storage.ErrRepositoryNotFound), errors.Is(err, storage.ErrStorageNotFound),
+		errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT), errors.Is(err, syscall.EROFS), errors.Is(err, syscall.EIO):
+		return "storage unavailable"
+	default:
+		return "write failed"
 	}
 }
 
