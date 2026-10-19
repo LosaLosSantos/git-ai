@@ -52,7 +52,9 @@ const (
 	NotSentLarge     = "large"
 	NotSentLockfile  = "lockfile"
 	NotSentGenerated = "generated"
-	NotSentMinified  = "minified"
+	// NotSentRegions: more conflicting regions than the llm strategy's max_regions.
+	NotSentRegions  = "regions"
+	NotSentMinified = "minified"
 )
 
 // lockfiles are the base names of the lockfiles that always go to the agent.

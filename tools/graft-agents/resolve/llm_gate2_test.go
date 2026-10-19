@@ -66,67 +66,25 @@ func TestLLMStrategyDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 	}
 }
 
-func TestLLMEnsureNewlineFollowsLineEndings(t *testing.T) {
-	crlfBase := []string{"a\r\n", "b\r\n", "c\r\n"}
-	lfBase := []string{"a\n", "b\n", "c\n"}
-
-	// A CRLF neighbourhood gets CRLF, an LF file gets LF.
-	crlf := &llmRegion{start: 1, end: 2, base: "b\r\n", ours: "B\r\n", theirs: "b2\r\n"}
-	if got := llmEnsureNewline("X", crlfBase, crlf); got != "X\r\n" {
-		t.Fatalf("CRLF answer = %q, want %q", got, "X\r\n")
-	}
-	lf := &llmRegion{start: 1, end: 2, base: "b\n", ours: "B\n", theirs: "b2\n"}
-	if got := llmEnsureNewline("X", lfBase, lf); got != "X\n" {
-		t.Fatalf("LF answer = %q, want %q", got, "X\n")
-	}
-
-	// An answer that already ends in a newline is left alone.
-	if got := llmEnsureNewline("X\r\n", crlfBase, crlf); got != "X\r\n" {
-		t.Fatalf("terminated answer = %q", got)
-	}
-
-	// The last line without a terminator gets none.
-	last := &llmRegion{start: 2, end: 3, base: "c", ours: "C", theirs: "c2"}
-	if got := llmEnsureNewline("X", []string{"a\r\n", "b\r\n", "c"}, last); got != "X" {
-		t.Fatalf("unterminated last line = %q, want %q", got, "X")
-	}
-}
-
-func TestResolveLLMHunkModeKeepsCRLFLineEndings(t *testing.T) {
-	base := strings.ReplaceAll(numbered("line", 100), "\n", "\r\n")
+// TestResolveLLMKeepsCRLFLineEndings: the context of a CRLF file is CRLF, an answer that keeps
+// CRLF lands as it is, and one whose region is not newline-terminated is refused rather than
+// patched up (the newline rule).
+func TestResolveLLMKeepsCRLFLineEndings(t *testing.T) {
+	base := strings.ReplaceAll(numbered("line", 30), "\n", "\r\n")
 	ours := strings.Replace(base, "line 15\r\n", "o\r\n", 1)
 	theirs := strings.Replace(base, "line 15\r\n", "t\r\n", 1)
 	f := LLMFile{Path: "crlf.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
-	// The answer has no line terminator; the region is not the last line.
-	p := llmFixed("merged")
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
+	res, err := ResolveLLM(context.Background(), llmFixed("merged\r\n"), f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Hunks != 1 {
-		t.Fatalf("hunks = %d, want 1", res.Hunks)
-	}
 	content := string(res.Content)
-	if !strings.Contains(content, "merged\r\n") {
-		t.Fatalf("answer not CRLF-terminated: %q", content)
-	}
-	if lf, crlf := strings.Count(content, "\n"), strings.Count(content, "\r\n"); lf != crlf {
-		t.Fatalf("mixed line endings: %d LF, %d CRLF", lf, crlf)
-	}
-}
-
-func TestLLMHunkPromptMarksAbsentBase(t *testing.T) {
-	base := []string{"x\n"}
-	r := &llmRegion{start: 0, end: 0, base: "", ours: "o\n", theirs: "t\n"}
-
-	absent := llmHunkPrompt(LLMFile{Path: "f.txt"}, base, r, 1, 1, 8, "nonce1")
-	if !strings.Contains(absent, "BEGIN BASE REGION nonce1 (absent) =====") {
-		t.Fatalf("absent base not marked:\n%s", absent)
+	if want := strings.Replace(base, "line 15\r\n", "merged\r\n", 1); content != want {
+		t.Fatalf("content = %q", content)
 	}
 
-	present := llmHunkPrompt(LLMFile{Path: "f.txt", Base: []byte("x\n")}, base, r, 1, 1, 8, "nonce1")
-	if strings.Contains(present, "(absent)") {
-		t.Fatalf("present base marked absent:\n%s", present)
+	if _, err := ResolveLLM(context.Background(), llmFixed("merged"), f, LLMOptions{}); !errors.Is(err, ErrLLMRejected) {
+		t.Fatalf("err = %v, want the newline rule", err)
 	}
 }

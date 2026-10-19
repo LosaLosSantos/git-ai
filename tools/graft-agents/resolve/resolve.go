@@ -225,7 +225,8 @@ const (
 	// is spent).
 	AttemptFailed AttemptKind = "failed"
 	// AttemptRejected: the result broke a rule that every result must keep
-	// (conflict markers, mode, size, or its syntax).
+	// (conflict markers, mode, size, or its syntax), or a model answer broke
+	// the rules of an answer (ErrLLMRejected).
 	AttemptRejected AttemptKind = "rejected"
 	// AttemptCheckFailed: a configured check rejected the result.
 	AttemptCheckFailed AttemptKind = "check_failed"
@@ -417,7 +418,13 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return protocol.ResolvedFile{}, "", nil, ctxErr
 			}
-			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptFailed, Err: err})
+			// A model answer that breaks the rules of an answer (ErrLLMRejected) is a rejected
+			// result, not a failed call.
+			kind := AttemptFailed
+			if errors.Is(err, ErrLLMRejected) {
+				kind = AttemptRejected
+			}
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: kind, Err: err})
 			continue
 		}
 		if !ok {

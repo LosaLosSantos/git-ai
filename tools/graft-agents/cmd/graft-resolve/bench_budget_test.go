@@ -20,7 +20,10 @@ import (
 func modelConfig(t *testing.T, work string) string {
 	t.Helper()
 	answer := filepath.Join(work, "answer.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '{\"content\":\"x = 2 + 3\\\\n\",\"explanation\":\"bench\"}'\n"
+	// The conflict is the file's only line, so the patched code has no context: the program takes
+	// the nonce of the request and answers the human line between the PATCHED CODE lines.
+	script := "#!/bin/sh\nn=$(grep -o 'BEGIN PATCH [0-9a-f]*' | head -1 | cut -d' ' -f3)\n" +
+		"printf '===== BEGIN PATCHED CODE %s =====\\nx = 2 + 3\\n===== END PATCHED CODE %s =====\\n' \"$n\" \"$n\"\n"
 	if err := os.WriteFile(answer, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

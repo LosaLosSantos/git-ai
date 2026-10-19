@@ -598,3 +598,64 @@ way.
     conflict holding every side (pointer lines for binary sides, the text of text sides, notes for
     deleted and unavailable ones). --resolved refuses a pointer line, and a path that is a file on
     none of its sides can only be deleted.
+
+## 13. Prompt first (PM and Federico, approved)
+
+Direction from Federico: the prompt first, then the models; adopt a structure that is already used
+and measured instead of inventing one. The base is synthmerge's patch-application design (Andrea
+Arcangeli, synthmerge): the only published resolver measured against real human resolutions, and
+one that lands a change onto a tip, as a land does. synthmerge is GPL-3.0-or-later or AGPL: we take
+the structure only, written in our own words, with our own worked example; RESOLVE.md credits it.
+
+**R1, the structure** (`tools/graft-agents/resolve/llm_patch.go`, the only mode of the llm
+strategy; the whole-file mode and the JSON answers are removed):
+* One model call per conflicting region; the regions only one side changed are merged locally.
+* PATCH: THEIRS' change to the region, a unified diff from BASE with 3 context lines (synthmerge's
+  default). CODE: OURS' region with the same 3 lines before and after, taken from the file with
+  every other conflicting region as OURS. The task: apply the PATCH to the CODE.
+* System message: the worked example, the commit messages of both sides (Federico's decision
+  that both go in the prompt; synthmerge sends the change's message with its commit diff), the other
+  conflicting regions of the file for reference, the directives last. User message: the PATCH,
+  then the CODE.
+* Plain-text answer between BEGIN and END lines carrying the request's random token.
+* Validation as synthmerge's: the answer starts and ends with the context lines (blank lines at a
+  boundary are given back, up to the number of context lines less one), holds both, what is between
+  them ends with a newline (unless the region ends a file without a final newline) and does not
+  read as a patch; plus our marker rule and size bound.
+* An answer equal to OURS is kept: synthmerge's default (it refuses one only on request, and its
+  bench does not), and the report counts how many answers equal OURS anyway.
+* No retry in R1 (faithful: synthmerge's retries shrink the context).
+
+PM's additions:
+1. A file is resolved only when every region is: the first rejected region rejects the file, which
+   goes to the agent without a proposal; the report counts rejections by their first reason.
+2. At most 20 regions per file (`max_regions`); a file with more makes no call and is reported as
+   not sent (regions). Every call books its worst case against the budget first.
+3. The answer equal to OURS: see above.
+4. Deviation (a): the commit diff of THEIRS is not sent; it joins P5 (a protocol field), measured as
+   its own step later.
+5. No retry in R1.
+6. Unit tests use recorded answers and fake servers only, never the network.
+7. The run script reads the account's credits before every run and refuses to start unless the
+   balance covers the cap plus $0.50; the key is read from its file and never printed.
+
+Deviations, measured or stated:
+* (b) The PATCH is our LCS line diff, not git's histogram diff: on the 300 paired cases (288
+  content conflicts, 403 regions) the two differ in 18 regions of 17 cases (`bench histogram`).
+* (c) Our worked example is a different snippet, written by us.
+* (d) One model and no consensus, as Federico decided.
+
+**Measurement.** Luna, effort low, max_tokens 8000, routing pinned to the standard tiers, the same
+300 paired cases (`--sample 300 --seed 1`, the first 300 of the Luna 600), cap $1.20 a run, the
+whole series under $5 real, and a run over $1.00 real stops the series until the PM is told.
+* R0: the stored Luna answers on those 300, re-judged ($0).
+* R1: the structure above.
+* Then one extra at a time, each kept only if it helps on the same cases (lower strict error rate,
+  more wrong-to-correct than correct-to-wrong flips): R2 one repair round with the same model and a
+  duplicate-declaration check (Shen 2026's generate-validate-retry), R3 the enclosing scope of the
+  region, R4 temperature 0, R5 the best so far at effort medium. P5 (the commit diff) and P6b (the
+  commit subjects of the regions) need protocol fields and wait for their own approval.
+* Every report gives, per language: the strict error rate, the bound with reordering and
+  whitespace counted as correct, the cases where the human changed lines outside the conflict
+  regions as their own category and a rate without them, acceptance and rejections by reason, the
+  flips against the previous step and R0 with an exact McNemar p-value, and the spend.

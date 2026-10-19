@@ -32,7 +32,7 @@ func wp3Conflict(path string) protocol.FileConflict {
 
 func TestLLMAnswerMustParse(t *testing.T) {
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("package a\n\nvar x = 2 +\n"), nil
+		return wp19Answer("var x = 2 +\n"), nil
 	})
 	r := wp19Build(t, wp3Config)
 	_, err := r.Resolve(context.Background(), wp19Request(wp3Conflict("a.go")))
@@ -51,7 +51,7 @@ func TestLLMAnswerMustParse(t *testing.T) {
 
 func TestLLMAnswerThatParsesIsAccepted(t *testing.T) {
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("package a\n\nvar x = 2 + 3\n"), nil
+		return wp19Answer("var x = 2 + 3\n"), nil
 	})
 	r := wp19Build(t, wp3Config)
 	resp, err := r.Resolve(context.Background(), wp19Request(wp3Conflict("a.go")))
@@ -67,7 +67,7 @@ func TestLLMAnswerThatParsesIsAccepted(t *testing.T) {
 // any content without conflict markers is accepted.
 func TestLLMAnswerWithoutGrammarGetsMarkerRuleOnly(t *testing.T) {
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("package a\n\nvar x = 2 +\n"), nil
+		return wp19Answer("var x = 2 +\n"), nil
 	})
 	r := wp19Build(t, wp3Config)
 	if _, err := r.Resolve(context.Background(), wp19Request(wp3Conflict("a.go.txt"))); err != nil {
@@ -105,7 +105,7 @@ func TestLLMAnswerForFileTheGrammarCannotReadIsNotSyntaxChecked(t *testing.T) {
 		return wp19Side(protocol.ModeFile, "// @flow\nimport type {N} from './n';\nconst x: ?string = "+v+";\n")
 	}
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("// @flow\nimport type {N} from './n';\nconst x: ?string = '2';\n"), nil
+		return wp19Answer("const x: ?string = '2';\n"), nil
 	})
 	r := wp19Build(t, wp3Config)
 	f := protocol.FileConflict{Path: "a.js", Kind: protocol.KindContent, Base: flow("'0'"), Ours: flow("'1'"), Theirs: flow("'3'")}

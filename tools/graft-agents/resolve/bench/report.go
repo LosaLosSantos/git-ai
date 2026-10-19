@@ -25,6 +25,8 @@ type Counts struct {
 	// verdict on, because a side does not parse.
 	BlankLinesOnly  int `json:"wrong_blank_lines_only"`
 	SyntaxUnchecked int `json:"syntax_unchecked"`
+	// EqualsOurs counts the accepted results equal to OURS (part of Correct and Wrong).
+	EqualsOurs int `json:"equals_ours"`
 }
 
 // Accepted is the number of results that would land: correct and wrong.
@@ -46,6 +48,9 @@ func (c *Counts) add(r Result) {
 	}
 	if r.SyntaxUnchecked {
 		c.SyntaxUnchecked++
+	}
+	if r.EqualsOurs {
+		c.EqualsOurs++
 	}
 	switch r.Outcome {
 	case OutcomeCorrect:
@@ -81,8 +86,10 @@ type Report struct {
 	// model attempted.
 	Languages map[string]Counts `json:"languages"`
 	Kinds     map[string]Counts `json:"kinds"`
-	// NotSent counts the cases that were not sent, by reason.
-	NotSent map[string]int `json:"not_sent"`
+	// NotSent counts the cases that were not sent, by reason, and Rejected the results rejected
+	// by checks, by the first reason (RejectionReason).
+	NotSent  map[string]int `json:"not_sent"`
+	Rejected map[string]int `json:"rejected"`
 	// SpendUSD is the AI spend of the run in USD, when a budget was used: the usage the provider
 	// reported, and the worst case of the calls whose usage was not reported. MaxUSD is the cap.
 	SpendUSD float64 `json:"spend_usd,omitempty"`
@@ -100,7 +107,7 @@ const LowN = 30
 // NewReport aggregates results.
 func NewReport(label string, results []Result) Report {
 	rep := Report{Label: label, Families: map[string]Counts{}, Languages: map[string]Counts{}, Kinds: map[string]Counts{},
-		NotSent: map[string]int{}, Results: results}
+		NotSent: map[string]int{}, Rejected: map[string]int{}, Results: results}
 	for _, r := range results {
 		rep.Total.add(r)
 		for _, g := range []struct {
@@ -113,6 +120,9 @@ func NewReport(label string, results []Result) Report {
 		}
 		if r.Outcome == OutcomeNotSent {
 			rep.NotSent[r.Reason]++
+		}
+		if r.Outcome == OutcomeRejected {
+			rep.Rejected[RejectionReason(r.Reason)]++
 		}
 		if r.Outcome == OutcomeStopped && rep.StopReason == "" {
 			rep.StopReason = r.Reason
@@ -213,6 +223,20 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	}
 	fmt.Fprintf(&b, "\nAccepted results the syntax check gave no verdict on, because a side does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): %d of %d. By language: %s.\n",
 		rep.Total.SyntaxUnchecked, rep.Total.Accepted(), strings.Join(unchecked, ", "))
+	fmt.Fprintf(&b, "\nAccepted results equal to OURS (the model kept the tip's version): %d of %d (correct %d, wrong %d).\n",
+		rep.Total.EqualsOurs, rep.Total.Accepted(), rep.equalsOurs(OutcomeCorrect), rep.equalsOurs(OutcomeWrong))
+	if len(rep.Rejected) > 0 {
+		reasons := make([]string, 0, len(rep.Rejected))
+		for r := range rep.Rejected {
+			reasons = append(reasons, r)
+		}
+		sort.Strings(reasons)
+		parts := make([]string, 0, len(reasons))
+		for _, r := range reasons {
+			parts = append(parts, fmt.Sprintf("%s %d", r, rep.Rejected[r]))
+		}
+		fmt.Fprintf(&b, "\nRejected by checks, by the first reason: %s.\n", strings.Join(parts, ", "))
+	}
 	if len(rep.NotSent) > 0 {
 		reasons := make([]string, 0, len(rep.NotSent))
 		for r := range rep.NotSent {
@@ -227,4 +251,33 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// equalsOurs counts the results of an outcome that are equal to OURS.
+func (rep Report) equalsOurs(outcome string) int {
+	n := 0
+	for _, r := range rep.Results {
+		if r.Outcome == outcome && r.EqualsOurs {
+			n++
+		}
+	}
+	return n
+}
+
+// RejectionReason reduces the reason of a rejected result to its kind, for counting: the rule of a
+// model answer that it broke (after "llm answer rejected: "), a syntax error, or a configured check.
+func RejectionReason(reason string) string {
+	const llm = "llm answer rejected: "
+	switch {
+	case strings.Contains(reason, llm):
+		return reason[strings.Index(reason, llm)+len(llm):]
+	case strings.Contains(reason, "does not parse"):
+		return "syntax error"
+	case strings.Contains(reason, "check failed"):
+		return "configured check"
+	}
+	if len(reason) > 80 {
+		return reason[:80]
+	}
+	return reason
 }

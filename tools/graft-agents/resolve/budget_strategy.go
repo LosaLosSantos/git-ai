@@ -135,6 +135,17 @@ func (r *Resolver) LLMRoutings() map[string]*llm.Routing {
 	return out
 }
 
+// LLMMaxRegions returns the largest max_regions of r's llm strategies, or 0 when r has none.
+func (r *Resolver) LLMMaxRegions() int {
+	n := 0
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			n = max(n, s.opt.MaxRegions)
+		}
+	}
+	return n
+}
+
 // LLMMaxPromptTokens returns an upper bound of the input tokens of one model call of r's llm
 // strategies, counted like the budget's worst case: one token per byte. A prompt holds file data
 // within max_prompt_bytes (whole file or one region), the two commit messages, the system prompt,

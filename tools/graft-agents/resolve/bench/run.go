@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -55,8 +56,11 @@ type Result struct {
 	BlankLinesOnly bool `json:"blank_lines_only,omitempty"`
 	// SyntaxUnchecked marks an accepted resolution the syntax check gave no verdict on: a side
 	// does not parse, so the grammar cannot judge the file (syntax.CheckMerge).
-	SyntaxUnchecked bool   `json:"syntax_unchecked,omitempty"`
-	Strategy        string `json:"strategy,omitempty"`
+	SyntaxUnchecked bool `json:"syntax_unchecked,omitempty"`
+	// EqualsOurs marks an accepted resolution equal to OURS after the judge's normalization:
+	// taking ours is often the right answer, and the report counts how often the model did.
+	EqualsOurs bool   `json:"equals_ours,omitempty"`
+	Strategy   string `json:"strategy,omitempty"`
 	// Answer is the action of an accepted resolution ("write" or "delete"); with
 	// Runner.AnswersDir its content is stored for audit and Rejudge.
 	Answer  string  `json:"answer,omitempty"`
@@ -233,6 +237,13 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 			return res, err
 		}
 		res.Outcome, res.Strategy, res.Reason = classifyFailure(unresolved.Failures[0])
+		// A content conflict with more regions than the llm strategy sends is declined before
+		// any call: it is not sent, for that reason.
+		if res.Outcome == OutcomeAbstained && c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {
+			if max := r.Resolver.LLMMaxRegions(); max > 0 && resolve.LLMConflictRegions(sideBytes(sides["base"]), sideBytes(sides["ours"]), sideBytes(sides["theirs"])) > max {
+				res.Outcome, res.Reason = OutcomeNotSent, NotSentRegions
+			}
+		}
 		return res, nil
 	}
 
@@ -256,6 +267,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		}
 	}
 	judgeResult(&res, f.Content, f.Action == protocol.ActionDelete, human, c.HumanBlob == nil)
+	res.EqualsOurs = f.Action == protocol.ActionWrite && sides["ours"] != nil && bytes.Equal(normalize(f.Content), normalize(sides["ours"].Content))
 	return res, nil
 }
 

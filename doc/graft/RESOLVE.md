@@ -563,20 +563,49 @@ timeout = "180s"
 
 The `llm` strategy is registered by `tools/graft-agents` and uses an
 `llm.Provider` configured in `resolve.toml`. Providers are anthropic, any
-OpenAI-compatible endpoint, or any command. The strategy sends the three
-versions of a file and the commit messages of both sides (the tip's and the
-change's, as the intent of each side, at most 4 KiB each) to the model and
-asks for a JSON answer:
+OpenAI-compatible endpoint, or any command.
 
-```json
-{"content": "<complete file>", "explanation": "..."}
-```
+The strategy asks the model to apply a patch, one conflicting region at a
+time. Its prompt structure follows synthmerge's patch-application design
+(Andrea Arcangeli, synthmerge): the structure only, written in our own words,
+with our own worked example. The changes that only one side made, or both
+the same way, are merged locally; for each region that both sides changed
+differently there is one model call, whose request holds:
+
+- the PATCH: THEIRS' change to the region, a unified diff from BASE, with
+  `context_lines` (default 3) of context;
+- the CODE: OURS' version of the region, with the same context lines (taken
+  from the file with every other conflicting region as OURS);
+- in the system message, in this order: one worked example of the task, the
+  commit messages of both sides (the tip's and the change's, as the intent of
+  each side, at most 4 KiB each), the other conflicting regions of the file
+  for reference, and the directives last, closest to the answer.
+
+The model answers in plain text, the patched code between a BEGIN and an END
+line that carry the request's random token: no JSON, no response format, and
+no explanation. The answer is accepted for a region only when:
+
+- it starts with the context lines before the region and ends with those
+  after it, copied unchanged (a model that drops blank lines at a boundary is
+  given them back, up to the number of context lines less one);
+- what is between them ends with a newline (unless the region ends a file
+  that has no final newline) and does not read as a patch (lines starting
+  with `+` or `-` when neither the CODE nor the PATCH has such lines);
+- it holds no conflict marker, and is within `max_answer_bytes`.
+
+A file is resolved only when every region is: the first region that is
+rejected rejects the file, which goes to the agent. A file with more than
+`max_regions` (default 20) conflicting regions, or a region whose request is
+over `max_prompt_bytes`, is declined before any call. An answer equal to
+OURS is kept (taking the tip's version is often right); the bench counts how
+often it happens. The PATCH is our own line diff, not git's histogram diff
+that synthmerge uses: on the benchmark sample of 300 cases the two differ in
+18 of 403 regions.
 
 - The model is not asked how sure it is, and nothing it says about its answer
-  decides whether the answer is used: other fields in the answer are ignored,
-  and acceptance comes from the checks alone. The former `min_confidence`
-  option is gone; a configuration that still sets it fails at startup.
-- Any answer containing conflict markers is rejected.
+  decides whether the answer is used: acceptance comes from the checks alone.
+  The former `min_confidence` option is gone; a configuration that still sets
+  it fails at startup.
 - The answer must parse. graft-resolve parses it with the tree-sitter grammar
   of its language, chosen by extension: TypeScript (`.ts`, `.mts`, `.cts`),
   TSX (`.tsx`), JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`), Python (`.py`,

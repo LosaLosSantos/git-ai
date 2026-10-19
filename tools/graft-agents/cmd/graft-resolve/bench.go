@@ -49,8 +49,10 @@ func runBench(args []string, stdout, stderr io.Writer) int {
 		return benchSyntax(ctx, args[1:], stdout, stderr)
 	case "filter":
 		return benchFilter(ctx, args[1:], stdout, stderr)
+	case "histogram":
+		return benchHistogram(ctx, args[1:], stdout, stderr)
 	}
-	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine, run, rejudge, syntax or filter\n", args[0])
+	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine, run, rejudge, syntax, filter or histogram\n", args[0])
 	return 2
 }
 
@@ -406,6 +408,57 @@ func benchSyntax(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		}
 		fmt.Fprintf(stdout, "fails: %s %s %s %s (conflict markers: %v): %s\n", f.ID, f.Repo, f.Merge, f.Path, f.Markers, f.Reason)
 	}
+	return 0
+}
+
+// benchHistogram compares, on a sample of the manifest, the PATCH the llm strategy sends for each
+// conflicting region (its own line diff) with git diff --histogram on the same texts, which
+// synthmerge uses. It makes no model call:
+//
+//	graft-resolve bench histogram --manifest FILE --clones DIR [--sample N] [--seed S] [--context-lines N]
+func benchHistogram(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("graft-resolve bench histogram", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	manifestPath := fs.String("manifest", "", "manifest written by bench mine")
+	clones := fs.String("clones", "", "directory of the clones of the corpus repositories")
+	sample := fs.Int("sample", 0, "number of cases, stratified by family (0: every case)")
+	seed := fs.Int64("seed", 1, "seed of the sample")
+	contextLines := fs.Int("context-lines", 3, "context lines of the PATCH")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *manifestPath == "" || *clones == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "graft-resolve bench histogram: --manifest and --clones are required")
+		return 2
+	}
+	manifest, err := bench.LoadManifest(*manifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench histogram: %v\n", err)
+		return 1
+	}
+	cases := bench.Sample(manifest.Cases, *sample, *seed)
+	stats, err := bench.PatchDiffs(ctx, cases, func(repo string) string { return bench.CloneDir(*clones, repo) }, *contextLines)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench histogram: %v\n", err)
+		return 1
+	}
+	langs := make([]string, 0, len(stats))
+	for l := range stats {
+		langs = append(langs, l)
+	}
+	sort.Strings(langs)
+	var total bench.PatchDiffStats
+	for _, l := range langs {
+		st := stats[l]
+		fmt.Fprintf(stdout, "%s: %d cases, %d regions; the PATCH differs from git's histogram diff in %d regions of %d cases\n",
+			l, st.Cases, st.Regions, st.DifferentRegion, st.DifferentCases)
+		total.Cases += st.Cases
+		total.Regions += st.Regions
+		total.DifferentRegion += st.DifferentRegion
+		total.DifferentCases += st.DifferentCases
+	}
+	fmt.Fprintf(stdout, "total: %d cases, %d regions; the PATCH differs from git's histogram diff in %d regions of %d cases\n",
+		total.Cases, total.Regions, total.DifferentRegion, total.DifferentCases)
 	return 0
 }
 

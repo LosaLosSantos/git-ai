@@ -20,10 +20,10 @@ import (
 //	[[strategy]]
 //	type = "llm"
 //	paths = ["**/*.go", "docs/**"]
-//	max_prompt_bytes = 65536       # optional: largest prompt sent (whole file or region)
-//	context_lines = 8              # optional
+//	max_prompt_bytes = 65536       # optional: largest request of one region
+//	context_lines = 3              # optional: context lines of the PATCH and the CODE
 //	max_answer_bytes = 1048576     # optional
-//	max_regions = 32               # optional: most conflicting regions per file
+//	max_regions = 20               # optional: most conflicting regions per file (one call each)
 //
 //	[strategy.llm]
 //	type = "openai"
