@@ -721,8 +721,44 @@ func TestPhase3ProtectedBranchBatches(t *testing.T) {
 // startEagerGitaly starts a standalone Gitaly like startGitaly, with the eager
 // observer of internal/graft/eager wired into the hook manager and a derived
 // data pool, as serve.go does for the production server.
-func startEagerGitaly(t *testing.T, graft config.Graft, sharedToken string) gitalyStack {
+// eagerEvents report the background work of startEagerGitaly's server as it
+// ends: a batch of the derived-data warmers, a commit-graph write. The work
+// is asynchronous by design (a queue, a debounce), so a test waits for these
+// instead of a time.
+type eagerEvents struct {
+	warmed       chan struct{}
+	graphWritten chan struct{}
+}
+
+// eagerDeadlock bounds the wait for the background work: it only turns a
+// deadlock into a failure.
+const eagerDeadlock = 5 * time.Minute
+
+// waitEager waits until check holds, checking it at once and after every
+// event of events.
+func waitEager(t *testing.T, events <-chan struct{}, check func() bool, what string) {
 	t.Helper()
+	deadlock := time.After(eagerDeadlock)
+	for !check() {
+		select {
+		case <-events:
+		case <-deadlock:
+			require.FailNow(t, "no background work made it true", what)
+		}
+	}
+}
+
+func startEagerGitaly(t *testing.T, graft config.Graft, sharedToken string) (gitalyStack, eagerEvents) {
+	t.Helper()
+	events := eagerEvents{warmed: make(chan struct{}, 1024), graphWritten: make(chan struct{}, 1024)}
+	notify := func(ch chan struct{}) {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// The buffer is far larger than what a test does; a full one means
+			// that nobody waits.
+		}
+	}
 
 	ctx := featureflag.OutgoingCtxWithFeatureFlag(testhelper.Context(t), featureflag.GPGSigning, false)
 	cfg := testcfg.Build(t)
@@ -743,8 +779,22 @@ func startEagerGitaly(t *testing.T, graft config.Graft, sharedToken string) gita
 		return localrepo.New(logger, locator, gitCmdFactory, catfileCache, repo)
 	}
 
+	// The pool calls the cleanup of a warm environment when every warmer of
+	// the batch ran: that is the end of the batch.
+	opener := eager.WarmEnvOpener(build, logger, catfileCache)
 	pool := derived.NewPool(logger, cfg.Graft.Derived.WorkersOrDefault(), cfg.Graft.Derived.QueueSizeOrDefault(),
-		eager.WarmEnvOpener(build, logger, catfileCache))
+		func(ctx context.Context, repo storage.Repository) (derived.WarmEnv, func(), error) {
+			env, cleanup, err := opener(ctx, repo)
+			if err != nil {
+				return env, cleanup, err
+			}
+			return env, func() {
+				if cleanup != nil {
+					cleanup()
+				}
+				notify(events.warmed)
+			}, nil
+		})
 	poolCtx, cancelPool := context.WithCancel(testhelper.Context(t))
 	t.Cleanup(cancelPool)
 	go pool.Run(poolCtx)
@@ -758,9 +808,13 @@ func startEagerGitaly(t *testing.T, graft config.Graft, sharedToken string) gita
 	observer := eager.NewObserver(testhelper.Context(t), logger,
 		eager.Options{Eager: true, CommitGraph: true},
 		eager.Deps{
-			Enqueuer:         pool,
-			ListNewCommits:   eager.NewCommitsLister(build),
-			WriteCommitGraph: eager.CommitGraphWriterFor(build, housekeepingManager),
+			Enqueuer:       pool,
+			ListNewCommits: eager.NewCommitsLister(build),
+			WriteCommitGraph: func(ctx context.Context, repo storage.Repository) error {
+				err := eager.CommitGraphWriterFor(build, housekeepingManager)(ctx, repo)
+				notify(events.graphWritten)
+				return err
+			},
 		},
 	)
 	t.Cleanup(observer.Close)
@@ -791,19 +845,21 @@ func startEagerGitaly(t *testing.T, graft config.Graft, sharedToken string) gita
 		storage:  cfg.Storages[0].Name,
 		relPath:  repoProto.GetRelativePath(),
 		repoPath: repoPath,
-	}
+	}, events
 }
 
-// TestPhase3EagerDerivedDataVisibleAfterLand checks that after a land returns,
-// the eager derived data of the landed commit is stored: the commit-graph
-// chain is written, and the graph and changed-paths entries of the commit are
-// present without any query having computed them.
+// TestPhase3EagerDerivedDataVisibleAfterLand checks that a land makes the
+// background work store the eager derived data of the landed commit: the
+// commit-graph chain is written, and the graph and changed-paths entries of
+// the commit are present without any query having computed them. The work is
+// asynchronous by design (a queue of warmers, a debounced commit-graph
+// write), so the test waits for its events, not for a time.
 func TestPhase3EagerDerivedDataVisibleAfterLand(t *testing.T) {
 	t.Parallel()
 
 	ex := loadExample(t)
 	ex.graft.Derived.Eager = true
-	s := startEagerGitaly(t, ex.graft, ex.sharedToken)
+	s, events := startEagerGitaly(t, ex.graft, ex.sharedToken)
 	repo := s.repoAs(t, exampleTokens["planner"])
 	ctx := s.ctx
 
@@ -818,21 +874,23 @@ func TestPhase3EagerDerivedDataVisibleAfterLand(t *testing.T) {
 	require.NoError(t, err)
 	landed := git.ObjectID(res.LandedCommitID)
 
-	require.Eventually(t, func() bool {
+	waitEager(t, events.graphWritten, func() bool {
 		_, err := os.Stat(filepath.Join(s.repoPath, "objects", "info", "commit-graphs", "commit-graph-chain"))
 		return err == nil
-	}, 10*time.Second, 10*time.Millisecond, "the land writes the commit-graph chain")
+	}, "the land writes the commit-graph chain")
 
 	store := derived.NewStore(s.repoPath)
-	require.Eventually(t, func() bool {
+	waitEager(t, events.warmed, func() bool {
 		_, ok, err := store.Kind("graph", 1).Get(landed)
-		return err == nil && ok
-	}, 10*time.Second, 10*time.Millisecond, "the graph entry of the landed commit is warmed")
+		require.NoError(t, err)
+		return ok
+	}, "the graph entry of the landed commit is warmed")
 
-	require.Eventually(t, func() bool {
+	waitEager(t, events.warmed, func() bool {
 		value, ok, err := store.Kind("changed-paths", 1).Get(landed)
-		return err == nil && ok && strings.Contains(string(value), "eager/landed.txt")
-	}, 10*time.Second, 10*time.Millisecond, "the changed-paths entry of the landed commit is warmed")
+		require.NoError(t, err)
+		return ok && strings.Contains(string(value), "eager/landed.txt")
+	}, "the changed-paths entry of the landed commit is warmed")
 }
 
 // derivedPathHistory returns the IDs of the path history of path from rev,
