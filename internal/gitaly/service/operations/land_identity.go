@@ -89,43 +89,57 @@ func (a *landingAttempt) landedEarlier(ctx context.Context, reference git.Refere
 		return nil, nil
 	}
 
+	// The revert only explains the answer, so a failure to look for it does not change the
+	// answer: it is logged, and the answer names no revert.
 	revertedBy, err := a.revertOf(ctx, landed, tip)
 	if err != nil {
-		return nil, err
+		a.server.logger.WithError(err).WithField("landed", landed.String()).
+			Error("graft: looking for the revert of an earlier land failed; the answer names no revert")
 	}
 
 	return &landIdentity{landed: landed, sequence: record.Sequence, revertedBy: revertedBy}, nil
 }
 
+// revertSearchCommits bounds the commits that revertOf reads: the revert is looked for among the
+// commits after the landed one that are closest to the tip, so that a long history after it does
+// not slow the answer. Tests lower it.
+var revertSearchCommits = 1000
+
 // revertOf returns the latest commit after landed up to tip whose message holds "This reverts
 // commit <landed>", the line that git revert and graft-verify write, or an empty ID when there is
-// none. A revert written another way is not found.
+// none among the revertSearchCommits commits closest to tip. A revert written another way, or
+// further from the tip, is not found. The revert only explains the answer: the land is already
+// landed whatever revertOf finds.
 func (a *landingAttempt) revertOf(ctx context.Context, landed, tip git.ObjectID) (git.ObjectID, error) {
 	var stdout, stderr bytes.Buffer
 	if err := a.repo.ExecAndWait(ctx, gitcmd.Command{
 		Name: "log",
 		Flags: []gitcmd.Option{
-			gitcmd.Flag{Name: "--format=%H"},
-			gitcmd.Flag{Name: "--max-count=1"},
-			gitcmd.Flag{Name: "--fixed-strings"},
-			gitcmd.Flag{Name: "--grep=This reverts commit " + landed.String()},
+			gitcmd.Flag{Name: "--format=%H%x00%B%x00"},
+			gitcmd.Flag{Name: fmt.Sprintf("--max-count=%d", revertSearchCommits)},
 		},
 		Args: []string{landed.String() + ".." + tip.String()},
 	}, gitcmd.WithStdout(&stdout), gitcmd.WithStderr(&stderr)); err != nil {
-		return "", structerr.NewInternal("looking for a revert of %s: %w, stderr: %q", landed, err, stderr.String())
+		return "", fmt.Errorf("looking for a revert of %s: %w, stderr: %q", landed, err, stderr.String())
 	}
 
-	line := strings.TrimSpace(stdout.String())
-	if line == "" {
-		return "", nil
+	// The output is pairs of fields, the commit ID and its message, each ended by a NUL, newest
+	// commit first. Messages cannot hold a NUL.
+	line := "This reverts commit " + landed.String()
+	fields := strings.Split(stdout.String(), "\x00")
+	for i := 0; i+1 < len(fields); i += 2 {
+		if !strings.Contains(fields[i+1], line) {
+			continue
+		}
+
+		revertedBy, err := a.objectHash.FromHex(strings.TrimSpace(fields[i]))
+		if err != nil {
+			return "", fmt.Errorf("looking for a revert of %s: %w", landed, err)
+		}
+		return revertedBy, nil
 	}
 
-	revertedBy, err := a.objectHash.FromHex(line)
-	if err != nil {
-		return "", structerr.NewInternal("looking for a revert of %s: %w", landed, err)
-	}
-
-	return revertedBy, nil
+	return "", nil
 }
 
 // lookupLand returns the last land of original on the branch reference of repository that the

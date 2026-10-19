@@ -143,13 +143,17 @@ does the same for each member before the batch plans its chain.
 ### 5.1 The revert in the answer
 
 Only when the answer is already `AlreadyLanded` from the index, the land looks for a
-revert of the landed commit among the commits after it: one
-`git log --format=%H -n1 --fixed-strings --grep="This reverts commit <landed>" <landed>..<tip>`,
-the line that `git revert` ("This reverts commit <id>.") and graft-verify's revert
-("This reverts commit <id>, which failed ...") write. The walk covers only the
-commits landed after the change, it runs on the rare path of a retried or repeated land,
-and its result only adds to the message: a revert written another way is not named, and
-the answer is the same.
+revert of the landed commit among the commits after it, with one bounded
+`git log --max-count=1000 <landed>..<tip>`: the newest commit among the 1000 closest to
+the tip whose message holds "This reverts commit <landed>", the line that `git revert`
+("This reverts commit <id>.") and graft-verify's revert ("This reverts commit <id>,
+which failed ...") write. The bound keeps a long history after the change from slowing
+the answer; it runs only on the rare path of a retried or repeated land.
+
+The revert only shapes the message, never the decision: the answer is `AlreadyLanded`
+before it is looked for, and is the same whatever the search finds. A revert written
+another way, or further than 1000 commits from the tip, is not named; a search that
+fails is logged at Error and the answer names no revert.
 
 This changes one behaviour on purpose: a change that landed and was reverted cannot be
 landed again from the same commit. The land answers `AlreadyLanded`, because the change

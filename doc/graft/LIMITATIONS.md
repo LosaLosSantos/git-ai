@@ -185,8 +185,8 @@ Git hooks use private.
 - A change that landed is not landed again from the same `commit_id` on the
   same branch while the commit it landed as is on the branch, also when a
   later commit reverted it: the land answers `already_landed` and names the
-  revert when its message says "This reverts commit <id>" (the land identity
-  of [PLAN11](PLAN11.md)). Landing it again needs a new commit: a revert of
+  revert when its message says "This reverts commit <id>" and it is among the
+  1000 commits closest to the tip (the land identity of [PLAN11](PLAN11.md)). Landing it again needs a new commit: a revert of
   the revert, or the change committed again. A branch reset past the land
   lands the change again.
 - The land identity is recorded in the changeset log. With

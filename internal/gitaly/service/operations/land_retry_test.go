@@ -292,6 +292,44 @@ func testUserLandRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 	})
 }
 
+// TestUserLand_revertBeyondTheSearchIsNotNamed lands a change that a later commit reverted, with
+// more commits after the revert than the search for it reads: the land still answers already
+// landed, and names no revert. The search only explains the answer. The test lowers
+// revertSearchCommits, so it does not run in parallel.
+func TestUserLand_revertBeyondTheSearchIsNotNamed(t *testing.T) {
+	ctx, cfg, client := setupOperationsService(t, testhelper.Context(t))
+	ctx = featureflag.ContextWithFeatureFlag(ctx, featureflag.GPGSigning, true)
+
+	original := revertSearchCommits
+	revertSearchCommits = 2
+	t.Cleanup(func() { revertSearchCommits = original })
+
+	fx := newRetryFixture(t, ctx, cfg)
+	request := landRequest(fx.repoProto, git.DefaultBranch, fx.change)
+	first, err := client.UserLand(ctx, request)
+	require.NoError(t, err)
+	landed := git.ObjectID(first.GetLandedCommitId())
+
+	tip := gittest.WriteCommit(t, cfg, fx.repoPath,
+		gittest.WithBranch(git.DefaultBranch),
+		gittest.WithParents(landed),
+		gittest.WithTreeEntries(fx.withoutY...),
+		gittest.WithMessage(fmt.Sprintf("Revert \"y\"\n\nThis reverts commit %s.\n", landed)),
+	)
+	for i := 0; i < 2; i++ {
+		tip = gittest.WriteCommit(t, cfg, fx.repoPath,
+			gittest.WithBranch(git.DefaultBranch),
+			gittest.WithParents(tip),
+			gittest.WithTreeEntries(append(fx.withoutY, gittest.TreeEntry{Mode: "100644", Path: "z", Content: fmt.Sprint(i)})...),
+		)
+	}
+
+	second, err := client.UserLand(ctx, request)
+	require.NoError(t, err)
+	requireLandedEarlier(t, second, landEntry(t, fx.repoPath, landed), landed, "")
+	requireBranchAt(t, cfg, fx.repoPath, git.DefaultBranch, tip)
+}
+
 // TestUserLand_retryOfAResolvedLand retries a land whose conflicts the resolver resolved into a
 // merge commit: commit_id is a parent of that commit, so the retry finds it on the branch, as for a
 // merge, and the resolver is not asked again.
