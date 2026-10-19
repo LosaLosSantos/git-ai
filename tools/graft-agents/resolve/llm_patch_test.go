@@ -13,10 +13,6 @@ import (
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
-// r1bOptions switch the design step off (PLAN10 15.10): the request and the single call per region of
-// R1b, which the tests that pin that behaviour run with.
-var r1bOptions = LLMOptions{NoSymmetricContext: true, NoAbstain: true, NoRepair: true}
-
 // llmRawModel marks a fake answer whose text is sent as it is, not wrapped by patchWrap.
 const llmRawModel = "raw-text"
 
@@ -240,12 +236,12 @@ func TestLLMPatchAllOrNothing(t *testing.T) {
 	ours := strings.NewReplacer("line 5\n", "o5\n", "line 20\n", "o20\n").Replace(base)
 	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 20\n", "t20\n").Replace(base)
 	p := patchFake(t, func(i int, _ llm.Request) (*llm.Response, error) {
-		if i == 1 {
+		if i >= 1 { // the second region, and its repair round
 			return llmRawAnswer("no block"), nil
 		}
 		return llmFakeAnswer("merged\n"), nil
 	})
-	_, err := ResolveLLM(context.Background(), p, LLMFile{Path: "x.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}, r1bOptions)
+	_, err := ResolveLLM(context.Background(), p, LLMFile{Path: "x.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}, LLMOptions{})
 	if !errors.Is(err, ErrLLMRejected) || !strings.Contains(err.Error(), "region 2") {
 		t.Fatalf("err = %v, want region 2 rejected", err)
 	}

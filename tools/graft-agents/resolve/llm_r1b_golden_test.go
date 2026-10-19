@@ -52,7 +52,7 @@ func TestR1bRequestsAreByteForByte(t *testing.T) {
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
 			p := llmFixed("merged\n")
-			if _, err := ResolveLLM(context.Background(), p, files[name], r1bOptions); err != nil {
+			if _, err := ResolveLLM(context.Background(), p, files[name], LLMOptions{}); err != nil {
 				t.Fatal(err)
 			}
 			var sb strings.Builder

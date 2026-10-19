@@ -12,10 +12,10 @@ import (
 // Tests of the review of the design step: the repair quotes the same thing whatever triggered it, is
 // skipped when it would not fit, the regions are git's, and the counters count what happened.
 
-// TestLLMRepairQuotesTheBlockWhateverTheTrigger: the previous answer of a repair is the patched code
-// between the tags of its block, with the context lines of the CODE, whether a rule of an answer was
-// broken (the code as the model wrote it) or a check found something in a valid region.
-func TestLLMRepairQuotesTheBlockWhateverTheTrigger(t *testing.T) {
+// TestLLMRepairQuotesTheBlockAsTheModelWroteIt: the previous answer of a repair is the patched code
+// between the tags of its block, as the model wrote it when a rule of an answer was broken (the syntax
+// repair, where the region was valid, quotes it with the context lines of the CODE: llm_design_syntax_test.go).
+func TestLLMRepairQuotesTheBlockAsTheModelWroteIt(t *testing.T) {
 	// A rule broken: the anchors are missing, and the previous answer is what the model wrote.
 	f := designFile()
 	p := &llmFake{answer: func(i int, req llm.Request) (*llm.Response, error) {
@@ -32,52 +32,21 @@ func TestLLMRepairQuotesTheBlockWhateverTheTrigger(t *testing.T) {
 	if want := "===== BEGIN PATCHED CODE " + nonce + " =====\nmerged\n===== END PATCHED CODE " + nonce + " =====\n"; got != want {
 		t.Fatalf("rule-break repair quotes %q, want %q", got, want)
 	}
-
-	// A valid region with a composition finding: the same shape, with the context lines.
-	c := compositionFile()
-	q := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
-		if i == 0 {
-			return llmFakeAnswer("O5\nline 6\n"), nil
-		}
-		return llmFakeAnswer("O5\nT6\n"), nil
-	}}
-	if _, err := ResolveLLM(context.Background(), q, c, LLMOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	nonce = requestNonce(t, q.reqs[1])
-	got = patchSection(t, q.reqs[1].Prompt, "YOUR PREVIOUS ANSWER", nonce)
-	if !strings.HasPrefix(got, "===== BEGIN PATCHED CODE "+nonce+" =====\nline 2\nline 3\nline 4\nO5\nline 6\n") ||
-		!strings.HasSuffix(got, "line 7\nline 8\nline 9\n===== END PATCHED CODE "+nonce+" =====\n") {
-		t.Fatalf("composition repair quotes %q", got)
-	}
 }
 
 // TestLLMRepairIsSkippedWhenItWouldNotFit: the repair request holds the previous answer and the findings
 // besides the first request, and is held to max_prompt_bytes like it. Too big: no repair call, and the
-// first answer stays (or the region is rejected, if the first answer broke a rule).
+// region is rejected (the first answer broke a rule).
 func TestLLMRepairIsSkippedWhenItWouldNotFit(t *testing.T) {
-	c := compositionFile()
-	probe := llmFixed("O5\nT6\n")
-	if _, err := ResolveLLM(context.Background(), probe, c, LLMOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	size := len(probe.reqs[0].System) + len(probe.reqs[0].Prompt)
-
-	p := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return llmFakeAnswer("O5\nline 6\n"), nil }}
-	res, err := ResolveLLM(context.Background(), p, c, LLMOptions{MaxPromptBytes: size + 40})
-	if err != nil || len(p.reqs) != 1 || res.Repairs != 0 || !strings.Contains(string(res.Content), "O5\nline 6\n") {
-		t.Fatalf("err %v, calls %d, repairs %d, content %q", err, len(p.reqs), res.Repairs, res.Content)
-	}
-
 	f := designFile()
 	q := &llmFake{answer: func(_ int, req llm.Request) (*llm.Response, error) {
 		return rawPatched(requestNonce(t, req), "merged\n"), nil
 	}}
-	probe = llmFixed("merged\n")
+	probe := llmFixed("merged\n")
 	if _, err := ResolveLLM(context.Background(), probe, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	size = len(probe.reqs[0].System) + len(probe.reqs[0].Prompt)
+	size := len(probe.reqs[0].System) + len(probe.reqs[0].Prompt)
 	if _, err := ResolveLLM(context.Background(), q, f, LLMOptions{MaxPromptBytes: size + 40}); !errors.Is(err, ErrLLMRejected) || len(q.reqs) != 1 {
 		t.Fatalf("err %v after %d calls, want rejected with no repair call", err, len(q.reqs))
 	}
@@ -87,10 +56,10 @@ func TestLLMRepairIsSkippedWhenItWouldNotFit(t *testing.T) {
 // are counted on the final answers, after the repairs.
 func TestLLMCountersCountWhatHappened(t *testing.T) {
 	c := compositionFile()
-	// The first answer is OURS' region (it drops THEIRS' change); the repair gives another one.
-	p := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
+	// The first answer breaks the anchors rule; the repair gives a good one.
+	p := &llmFake{answer: func(i int, req llm.Request) (*llm.Response, error) {
 		if i == 0 {
-			return llmFakeAnswer("O5\nline 6\n"), nil
+			return rawPatched(requestNonce(t, req), "merged\n"), nil
 		}
 		return llmFakeAnswer("O5\nT6\n"), nil
 	}}
@@ -102,15 +71,26 @@ func TestLLMCountersCountWhatHappened(t *testing.T) {
 		t.Fatalf("equal to OURS %d, repairs %d, calls %d", res.RegionsEqualOurs, res.Repairs, res.Calls)
 	}
 
-	broken := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
+	// A repair call that fails rejects the file (the first answer broke a rule) and is no repair.
+	broken := &llmFake{answer: func(i int, req llm.Request) (*llm.Response, error) {
 		if i == 0 {
-			return llmFakeAnswer("O5\nline 6\n"), nil
+			return rawPatched(requestNonce(t, req), "merged\n"), nil
 		}
 		return nil, errors.New("503")
 	}}
-	res, err = ResolveLLM(context.Background(), broken, c, LLMOptions{})
+	stats := &LLMRegionStats{}
+	if _, err = ResolveLLM(WithLLMRegionStats(context.Background(), stats), broken, c, LLMOptions{}); err == nil {
+		t.Fatal("a failed repair call of a broken answer resolved the file")
+	}
+	if calls, repairs := stats.Calls(); calls != 1 || repairs != 0 {
+		t.Fatalf("calls %d, repairs %d: a repair that failed is no repair", calls, repairs)
+	}
+
+	// A valid answer that is OURS' region is counted as such, and no round is made for the finding.
+	same := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return llmFakeAnswer("O5\nline 6\n"), nil }}
+	res, err = ResolveLLM(context.Background(), same, c, LLMOptions{})
 	if err != nil || res.Repairs != 0 || res.Calls != 1 || res.RegionsEqualOurs != 1 {
-		t.Fatalf("err %v, repairs %d, calls %d, equal %d: a repair that failed is no repair", err, res.Repairs, res.Calls, res.RegionsEqualOurs)
+		t.Fatalf("err %v, repairs %d, calls %d, equal %d", err, res.Repairs, res.Calls, res.RegionsEqualOurs)
 	}
 }
 

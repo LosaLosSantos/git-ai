@@ -56,7 +56,7 @@ func TestLLMRequestOmitsEmptyMessagesAndCutsLongOnes(t *testing.T) {
 	p := llmFixed("merged\n")
 	long := strings.Repeat("é", llmMaxMessageBytes) // 2 bytes each, cut on a rune boundary
 	f := LLMFile{Path: "a.go", Base: []byte("base\n"), Ours: []byte("ours\n"), Theirs: []byte("theirs\n"), TheirsMessage: long}
-	if _, err := ResolveLLM(context.Background(), p, f, r1bOptions); err != nil {
+	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	sys := p.reqs[0].System

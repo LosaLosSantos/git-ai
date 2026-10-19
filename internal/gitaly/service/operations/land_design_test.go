@@ -6,46 +6,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// Tests of the server side of the design step (PLAN10 15.10): the intent of OURS goes to the resolver, and
-// the composition report of a model's resolution goes to the agent with the proposal.
-
-// TestUserLand_theResolverGetsTheIntentOfOurs: each file of the request carries the commit message that
-// explains OURS' change to it: the newest commit between the merge base and the tip that touched the
-// path. A path that only another commit touched gets the message of that commit, not the tip's.
-func TestUserLand_theResolverGetsTheIntentOfOurs(t *testing.T) {
-	t.Parallel()
-
-	dir, argv := resolverScript(t, "")
-	writeAnswer(t, dir, validAnswer())
-	rcfg := enabledResolver(argv)
-	fx := newResolveFixtureWith(t, rcfg,
-		entries("a", "base\n", "b", "base\n", "c", "c\n"),
-		entries("a", "ours\n", "b", "ours\n", "c", "c\n"),
-		entries("a", "theirs\n", "b", "theirs\n", "c", "c\n", "d", "d\n"),
-	)
-	// The tip's history on the path: a was changed by an older commit, then b by the tip.
-	older := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithMessage("rework a for the new loader\n\nbody of the message"),
-		gittest.WithTreeEntries(entries("a", "ours\n", "b", "base\n", "c", "c\n")...))
-	tip := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(older), gittest.WithMessage("tune b"), gittest.WithBranch("main"),
-		gittest.WithTreeEntries(entries("a", "ours\n", "b", "ours\n", "c", "c\n")...))
-	require.NotEqual(t, fx.tip, tip)
-
-	_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
-	require.NoError(t, err)
-
-	req := resolverRequest(t, dir, 1)
-	messages := map[string]string{}
-	for _, f := range req.Files {
-		messages[f.Path] = f.OursMessage
-	}
-	require.Equal(t, "rework a for the new loader\n\nbody of the message", messages["a"], "the commit that touched a, not the tip's")
-	require.Equal(t, "tune b", messages["b"])
-}
+// Tests of the server side of the design step (PLAN10 15.11): the composition report of a model's
+// resolution goes to the agent with the proposal.
 
 // TestUserLand_theReportGoesWithTheProposal: the composition report of a model's resolution is the start
 // of the explanation of its proposal, cut to the size of a reason.

@@ -17,14 +17,14 @@ func TestLLMStrategyRejectsAnswerWithoutPatchedCode(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
 		return llmRawAnswer(`{"merged":"base\nours\ntheirs\n"}`), nil
 	})
-	r := wp19Build(t, strings.Replace(wp19LLMConfig, `paths = ["*.txt", "**/*.txt"]`, "paths = [\"*.txt\", \"**/*.txt\"]\nrepair = false", 1))
+	r := wp19Build(t, wp19LLMConfig)
 
 	resp, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("a/b.txt")))
 	if err == nil {
 		t.Fatalf("resolved an answer without patched code: %+v", resp)
 	}
-	if fake.calls() != 1 {
-		t.Fatalf("provider calls = %d", fake.calls())
+	if fake.calls() != 2 {
+		t.Fatalf("provider calls = %d, want the call and its one repair round", fake.calls())
 	}
 }
 

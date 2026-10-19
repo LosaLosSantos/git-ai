@@ -148,10 +148,6 @@ type File struct {
 	Base   *Side  `json:"base"`
 	Ours   *Side  `json:"ours"`
 	Theirs *Side  `json:"theirs"`
-	// OursMessage is the commit message that explains OURS' change to this file: the newest commit of
-	// the tip's side that touched it. The intent of OURS, as Messages.Commit is THEIRS'. Untrusted
-	// data; empty when none was found.
-	OursMessage string `json:"ours_message,omitempty"`
 }
 
 // Side is one version of a file. Content is base64 on the wire; a present

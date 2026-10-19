@@ -257,9 +257,6 @@ const (
 	AttemptRejected AttemptKind = "rejected"
 	// AttemptCheckFailed: a configured check rejected the result.
 	AttemptCheckFailed AttemptKind = "check_failed"
-	// AttemptAbstained: the model answered that the two changes cannot both hold, and said why
-	// (ErrLLMAbstained). Not a failure and not a guess: the reason goes to the agent.
-	AttemptAbstained AttemptKind = "abstained"
 )
 
 // Attempt is one strategy that applied to a file without resolving it.
@@ -424,8 +421,6 @@ func attemptReasons(attempts []Attempt) []string {
 			reasons = append(reasons, fmt.Sprintf("%s: rejected: %v", a.Strategy, a.Err))
 		case AttemptCheckFailed:
 			reasons = append(reasons, fmt.Sprintf("%s: check failed: %v", a.Strategy, a.Err))
-		case AttemptAbstained:
-			reasons = append(reasons, fmt.Sprintf("%s: %v", a.Strategy, a.Err))
 		default:
 			reasons = append(reasons, fmt.Sprintf("%s: %v", a.Strategy, a.Err))
 		}
@@ -453,11 +448,8 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			// A model answer that breaks the rules of an answer (ErrLLMRejected) is a rejected
 			// result, not a failed call.
 			kind := AttemptFailed
-			switch {
-			case errors.Is(err, ErrLLMRejected):
+			if errors.Is(err, ErrLLMRejected) {
 				kind = AttemptRejected
-			case errors.Is(err, ErrLLMAbstained):
-				kind = AttemptAbstained
 			}
 			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: kind, Err: err})
 			continue

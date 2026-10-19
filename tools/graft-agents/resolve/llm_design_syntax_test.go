@@ -54,10 +54,4 @@ func TestLLMDesignRepairOnTheSyntaxOfTheFile(t *testing.T) {
 	if err != nil || len(still.reqs) != 2 || !strings.Contains(string(res.Content), "return 2 +\n") {
 		t.Fatalf("err %v, requests %d, content %q", err, len(still.reqs), res.Content)
 	}
-
-	// Without the option: one call, and the answer is left to the chain's check.
-	none := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return llmFakeAnswer("\treturn 2 +\n"), nil }}
-	if _, err := ResolveLLM(context.Background(), none, syntaxFile(), LLMOptions{NoRepair: true}); err != nil || len(none.reqs) != 1 {
-		t.Fatalf("err %v after %d calls", err, len(none.reqs))
-	}
 }

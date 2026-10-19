@@ -127,10 +127,6 @@ type FileConflict struct {
 	Base   *Side  `json:"base"`
 	Ours   *Side  `json:"ours"`
 	Theirs *Side  `json:"theirs"`
-	// OursMessage is the commit message that explains OURS' change to this file: the newest commit
-	// of the tip's side (merge base..tip) that touched the path. It is the intent of OURS, as
-	// Messages.Commit is THEIRS', and is untrusted data. Empty when the server found none.
-	OursMessage string `json:"ours_message,omitempty"`
 }
 
 // Side is one version of a file.

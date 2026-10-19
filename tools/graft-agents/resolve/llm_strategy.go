@@ -24,12 +24,6 @@ import (
 //	context_lines = 3              # optional: context lines of the PATCH and the CODE
 //	max_answer_bytes = 1048576     # optional
 //	max_regions = 20               # optional: most conflicting regions per file (one call each)
-//	symmetric_context = true       # optional: OURS' change and intent beside THEIRS' (PLAN10 15.10)
-//	abstain = true                 # optional: the model may answer that the two changes cannot both hold
-//	repair = true                  # optional: one repair round, driven by deterministic findings
-//	repair_composition = true      # optional: false = repair only a broken answer, never an accepted one
-//	git_regions = true             # optional: the regions are git's own merge (git merge-file), not our diff
-//	max_context_bytes = 4096       # optional: cap on the symmetric context of a region
 //	call_timeout = "120s"          # optional: bound on one model call (one region)
 //
 //	[strategy.llm]
@@ -86,7 +80,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	if _, ok := spec.Options["min_confidence"]; ok {
 		return nil, fmt.Errorf("strategy %q: min_confidence is gone: the model reports no confidence and an answer is accepted on the checks alone; remove the option", spec.Name)
 	}
-	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions", "call_timeout", "symmetric_context", "abstain", "repair", "repair_composition", "git_regions", "max_context_bytes"); err != nil {
+	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions", "call_timeout"); err != nil {
 		return nil, err
 	}
 
@@ -102,22 +96,6 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 		return nil, err
 	}
 	if opt.MaxRegions, err = llmOptInt(spec, "max_regions"); err != nil {
-		return nil, err
-	}
-	// The elements of the design step are on unless switched off (PLAN10 15.10).
-	for _, o := range []struct {
-		key string
-		off *bool
-	}{{"symmetric_context", &opt.NoSymmetricContext}, {"abstain", &opt.NoAbstain}, {"repair", &opt.NoRepair}, {"repair_composition", &opt.NoCompositionRepair}, {"git_regions", &opt.NoGitRegions}} {
-		if v, ok := spec.Options[o.key]; ok {
-			on, isBool := v.(bool)
-			if !isBool {
-				return nil, fmt.Errorf("strategy %q: %s must be true or false", spec.Name, o.key)
-			}
-			*o.off = !on
-		}
-	}
-	if opt.MaxContextBytes, err = llmOptInt(spec, "max_context_bytes"); err != nil {
 		return nil, err
 	}
 	if v, ok := spec.Options["call_timeout"]; ok {
@@ -178,7 +156,6 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 		Ours:          llmBytes(f.Ours.Content),
 		Theirs:        llmBytes(f.Theirs.Content),
 		TheirsMessage: req.Messages.Commit,
-		OursMessage:   f.OursMessage,
 	}
 	if f.Base != nil {
 		lf.Base = llmBytes(f.Base.Content)

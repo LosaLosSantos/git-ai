@@ -163,9 +163,7 @@ func (s *Server) landResolveAt(
 			continue
 		}
 		mine = append(mine, f)
-		rf := landRequestFile(f)
-		rf.OursMessage = s.landOursMessage(ctx, repo, l, f.conflict.path)
-		sent = append(sent, rf)
+		sent = append(sent, landRequestFile(f))
 	}
 
 	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
@@ -292,36 +290,6 @@ func (s *Server) landResolveAt(
 	}
 
 	return l, combined, nil
-}
-
-// maxOursMessageBytes bounds the commit message of OURS' change that goes to the resolver.
-const maxOursMessageBytes = 4 << 10
-
-// landOursMessage returns the commit message that explains OURS' change to the path: the message of
-// the newest commit between the merge base and the tip that touched it (git log -1 base..tip -- path).
-// It is the intent of OURS, as the landed commit's message is THEIRS'. It is untrusted data, cut, and
-// empty when there is no merge base or no such commit; a failure to read it is no failure of the land.
-//
-// The request is no longer free of the tip, strictly: a verdict is reused at another tip (15.8)
-// whenever the sides are the same, and the message is a function of the tip's history of the path,
-// which the blob of OURS stands for. The verdict of a file does not wait for a message that could only
-// differ if OURS' blob came about another way.
-func (s *Server) landOursMessage(ctx context.Context, repo *localrepo.Repo, l landListing, path string) string {
-	if !l.hasBase || l.base == "" {
-		return ""
-	}
-	var out landBoundedBuffer
-	out.limit = maxOursMessageBytes
-	err := repo.ExecAndWait(ctx, gitcmd.Command{
-		Name:        "log",
-		Flags:       []gitcmd.Option{gitcmd.Flag{Name: "-1"}, gitcmd.Flag{Name: "--format=%B"}},
-		Args:        []string{l.base.String() + ".." + l.tip.String()},
-		PostSepArgs: []string{":(literal)" + path},
-	}, gitcmd.WithStdout(&out))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out.String())
 }
 
 // landSetOutcomes sets the outcome of each of files from the answer that covers them: RESOLVED, or

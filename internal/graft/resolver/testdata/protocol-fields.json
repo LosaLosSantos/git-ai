@@ -3,7 +3,7 @@
   "request": ["actor", "branch", "commit", "files", "limits", "merge_base", "messages", "operation", "repository", "resolution", "tip", "version"],
   "repository": ["relative_path", "storage"],
   "messages": ["commit", "tip"],
-  "file": ["base", "kind", "ours", "ours_message", "path", "theirs"],
+  "file": ["base", "kind", "ours", "path", "theirs"],
   "side": ["content", "mode", "oid"],
   "limits": ["max_file_bytes"],
   "response": ["explanation", "files", "resolver", "version"],

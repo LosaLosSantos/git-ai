@@ -22,11 +22,9 @@ type Counts struct {
 	NotRun    int `json:"not_run_cap"`
 	Stopped   int `json:"not_run_stopped"`
 	Abstained int `json:"abstained"`
-	// ModelAbstained counts the abstained cases that are the model's answer (part of Abstained);
-	// Calls and Repairs the model calls and the repair rounds among them (PLAN10 15.10).
-	ModelAbstained int `json:"model_abstained"`
-	Calls          int `json:"calls"`
-	Repairs        int `json:"repairs"`
+	// Calls and Repairs are the model calls and the repair rounds among them (PLAN10 15.11).
+	Calls   int `json:"calls"`
+	Repairs int `json:"repairs"`
 	// BlankLinesOnly counts the wrong results that differ from the human resolution in blank
 	// lines only (part of Wrong); SyntaxUnchecked the accepted results the syntax check gave no
 	// verdict on, because a side does not parse.
@@ -72,9 +70,6 @@ func (c *Counts) add(r Result) {
 	c.RegionsEqualOurs += r.RegionsEqualOurs
 	c.Calls += r.Calls
 	c.Repairs += r.Repairs
-	if r.ModelAbstained {
-		c.ModelAbstained++
-	}
 	c.InputTokens += r.InputTokens
 	c.OutputTokens += r.OutputTokens
 	c.ReasoningTokens += r.ReasoningTokens
@@ -254,8 +249,7 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	fmt.Fprintf(&b, "\nRegions of the accepted model answers answered with OURS' region unchanged: %d of %d.\n",
 		rep.Total.RegionsEqualOurs, rep.Total.Regions)
 	if t := rep.Total; t.Calls > 0 {
-		fmt.Fprintf(&b, "\nModel calls: %d, of which %d repair rounds driven by deterministic findings; the model abstained on %d cases (the two changes cannot both hold; each reached the agent with its reason).\n",
-			t.Calls, t.Repairs, t.ModelAbstained)
+		fmt.Fprintf(&b, "\nModel calls: %d, of which %d repair rounds driven by deterministic findings.\n", t.Calls, t.Repairs)
 	}
 	providers := map[string]int{}
 	for _, r := range rep.Results {

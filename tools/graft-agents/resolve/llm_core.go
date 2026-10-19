@@ -22,10 +22,6 @@ const (
 	defaultLLMContextLines   = 3
 	defaultLLMMaxAnswerBytes = 1 << 20
 	defaultLLMMaxRegions     = 20
-	// defaultLLMContextBytes caps the symmetric context of a region (OURS' change; the messages get
-	// a quarter each): about a thousand tokens, so that the context of a conflict stays in step with
-	// the PATCH and the CODE it explains.
-	defaultLLMContextBytes = 4 << 10
 	// defaultLLMCallTimeout bounds one model call; the strategy's timeout bounds the whole file.
 	defaultLLMCallTimeout  = 120 * time.Second
 	defaultLLMMaxDiffCells = 8 << 20
@@ -39,10 +35,6 @@ var (
 	// is absent, the content is binary, or the diff is too large). The
 	// strategy chain continues with the next strategy.
 	ErrLLMNotApplicable = errors.New("resolve: llm strategy not applicable")
-
-	// ErrLLMAbstained means the model answered that the two changes cannot both hold, and said why
-	// (the design step, PLAN10 15.10). It is no failure and no guess: the agent gets the reason.
-	ErrLLMAbstained = errors.New("resolve: llm abstained")
 
 	// ErrLLMRejected means the model answered but the answer failed
 	// validation (no patched code, the context lines, the newline, conflict
@@ -73,24 +65,6 @@ type LLMOptions struct {
 	// the whole file that the caller's context carries. Zero means the
 	// default.
 	CallTimeout time.Duration
-	// NoSymmetricContext leaves out OURS' side of the context: its change from the BASE as a diff
-	// and its commit message. Without them the request is the one of R1b, which the measurement of
-	// the design step (PLAN10 15.10) takes as its baseline.
-	NoSymmetricContext bool
-	// NoAbstain does not offer the model the answer "the two changes cannot both hold".
-	NoAbstain bool
-	// NoRepair makes no second call: an answer that the deterministic checks reject is rejected.
-	NoRepair bool
-	// NoCompositionRepair leaves an answer that the rules and the syntax accept alone: the repair
-	// round is then spent only on an answer that is broken (a rule it breaks, a syntax error of the
-	// assembled file), never on a drop or a duplicate that the composition check found in an
-	// accepted one. Without effect when NoRepair is set.
-	NoCompositionRepair bool
-	// MaxContextBytes caps the symmetric context of a region. Zero means the default.
-	MaxContextBytes int
-	// NoGitRegions takes the regions from our own line diff and not from git's merge (llmFileRegions).
-	// git merge-file is used by default, and our diff is the fallback when git cannot be run.
-	NoGitRegions bool
 }
 
 func (o LLMOptions) withDefaults() (LLMOptions, error) {
@@ -108,9 +82,6 @@ func (o LLMOptions) withDefaults() (LLMOptions, error) {
 	}
 	if o.MaxRegions <= 0 {
 		o.MaxRegions = defaultLLMMaxRegions
-	}
-	if o.MaxContextBytes <= 0 {
-		o.MaxContextBytes = defaultLLMContextBytes
 	}
 	if o.CallTimeout < 0 {
 		return o, fmt.Errorf("resolve: invalid llm call timeout %s", o.CallTimeout)
@@ -135,10 +106,6 @@ type LLMFile struct {
 	Ours          []byte
 	Theirs        []byte
 	TheirsMessage string
-	// OursMessage is the commit message that explains OURS' change to this file (the newest commit
-	// of the tip's side that touched it), the intent of OURS as TheirsMessage is THEIRS'. Untrusted
-	// data, cut, and may be empty.
-	OursMessage string
 }
 
 // LLMResult is a validated model resolution of one file. Nothing the model
@@ -177,7 +144,6 @@ type LLMRegionStats struct {
 	rejected           []string
 	usage              llm.Usage
 	calls, repairs     int
-	abstained          string
 	report             []string
 	providers          map[string]int
 }
@@ -219,20 +185,6 @@ func (s *LLMRegionStats) Calls() (calls, repairs int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls, s.repairs
-}
-
-// RecordAbstained keeps why the model abstained.
-func (s *LLMRegionStats) RecordAbstained(reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.abstained = reason
-}
-
-// Abstained returns why the model abstained, or "".
-func (s *LLMRegionStats) Abstained() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.abstained
 }
 
 // RecordReport keeps the composition report of the last file resolved.
