@@ -292,8 +292,9 @@ func landStoppedReason(need *landNeedsResolution, timeout time.Duration) string 
 }
 
 // landFinalPasses bounds the passes of landFinalPass: each is cheap, as it calls no resolver and runs
-// no command, so that losing the branch to another land four times in a row is a branch that moves
-// by the millisecond.
+// no verification of a model's resolution, so that losing the branch to another land four times in a
+// row is a branch that moves by the millisecond. (A land of rules only may run verify.command once
+// in the lane, in the pass that lands; that is the lane's verification, which is not repeated.)
 const landFinalPasses = 4
 
 // landFinalPass ends a land that could not go on (landResolving): the agent gets the package, not

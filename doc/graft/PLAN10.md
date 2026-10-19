@@ -1312,12 +1312,25 @@ and the tree it verifies depends on the tip.
   link of the tree, also when a case-insensitive file system would see the same name (a link "A" and
   an entry "a/x"), a parent that is a link or a file, a path over 4096 bytes. Each directory is made
   one component at a time and looked at with Lstat (never MkdirAll, which follows links), a file is
-  created with O_EXCL and O_NOFOLLOW. Resources: verify.max_tree_entries (default 200000) and
-  verify.max_tree_bytes (default 2 GiB), checked from the listing (ls-tree -l) before the content is
-  read; the listing and the blobs are streamed, entry by entry, through two commands, so the memory is
-  that of the entries. The checkout runs inside verify.timeout, as the command does. A refusal is no
-  error of the server: nothing is verified, the files are PROPOSED (a model's) or REJECTED (rules'),
-  and the reason says which limit or path.
+  created with O_EXCL and O_NOFOLLOW. Resources, all failing closed with the reason: a git tree can
+  name one subtree many times, so a push of a few KB expands to as many paths as it has names, each as
+  deep as the subtree. verify.max_tree_entries (default 200000) counts the entries AND the directories
+  that the checkout makes (both are inodes); verify.max_tree_depth (default 64) the components of a
+  path; verify.max_tree_bytes (default 2 GiB) the bytes of the files and of the targets of links; and
+  a fixed 128 MiB the memory of the paths, each entry and each directory charged twice (the sets that
+  look for links and for folded names). The limits are checked entry by entry, from the listing
+  (ls-tree -l), BEFORE that entry's content is read, not from a first pass over the whole listing: the
+  listing and the blobs are streamed through two commands, so the memory is that of the paths kept (the
+  fixed budget), and an entry that would go over stops the checkout with the earlier ones already
+  written. The context is checked at every entry. A name over 255 bytes, a path that with the
+  directory reaches PATH_MAX, a NUL in the target of a link, and a system call that fails (a name
+  that exists already, no room) are refused with the reason, not errors of the server. The checkout
+  runs inside verify.timeout, as the command does. A refusal is no error of the server: nothing is
+  verified, the files are PROPOSED (a model's) or REJECTED (rules'), and the reason says which limit
+  or path. Not built: NTFS trailing-dot and space folding in the check of colliding names (the
+  .git check has it); Gitaly does not run on Windows. Under MVCC (a snapshot pinned for the RPC) a
+  lost race ends with the retryable FailedPrecondition "kept moving" even for a model's resolution:
+  that call carries no package; the client's retry gets one.
 * **Tests.** A model's resolution that passes lands, signed, with the command run once (so not in
   the lane); one that fails gives a proposal and the output; without a verify.command it is a
   proposal; a tip that moved gets its new tree verified and lands, with no resolver call; a tip that

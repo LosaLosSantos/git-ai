@@ -402,11 +402,6 @@ func landMergeConflictError(tip, commitID git.ObjectID, conflictingFiles [][]byt
 	})
 }
 
-// landKeptMoving is the error of a landing that gave up because the branch kept moving. A model's
-// resolution is handed back instead, as a land that needs its new tree verified (it is the same
-// cause: the branch moved on): UserLand goes out again, and at its deadline the agent gets the
-// proposals, not an error about a branch it has nothing to do with. The others get
-// landKeptMovingError.
 // landSnapshotPinned reports whether the RPC reads a snapshot that is pinned for all of it (MVCC).
 func landSnapshotPinned(ctx context.Context) bool {
 	return mvcc.CacheFromContext(ctx) != nil
@@ -428,6 +423,11 @@ func landLostRace(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict
 	return nil
 }
 
+// landKeptMoving is the error of a landing that gave up because the branch kept moving. A model's
+// resolution is handed back instead, as a land that needs its new tree verified (it is the same
+// cause: the branch moved on): UserLand goes out again, and at its deadline the agent gets the
+// proposals, not an error about a branch it has nothing to do with. The others get
+// landKeptMovingError.
 func landKeptMoving(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempts int) error {
 	if pre.hasModel() {
 		return &landNeedsResolution{tip: conflict.newOID, commit: git.ObjectID(in.GetCommitId()), moved: true}

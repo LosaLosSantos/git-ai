@@ -2,6 +2,7 @@ package operations
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1" //nolint:gosec // the hash git names its objects with
 	"crypto/sha256"
@@ -72,7 +73,12 @@ func (s *Server) landVerify(ctx context.Context, repo *localrepo.Repo, tree git.
 	// write is a verification that did not finish.
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	limits := landCheckoutLimits{entries: v.MaxTreeEntriesOrDefault(), bytes: v.MaxTreeBytesOrDefault()}
+	limits := landCheckoutLimits{
+		entries:   v.MaxTreeEntriesOrDefault(),
+		bytes:     v.MaxTreeBytesOrDefault(),
+		depth:     v.MaxTreeDepthOrDefault(),
+		pathBytes: landMaxPathBytes,
+	}
 	if err := landCheckoutTree(runCtx, repo, tree, checkout, limits); err != nil {
 		var refusal *landCheckoutRefusal
 		switch {
@@ -190,17 +196,33 @@ const (
 	landMaxLinkTarget = 64 << 10
 	// landMaxTreePath bounds a path of the tree, and with it the record that is read of the listing.
 	landMaxTreePath = 4096
+	// landNameMax and landPathMax are the limits of a name and of a whole path on the file systems
+	// of Linux (NAME_MAX, PATH_MAX): beyond them the checkout refuses, rather than fail on the system call.
+	landNameMax = 255
+	landPathMax = 4096
 )
 
 func (e landTreeEntry) isGitlink() bool { return e.mode&landTreeModeTypeMask == landTreeModeGitlink }
 func (e landTreeEntry) isSymlink() bool { return e.mode&landTreeModeTypeMask == landTreeModeSymlink }
 func (e landTreeEntry) isRegular() bool { return e.mode&landTreeModeTypeMask == landTreeModeRegular }
 
+// landMaxPathBytes bounds the bytes of the distinct paths a checkout keeps in memory: of every entry
+// and of every directory made, each charged twice (the sets that look for links and for names that a
+// case-insensitive file system folds together). A few thousand bytes of path times many entries is
+// where a small push could otherwise take the memory of the server.
+const landMaxPathBytes = 128 << 20
+
 // landCheckoutLimits bound a checkout; a zero field is no limit (the server always sets them, from
-// verify.max_tree_entries and verify.max_tree_bytes).
+// verify.max_tree_entries, verify.max_tree_bytes, verify.max_tree_depth and landMaxPathBytes).
+//
+// entries counts the entries of the tree AND the directories the checkout makes for them, as both
+// are inodes; depth is the number of components of a path; bytes the bytes of the files and links
+// (a link's target included); pathBytes the memory of the paths.
 type landCheckoutLimits struct {
-	entries int
-	bytes   int64
+	entries   int
+	bytes     int64
+	depth     int
+	pathBytes int64
 }
 
 // landCheckoutRefusal is a tree that the checkout refuses to write, closed: it holds more than the
@@ -272,7 +294,7 @@ func landCheckoutTreeThen(ctx context.Context, repo *localrepo.Repo, tree git.Ob
 	}()
 
 	var entries []landTreeEntry
-	m := newLandMaterializer(dir, limits)
+	m := newLandMaterializer(ctx, dir, limits)
 	batch := bufio.NewReaderSize(cat, 1<<20)
 	var writeErr error
 	for e := range listed {
@@ -439,24 +461,44 @@ type landFolded struct {
 
 // landMaterializer writes the entries of a tree under dir, one at a time.
 type landMaterializer struct {
+	ctx    context.Context
 	dir    string
 	limits landCheckoutLimits
 	links  map[string]bool       // the paths of the symbolic links written
 	dirs   map[string]bool       // the directories made
 	folded map[string]landFolded // the paths as a case-insensitive file system sees them
-	count  int                   // entries written
+	count  int                   // entries written, and directories made
 	bytes  int64                 // bytes of files and links written
+	paths  int64                 // bytes of the paths kept in memory
 }
 
-func newLandMaterializer(dir string, limits landCheckoutLimits) *landMaterializer {
-	return &landMaterializer{dir: dir, limits: limits, links: map[string]bool{}, dirs: map[string]bool{}, folded: map[string]landFolded{}}
+func newLandMaterializer(ctx context.Context, dir string, limits landCheckoutLimits) *landMaterializer {
+	return &landMaterializer{ctx: ctx, dir: dir, limits: limits, links: map[string]bool{}, dirs: map[string]bool{}, folded: map[string]landFolded{}}
+}
+
+// landOSError is the refusal for what the file system would not do: a name too long for it, a name
+// that exists already (two names a case-insensitive file system makes one), no room. The tree is
+// not one this server can write, which is the agent's to know, not an error of the server.
+func landOSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return landRefuse("the tree cannot be written on this file system: %v", err)
+}
+
+// landOSWriter makes the errors of writing a file refusals, and not the errors of reading git.
+type landOSWriter struct{ w io.Writer }
+
+func (o landOSWriter) Write(p []byte) (int, error) {
+	n, err := o.w.Write(p)
+	return n, landOSError(err)
 }
 
 // landMaterialize writes the entries under dir, reading the contents of the files and links from batch
 // in their order (the answer of git-cat-file(1) --batch to the blobs of the listing, gitlinks left
 // out). See landMaterializer.add for what it refuses. It sets size and target of the entries.
 func landMaterialize(entries []landTreeEntry, batch *bufio.Reader, dir string) error {
-	m := newLandMaterializer(dir, landCheckoutLimits{})
+	m := newLandMaterializer(context.Background(), dir, landCheckoutLimits{})
 	for i := range entries {
 		if err := m.add(&entries[i], batch); err != nil {
 			return err
@@ -479,21 +521,38 @@ func landMaterialize(entries []landTreeEntry, batch *bufio.Reader, dir string) e
 // which would follow a link; a file is created with O_EXCL and O_NOFOLLOW; a link is written as a
 // link and never followed.
 func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
+	}
 	if !landTreePathValid(e.path) {
 		return landRefuse("unsafe path %q in the tree", e.path)
 	}
-	if len(e.path) > landMaxTreePath {
-		return landRefuse("the tree has a path longer than %d bytes", landMaxTreePath)
+	// The file system's own limits, refused up front: a name of more than 255 bytes, a path that
+	// with the directory of the checkout reaches PATH_MAX.
+	if len(e.path) > landMaxTreePath || len(m.dir)+1+len(e.path) >= landPathMax {
+		return landRefuse("the tree has a path too long to write (limit %d bytes, with the directory of the checkout)", min(landMaxTreePath, landPathMax-len(m.dir)-2))
 	}
-	if m.count++; m.limits.entries > 0 && m.count > m.limits.entries {
-		return landRefuse("the tree has more than %d entries (verify.max_tree_entries)", m.limits.entries)
+	if err := m.charge(1); err != nil {
+		return err
 	}
 	if e.sized && !e.isGitlink() && m.limits.bytes > 0 && m.bytes+e.listed > m.limits.bytes {
 		return landRefuse("the tree has more than %d bytes of files (verify.max_tree_bytes)", m.limits.bytes)
 	}
 
 	parts := strings.Split(e.path, "/")
+	if m.limits.depth > 0 && len(parts) > m.limits.depth {
+		return landRefuse("the tree has a path of %d components, more than %d (verify.max_tree_depth)", len(parts), m.limits.depth)
+	}
+	if !e.isGitlink() {
+		// An entry is kept in memory by its path, twice (the entries and the folded names).
+		if err := m.chargePath(2 * int64(len(e.path))); err != nil {
+			return err
+		}
+	}
 	for _, c := range parts {
+		if len(c) > landNameMax {
+			return landRefuse("the path %q has a name of more than %d bytes", e.path, landNameMax)
+		}
 		if resolver.IsGitDirName(c) {
 			return landRefuse("the path %q has a component that names .git, which a checkout does not write", e.path)
 		}
@@ -544,8 +603,11 @@ func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
 		if _, err := io.ReadFull(batch, content); err != nil {
 			return fmt.Errorf("%q: %w", e.path, err)
 		}
+		if bytes.IndexByte(content, 0) >= 0 {
+			return landRefuse("the symbolic link %q has a NUL in its target", e.path)
+		}
 		if err := os.Symlink(string(content), target); err != nil {
-			return err
+			return landOSError(err)
 		}
 		e.target, e.size = string(content), size
 		m.links[e.path] = true
@@ -556,23 +618,43 @@ func (m *landMaterializer) add(e *landTreeEntry, batch *bufio.Reader) error {
 		}
 		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, perm)
 		if err != nil {
-			return err
+			return landOSError(err)
 		}
-		if _, err := io.CopyN(f, batch, size); err != nil {
+		if _, err := io.CopyN(landOSWriter{f}, batch, size); err != nil {
 			_ = f.Close()
+			var refusal *landCheckoutRefusal
+			if errors.As(err, &refusal) {
+				return err
+			}
 			return fmt.Errorf("%q: %w", e.path, err)
 		}
 		if err := f.Close(); err != nil {
-			return err
+			return landOSError(err)
 		}
 		// The mode is the tree's, whatever the umask of the process.
 		if err := os.Chmod(target, perm); err != nil {
-			return err
+			return landOSError(err)
 		}
 		e.size = size
 	}
 	if b, err := batch.ReadByte(); err != nil || b != '\n' {
 		return fmt.Errorf("%q: the blob is not followed by a line feed", e.path)
+	}
+	return nil
+}
+
+// charge counts n more entries or directories against verify.max_tree_entries.
+func (m *landMaterializer) charge(n int) error {
+	if m.count += n; m.limits.entries > 0 && m.count > m.limits.entries {
+		return landRefuse("the tree has more than %d entries and directories (verify.max_tree_entries)", m.limits.entries)
+	}
+	return nil
+}
+
+// chargePath counts n bytes of paths kept in memory against landMaxPathBytes.
+func (m *landMaterializer) chargePath(n int64) error {
+	if m.paths += n; m.limits.pathBytes > 0 && m.paths > m.limits.pathBytes {
+		return landRefuse("the paths of the tree take more than %d bytes of memory", m.limits.pathBytes)
 	}
 	return nil
 }
@@ -591,11 +673,18 @@ func (m *landMaterializer) mkdirAll(parts []string) error {
 		info, err := os.Lstat(current)
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
-			if err := os.Mkdir(current, 0o755); err != nil {
+			// A directory is an inode and a path kept in memory, charged like the entries.
+			if err := m.charge(1); err != nil {
 				return err
 			}
+			if err := m.chargePath(2 * int64(len(key))); err != nil {
+				return err
+			}
+			if err := os.Mkdir(current, 0o755); err != nil {
+				return landOSError(err)
+			}
 		case err != nil:
-			return err
+			return landOSError(err)
 		case !info.IsDir():
 			return landRefuse("%q is in the way of a directory of the tree, and is not a directory", key)
 		}

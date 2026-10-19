@@ -55,6 +55,8 @@ func TestGraftResolverValidateVerify(t *testing.T) {
 	require.Equal(t, "5m0s", d.String())
 	require.Equal(t, 200000, GraftResolverVerify{}.MaxTreeEntriesOrDefault())
 	require.Equal(t, int64(2<<30), GraftResolverVerify{}.MaxTreeBytesOrDefault())
+	require.Equal(t, 64, GraftResolverVerify{}.MaxTreeDepthOrDefault())
+	require.Equal(t, 3, GraftResolverVerify{MaxTreeDepth: 3}.MaxTreeDepthOrDefault())
 	require.Equal(t, 7, GraftResolverVerify{MaxTreeEntries: 7}.MaxTreeEntriesOrDefault())
 	require.Equal(t, int64(9), GraftResolverVerify{MaxTreeBytes: 9}.MaxTreeBytesOrDefault())
 
@@ -65,6 +67,7 @@ func TestGraftResolverValidateVerify(t *testing.T) {
 		"zero timeout":     {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
 		"negative entries": {MaxTreeEntries: -1},
 		"negative bytes":   {MaxTreeBytes: -1},
+		"negative depth":   {MaxTreeDepth: -1},
 	} {
 		require.Error(t, GraftResolver{Verify: v}.validate(), name)
 	}

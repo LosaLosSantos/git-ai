@@ -415,8 +415,11 @@ read back and compared with the listing, the content of every file included (it
 is hashed as a git blob and must be the object ID of the tree), and a difference
 fails the checkout closed. The listing and the blobs are streamed, not held in
 memory, and the checkout refuses, with the reason in the package and without
-running the command: a tree over `verify.max_tree_entries` entries or
-`verify.max_tree_bytes` bytes, a path component that names `.git` on any file
+running the command: a tree over `verify.max_tree_entries` entries and
+directories made, `verify.max_tree_depth` components in a path, or
+`verify.max_tree_bytes` bytes of files and link targets (checked per entry,
+before that entry's content is read, so the earlier entries are already
+written), or paths that take more than 128 MiB of memory, a path component that names `.git` on any file
 system (the command may run git there, and a `.git` of the tree would be its
 repository), and an entry under a symbolic link, also when a case-insensitive
 file system would see the same name. The checkout and the command run inside

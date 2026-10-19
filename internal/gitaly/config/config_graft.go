@@ -387,6 +387,9 @@ type GraftResolverVerify struct {
 	// MaxTreeBytes bounds the bytes of the files of that tree. Zero means
 	// DefaultGraftResolverVerifyMaxTreeBytes.
 	MaxTreeBytes int64 `json:"max_tree_bytes" toml:"max_tree_bytes,omitempty"`
+	// MaxTreeDepth bounds the components of a path of that tree. Zero means
+	// DefaultGraftResolverVerifyMaxTreeDepth.
+	MaxTreeDepth int `json:"max_tree_depth" toml:"max_tree_depth,omitempty"`
 }
 
 // DefaultGraftResolverVerifyTimeout is the default GraftResolverVerify.Timeout.
@@ -397,7 +400,17 @@ const (
 	DefaultGraftResolverVerifyMaxTreeEntries = 200000
 	// DefaultGraftResolverVerifyMaxTreeBytes is the default GraftResolverVerify.MaxTreeBytes: 2 GiB.
 	DefaultGraftResolverVerifyMaxTreeBytes int64 = 2 << 30
+	// DefaultGraftResolverVerifyMaxTreeDepth is the default GraftResolverVerify.MaxTreeDepth.
+	DefaultGraftResolverVerifyMaxTreeDepth = 64
 )
+
+// MaxTreeDepthOrDefault returns MaxTreeDepth or its default.
+func (v GraftResolverVerify) MaxTreeDepthOrDefault() int {
+	if v.MaxTreeDepth > 0 {
+		return v.MaxTreeDepth
+	}
+	return DefaultGraftResolverVerifyMaxTreeDepth
+}
 
 // MaxTreeEntriesOrDefault returns MaxTreeEntries or its default.
 func (v GraftResolverVerify) MaxTreeEntriesOrDefault() int {
@@ -429,8 +442,8 @@ func (v GraftResolverVerify) TimeoutOrDefault() (time.Duration, error) {
 }
 
 func (v GraftResolverVerify) validate() error {
-	if v.MaxTreeEntries < 0 || v.MaxTreeBytes < 0 {
-		return fmt.Errorf("graft land resolver verify: max_tree_entries and max_tree_bytes must not be negative (0 means the default)")
+	if v.MaxTreeEntries < 0 || v.MaxTreeBytes < 0 || v.MaxTreeDepth < 0 {
+		return fmt.Errorf("graft land resolver verify: max_tree_entries, max_tree_bytes and max_tree_depth must not be negative (0 means the default)")
 	}
 	if !v.Enabled {
 		return nil

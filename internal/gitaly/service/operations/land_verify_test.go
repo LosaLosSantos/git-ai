@@ -4,12 +4,14 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -569,11 +571,22 @@ func TestLandCheckoutTree_limits(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, t.TempDir(), landCheckoutLimits{entries: len(entries), bytes: total}), "at the limits")
+	// The entries count, and so does every directory the checkout makes for them (a gitlink is both).
+	written := t.TempDir()
+	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, written, landCheckoutLimits{}))
+	dirs := 0
+	require.NoError(t, filepath.WalkDir(written, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && p != written {
+			dirs++
+		}
+		return nil
+	}))
+	count := len(entries) + dirs
+	require.NoError(t, landCheckoutTree(ctx, fx.repo, fx.tree, t.TempDir(), landCheckoutLimits{entries: count, bytes: total}), "at the limits")
 
 	var refusal *landCheckoutRefusal
 	dir := t.TempDir()
-	require.ErrorAs(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{entries: len(entries) - 1}), &refusal)
+	require.ErrorAs(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{entries: count - 1}), &refusal)
 	require.Contains(t, refusal.reason, "more than")
 	require.Contains(t, refusal.reason, "verify.max_tree_entries")
 
@@ -581,15 +594,15 @@ func TestLandCheckoutTree_limits(t *testing.T) {
 	require.ErrorAs(t, landCheckoutTree(ctx, fx.repo, fx.tree, dir, landCheckoutLimits{bytes: total - 1}), &refusal)
 	require.Contains(t, refusal.reason, "verify.max_tree_bytes")
 	// The bytes were refused from the listing, before the file that goes over was read: less than the tree is there.
-	var written int64
+	var bytesWritten int64
 	require.NoError(t, filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err == nil && d.Type().IsRegular() {
 			info, _ := d.Info()
-			written += info.Size()
+			bytesWritten += info.Size()
 		}
 		return nil
 	}))
-	require.Less(t, written, total)
+	require.Less(t, bytesWritten, total)
 }
 
 // TestLandCheckoutTree_streamsALargeTree: a tree whose listing and blobs are far over the buffers between
@@ -663,4 +676,137 @@ func TestLandVerify_aTreeThatCannotBeCheckedOutIsNotVerified(t *testing.T) {
 			require.Equal(t, 0, verifyRuns(t, vdir), "the command did not run")
 		})
 	}
+}
+
+// shared builds the tree of the attack: a subtree of the given depth, and a root that holds it once per
+// name. A few hundred bytes of objects, that git-ls-tree(1) -r expands to one path per name, each as
+// deep as the subtree.
+func sharedSubtree(t *testing.T, cfg config.Cfg, repoPath string, depth int, names []string) git.ObjectID {
+	t.Helper()
+
+	subtree := gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{Mode: "100644", Path: "leaf", Content: "leaf\n"}})
+	for i := 1; i < depth; i++ {
+		subtree = gittest.WriteTree(t, cfg, repoPath, []gittest.TreeEntry{{Mode: "040000", Path: "d", OID: subtree}})
+	}
+	var root []gittest.TreeEntry
+	for _, name := range names {
+		root = append(root, gittest.TreeEntry{Mode: "040000", Path: name, OID: subtree})
+	}
+	return gittest.WriteTree(t, cfg, repoPath, root)
+}
+
+// inodes counts what a checkout made under dir.
+func inodes(t *testing.T, dir string) int {
+	t.Helper()
+
+	n := 0
+	require.NoError(t, filepath.WalkDir(dir, func(string, os.DirEntry, error) error { n++; return nil }))
+	return n - 1
+}
+
+// TestLandCheckoutTree_aSmallPushCannotBecomeALargeCheckout: a tree of a few hundred bytes that git expands
+// (many names for one deep subtree, or many directories) is refused, closed and early, by the depth, the
+// entries and directories together, and the memory of the paths; what was made under the directory is
+// bounded by the limit, not by the expansion.
+func TestLandCheckoutTree_aSmallPushCannotBecomeALargeCheckout(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	names := make([]string, 300)
+	for i := range names {
+		names[i] = fmt.Sprintf("n%03d", i)
+	}
+	deep := sharedSubtree(t, cfg, repoPath, 200, names[:40])
+	medium := sharedSubtree(t, cfg, repoPath, 30, names)
+
+	var wide []gittest.TreeEntry
+	for i := 0; i < 600; i++ {
+		wide = append(wide, gittest.TreeEntry{Mode: "100644", Path: fmt.Sprintf("w%03d/f", i), Content: "x\n"})
+	}
+	wideTree := gittest.WriteTree(t, cfg, repoPath, nestTreeEntries(t, cfg, repoPath, wide))
+
+	defaults := landCheckoutLimits{entries: config.DefaultGraftResolverVerifyMaxTreeEntries, bytes: config.DefaultGraftResolverVerifyMaxTreeBytes, depth: config.DefaultGraftResolverVerifyMaxTreeDepth, pathBytes: landMaxPathBytes}
+	for name, tc := range map[string]struct {
+		tree     git.ObjectID
+		limits   landCheckoutLimits
+		reason   string
+		maxMaker int
+	}{
+		"the depth, with the defaults": {deep, defaults, "verify.max_tree_depth", 70},
+		"directories count as entries": {medium, landCheckoutLimits{entries: 500, depth: 64}, "verify.max_tree_entries", 500},
+		"the shallow and wide variant": {wideTree, landCheckoutLimits{entries: 1000, depth: 64}, "verify.max_tree_entries", 1000},
+		"the memory of the paths":      {medium, landCheckoutLimits{depth: 64, pathBytes: 20000}, "bytes of memory", 400},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			start := time.Now()
+			err := landCheckoutTree(ctx, repo, tc.tree, dir, tc.limits)
+			var refusal *landCheckoutRefusal
+			require.ErrorAs(t, err, &refusal)
+			require.Contains(t, refusal.reason, tc.reason)
+			require.Less(t, inodes(t, dir), tc.maxMaker+1, "what the checkout made is bounded by the limit")
+			require.Less(t, time.Since(start), 30*time.Second)
+		})
+	}
+
+	t.Run("the same trees within the limits are written", func(t *testing.T) {
+		t.Parallel()
+
+		require.NoError(t, landCheckoutTree(ctx, repo, medium, t.TempDir(), landCheckoutLimits{entries: 100000, depth: 64, pathBytes: landMaxPathBytes}))
+	})
+}
+
+// TestLandMaterialize_refusesWhatTheFileSystemWouldNot: the limits of the file system are refused up front, or
+// turned into a refusal with the reason when the system call fails: a land with such a tree still gets its
+// package, and not an error of the server.
+func TestLandMaterialize_refusesWhatTheFileSystemWouldNot(t *testing.T) {
+	t.Parallel()
+
+	reg, link := uint32(0o100644), uint32(0o120000)
+	longName := strings.Repeat("n", 256)
+	var longPath []string
+	for i := 0; i < 20; i++ {
+		longPath = append(longPath, strings.Repeat("p", 250))
+	}
+	for name, tc := range map[string]struct {
+		dir     func(t *testing.T) string
+		entries []fakeTreeEntry
+		reason  string
+	}{
+		"a name of more than 255 bytes": {entries: []fakeTreeEntry{{reg, longName, "x"}}, reason: "more than 255 bytes"},
+		"a path that reaches PATH_MAX":  {entries: []fakeTreeEntry{{reg, strings.Join(longPath, "/"), "x"}}, reason: "too long"},
+		"a NUL in the target of a link": {entries: []fakeTreeEntry{{link, "l", "a\x00b"}}, reason: "NUL"},
+		"a system call that fails": {
+			dir:     func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") },
+			entries: []fakeTreeEntry{{reg, "a/b", "x"}},
+			reason:  "cannot be written on this file system",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			if tc.dir != nil {
+				dir = tc.dir(t)
+			}
+			var refusal *landCheckoutRefusal
+			require.ErrorAs(t, materializeFake(t, dir, tc.entries...), &refusal)
+			require.Contains(t, refusal.reason, tc.reason)
+		})
+	}
+
+	t.Run("a context that ended stops the next entry", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		m := newLandMaterializer(ctx, t.TempDir(), landCheckoutLimits{})
+		entries, contents := fakeEntries(t)
+		require.ErrorIs(t, m.add(&entries[0], batchOf(contents, entries)), context.Canceled)
+	})
 }
