@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,18 +158,58 @@ func (e *env) metric(name, label string) float64 {
 		if family.GetName() != name {
 			continue
 		}
+		// A metric is a counter or a gauge; the other value is zero.
 		for _, m := range family.GetMetric() {
 			if label == "" {
-				return m.GetCounter().GetValue()
+				return m.GetCounter().GetValue() + m.GetGauge().GetValue()
 			}
 			for _, l := range m.GetLabel() {
 				if l.GetValue() == label {
-					return m.GetCounter().GetValue()
+					return m.GetCounter().GetValue() + m.GetGauge().GetValue()
 				}
 			}
 		}
 	}
 	return 0
+}
+
+// exec runs a statement with "?" placeholders on the database of the env.
+func (e *env) exec(query string, args ...any) {
+	e.t.Helper()
+	store := e.core.Meta.(*sqlstore.Store)
+	if store.Dialect() == sqlstore.Postgres {
+		for n := 1; strings.Contains(query, "?"); n++ {
+			query = strings.Replace(query, "?", fmt.Sprintf("$%d", n), 1)
+		}
+	}
+	_, err := store.DB().ExecContext(testhelper.Context(e.t), query, args...)
+	require.NoError(e.t, err)
+}
+
+// past returns the database time value of d before now.
+func (e *env) past(d time.Duration) any {
+	t := time.Now().Add(-d).UTC()
+	if e.core.Meta.(*sqlstore.Store).Dialect() == sqlstore.SQLite {
+		return t.Format(time.RFC3339Nano)
+	}
+	return t
+}
+
+// The tests age rows on the database clock instead of waiting with a short
+// gc_grace: the writers' deadline W is gc_grace - gc_margin, and a checkpoint
+// built under the race detector on a loaded host does not fit in a W of a
+// fraction of a second.
+
+// ageCheckpoints makes every checkpoint of the repository older than
+// gc_grace.
+func (e *env) ageCheckpoints() {
+	e.exec("UPDATE graft_checkpoints SET created_at = ? WHERE repo_id = ?", e.past(e.core.GCGrace+time.Minute), e.repo.ID)
+}
+
+// observedLongAgo records that a collection observed the object unreferenced
+// more than gc_grace ago.
+func (e *env) observedLongAgo(key string) {
+	e.exec("INSERT INTO graft_gc_orphans (repo_id, pack_key, first_seen) VALUES (?, ?, ?)", e.repo.ID, key, e.past(e.core.GCGrace+time.Minute))
 }
 
 // config3 is a configuration with the checkpoints and the garbage collection
@@ -187,7 +228,7 @@ func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
 	ctx := testhelper.Context(t)
 	cfg := config3(1, 0)
 	cfg.Collect = false
-	e := newEnv(t, coretest.Options{GCGrace: 200 * time.Millisecond, GCMargin: 50 * time.Millisecond}, cfg)
+	e := newEnv(t, coretest.Options{}, cfg)
 
 	var built []corestore.Checkpoint
 	for i := 0; i < 3; i++ {
@@ -204,10 +245,11 @@ func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
 	}
 
 	newest := built[len(built)-1]
-	require.Eventually(t, func() bool {
-		require.NoError(t, e.runner.RunOnce(ctx))
-		return len(e.checkpoints()) == 1
-	}, 30*time.Second, 50*time.Millisecond, "the superseded checkpoints are dropped")
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 3, "no checkpoint is gc_grace old yet")
+	e.ageCheckpoints()
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Len(t, e.checkpoints(), 1, "the superseded checkpoints are dropped")
 	require.Equal(t, newest.Seq, e.checkpoints()[0].Seq)
 
 	keys := e.bucketKeys()
@@ -224,6 +266,39 @@ func TestRunOnceDropsSupersededCheckpointsWithGCOff(t *testing.T) {
 	before := e.metric("graft_storage_maintenance_skipped_total", "nothing_due")
 	require.NoError(t, e.runner.RunOnce(ctx))
 	require.Equal(t, before+1, e.metric("graft_storage_maintenance_skipped_total", "nothing_due"))
+}
+
+// TestRunOnceReconcilesLeaks: with the collection on, a run reconciles the
+// bucket before it collects the removed repositories, and its metrics count
+// the leaks found and tombstoned and the IDs ahead of the allocator.
+func TestRunOnceReconcilesLeaks(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
+	put := func(repoID int64) {
+		content := []byte(fmt.Sprintf("objects of %d", repoID))
+		require.NoError(t, e.core.Blobs.Put(ctx, corestore.NewPackKey(repoID, sha256.Sum256(content)), bytes.NewReader(content)))
+	}
+
+	// A row deleted by hand before the trigger existed: no tombstone.
+	leaked, _, err := e.core.Meta.RegisterRepository(ctx, corestore.RepoKey{Storage: "default", RelativePath: "leaked.git"}, "sha1", corestore.InitialState{})
+	require.NoError(t, err)
+	put(leaked.ID)
+	e.exec("DELETE FROM graft_repositories WHERE repo_id = ?", leaked.ID)
+	e.exec("DELETE FROM graft_gc_removed WHERE repo_id = ?", leaked.ID)
+	put(leaked.ID + 2)
+
+	// The allocator was observed at its position longer than W ago.
+	e.exec("INSERT INTO graft_gc_allocator_marks (observed_at, position) VALUES (?, ?)", e.past(e.core.WriteDeadline()+time.Minute), leaked.ID)
+
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_leaks_found_total", ""))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_leaks_tombstoned_total", ""))
+	require.Equal(t, 1.0, e.metric("graft_storage_maintenance_ids_ahead_of_allocator", ""))
+	removed, err := e.core.Meta.ListRemovedRepositories(ctx, "", 0)
+	require.NoError(t, err)
+	require.Len(t, removed, 1)
+	require.Equal(t, leaked.ID, removed[0].RepoID)
 }
 
 // leaseExpiry returns the expiry of the repository's maintenance lease, which
@@ -277,33 +352,33 @@ func TestRunOnceDoesOnlyWhatIsOn(t *testing.T) {
 		require.NoError(t, e.core.Blobs.Put(ctx, key, bytes.NewReader(content)))
 		return key
 	}
-	opts := coretest.Options{GCGrace: 200 * time.Millisecond, GCMargin: 50 * time.Millisecond}
+	exists := func(e *env, key string) bool {
+		ok, err := e.core.Blobs.Exists(ctx, key)
+		require.NoError(t, err)
+		return ok
+	}
 
+	// An orphan that a collection would delete now: it was observed more than
+	// gc_grace ago.
 	checkpointsOnly := config3(1, 0)
 	checkpointsOnly.Collect = false
-	e := newEnv(t, opts, checkpointsOnly)
+	e := newEnv(t, coretest.Options{}, checkpointsOnly)
 	e.fresh()
 	key := orphan(e)
-	require.Never(t, func() bool {
-		require.NoError(t, e.runner.RunOnce(ctx))
-		exists, err := e.core.Blobs.Exists(ctx, key)
-		require.NoError(t, err)
-		return !exists
-	}, time.Second, 100*time.Millisecond, "checkpoints alone delete nothing")
+	e.observedLongAgo(key)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.True(t, exists(e, key), "checkpoints alone delete nothing")
 	_, ok := e.newestCheckpoint()
 	require.True(t, ok)
 
 	collectOnly := config3(1, 0)
 	collectOnly.Checkpoints = false
-	e = newEnv(t, opts, collectOnly)
+	e = newEnv(t, coretest.Options{}, collectOnly)
 	e.fresh()
 	key = orphan(e)
-	require.Eventually(t, func() bool {
-		require.NoError(t, e.runner.RunOnce(ctx))
-		exists, err := e.core.Blobs.Exists(ctx, key)
-		require.NoError(t, err)
-		return !exists
-	}, 30*time.Second, 100*time.Millisecond)
+	e.observedLongAgo(key)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	require.False(t, exists(e, key), "the collection deletes it")
 	_, ok = e.newestCheckpoint()
 	require.False(t, ok, "the collection alone creates no checkpoint")
 }
@@ -393,7 +468,7 @@ func TestRunOnceSkipsARepositoryWhoseLeaseIsHeld(t *testing.T) {
 func TestRunOnceCollectsAnOrphanPack(t *testing.T) {
 	t.Parallel()
 	ctx := testhelper.Context(t)
-	e := newEnv(t, coretest.Options{GCGrace: 200 * time.Millisecond, GCMargin: 50 * time.Millisecond}, config3(0, 0))
+	e := newEnv(t, coretest.Options{}, config3(0, 0))
 	e.fresh()
 
 	content := []byte("an orphan pack")
@@ -406,12 +481,11 @@ func TestRunOnceCollectsAnOrphanPack(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists, "observed, not yet deleted")
 
-	require.Eventually(t, func() bool {
-		require.NoError(t, e.runner.RunOnce(ctx))
-		exists, err := e.core.Blobs.Exists(ctx, key)
-		require.NoError(t, err)
-		return !exists
-	}, 30*time.Second, 100*time.Millisecond)
+	e.exec("UPDATE graft_gc_orphans SET first_seen = ? WHERE repo_id = ?", e.past(e.core.GCGrace+time.Minute), e.repo.ID)
+	require.NoError(t, e.runner.RunOnce(ctx))
+	exists, err = e.core.Blobs.Exists(ctx, key)
+	require.NoError(t, err)
+	require.False(t, exists, "deleted gc_grace after its observation")
 	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_packs_deleted_total", ""))
 	require.Equal(t, float64(len(content)), e.metric("graft_storage_maintenance_bytes_reclaimed_total", ""))
 }

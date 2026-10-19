@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -144,6 +145,20 @@ func TestCLIStorageMaintenanceAgainstServer(t *testing.T) {
 	code, stdout, stderr = runCLI(t, append([]string{"storage", "gc", "--removed"}, server...)...)
 	require.Equal(t, exitOK, code, stderr)
 	require.Equal(t, "deleted 0 objects (0 bytes) of 0 removed repositories of storage "+repo.GetStorageName()+"\n", stdout)
+
+	// Objects of a repository ID the database has not allocated (a database
+	// restored from an older backup) are reported, never touched.
+	record, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repo))
+	require.NoError(t, err)
+	ahead := corestore.NewPackKey(record.ID+2, sha256.Sum256([]byte("ahead")))
+	require.NoError(t, core.Blobs.Put(ctx, ahead, strings.NewReader("ahead")))
+	code, stdout, stderr = runCLI(t, append([]string{"storage", "gc", "--removed"}, server...)...)
+	require.Equal(t, exitOK, code, stderr)
+	require.Equal(t, "deleted 0 objects (0 bytes) of 0 removed repositories of storage "+repo.GetStorageName()+"\n"+
+		"warning: 1 repository IDs above the database's allocator have objects in the bucket (a database restored from an older backup?); they are left alone\n", stdout)
+	exists, err := core.Blobs.Exists(ctx, ahead)
+	require.NoError(t, err)
+	require.True(t, exists)
 }
 
 // TestCLIStorageCoreOff checks that a server without a storage core reports

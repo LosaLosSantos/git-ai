@@ -350,7 +350,11 @@ AND relative_path = '<relative path>'`; its changesets, references, changelog
 and reviews go with it) and run `graft storage import` again. The new
 registration gets a new repository ID and a full pack, and takes the changelog
 and the reviews from the files again, so do this before switching to
-authoritative mode.
+authoritative mode. The deletion records the tombstone of the old ID (a
+database trigger, whoever deletes the row), so garbage collection deletes the
+old objects `gc_grace` later. Rows deleted this way before this release left
+their objects in the bucket; garbage collection finds them and records their
+tombstones (see `gc --removed` below).
 
 ### Checkpoints and garbage collection
 
@@ -407,7 +411,15 @@ graft storage gc --removed -address unix:/var/opt/graft/gitaly.sock [-storage de
   of the repository (the background one, another node) holds it, or `Aborted`
   when the lease is lost during the collection.
 - `gc --removed` deletes every object of the repositories of the storage that
-  were removed at least `gc_grace` ago.
+  were removed at least `gc_grace` ago. It first reconciles the bucket: a
+  repository ID allocated at least `gc_grace − gc_margin` ago that has objects
+  in the bucket and neither a row nor a tombstone (a row deleted by hand before
+  this release) gets a tombstone, so its objects go `gc_grace` later. A run
+  examines at most 256 IDs, from where the previous run stopped, and reads at
+  most one object of each; it prints what it found. Objects of IDs above the
+  database's allocator (a database restored from an older backup) are reported
+  with a warning and never touched: the database will hand those IDs out again.
+  The background maintenance does the same with `gc = "auto"`.
 - `--dry-run` reports what would be deleted and changes nothing. It is a usage
   error on the subcommands that do not read it, like `--connectivity` outside
   `verify` and `--removed` outside `gc`.
@@ -418,12 +430,13 @@ can never call the storage core service, whatever `agent_rpcs` says.
 ### Upgrades
 
 Upgrading from v0.2.x to this release changes the storage core's database
-(migration `20261018000000_graft_storage_gc`) and the keys of the packs in the
+(migrations `20261018000000_graft_storage_gc` and
+`20261019000000_graft_storage_reconcile`: the tombstone trigger and the state
+of the bucket reconciliation) and the keys of the packs in the
 bucket (owned keys, see Packs). A node of the old version cannot work next to
 a node of the new one:
 - **It cannot start.** A v0.2.x node that restarts after the migration
-  refuses the database, with an error about an unknown migration
-  (`20261018000000_graft_storage_gc`).
+  refuses the database, with an error about the unknown migrations.
 - **It cannot read.** A v0.2.x node still running reads only the old 64-hex
   pack keys, so its reads of a repository that a new node wrote fail with
   "invalid pack key".
@@ -712,7 +725,9 @@ without a single divergence.
 | `graft_storage_maintenance_checkpoints_total` | Checkpoints created by the background maintenance. |
 | `graft_storage_maintenance_packs_deleted_total`, `graft_storage_maintenance_bytes_reclaimed_total` | Bucket objects, and their bytes, deleted by the background garbage collection. |
 | `graft_storage_maintenance_skipped_total{reason}` | Repositories the background maintenance skipped: `no_local_copy`, `nothing_due` (no checkpoint due, no superseded checkpoint, no collection; decided without the lease), `lease_held`. |
-| `graft_storage_maintenance_failures_total{step}` | Failed steps of the background maintenance: `collect_removed`, `list`, `lease`, `checkpoint`, `collect`. |
+| `graft_storage_maintenance_failures_total{step}` | Failed steps of the background maintenance: `reconcile`, `collect_removed`, `list`, `lease`, `checkpoint`, `collect`. |
+| `graft_storage_maintenance_leaks_found_total`, `graft_storage_maintenance_leaks_tombstoned_total` | Repository IDs with objects in the bucket and neither a row nor a tombstone, found by the reconciliation, and the tombstones it recorded for them. |
+| `graft_storage_maintenance_ids_ahead_of_allocator` | Repository IDs above the database's allocator with objects in the bucket at the last reconciliation (a database restored from an older backup); never touched. Alert on a value above 0. |
 | `graft_review_roots_backfilled_total` | Keep-around references of open-review commits written by the backfill (daily housekeeping and before every checkpoint). |
 | `graft_review_roots_deleted_total` | Keep-around references deleted because no open review uses them. |
 | `graft_review_roots_missing_total` | Open-review commits the backfill found missing from the repository; the review can only be closed. |

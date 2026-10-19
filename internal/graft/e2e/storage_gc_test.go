@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +15,33 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/feder-cr/git-ai/sdk"
 )
+
+// The tests age rows on the database clock instead of waiting with a short
+// gc_grace: the writers' deadline W is gc_grace - gc_margin, and an agent's
+// write under the race detector on a loaded host does not fit in a W of a
+// second or two.
+
+// exec runs a statement with "?" placeholders on the cluster's database.
+func (n storageNode) exec(t *testing.T, query string, args ...any) {
+	t.Helper()
+	store := n.core.Meta.(*sqlstore.Store)
+	if store.Dialect() == sqlstore.Postgres {
+		for i := 1; strings.Contains(query, "?"); i++ {
+			query = strings.Replace(query, "?", fmt.Sprintf("$%d", i), 1)
+		}
+	}
+	_, err := store.DB().ExecContext(n.ctx, query, args...)
+	require.NoError(t, err)
+}
+
+// longAgo returns the database time value of more than gc_grace before now.
+func (n storageNode) longAgo() any {
+	t := time.Now().Add(-n.core.GCGrace - time.Minute).UTC()
+	if n.core.Meta.(*sqlstore.Store).Dialect() == sqlstore.SQLite {
+		return t.Format(time.RFC3339Nano)
+	}
+	return t
+}
 
 // TestStorageGCAcrossNodes runs the compaction of milestone 3 on a cluster of
 // real servers sharing one database and one bucket (doc/graft/PLAN7.md): node
@@ -26,12 +54,6 @@ func TestStorageGCAcrossNodes(t *testing.T) {
 	forEachStorageDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
 		graft, tokens := workerGraft(1)
 		cluster := newStorageCluster(t, dialect, corestore.ModeAuthoritative, unbatched(graft))
-		// A short grace, so that the test sees packs collected. The writers'
-		// deadline (grace - margin) stays long enough for an upload under load.
-		cluster.adjust = func(core *corestore.Core) {
-			core.GCGrace = 2 * time.Second
-			core.GCMargin = 200 * time.Millisecond
-		}
 		a := cluster.addNode(t)
 		b := cluster.addNode(t)
 
@@ -58,13 +80,14 @@ func TestStorageGCAcrossNodes(t *testing.T) {
 		require.Equal(t, a.record(t, rel).HeadSeq, cp.Sequence)
 
 		// Node B collects once the checkpoint is gc_grace old.
-		var collected *sdk.StorageGC
-		require.Eventually(t, func() bool {
-			res, err := b.operator(t, rel).StorageGC(b.ctx, false)
-			require.NoError(t, err)
-			collected = res
-			return res.Boundary == cp.Sequence && res.CoveredDeleted > 0
-		}, 60*time.Second, 200*time.Millisecond)
+		repoID := a.record(t, rel).ID
+		collected, err := b.operator(t, rel).StorageGC(b.ctx, false)
+		require.NoError(t, err)
+		require.Zero(t, collected.Boundary, "the checkpoint is younger than gc_grace")
+		a.exec(t, "UPDATE graft_checkpoints SET created_at = ? WHERE repo_id = ?", a.longAgo(), repoID)
+		collected, err = b.operator(t, rel).StorageGC(b.ctx, false)
+		require.NoError(t, err)
+		require.Equal(t, cp.Sequence, collected.Boundary)
 		require.Equal(t, uint32(len(before)), collected.CoveredDeleted, "every changeset pack is covered by the checkpoint")
 		inBucket := bucketPacks(t, cluster.bucketURL)
 		for key := range before {
@@ -100,27 +123,30 @@ func TestStorageGCAcrossNodes(t *testing.T) {
 		// An orphan (the pack of a write that died before its database commit)
 		// is deleted gc_grace after a collection observed it.
 		orphan := []byte("the pack of a write that died")
-		orphanKey := corestore.NewPackKey(a.record(t, rel).ID, sha256.Sum256(orphan))
+		orphanKey := corestore.NewPackKey(repoID, sha256.Sum256(orphan))
 		require.NoError(t, a.core.Blobs.Put(a.ctx, orphanKey, bytes.NewReader(orphan)))
-		require.Eventually(t, func() bool {
-			res, err := a.operator(t, rel).StorageGC(a.ctx, false)
-			require.NoError(t, err)
-			return res.OrphansDeleted == 1
-		}, 60*time.Second, 200*time.Millisecond)
+		res, err := a.operator(t, rel).StorageGC(a.ctx, false)
+		require.NoError(t, err)
+		require.Equal(t, uint32(1), res.OrphansObserved)
+		a.exec(t, "UPDATE graft_gc_orphans SET first_seen = ? WHERE repo_id = ?", a.longAgo(), repoID)
+		res, err = a.operator(t, rel).StorageGC(a.ctx, false)
+		require.NoError(t, err)
+		require.Equal(t, uint32(1), res.OrphansDeleted)
 		require.False(t, bucketPacks(t, cluster.bucketURL)[orphanKey])
 
 		// A removed repository's objects go once its tombstone is gc_grace old.
-		repoID := a.record(t, rel).ID
 		_, err = gitalypb.NewRepositoryServiceClient(a.conn(t)).RemoveRepository(a.setupCtx, &gitalypb.RemoveRepositoryRequest{Repository: a.repository(rel)})
 		require.NoError(t, err)
 		client, err := sdk.Dial(a.ctx, a.cfg.SocketPath, sdk.WithStorage(a.cfg.Storages[0].Name), sdk.WithToken(sharedTestToken))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
-		require.Eventually(t, func() bool {
-			res, err := client.StorageGCRemoved(a.ctx, "", false)
-			require.NoError(t, err)
-			return res.Repositories == 1
-		}, 60*time.Second, 200*time.Millisecond)
+		removed, err := client.StorageGCRemoved(a.ctx, "", false)
+		require.NoError(t, err)
+		require.Zero(t, removed.Repositories, "the tombstone is younger than gc_grace")
+		a.exec(t, "UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", a.longAgo(), repoID)
+		removed, err = client.StorageGCRemoved(a.ctx, "", false)
+		require.NoError(t, err)
+		require.Equal(t, uint32(1), removed.Repositories)
 		prefix := fmt.Sprintf("repos/%d/", repoID)
 		for key := range bucketPacks(t, cluster.bucketURL) {
 			require.NotContains(t, key, prefix, "an object of the removed repository is left")
@@ -139,10 +165,6 @@ func TestStorageCheckpointBackfillsReviewRoots(t *testing.T) {
 	forEachStorageDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
 		graft, tokens := workerGraft(1)
 		cluster := newStorageCluster(t, dialect, corestore.ModeAuthoritative, unbatched(graft))
-		cluster.adjust = func(core *corestore.Core) {
-			core.GCGrace = 2 * time.Second
-			core.GCMargin = 200 * time.Millisecond
-		}
 		a := cluster.addNode(t)
 
 		rel := a.createRepository(t).GetRelativePath()
@@ -174,11 +196,11 @@ func TestStorageCheckpointBackfillsReviewRoots(t *testing.T) {
 		require.Equal(t, corestore.Target(base), snapshot[corestore.KeepAroundRef(base)], "the checkpoint holds the review base")
 
 		covered := a.referencedPacks(t, rel)
-		require.Eventually(t, func() bool {
-			res, err := a.operator(t, rel).StorageGC(a.ctx, false)
-			require.NoError(t, err)
-			return res.Boundary == cp.Sequence && res.CoveredDeleted > 0
-		}, 60*time.Second, 200*time.Millisecond)
+		a.exec(t, "UPDATE graft_checkpoints SET created_at = ? WHERE repo_id = ?", a.longAgo(), repoID)
+		res, err := a.operator(t, rel).StorageGC(a.ctx, false)
+		require.NoError(t, err)
+		require.Equal(t, cp.Sequence, res.Boundary)
+		require.Equal(t, uint32(len(covered)), res.CoveredDeleted)
 		inBucket := bucketPacks(t, cluster.bucketURL)
 		for key := range covered {
 			require.False(t, inBucket[key], "covered pack %s deleted", key)

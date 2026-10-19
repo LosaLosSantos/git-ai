@@ -69,8 +69,10 @@ service StorageCoreService {
   }
 
   // CollectRemovedRepositories deletes every object of the repositories of a
-  // storage that were removed at least gc_grace ago. It fails with
-  // FailedPrecondition when the storage core is off.
+  // storage that were removed at least gc_grace ago. It first reconciles the
+  // bucket: a repository ID with objects and neither a row nor a tombstone
+  // gets a tombstone. It fails with FailedPrecondition when the storage core
+  // is off.
   rpc CollectRemovedRepositories(CollectRemovedRepositoriesRequest) returns (CollectRemovedRepositoriesResponse) {
     option (op_type) = {
       op:          MUTATOR
@@ -229,4 +231,15 @@ message CollectRemovedRepositoriesResponse {
   int64 bytes_reclaimed = 3;
   // dry_run tells that nothing was deleted or recorded.
   bool dry_run = 4;
+  // leaks_found is the number of repository IDs the reconciliation found with
+  // objects in the bucket and neither a row nor a tombstone (a row deleted
+  // without one).
+  uint32 leaks_found = 5;
+  // leaks_tombstoned is the number of tombstones the reconciliation recorded
+  // for them; their objects are deleted once the tombstone is gc_grace old.
+  uint32 leaks_tombstoned = 6;
+  // ids_ahead_of_allocator is the number of repository IDs above the
+  // database's allocator that have objects in the bucket (a database restored
+  // from an older backup). They are never touched.
+  uint32 ids_ahead_of_allocator = 7;
 }

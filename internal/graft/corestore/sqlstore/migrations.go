@@ -147,6 +147,35 @@ var sqliteMigrations = []*migrate.Migration{
 			`DROP TABLE graft_checkpoints`,
 		},
 	},
+	{
+		// Integrated review m4 (doc/graft/PLAN7.md, "Removed repositories"): every
+		// deletion of a repository row records its tombstone, also one made by
+		// hand, replacing a reconciled one of the same ID (its grace starts at
+		// the deletion); and the state of the reconciliation that tombstones the
+		// bucket prefixes of rows deleted without one before this migration.
+		Id: "20261019000000_graft_storage_reconcile",
+		Up: []string{
+			`CREATE TRIGGER graft_repositories_tombstone AFTER DELETE ON graft_repositories
+			BEGIN
+				INSERT OR REPLACE INTO graft_gc_removed (repo_id, storage, relative_path, removed_at)
+				VALUES (OLD.repo_id, OLD.storage, OLD.relative_path, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+			END`,
+			`CREATE TABLE graft_gc_allocator_marks (
+				observed_at TEXT    NOT NULL PRIMARY KEY,
+				position    INTEGER NOT NULL
+			)`,
+			`CREATE TABLE graft_gc_reconcile (
+				id           INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+				done_through INTEGER NOT NULL
+			)`,
+			`INSERT INTO graft_gc_reconcile (id, done_through) VALUES (1, 0)`,
+		},
+		Down: []string{
+			`DROP TABLE graft_gc_reconcile`,
+			`DROP TABLE graft_gc_allocator_marks`,
+			`DROP TRIGGER graft_repositories_tombstone`,
+		},
+	},
 }
 
 // notOwnedPackKeyMessage is the error of the trigger that refuses a changeset
@@ -292,6 +321,38 @@ var postgresMigrations = []*migrate.Migration{
 			`DROP TABLE graft_gc_orphans`,
 			`DROP TABLE graft_checkpoint_refs`,
 			`DROP TABLE graft_checkpoints`,
+		},
+	},
+	{
+		// See the SQLite migration of the same ID.
+		Id: "20261019000000_graft_storage_reconcile",
+		Up: []string{
+			`CREATE FUNCTION graft_repositories_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				INSERT INTO graft_gc_removed (repo_id, storage, relative_path, removed_at)
+				VALUES (OLD.repo_id, OLD.storage, OLD.relative_path, clock_timestamp())
+				ON CONFLICT (repo_id) DO UPDATE SET storage = EXCLUDED.storage,
+					relative_path = EXCLUDED.relative_path, removed_at = EXCLUDED.removed_at;
+				RETURN OLD;
+			END
+			$$`,
+			`CREATE TRIGGER graft_repositories_tombstone AFTER DELETE ON graft_repositories
+			FOR EACH ROW EXECUTE FUNCTION graft_repositories_tombstone()`,
+			`CREATE TABLE graft_gc_allocator_marks (
+				observed_at TIMESTAMPTZ NOT NULL PRIMARY KEY,
+				position    BIGINT      NOT NULL
+			)`,
+			`CREATE TABLE graft_gc_reconcile (
+				id           INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+				done_through BIGINT  NOT NULL
+			)`,
+			`INSERT INTO graft_gc_reconcile (id, done_through) VALUES (1, 0)`,
+		},
+		Down: []string{
+			`DROP TABLE graft_gc_reconcile`,
+			`DROP TABLE graft_gc_allocator_marks`,
+			`DROP TRIGGER graft_repositories_tombstone ON graft_repositories`,
+			`DROP FUNCTION graft_repositories_tombstone()`,
 		},
 	},
 }

@@ -172,13 +172,16 @@ func (s *Store) ListRemovedRepositories(ctx context.Context, storage string, min
 			return err
 		}
 
-		query := "SELECT repo_id, storage, relative_path, removed_at FROM graft_gc_removed"
+		// A reconciled tombstone (RecordLeak) has an empty key: it belongs to
+		// every storage's list. One whose ID has a row is not a removal.
+		query := `SELECT g.repo_id, g.storage, g.relative_path, g.removed_at FROM graft_gc_removed g
+			WHERE NOT EXISTS (SELECT 1 FROM graft_repositories r WHERE r.repo_id = g.repo_id)`
 		var args []any
 		if storage != "" {
-			query += " WHERE storage = ?"
+			query += " AND (g.storage = ? OR g.storage = '')"
 			args = append(args, storage)
 		}
-		query += " ORDER BY repo_id"
+		query += " ORDER BY g.repo_id"
 
 		rows, err := tx.QueryContext(ctx, s.bind(query), args...)
 		if err != nil {

@@ -781,9 +781,20 @@ type CollectRemovedRepositoriesResponse struct {
 	// bytes_reclaimed is the size of those objects.
 	BytesReclaimed int64 `protobuf:"varint,3,opt,name=bytes_reclaimed,json=bytesReclaimed,proto3" json:"bytes_reclaimed,omitempty"`
 	// dry_run tells that nothing was deleted or recorded.
-	DryRun        bool `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	DryRun bool `protobuf:"varint,4,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	// leaks_found is the number of repository IDs the reconciliation found with
+	// objects in the bucket and neither a row nor a tombstone (a row deleted
+	// without one).
+	LeaksFound uint32 `protobuf:"varint,5,opt,name=leaks_found,json=leaksFound,proto3" json:"leaks_found,omitempty"`
+	// leaks_tombstoned is the number of tombstones the reconciliation recorded
+	// for them; their objects are deleted once the tombstone is gc_grace old.
+	LeaksTombstoned uint32 `protobuf:"varint,6,opt,name=leaks_tombstoned,json=leaksTombstoned,proto3" json:"leaks_tombstoned,omitempty"`
+	// ids_ahead_of_allocator is the number of repository IDs above the
+	// database's allocator that have objects in the bucket (a database restored
+	// from an older backup). They are never touched.
+	IdsAheadOfAllocator uint32 `protobuf:"varint,7,opt,name=ids_ahead_of_allocator,json=idsAheadOfAllocator,proto3" json:"ids_ahead_of_allocator,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *CollectRemovedRepositoriesResponse) Reset() {
@@ -842,6 +853,27 @@ func (x *CollectRemovedRepositoriesResponse) GetDryRun() bool {
 		return x.DryRun
 	}
 	return false
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetLeaksFound() uint32 {
+	if x != nil {
+		return x.LeaksFound
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetLeaksTombstoned() uint32 {
+	if x != nil {
+		return x.LeaksTombstoned
+	}
+	return 0
+}
+
+func (x *CollectRemovedRepositoriesResponse) GetIdsAheadOfAllocator() uint32 {
+	if x != nil {
+		return x.IdsAheadOfAllocator
+	}
+	return 0
 }
 
 // ReferenceDivergence is a reference whose local value differs from the
@@ -983,12 +1015,16 @@ const file_storage_core_proto_rawDesc = "" +
 	"\adry_run\x18\t \x01(\bR\x06dryRun\"e\n" +
 	"!CollectRemovedRepositoriesRequest\x12'\n" +
 	"\fstorage_name\x18\x01 \x01(\tB\x04\x88\xc6,\x01R\vstorageName\x12\x17\n" +
-	"\adry_run\x18\x02 \x01(\bR\x06dryRun\"\xaf\x01\n" +
+	"\adry_run\x18\x02 \x01(\bR\x06dryRun\"\xb0\x02\n" +
 	"\"CollectRemovedRepositoriesResponse\x12\"\n" +
 	"\frepositories\x18\x01 \x01(\rR\frepositories\x12#\n" +
 	"\rpacks_deleted\x18\x02 \x01(\rR\fpacksDeleted\x12'\n" +
 	"\x0fbytes_reclaimed\x18\x03 \x01(\x03R\x0ebytesReclaimed\x12\x17\n" +
-	"\adry_run\x18\x04 \x01(\bR\x06dryRun2\xe5\x04\n" +
+	"\adry_run\x18\x04 \x01(\bR\x06dryRun\x12\x1f\n" +
+	"\vleaks_found\x18\x05 \x01(\rR\n" +
+	"leaksFound\x12)\n" +
+	"\x10leaks_tombstoned\x18\x06 \x01(\rR\x0fleaksTombstoned\x123\n" +
+	"\x16ids_ahead_of_allocator\x18\a \x01(\rR\x13idsAheadOfAllocator2\xe5\x04\n" +
 	"\x12StorageCoreService\x12]\n" +
 	"\x10ImportRepository\x12\x1f.gitaly.ImportRepositoryRequest\x1a .gitaly.ImportRepositoryResponse\"\x06\xfa\x97(\x02\b\x01\x12Z\n" +
 	"\x0fGetStorageState\x12\x1e.gitaly.GetStorageStateRequest\x1a\x1f.gitaly.GetStorageStateResponse\"\x06\xfa\x97(\x02\b\x02\x12]\n" +

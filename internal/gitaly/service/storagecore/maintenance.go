@@ -124,14 +124,22 @@ func (s *server) CollectRemovedRepositories(ctx context.Context, req *gitalypb.C
 		return nil, err
 	}
 
-	report, err := gc.New(core, s.deps.GetLogger()).CollectRemoved(ctx, storageName, req.GetDryRun())
+	collector := gc.New(core, s.deps.GetLogger())
+	reconciled, err := collector.Reconcile(ctx, req.GetDryRun())
+	if err != nil {
+		return nil, err
+	}
+	report, err := collector.CollectRemoved(ctx, storageName, req.GetDryRun())
 	if err != nil {
 		return nil, err
 	}
 	return &gitalypb.CollectRemovedRepositoriesResponse{
-		Repositories:   uint32(report.RemovedRepos),
-		PacksDeleted:   uint32(report.PacksDeleted),
-		BytesReclaimed: report.BytesReclaimed,
-		DryRun:         report.DryRun,
+		Repositories:        uint32(report.RemovedRepos),
+		PacksDeleted:        uint32(report.PacksDeleted),
+		BytesReclaimed:      report.BytesReclaimed,
+		DryRun:              report.DryRun,
+		LeaksFound:          uint32(reconciled.LeaksFound),
+		LeaksTombstoned:     uint32(reconciled.LeaksTombstoned),
+		IdsAheadOfAllocator: uint32(reconciled.AheadOfAllocator),
 	}, nil
 }

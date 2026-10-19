@@ -183,6 +183,18 @@ func storageGCRemoved(ctx context.Context, out io.Writer, o *options, f *storage
 	}
 	fmt.Fprintf(out, "%s %d objects (%d bytes) of %d removed repositories of storage %s\n",
 		verb, res.PacksDeleted, res.BytesReclaimed, res.Repositories, displayText(client.Storage()))
+	if res.LeaksFound > 0 {
+		recorded := "recorded"
+		if res.DryRun {
+			recorded = "would record"
+		}
+		fmt.Fprintf(out, "found %d repository IDs with objects and no row or tombstone; %s %d tombstones (their objects are deleted after gc_grace)\n",
+			res.LeaksFound, recorded, res.LeaksTombstoned)
+	}
+	if res.IDsAheadOfAllocator > 0 {
+		fmt.Fprintf(out, "warning: %d repository IDs above the database's allocator have objects in the bucket (a database restored from an older backup?); they are left alone\n",
+			res.IDsAheadOfAllocator)
+	}
 	return nil
 }
 

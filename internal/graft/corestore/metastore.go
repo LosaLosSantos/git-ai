@@ -242,11 +242,30 @@ type MetaStore interface {
 	ReleaseMaintenanceLease(ctx context.Context, repoID int64, holder string) error
 
 	// ListRemovedRepositories returns the tombstones of the storage (of every
-	// storage when it is empty) recorded at least minAge ago on the database
-	// clock, ascending by repository ID.
+	// storage when it is empty), and those of an unknown key (RecordLeak),
+	// recorded at least minAge ago on the database clock, ascending by
+	// repository ID. A tombstone whose ID has a row (a reconciled ID whose
+	// creation committed after all) is not returned.
 	ListRemovedRepositories(ctx context.Context, storage string, minAge time.Duration) ([]RemovedRepository, error)
 	// DeleteRemovedRepository removes a tombstone; a missing one is success.
 	DeleteRemovedRepository(ctx context.Context, repoID int64) error
+
+	// ObserveAllocator reads the repository ID allocator and the
+	// reconciliation cursor and, unless dryRun, records the observation
+	// (AllocatorView.Now, Position) and drops the observations older than the
+	// one Bound comes from, in one transaction (doc/graft/PLAN7.md, "Removed
+	// repositories", reconciliation).
+	ObserveAllocator(ctx context.Context, minAge time.Duration, dryRun bool) (AllocatorView, error)
+	// UnrecordedIDs returns the repository IDs in (after, upTo] that have
+	// neither a row nor a tombstone, ascending.
+	UnrecordedIDs(ctx context.Context, after, upTo int64) ([]int64, error)
+	// RecordLeak records a tombstone for repoID, with an unknown key (empty
+	// storage and relative path) and the database time, unless the ID has a
+	// row or a tombstone; it reports whether it recorded one.
+	RecordLeak(ctx context.Context, repoID int64) (bool, error)
+	// AdvanceReconcile moves the reconciliation cursor to doneThrough unless
+	// it is there or further already.
+	AdvanceReconcile(ctx context.Context, doneThrough int64) error
 
 	// Close releases the database.
 	Close() error

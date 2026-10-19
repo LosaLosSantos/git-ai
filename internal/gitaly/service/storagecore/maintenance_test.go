@@ -21,12 +21,31 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// shortGC makes garbage collection wait a short grace, so that a test sees an
-// orphan deleted. The writers' deadline (grace - margin) stays long enough for
-// the import's upload under load.
-func shortGC(core *corestore.Core) {
-	core.GCGrace = time.Second
-	core.GCMargin = 100 * time.Millisecond
+// The tests age rows on the database clock instead of waiting with a short
+// gc_grace: the writers' deadline W is gc_grace - gc_margin, and an import or
+// a shadow write under the race detector on a loaded host does not fit in a W
+// of a second.
+
+// exec runs a statement with "?" placeholders on the database.
+func (h *harness) exec(query string, args ...any) {
+	h.t.Helper()
+	store := h.core.Meta.(*sqlstore.Store)
+	if store.Dialect() == sqlstore.Postgres {
+		for n := 1; strings.Contains(query, "?"); n++ {
+			query = strings.Replace(query, "?", fmt.Sprintf("$%d", n), 1)
+		}
+	}
+	_, err := store.DB().ExecContext(h.ctx, query, args...)
+	require.NoError(h.t, err)
+}
+
+// longAgo returns the database time value of more than gc_grace before now.
+func (h *harness) longAgo() any {
+	t := time.Now().Add(-h.core.GCGrace - time.Minute).UTC()
+	if h.core.Meta.(*sqlstore.Store).Dialect() == sqlstore.SQLite {
+		return t.Format(time.RFC3339Nano)
+	}
+	return t
 }
 
 // putOrphan stores an object under the repository's pack prefix that no row
@@ -101,7 +120,7 @@ func TestCreateCheckpointRefusals(t *testing.T) {
 func TestCollectGarbage(t *testing.T) {
 	t.Parallel()
 	forEachCore(t, func(t *testing.T, mode corestore.Mode, dialect sqlstore.Dialect) {
-		h := setup(t, mode, dialect, shortGC)
+		h := setup(t, mode, dialect)
 		h.seed()
 		repoID := h.importRepo()
 		orphan := h.putOrphan(repoID, "the pack of a write that died")
@@ -117,11 +136,11 @@ func TestCollectGarbage(t *testing.T) {
 		require.Equal(t, uint32(1), first.GetOrphansObserved())
 		require.True(t, h.exists(orphan), "observed, not yet deleted")
 
-		require.Eventually(t, func() bool {
-			resp, err := h.client.CollectGarbage(h.ctx, &gitalypb.CollectGarbageRequest{Repository: h.repo})
-			require.NoError(t, err)
-			return resp.GetOrphansDeleted() == 1 && resp.GetBytesReclaimed() > 0
-		}, 30*time.Second, 50*time.Millisecond)
+		h.exec("UPDATE graft_gc_orphans SET first_seen = ? WHERE repo_id = ?", h.longAgo(), repoID)
+		resp, err := h.client.CollectGarbage(h.ctx, &gitalypb.CollectGarbageRequest{Repository: h.repo})
+		require.NoError(t, err)
+		require.Equal(t, uint32(1), resp.GetOrphansDeleted())
+		require.Positive(t, resp.GetBytesReclaimed())
 		require.False(t, h.exists(orphan))
 		require.Empty(t, h.verify(true).GetDivergences(), "the repository is intact")
 	})
@@ -159,7 +178,7 @@ func TestCollectGarbageRefusals(t *testing.T) {
 func TestCollectRemovedRepositories(t *testing.T) {
 	t.Parallel()
 	forEachCore(t, func(t *testing.T, mode corestore.Mode, dialect sqlstore.Dialect) {
-		h := setup(t, mode, dialect, shortGC)
+		h := setup(t, mode, dialect)
 		h.seed()
 		repoID := h.importRepo()
 		packs := h.packKeys(repoID)
@@ -170,11 +189,58 @@ func TestCollectRemovedRepositories(t *testing.T) {
 		require.True(t, removed)
 
 		storageName := h.cfg.Storages[0].Name
-		require.Eventually(t, func() bool {
+		collect := func() *gitalypb.CollectRemovedRepositoriesResponse {
 			resp, err := h.client.CollectRemovedRepositories(h.ctx, &gitalypb.CollectRemovedRepositoriesRequest{StorageName: storageName})
 			require.NoError(t, err)
-			return resp.GetRepositories() == 1 && resp.GetPacksDeleted() >= uint32(len(packs))
-		}, 30*time.Second, 50*time.Millisecond)
+			return resp
+		}
+		require.Zero(t, collect().GetRepositories(), "the tombstone is younger than gc_grace")
+		h.exec("UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", h.longAgo(), repoID)
+		resp := collect()
+		require.Equal(t, uint32(1), resp.GetRepositories())
+		require.GreaterOrEqual(t, resp.GetPacksDeleted(), uint32(len(packs)))
+		require.Empty(t, h.packKeys(repoID))
+	})
+}
+
+// TestCollectRemovedRepositoriesReconcilesLeaks: the objects of a repository
+// whose row went without a tombstone (deleted by hand before the trigger
+// existed) are found by the reconciliation of the RPC once the allocation is W
+// old, get a tombstone, and are deleted once it is gc_grace old (integrated
+// review m4).
+func TestCollectRemovedRepositoriesReconcilesLeaks(t *testing.T) {
+	t.Parallel()
+	forEachDialect(t, func(t *testing.T, dialect sqlstore.Dialect) {
+		h := setup(t, corestore.ModeAuthoritative, dialect)
+		h.seed()
+		repoID := h.importRepo()
+		packs := h.packKeys(repoID)
+		require.NotEmpty(t, packs)
+
+		h.exec("DELETE FROM graft_repositories WHERE repo_id = ?", repoID)
+		h.exec("DELETE FROM graft_gc_removed WHERE repo_id = ?", repoID)
+
+		storageName := h.cfg.Storages[0].Name
+		collect := func() *gitalypb.CollectRemovedRepositoriesResponse {
+			resp, err := h.client.CollectRemovedRepositories(h.ctx, &gitalypb.CollectRemovedRepositoriesRequest{StorageName: storageName})
+			require.NoError(t, err)
+			require.Zero(t, resp.GetIdsAheadOfAllocator())
+			return resp
+		}
+		require.Zero(t, collect().GetLeaksFound(), "the allocation is not W old yet")
+
+		// The allocator was observed at the ID longer than W ago.
+		h.exec("DELETE FROM graft_gc_allocator_marks")
+		h.exec("INSERT INTO graft_gc_allocator_marks (observed_at, position) VALUES (?, ?)", h.longAgo(), repoID)
+		resp := collect()
+		require.Equal(t, uint32(1), resp.GetLeaksFound())
+		require.Equal(t, uint32(1), resp.GetLeaksTombstoned())
+		require.Zero(t, resp.GetRepositories(), "the new tombstone is younger than gc_grace")
+
+		h.exec("UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", h.longAgo(), repoID)
+		resp = collect()
+		require.Equal(t, uint32(1), resp.GetRepositories())
+		require.Zero(t, resp.GetLeaksFound(), "examined once")
 		require.Empty(t, h.packKeys(repoID))
 	})
 }

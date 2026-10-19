@@ -482,43 +482,112 @@ guarded nor swept).
   blocked every checkpoint. It is removed with its errors, metric, tests and
   `gitops.IsReachable`. `CheckpointInput` has no root set, and the checkpoint
   build reads no reviews.
-* **LOCK ORDER (PM check 3).** Every transaction that must serialize with a
-  changeset, or with a review write that requires its roots, takes the
-  repository row **as its first statement**, before it reads or writes any
-  child table. On Postgres that is `SELECT ... FOR NO KEY UPDATE`; SQLite's
-  immediate transaction holds the database write lock from `BEGIN`. The
-  transactions: `CommitChangeset`, `RegisterRepository`, `ImportHistory`,
-  `InsertReview`, `UpdateReview` with `requireRoots`, and the lease methods.
-  * Transactions that touch only child rows without changing their `repo_id`
-    never lock the repository row and never upgrade a lock, so they cannot form
-    a cycle with the first group: `UpdateReview` without `requireRoots`,
-    `ReportApplied`, the orphan observations, `DeleteCheckpoint`, and since the
-    integrated review `CreateCheckpoint`.
-  * Insert-only child transactions take Postgres's implicit `KEY SHARE` on the
-    parent and nothing after it. `FOR NO KEY UPDATE` does not conflict with
-    `KEY SHARE`, so they never hold up a writer. Deleting the repository still
-    waits for them.
-  * **Changed by the integrated review (M4).** `CreateCheckpoint` used to lock
-    the row and insert its snapshot one statement per reference. At 100k
-    references on Postgres a writer of the repository waited 38–46 s, locally.
-  * It now reads the row without locking it, and writes the snapshot 1000
-    references per statement. Nothing in it needs the writers excluded:
-    * the head only grows;
-    * the primary key makes one checkpoint per sequence: a concurrent build of
-      the same sequence inserts nothing (`ON CONFLICT DO NOTHING`) and returns
-      the one that committed;
-    * a checkpoint below a newer one is never the newest, so no seed reads it.
-  * Measured at 100k references (`TestCheckpointOfManyReferences`):
-    * Postgres: the record takes 1.6–1.7 s, while about 500 changesets commit,
-      the longest in 15–20 ms;
-    * SQLite: 0.23–0.27 s, before 0.63–0.70 s. SQLite has one write lock for
-      the whole database, so a writer waits for that. Tested with `-race` on Postgres and SQLite
-  (`TestLockOrderConcurrentWriters`): concurrent lands, review creations and
-  head moves (requiring their roots), a sweeper that deletes keep-around
-  references until the writers are done, comments, checkpoint commits and
-  leases on one repository. The test checks that no deadlock surfaces (the
-  retry hook counts them, and the count must stay at zero), the invariant at
-  the end, and dense sequences.
+* **LOCK ORDER (PM check 3; self-contained, as of the integrated review).**
+  *What it guarantees.* The write transactions of the storage core on one
+  repository never deadlock with each other, except the one case named below,
+  which Postgres detects and the store retries. The rule also gives the
+  serialisation that the invariants need: a changeset, a review write that
+  requires its roots, and the conditions checked with them (the review roots,
+  `max_open_reviews`) see each other in a total order.
+
+  *Background.* The database has one row per repository (`graft_repositories`,
+  "the row") and child tables keyed by `repo_id` (references, changesets,
+  changelog, reviews, nodes, checkpoints and their references, orphan
+  observations, leases), all with `ON DELETE CASCADE` foreign keys. SQLite has
+  one write lock for the whole database, taken at `BEGIN IMMEDIATE`: its write
+  transactions run one at a time and cannot deadlock. The rest is about
+  Postgres, where locks are per row. There, an insert of a child row takes
+  `FOR KEY SHARE` on the parent row (the foreign key check) until the
+  transaction ends; `FOR NO KEY UPDATE` does not conflict with `FOR KEY SHARE`;
+  a `DELETE` of the row takes `FOR UPDATE`, which does.
+
+  *The rule.*
+  1. **Row-first transactions.** A transaction that must serialise with the
+     writers of the repository locks the row **as its first statement**, before
+     it reads or writes a child table: `SELECT ... FOR NO KEY UPDATE` (Postgres;
+     on SQLite the write lock is already held). These are `CommitChangeset`,
+     `RegisterRepository` (it inserts the row), `ImportHistory`, `InsertReview`
+     (always; it allocates the review ID, checks the roots when required and
+     counts the open reviews for `max_open_reviews`), `UpdateReview` with
+     `requireRoots`, the three lease methods, and `DeleteRepository` (which
+     then deletes the row: the only upgrade, to `FOR UPDATE`, of a lock it
+     already holds; the trigger `graft_repositories_tombstone` inserts the
+     tombstone, a table without a foreign key).
+  2. **Child-only transactions.** Every other write transaction never locks the
+     row explicitly and never changes a `repo_id`:
+     * insert-only: `CreateCheckpoint` (since M4, below), `RecordOrphans`,
+       `ReportApplied` (an upsert), and the reconciliation's `RecordLeak`
+       (`graft_gc_removed` has no foreign key);
+     * update or delete of child rows only: `UpdateReview` without
+       `requireRoots` (comments, verdicts, closes; one row, with a version
+       check), `ForgetOrphans`, `DeleteCheckpoint` (one checkpoint row, whose
+       references cascade), `DeleteRemovedRepository`;
+     * tables of their own: `ObserveAllocator` and `AdvanceReconcile`
+       (`graft_gc_allocator_marks`, the one row of `graft_gc_reconcile`).
+
+  *Why no cycle.* A cycle needs every transaction in it to hold a lock while it
+  waits for the next. Take the waits one by one:
+  * A row-first transaction waits for the row before it holds anything of the
+    repository, so that wait closes no cycle. Holding the row, it can wait only
+    for a child row that another transaction holds.
+  * The row-first transactions that hold the row run one at a time, so the
+    child row it waits for is held by a child-only transaction.
+  * A child-only transaction waits on the row only at its first insert (the
+    key share), while it holds nothing yet: no cycle through that wait. Its
+    other waits are for child rows.
+  * The child-only transactions that hold one child row and wait for another
+    are the multi-row ones, and each kind touches rows nobody else holds at the
+    same time: `ForgetOrphans` and `RecordOrphans` run in a collection, which
+    holds the repository's maintenance lease, so one at a time per repository;
+    `CreateCheckpoint` inserts rows of its own sequence (a concurrent build of
+    the same sequence waits on the primary key and then does nothing).
+  * The single-row ones (`UpdateReview` without roots, `DeleteCheckpoint`'s
+    checkpoint row, `ReportApplied`) wait for nothing once they hold their row.
+  So a chain of waits never comes back to its first transaction, except
+  through the cascade of a repository removal, below.
+
+  *The exception: removing a repository.* `DeleteRepository` holds the row
+  `FOR UPDATE` and its cascade deletes child rows in the database's order. A
+  child-only transaction that deletes several child rows in its own order
+  (`ForgetOrphans`) can then hold one row the cascade needs while waiting for
+  another the cascade holds. Postgres detects the cycle after
+  `deadlock_timeout` and aborts one transaction with SQLSTATE 40P01, which the
+  store retries like a serialisation failure (`isRetryable`, `withTx`): the
+  outcome is that of a serial order (the repository is gone, or the
+  observations were forgotten first). This costs a second at worst, only while
+  a repository is removed during its collection, and changes no result.
+
+  *Changed by the integrated review (M4).* `CreateCheckpoint` used to be
+  row-first, and inserted its snapshot one statement per reference: at 100k
+  references on Postgres a writer of the repository waited 38–46 s, locally.
+  It now reads the row without locking it and writes the snapshot 1000
+  references per statement. Nothing in it needs the writers excluded:
+  * the head only grows, so a sequence at or below the head read stays so;
+  * the primary key makes one checkpoint per sequence: a concurrent build of
+    the same sequence inserts nothing (`ON CONFLICT DO NOTHING`) and returns the
+    one that committed, and a newer checkpoint covers the request and is
+    returned too (m7);
+  * a checkpoint below a newer one is never the newest, so no seed reads it;
+  * a concurrent removal of the repository either waits for it (its key share)
+    or makes its first insert fail on the foreign key: nothing is recorded,
+    and its pack is an orphan of a removed repository, collected with it;
+  * the pack's write deadline is checked in the same transaction on the
+    database clock (`PackDeadline`, m6), as for a changeset.
+  Measured at 100k references (`TestCheckpointOfManyReferences`): on Postgres
+  the record takes 1.6–1.7 s while about 500 changesets commit, the longest in
+  15–20 ms; on SQLite 0.23–0.27 s (before: 0.63–0.70 s), during which writers
+  wait for SQLite's one write lock.
+
+  *Tests.* `TestLockOrderConcurrentWriters`, with `-race` on Postgres and
+  SQLite: concurrent lands, review creations and head moves (requiring their
+  roots), a sweeper that deletes keep-around references until the writers are
+  done, comments, checkpoint commits and leases on one repository. It checks
+  that no deadlock surfaces (the retry hook counts them, and the count must stay
+  at zero), the invariant at the end, and dense sequences.
+  `TestConcurrentCheckpointsOfOneSequence` (six concurrent records of one
+  sequence), `TestCheckpointOfManyReferences` (writers during a large record),
+  `TestCreateIsBoundedByTheOpenReviews` (concurrent creates against the
+  limit, two handles).
 * **Files.** `internal/graft/corestore/reviewroots/**` (Protect, Sweep,
   Backfill), `internal/gitaly/service/review/**` (the roots writes and the
   close release), `internal/graft/corestore/dbreview/**`
@@ -1447,6 +1516,78 @@ are idempotent, observations are inserted with "do nothing on conflict".
 prefix after the sweep (the PACK OWNERSHIP RULE makes this an enforced bound, not
 an assumption). A crash after a partial prefix deletion leaves the tombstone; the
 next run finishes it. No lease (the repository is gone and its ID is never reused).
+
+**Every deletion has a tombstone (integrated review m4, approved by the PM).**
+Before migration `20261019000000_graft_storage_reconcile`, only `DeleteRepository`
+wrote the tombstone; a row deleted otherwise (the repair procedure of STORAGE.md,
+"State and verify", deletes it by hand) left its prefix in the bucket forever.
+The migration adds the trigger `graft_repositories_tombstone`: `AFTER DELETE` on
+`graft_repositories`, it records the tombstone of the deleted row on the database
+clock (`clock_timestamp()`; SQLite's `'now'`, the host clock that SQLite's
+`wallTime` reads too), in the deleting transaction, whoever deletes.
+`DeleteRepository` relies on it. On a tombstone of the same ID (a reconciled one,
+below) the trigger replaces it: the grace of a removal starts at the removal.
+
+**Reconciliation of the leaks from before the migration.**
+`gc.Collector.Reconcile` records a tombstone with an empty key (`RecordLeak`) for
+a repository ID that has objects under `repos/<id>/` and neither a row nor a
+tombstone; `CollectRemoved` then treats it like any removal
+(`ListRemovedRepositories` returns the keyless tombstones in every storage's
+list). It runs in the background maintenance before `CollectRemoved` (with `gc =
+"auto"`) and in `CollectRemovedRepositories` (`graft storage gc --removed`).
+* *Which IDs.* The allocator (Postgres sequence, SQLite `sqlite_sequence`) has
+  no time per ID, so every run records its position with the database time
+  (`graft_gc_allocator_marks`, `ObserveAllocator`), and examines only IDs at or
+  below the greatest position observed at least W ago (`Bound`): IDs allocated
+  at least W ago. It keeps the newest such mark and those after it.
+* *Proof that a creation in flight is never collected.* Invariant U: an object
+  under `repos/<id>/` is written only by `Core.UploadPack(record, readAt, …)`,
+  whose record is a read that found the row of `id` (RULE 26: the only uploader;
+  `Blobs.Put` has no other caller outside tests); so a creation
+  writes nothing before its row commits, and its prefix is empty: the
+  reconciliation, which tombstones only a prefix with objects, leaves it alone.
+  Two more barriers, for a writer that would break U: (1) an ID younger than W
+  is not examined (the PM's guard; on Postgres the sequence counts an
+  allocation before its row commits, on SQLite an uncommitted allocation is
+  invisible and the single write lock serialises it with the reconciliation);
+  (2) a tombstone whose ID has a row is not a removal: `ListRemovedRepositories`
+  excludes it, so a creation that commits after it was tombstoned keeps its
+  objects, and its later deletion replaces the tombstone with a fresh grace.
+  Test: `TestReconcileNeverCollectsACreationInFlight` holds a Postgres
+  transaction between the allocation and the commit of a row, with an object
+  under its prefix, across reconciliations: not examined while younger than W;
+  examined after, tombstoned, then committed, and not collected.
+* *Safety of a tombstoned leak.* No row for the ID now, and objects under its
+  prefix: by U the row was committed once and has been deleted (IDs are never
+  reused: Postgres `BIGSERIAL`, SQLite `AUTOINCREMENT`). A writer that read the
+  row before the deletion uploads until `t_r + W`; the tombstone's `removed_at`
+  is after the deletion, so the collection, `gc_grace > W` later, comes after
+  every such upload, as for any removal.
+* *Bounded, paged, idempotent, resumable.* A run examines at most 256 IDs after
+  its cursor (`graft_gc_reconcile.done_through`, `UnrecordedIDs`), reads at most
+  one object of each prefix (one page of a listing, stopped at the first
+  object), records tombstones with "do nothing on conflict" and then moves the
+  cursor past the batch. A run that stopped leaves the cursor, and the next run
+  examines the batch again, recording nothing twice. With the trigger, a new
+  ID never needs a second look: its deletion has its tombstone. After the
+  backlog, a run examines only the IDs allocated since the last one.
+* *IDs above the allocator* (a database restored from an older backup: the
+  allocator will hand those IDs out again) are probed, 16 above the position,
+  counted and logged, never touched.
+* Metrics: `graft_storage_maintenance_leaks_found_total`,
+  `graft_storage_maintenance_leaks_tombstoned_total`,
+  `graft_storage_maintenance_ids_ahead_of_allocator`, and the step
+  `reconcile` of `graft_storage_maintenance_failures_total`; the RPC returns
+  `leaks_found`, `leaks_tombstoned`, `ids_ahead_of_allocator`.
+* Why not an operator RPC that lists the bucket: the leaks then depend on an
+  operator remembering to run it, and a listing of the whole bucket costs O(all
+  objects) on every run. Why not a full listing in the background: the same
+  cost, every interval. The cursor makes the cost O(new IDs) after the backlog.
+* Tests: `TestDeletedRowGetsATombstone`, `TestReconcileTombstonesLeaks`,
+  `TestReconcileIsPagedAndResumable`, `TestReconcileNeverCollectsACreationInFlight`
+  (both dialects where the dialect allows; mutants without the W guard or
+  without the row exclusion fail them), `TestRunOnceReconcilesLeaks`
+  (metrics), `TestCollectRemovedRepositoriesReconcilesLeaks` (RPC).
 
 ### Hydration from a checkpoint (syncer, WP76)
 

@@ -40,6 +40,7 @@ const releaseTimeout = 10 * time.Second
 
 // Steps, the label of graft_storage_maintenance_failures_total.
 const (
+	stepReconcile      = "reconcile"
 	stepCollectRemoved = "collect_removed"
 	stepList           = "list"
 	stepLease          = "lease"
@@ -93,6 +94,9 @@ type Runner struct {
 	bytes       prometheus.Counter
 	skipped     *prometheus.CounterVec
 	failures    *prometheus.CounterVec
+	leaksFound  prometheus.Counter
+	leaksMarked prometheus.Counter
+	ahead       prometheus.Gauge
 }
 
 var _ prometheus.Collector = (*Runner)(nil)
@@ -148,8 +152,20 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 		}, []string{"reason"}),
 		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_failures_total",
-			Help: "Failed steps of the background maintenance, by step (collect_removed, list, lease, checkpoint, collect).",
+			Help: "Failed steps of the background maintenance, by step (reconcile, collect_removed, list, lease, checkpoint, collect).",
 		}, []string{"step"}),
+		leaksFound: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "graft_storage_maintenance_leaks_found_total",
+			Help: "Repository IDs whose objects are in the bucket without a row or a tombstone (a row deleted without one), found by the reconciliation.",
+		}),
+		leaksMarked: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "graft_storage_maintenance_leaks_tombstoned_total",
+			Help: "Tombstones the reconciliation recorded for leaked repository IDs; their objects are collected after gc_grace.",
+		}),
+		ahead: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "graft_storage_maintenance_ids_ahead_of_allocator",
+			Help: "Repository IDs above the database's allocator that have objects in the bucket, at the last reconciliation (a database restored from an older backup); never touched.",
+		}),
 	}
 	for _, result := range []string{"ok", "error"} {
 		r.runs.WithLabelValues(result)
@@ -157,7 +173,7 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 	for _, reason := range []string{"no_local_copy", "nothing_due", "lease_held"} {
 		r.skipped.WithLabelValues(reason)
 	}
-	for _, step := range []string{stepCollectRemoved, stepList, stepLease, stepCheckpoint, stepCollect} {
+	for _, step := range []string{stepReconcile, stepCollectRemoved, stepList, stepLease, stepCheckpoint, stepCollect} {
 		r.failures.WithLabelValues(step)
 	}
 	return r
@@ -197,6 +213,16 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 		r.failures.WithLabelValues(step).Inc()
 		r.logger.WithError(err).WithFields(fields).WithField("step", step).Error("storage core: background maintenance step failed")
 		errs = append(errs, err)
+	}
+
+	if r.cfg.Collect {
+		// Before the removed repositories are collected, so that a leak's
+		// tombstone is among them once it is gc_grace old.
+		report, err := r.collector.Reconcile(ctx, false)
+		if err != nil {
+			fail(stepReconcile, err, log.Fields{})
+		}
+		r.countReconcile(report)
 	}
 
 	for _, storageName := range r.storages {
@@ -416,6 +442,13 @@ func (r *Runner) count(report gc.Report) {
 	r.bytes.Add(float64(report.BytesReclaimed))
 }
 
+// countReconcile records what a reconciliation found.
+func (r *Runner) countReconcile(report gc.Report) {
+	r.leaksFound.Add(float64(report.LeaksFound))
+	r.leaksMarked.Add(float64(report.LeaksTombstoned))
+	r.ahead.Set(float64(report.AheadOfAllocator))
+}
+
 // Describe implements prometheus.Collector.
 func (r *Runner) Describe(descs chan<- *prometheus.Desc) {
 	r.runs.Describe(descs)
@@ -424,6 +457,9 @@ func (r *Runner) Describe(descs chan<- *prometheus.Desc) {
 	r.bytes.Describe(descs)
 	r.skipped.Describe(descs)
 	r.failures.Describe(descs)
+	r.leaksFound.Describe(descs)
+	r.leaksMarked.Describe(descs)
+	r.ahead.Describe(descs)
 }
 
 // Collect implements prometheus.Collector.
@@ -434,4 +470,7 @@ func (r *Runner) Collect(metrics chan<- prometheus.Metric) {
 	r.bytes.Collect(metrics)
 	r.skipped.Collect(metrics)
 	r.failures.Collect(metrics)
+	r.leaksFound.Collect(metrics)
+	r.leaksMarked.Collect(metrics)
+	r.ahead.Collect(metrics)
 }

@@ -196,6 +196,16 @@ type StorageGCRemoved struct {
 	BytesReclaimed int64 `json:"bytes_reclaimed"`
 	// DryRun tells that nothing was deleted or recorded.
 	DryRun bool `json:"dry_run"`
+	// LeaksFound is the number of repository IDs the reconciliation found with
+	// objects in the bucket and neither a row nor a tombstone.
+	LeaksFound uint32 `json:"leaks_found"`
+	// LeaksTombstoned is the number of tombstones it recorded for them; their
+	// objects are deleted once the tombstone is gc_grace old.
+	LeaksTombstoned uint32 `json:"leaks_tombstoned"`
+	// IDsAheadOfAllocator is the number of repository IDs above the
+	// database's allocator that have objects in the bucket (a database
+	// restored from an older backup); they are never touched.
+	IDsAheadOfAllocator uint32 `json:"ids_ahead_of_allocator"`
 }
 
 // StorageCheckpoint checkpoints the repository at its current database head:
@@ -244,7 +254,9 @@ func (r *Repo) StorageGC(ctx context.Context, dryRun bool) (*StorageGC, error) {
 }
 
 // StorageGCRemoved deletes every object of the repositories of the storage
-// that were removed at least gc_grace ago (with dryRun, only reports them). An
+// that were removed at least gc_grace ago (with dryRun, only reports them),
+// after it reconciled the bucket (a repository ID with objects and neither a
+// row nor a tombstone gets a tombstone). An
 // empty storage is the client's storage (WithStorage). It fails with
 // FailedPrecondition when the storage core is off.
 func (c *Client) StorageGCRemoved(ctx context.Context, storage string, dryRun bool) (*StorageGCRemoved, error) {
@@ -259,10 +271,13 @@ func (c *Client) StorageGCRemoved(ctx context.Context, storage string, dryRun bo
 		return nil, err
 	}
 	return &StorageGCRemoved{
-		Repositories:   resp.GetRepositories(),
-		PacksDeleted:   resp.GetPacksDeleted(),
-		BytesReclaimed: resp.GetBytesReclaimed(),
-		DryRun:         resp.GetDryRun(),
+		Repositories:        resp.GetRepositories(),
+		PacksDeleted:        resp.GetPacksDeleted(),
+		BytesReclaimed:      resp.GetBytesReclaimed(),
+		DryRun:              resp.GetDryRun(),
+		LeaksFound:          resp.GetLeaksFound(),
+		LeaksTombstoned:     resp.GetLeaksTombstoned(),
+		IDsAheadOfAllocator: resp.GetIdsAheadOfAllocator(),
 	}, nil
 }
 

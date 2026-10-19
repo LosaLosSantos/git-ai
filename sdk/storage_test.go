@@ -156,9 +156,12 @@ func TestStorageGC(t *testing.T) {
 
 func TestStorageGCRemoved(t *testing.T) {
 	fake := &fakeStorageCore{removedResp: &gitalypb.CollectRemovedRepositoriesResponse{
-		Repositories:   2,
-		PacksDeleted:   9,
-		BytesReclaimed: 4096,
+		Repositories:        2,
+		PacksDeleted:        9,
+		BytesReclaimed:      4096,
+		LeaksFound:          3,
+		LeaksTombstoned:     2,
+		IdsAheadOfAllocator: 1,
 	}}
 	client := dialFake(t, func(srv *grpc.Server) {
 		gitalypb.RegisterStorageCoreServiceServer(srv, fake)
@@ -166,7 +169,10 @@ func TestStorageGCRemoved(t *testing.T) {
 
 	res, err := client.StorageGCRemoved(t.Context(), "", false)
 	require.NoError(t, err)
-	require.Equal(t, &sdk.StorageGCRemoved{Repositories: 2, PacksDeleted: 9, BytesReclaimed: 4096}, res)
+	require.Equal(t, &sdk.StorageGCRemoved{
+		Repositories: 2, PacksDeleted: 9, BytesReclaimed: 4096,
+		LeaksFound: 3, LeaksTombstoned: 2, IDsAheadOfAllocator: 1,
+	}, res)
 
 	_, err = client.StorageGCRemoved(t.Context(), "other", true)
 	require.NoError(t, err)

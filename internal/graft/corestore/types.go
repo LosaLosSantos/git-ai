@@ -176,9 +176,29 @@ type Checkpoint struct {
 // are still to be deleted from the bucket.
 type RemovedRepository struct {
 	RepoID int64
-	Key    RepoKey
+	// Key is empty for a tombstone that the reconciliation recorded: the row
+	// was deleted without one, and its key with it.
+	Key RepoKey
 	// RemovedAt is a database time (doc/graft/PLAN7.md, CLOCK RULE).
 	RemovedAt time.Time
+}
+
+// AllocatorView is an observation of the repository ID allocator by the
+// reconciliation of the bucket (MetaStore.ObserveAllocator).
+type AllocatorView struct {
+	// Now is the database time of the observation.
+	Now time.Time
+	// Position is the greatest repository ID allocated, 0 for none. On
+	// Postgres it counts the allocations of creations whose row is not
+	// committed yet, or never will be; on SQLite only committed ones.
+	Position int64
+	// Bound is the greatest position observed at least minAge before Now, 0
+	// when there is none: every ID at or below it was allocated at least
+	// minAge ago.
+	Bound int64
+	// DoneThrough is the reconciliation cursor: every ID at or below it is
+	// reconciled.
+	DoneThrough int64
 }
 
 // GCState is what garbage collection decides on for one repository, read in

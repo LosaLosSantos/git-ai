@@ -442,23 +442,14 @@ func (s *Store) DeleteRepository(ctx context.Context, key corestore.RepoKey) (bo
 			return err
 		}
 
-		now, err := s.wallTime(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		// The cascade removes everything recorded for the repository; the
-		// tombstone, which has no foreign key, outlives it so that garbage
-		// collection deletes the repository's objects from the bucket
-		// (doc/graft/PLAN7.md, "Removed repositories").
+		// The cascade removes everything recorded for the repository. The
+		// trigger graft_repositories_tombstone records its tombstone, on the
+		// database clock, in this transaction; the tombstone has no foreign key
+		// and outlives the row, so that garbage collection deletes the
+		// repository's objects from the bucket (doc/graft/PLAN7.md, "Removed
+		// repositories"). A row deleted by hand gets one the same way.
 		if _, err := tx.ExecContext(ctx, s.bind("DELETE FROM graft_repositories WHERE repo_id = ?"), repo.id); err != nil {
 			return fmt.Errorf("delete repository: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, s.bind(`
-			INSERT INTO graft_gc_removed (repo_id, storage, relative_path, removed_at)
-			VALUES (?, ?, ?, ?)
-		`), repo.id, repo.key.Storage, repo.key.RelativePath, s.timeArg(now)); err != nil {
-			return fmt.Errorf("record the tombstone of repository %d: %w", repo.id, err)
 		}
 
 		deleted = true

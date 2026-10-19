@@ -64,6 +64,16 @@ type Report struct {
 	BytesReclaimed int64
 	// RemovedRepos are the removed repositories whose objects were deleted.
 	RemovedRepos int
+	// LeaksFound are the repository IDs of the reconciled range that have
+	// objects in the bucket and neither a row nor a tombstone.
+	LeaksFound int
+	// LeaksTombstoned are the tombstones the reconciliation recorded for them.
+	LeaksTombstoned int
+	// AheadOfAllocator are the repository IDs above the allocator's position
+	// that have objects in the bucket (a database restored from an older
+	// backup). They are reported and never touched: the allocator will hand
+	// them out again.
+	AheadOfAllocator int
 	// DryRun tells that nothing was deleted or recorded.
 	DryRun bool
 }
@@ -349,6 +359,107 @@ func (c *Collector) CollectRemoved(ctx context.Context, storage string, dryRun b
 			"repository":    r.Key.String(),
 			"objects":       len(infos),
 		}).InfoContext(ctx, "storage core: the objects of a removed repository are deleted")
+	}
+	return report, nil
+}
+
+const (
+	// reconcileBatch bounds the repository IDs one reconciliation examines.
+	reconcileBatch = 256
+	// aheadProbe is the number of IDs above the allocator's position whose
+	// prefixes a reconciliation checks.
+	aheadProbe = 16
+)
+
+// errFound stops a listing at its first object.
+var errFound = errors.New("found")
+
+// hasObjects reports whether the bucket has an object under the repository's
+// prefix. It reads one object at most (one page of a paged listing).
+func (c *Collector) hasObjects(ctx context.Context, repoID int64) (bool, error) {
+	err := c.core.Blobs.List(ctx, repoPrefix(repoID), func(corestore.BlobInfo) error { return errFound })
+	switch {
+	case errors.Is(err, errFound):
+		return true, nil
+	case err != nil:
+		return false, errBucket(err)
+	}
+	return false, nil
+}
+
+// Reconcile records a tombstone for every repository ID whose row was deleted
+// without one (before the trigger graft_repositories_tombstone existed) and
+// whose objects are still in the bucket; CollectRemoved then deletes them
+// like those of any removed repository (doc/graft/PLAN7.md, "Removed
+// repositories", reconciliation). It examines the IDs after its cursor, at
+// most reconcileBatch per run, and only those the allocator handed out at
+// least the write deadline W ago on the database clock: a creation still in
+// flight is never examined (on Postgres an allocated ID precedes its row). An
+// ID without a row or a tombstone gets one only when its prefix has objects;
+// the cursor then moves past the batch, so a run that stopped is resumed by
+// the next one and nothing is examined twice. IDs above the allocator that
+// have objects are counted and logged, never touched. A dry run records
+// nothing.
+func (c *Collector) Reconcile(ctx context.Context, dryRun bool) (Report, error) {
+	if err := c.validTimes(); err != nil {
+		return Report{}, err
+	}
+
+	view, err := c.core.Meta.ObserveAllocator(ctx, c.core.WriteDeadline(), dryRun)
+	if err != nil {
+		return Report{}, errDatabase(err)
+	}
+	report := Report{DryRun: dryRun}
+
+	for id := view.Position + 1; id <= view.Position+aheadProbe; id++ {
+		found, err := c.hasObjects(ctx, id)
+		if err != nil {
+			return report, err
+		}
+		if found {
+			report.AheadOfAllocator++
+			c.logger.WithFields(log.Fields{
+				"repository_id":      id,
+				"allocator_position": view.Position,
+			}).WarnContext(ctx, "storage core: the bucket has objects of a repository ID the database has not allocated; was the database restored from an older backup? They are left alone")
+		}
+	}
+
+	upTo := min(view.Bound, view.DoneThrough+reconcileBatch)
+	if upTo <= view.DoneThrough {
+		return report, nil
+	}
+	ids, err := c.core.Meta.UnrecordedIDs(ctx, view.DoneThrough, upTo)
+	if err != nil {
+		return report, errDatabase(err)
+	}
+	for _, id := range ids {
+		found, err := c.hasObjects(ctx, id)
+		if err != nil {
+			return report, err
+		}
+		if !found {
+			continue
+		}
+		report.LeaksFound++
+		if dryRun {
+			continue
+		}
+		recorded, err := c.core.Meta.RecordLeak(ctx, id)
+		if err != nil {
+			return report, errDatabase(err)
+		}
+		if recorded {
+			report.LeaksTombstoned++
+			c.logger.WithField("repository_id", id).InfoContext(ctx,
+				"storage core: the bucket has objects of a repository whose row was deleted without a tombstone; they are collected after gc_grace")
+		}
+	}
+	if dryRun {
+		return report, nil
+	}
+	if err := c.core.Meta.AdvanceReconcile(ctx, upTo); err != nil {
+		return report, errDatabase(err)
 	}
 	return report, nil
 }

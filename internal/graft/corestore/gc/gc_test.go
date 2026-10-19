@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -486,4 +487,203 @@ func TestCollectRemoved(t *testing.T) {
 
 		require.Equal(t, []string{kept}, e.objects(e.repo.ID), "other repositories are untouched")
 	})
+}
+
+// tombstones returns the tombstones of every storage, whatever their age.
+func (e *env) tombstones() map[int64]corestore.RemovedRepository {
+	e.t.Helper()
+	removed, err := e.core.Meta.ListRemovedRepositories(e.ctx, "", 0)
+	require.NoError(e.t, err)
+	out := map[int64]corestore.RemovedRepository{}
+	for _, r := range removed {
+		out[r.RepoID] = r
+	}
+	return out
+}
+
+// leak registers a repository, stores objects under its prefix and deletes
+// its row and its tombstone, as a row deleted by hand before the trigger
+// existed left them. It returns the repository ID.
+func (e *env) leak(name string, objects int) int64 {
+	e.t.Helper()
+	repo := e.register(name)
+	for range objects {
+		e.upload(repo.ID)
+	}
+	e.exec("DELETE FROM graft_repositories WHERE repo_id = ?", repo.ID)
+	e.exec("DELETE FROM graft_gc_removed WHERE repo_id = ?", repo.ID)
+	return repo.ID
+}
+
+// allocator returns the allocator view without recording an observation.
+func (e *env) allocator() corestore.AllocatorView {
+	e.t.Helper()
+	view, err := e.core.Meta.ObserveAllocator(e.ctx, e.core.WriteDeadline(), true)
+	require.NoError(e.t, err)
+	return view
+}
+
+// ageAllocator replaces the observations of the allocator by one of its
+// current position made d ago.
+func (e *env) ageAllocator(d time.Duration) {
+	e.t.Helper()
+	position := e.allocator().Position
+	e.exec("DELETE FROM graft_gc_allocator_marks")
+	e.exec("INSERT INTO graft_gc_allocator_marks (observed_at, position) VALUES (?, ?)", e.past(d), position)
+}
+
+func (e *env) reconcile(dryRun bool) gc.Report {
+	e.t.Helper()
+	report, err := e.gc.Reconcile(e.ctx, dryRun)
+	require.NoError(e.t, err)
+	return report
+}
+
+// TestDeletedRowGetsATombstone: a repository row deleted by hand (the repair
+// of STORAGE.md, "State and verify") gets its tombstone from the trigger, on
+// the database clock, and its objects are collected like those of a removed
+// repository (integrated review m4).
+func TestDeletedRowGetsATombstone(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, e *env) {
+		repo := e.register("by-hand")
+		e.upload(repo.ID)
+		e.exec("DELETE FROM graft_repositories WHERE repo_id = ?", repo.ID)
+
+		tombstone, ok := e.tombstones()[repo.ID]
+		require.True(t, ok, "the trigger records the tombstone")
+		require.Equal(t, repo.Key, tombstone.Key)
+		require.WithinDuration(t, time.Now(), tombstone.RemovedAt, time.Minute)
+
+		e.exec("UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", e.past(grace+time.Minute), repo.ID)
+		report, err := e.gc.CollectRemoved(e.ctx, "default", false)
+		require.NoError(t, err)
+		require.Equal(t, 1, report.RemovedRepos)
+		require.Empty(t, e.objects(repo.ID))
+	})
+}
+
+// TestReconcileTombstonesLeaks: the objects of a row deleted without a
+// tombstone get one, only for IDs allocated at least W ago, only when the
+// prefix has objects, once; the tombstone has no key and is collected by
+// every storage's collection after gc_grace (integrated review m4).
+func TestReconcileTombstonesLeaks(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, e *env) {
+		live := e.changeset()
+		leaked := e.leak("leaked", 2)
+		empty := e.leak("empty", 0)
+
+		require.Equal(t, gc.Report{}, e.reconcile(false), "no allocation is W old yet")
+		require.Len(t, e.objects(leaked), 2)
+
+		e.ageAllocator(grace)
+		require.Equal(t, gc.Report{LeaksFound: 1, DryRun: true}, e.reconcile(true))
+		require.NotContains(t, e.tombstones(), leaked, "a dry run records nothing")
+
+		require.Equal(t, gc.Report{LeaksFound: 1, LeaksTombstoned: 1}, e.reconcile(false))
+		tombstones := e.tombstones()
+		require.Contains(t, tombstones, leaked)
+		require.Equal(t, corestore.RepoKey{}, tombstones[leaked].Key, "the key went with the row")
+		require.NotContains(t, tombstones, empty, "an ID without objects needs nothing")
+		require.Equal(t, e.allocator().Position, e.allocator().DoneThrough, "the cursor is past the reconciled IDs")
+
+		require.Equal(t, gc.Report{}, e.reconcile(false), "a second run examines nothing again")
+
+		report, err := e.gc.CollectRemoved(e.ctx, "default", false)
+		require.NoError(t, err)
+		require.Zero(t, report.RemovedRepos, "the tombstone is younger than gc_grace")
+		e.exec("UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", e.past(grace+time.Minute), leaked)
+		report, err = e.gc.CollectRemoved(e.ctx, "default", false)
+		require.NoError(t, err)
+		require.Equal(t, 1, report.RemovedRepos, "a storage's collection takes the tombstones without a key")
+		require.Empty(t, e.objects(leaked))
+		require.Equal(t, []string{live}, e.objects(e.repo.ID), "the live repository is untouched")
+	})
+}
+
+// TestReconcileIsPagedAndResumable: a run examines at most one batch of IDs
+// after its cursor; the next run goes on from there, and IDs above the
+// allocator with objects are reported and never touched.
+func TestReconcileIsPagedAndResumable(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, e *env) {
+		const position = 2*gc.ReconcileBatch + 40
+		if e.store.Dialect() == sqlstore.Postgres {
+			e.exec(fmt.Sprintf("SELECT setval('graft_repositories_repo_id_seq', %d)", position))
+		} else {
+			e.exec("UPDATE sqlite_sequence SET seq = ? WHERE name = 'graft_repositories'", position)
+		}
+		first, second := int64(5), int64(gc.ReconcileBatch+10)
+		e.upload(first)
+		e.upload(second)
+		ahead := e.upload(position + 3)
+		e.ageAllocator(grace)
+
+		require.Equal(t, gc.Report{LeaksFound: 1, LeaksTombstoned: 1, AheadOfAllocator: 1}, e.reconcile(false))
+		require.Contains(t, e.tombstones(), first)
+		require.NotContains(t, e.tombstones(), second, "beyond the first batch")
+		require.EqualValues(t, gc.ReconcileBatch, e.allocator().DoneThrough)
+
+		// A run that stopped after recording a tombstone, before its cursor
+		// moved: the next one does not count it again.
+		_, err := e.core.Meta.RecordLeak(e.ctx, second)
+		require.NoError(t, err)
+		require.Equal(t, gc.Report{AheadOfAllocator: 1}, e.reconcile(false))
+		require.EqualValues(t, 2*gc.ReconcileBatch, e.allocator().DoneThrough)
+		require.Equal(t, gc.Report{AheadOfAllocator: 1}, e.reconcile(false))
+		require.EqualValues(t, position, e.allocator().DoneThrough)
+
+		require.NotContains(t, e.tombstones(), int64(position+3))
+		require.Equal(t, []string{ahead}, e.objects(position+3), "never touched")
+	})
+}
+
+// TestReconcileNeverCollectsACreationInFlight holds a creation between the
+// allocation of its ID and the commit of its row across reconciliations, on
+// Postgres, whose allocator counts the ID before the row commits. (SQLite's
+// allocator is transactional: an uncommitted creation's ID is not allocated
+// for any other reader, and the single writer lock serialises the creation
+// with the reconciliation's writes.) An object written under the ID before
+// the commit, which no writer of the storage core does, is the worst case.
+// The ID is not examined while its allocation is younger than W; examined
+// later it may get a tombstone, but once the row commits the tombstone is not
+// a removal: it is never collected, and a later deletion of the row starts a
+// fresh grace.
+func TestReconcileNeverCollectsACreationInFlight(t *testing.T) {
+	if !slices.Contains(coretest.Dialects(), sqlstore.Postgres) {
+		t.Skip("the allocator counts uncommitted creations on Postgres only, which is not configured")
+	}
+	e := newEnv(t, sqlstore.Postgres)
+
+	tx, err := e.store.DB().BeginTx(e.ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	var id int64
+	require.NoError(t, tx.QueryRowContext(e.ctx, `
+		INSERT INTO graft_repositories (storage, relative_path, object_format, head_seq, log_seq, next_review_id, created_at)
+		VALUES ('default', 'in-flight.git', 'sha1', 0, 0, 1, now()) RETURNING repo_id`).Scan(&id))
+	key := e.upload(id)
+
+	require.Equal(t, e.allocator().Position, id, "the allocator counts the creation")
+	require.Equal(t, gc.Report{}, e.reconcile(false), "an allocation younger than W is not examined")
+	require.NotContains(t, e.tombstones(), id)
+
+	// A creation that outlives W: its ID is examined and gets a tombstone.
+	e.ageAllocator(grace)
+	require.Equal(t, gc.Report{LeaksFound: 1, LeaksTombstoned: 1}, e.reconcile(false))
+	require.NoError(t, tx.Commit())
+
+	e.exec("UPDATE graft_gc_removed SET removed_at = ? WHERE repo_id = ?", e.past(grace+time.Minute), id)
+	report, err := e.gc.CollectRemoved(e.ctx, "default", false)
+	require.NoError(t, err)
+	require.Zero(t, report.RemovedRepos, "a tombstone whose ID has a row is not a removal")
+	require.Equal(t, []string{key}, e.objects(id))
+
+	// Its deletion is a removal, with a grace from the deletion.
+	e.exec("DELETE FROM graft_repositories WHERE repo_id = ?", id)
+	tombstone := e.tombstones()[id]
+	require.Equal(t, "in-flight.git", tombstone.Key.RelativePath)
+	require.WithinDuration(t, time.Now(), tombstone.RemovedAt, time.Minute)
+	report, err = e.gc.CollectRemoved(e.ctx, "default", false)
+	require.NoError(t, err)
+	require.Zero(t, report.RemovedRepos)
+	require.Equal(t, []string{key}, e.objects(id))
 }

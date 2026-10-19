@@ -67,8 +67,10 @@ type StorageCoreServiceClient interface {
 	// or while another maintenance of the repository holds its lease.
 	CollectGarbage(ctx context.Context, in *CollectGarbageRequest, opts ...grpc.CallOption) (*CollectGarbageResponse, error)
 	// CollectRemovedRepositories deletes every object of the repositories of a
-	// storage that were removed at least gc_grace ago. It fails with
-	// FailedPrecondition when the storage core is off.
+	// storage that were removed at least gc_grace ago. It first reconciles the
+	// bucket: a repository ID with objects and neither a row nor a tombstone
+	// gets a tombstone. It fails with FailedPrecondition when the storage core
+	// is off.
 	CollectRemovedRepositories(ctx context.Context, in *CollectRemovedRepositoriesRequest, opts ...grpc.CallOption) (*CollectRemovedRepositoriesResponse, error)
 }
 
@@ -180,8 +182,10 @@ type StorageCoreServiceServer interface {
 	// or while another maintenance of the repository holds its lease.
 	CollectGarbage(context.Context, *CollectGarbageRequest) (*CollectGarbageResponse, error)
 	// CollectRemovedRepositories deletes every object of the repositories of a
-	// storage that were removed at least gc_grace ago. It fails with
-	// FailedPrecondition when the storage core is off.
+	// storage that were removed at least gc_grace ago. It first reconciles the
+	// bucket: a repository ID with objects and neither a row nor a tombstone
+	// gets a tombstone. It fails with FailedPrecondition when the storage core
+	// is off.
 	CollectRemovedRepositories(context.Context, *CollectRemovedRepositoriesRequest) (*CollectRemovedRepositoriesResponse, error)
 	mustEmbedUnimplementedStorageCoreServiceServer()
 }
