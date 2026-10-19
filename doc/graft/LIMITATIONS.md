@@ -182,6 +182,8 @@ Git hooks use private.
   concurrent writer is only detected when the snapshot is published. The land
   then fails after one attempt with `reference_update`, and the client has to
   land again. The changeset log only lists the lands that were published.
+  Landing again is safe: when the concurrent writer landed the same change, the
+  new land answers `already_landed`. The SDK does not retry `reference_update`.
 - A change that landed is not landed again from the same `commit_id` on the
   same branch while the commit it landed as is on the branch, also when a
   later commit reverted it: the land answers `already_landed` and names the
@@ -192,10 +194,16 @@ Git hooks use private.
 - The land identity is recorded in the changeset log. With
   `[graft.changelog] disabled = true` nothing is recorded, and a retried
   rebase land replays the change: a change reverted in between lands again.
+- In the file changelog, every land update writes and fsyncs its intents
+  (`graft/changelog.intents`) in the prepared phase, under the references'
+  locks, and a land whose intents cannot be written fails. The intent of an
+  update that git never committed and whose change never landed again stays in
+  the file, one line of about 190 bytes per such update.
 - In the file changelog, the land identity index (`graft/changelog.lands`)
-  holds every land of the repository and is kept in memory for the 64 most
-  recently used repositories of a process; a repository beyond them reads its
-  index file again on its next land that diverges.
+  holds every land of the repository. The idle indexes of a process are kept
+  in memory within 64 repositories and 256 MiB, least recently used dropped
+  first; a dropped index is read from its file again on the next land of its
+  repository that diverges.
 - Hooks run on every attempt, so a slow custom hook adds latency under
   contention.
 - `graft land --strategy merge` and `ff_only` are available in the CLI. The

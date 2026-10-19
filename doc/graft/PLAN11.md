@@ -47,12 +47,15 @@ can drop members of a large batch.
 * A new field of the changelog metadata, `Lands []Land{Original, Landed}` with the
   branch they landed on (`LandReference`), separate from `Members`, carries the
   identity pairs; only the entry of that branch's update carries them. It is never
-  cut. `changelog.WithLands` validates them (a branch, full object IDs, at most 100
-  pairs, at most 40 KiB encoded) and a land whose identities do not pass fails
-  before its update rather than landing without its identity. A SHA-256 pair
-  encodes in 156 bytes and `max_size` is now at most 100, so 100 pairs and a
-  4096-byte branch name, escaped by JSON at worst into 6 bytes per byte, fit: the
-  check makes the bound an invariant.
+  cut. The branch name travels in the hooks payload as bytes (base64 in JSON), as
+  `Entry` and `Member` keep their names: a JSON string would replace the bytes of a
+  name that is not valid UTF-8 (review M2). `changelog.WithLands` validates the
+  identities (a branch, full object IDs, at most 100 pairs, at most 24 KiB encoded)
+  and a land whose identities do not pass fails before its update rather than landing
+  without its identity. A SHA-256 pair encodes in 156 bytes and `max_size` is now at
+  most 100, so a full batch and a branch name of 4096 bytes (5464 in base64) fit. A
+  request on a branch whose name is too long for a full batch (above about 6700
+  bytes) is refused with `InvalidArgument` when it arrives, alone, before any batch.
 * Every land path sets it: the batch update, `UpdateSolo` and `landWithRetries`
   (through `updateLandedReference`, which knows `commit_id` and the new tip).
 * The MVCC path records after its commit (`AfterCommit`), with the same metadata.
@@ -85,7 +88,10 @@ authoritative mode keeps the identities of its file changelog.
 
 Migration `20261020000000_graft_land_identities`, in both dialects, with the rule of
 milestone 3: a node whose database has a migration it does not know refuses to start
-(`unknown migrations`), so an older binary never writes changesets without the rows.
+(`unknown migrations`), so an older binary never writes changesets without the rows
+once it restarts. An older binary that is still running when the new one migrates the
+database keeps writing changesets without rows until it stops; the upgrade rule of the
+storage core (stop every node, upgrade, start) covers it.
 A repository removed by `RemoveRepository` loses its rows by `ON DELETE CASCADE`.
 
 ### 4.2 The file changelog (storage core off or shadow)
@@ -113,9 +119,49 @@ write and fsync. A secondary index file next to the log,
   another entry, or one past the end of the log (the repository was created again at
   the same path), is rebuilt from the whole log. The file is written without fsync,
   since whatever a crash leaves of it is either a good prefix or cut off.
-* The lookup keeps the index in memory, for the 64 most recently used repositories of
-  the process, and reads the file again when another process changed it. A lookup
-  whose index is already at the log's last durable sequence reads nothing.
+* The lookup keeps the index in memory and reads the file again when another process
+  changed it. The index remembers the log file it was read from (device and inode): a
+  log that is another file (the repository was created again) rebuilds it, and a
+  lookup whose log ends with the entry of the mark, in the same file, reads nothing.
+  The idle indexes are kept within 64 and 256 MiB together, least recently used
+  dropped first; an index larger than the budget is dropped when its lookup ends.
+* An index file whose records are mostly superseded by later ones (the same commit
+  landed again after a reset) is compacted from 1 MiB: rewritten as one block and
+  renamed over the old file.
+
+#### Intents: the window between git's commit and the changelog (review M1)
+
+The entry of an update is written in the committed phase of the reference transaction,
+after git committed the references. A crash, a full disk or a lock that times out in
+between would leave a landed branch without its identity, and a retry would replay the
+change (and land it again if it was reverted). The hook therefore records the identities
+of a land as intents in the prepared phase, before git may commit:
+
+* `graft/changelog.intents`, JSON lines
+  `{"ref":"<base64>","original":"...","landed":"...","head":N}`, appended under its
+  lock file and fsync'd (with the directory entries, once per process) before the
+  prepared phase returns. `head` is the last durable log sequence at that time. A
+  failure to record them aborts the transaction: the land fails instead of landing
+  without its identity. A torn line, left by a writer that crashed before its fsync and
+  whose update was therefore never committed, is cut off by the next writer.
+* The lookup reads the intents too: it gives the land the changelog recorded first,
+  then the intents the changelog does not confirm (an intent with the recorded landed
+  commit) or supersede (a recorded land of the same commit at a later sequence than
+  its `head`). The land path counts an intent like a record, only when its landed
+  commit is reachable from the tip: the intent of an update that git never committed
+  (aborted after the prepared phase, an MVCC snapshot that lost its commit) answers
+  nothing. An answer from an intent has no changelog sequence; its detail says
+  "landed as <oid>, which the changelog does not record".
+* The intents file is compacted, under its lock file, once it reaches 64 KiB and again
+  each time it doubled: the confirmed and superseded intents are dropped, the rest is
+  written to a new file, fsync'd and renamed over the old one, with the directory
+  fsync'd. The intents of updates that were never committed and whose change never
+  landed again stay; there is one line, about 190 bytes, per such update.
+* The cost is one write and one fsync per land update in the prepared phase, under the
+  references' locks; the bench measures it.
+
+In the authoritative mode the database row and the reference change are one transaction,
+so there is no such window and no intents.
 
 ## 5. The land path
 
@@ -197,6 +243,29 @@ after this plan.
 * The payload bound: a batch of `max_size` members with the longest branch name fits.
 * The SDK: rebase lands retried by default again; an end-to-end retry after a forced
   lost response.
+* Review M1/M2 and minors: a land whose changelog entry is lost answers from its intent;
+  the intent of an uncommitted update answers nothing; a branch whose name is not valid
+  UTF-8 keeps its identity through the hooks; two concurrent calls of the same land
+  land it once (unbatched and batched); a branch name too long for the identity is
+  refused when the request arrives; intents and index compaction; a replaced log file;
+  least recently used eviction.
+
+### 7.1 Two calls of the same land at once
+
+A retry can reach the server while the first call still runs. Unbatched, the call that
+loses the compare-and-swap retries, and its next attempt finds the other call's land (its
+intent is recorded before git commits): it answers `AlreadyLanded`. Batched, a request
+whose commit an earlier member of the same batch landed answers `AlreadyLanded` with that
+member's commit when the batch's update holds; when it does not, the request comes after
+a member and is landed again from the real tip, as every such request is.
+
+On repositories with the MVCC reference backend, a land detects a concurrent writer only
+when its snapshot is committed, after its handler returned, and it then fails after one
+attempt with `FailedPrecondition` and a `reference_update` detail: nothing of that call
+landed. The SDK does not retry it (it retries `Unavailable` only). Landing again is safe:
+if the concurrent writer was the same change, the new call answers `AlreadyLanded` from
+its intent or its record. Mapping this conflict to a retry in the SDK is left to a
+separate decision, since it widens the codes the SDK retries.
 
 ## 8. Ownership needed
 
