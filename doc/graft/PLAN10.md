@@ -898,7 +898,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
    [AI landing when every deterministic check passes: designed by Federico's amendment (14),
-    NOT ENABLED: the measurement in 15.5 shows no deterministic check that reaches the bar]
+    NOT ENABLED: the measurement in 15.6 shows no deterministic check that reaches the bar]
 ```
 
 ### 15.3 Composition report (planned; a report, not a gate)

@@ -587,3 +587,40 @@ func TestConcurrentResolve(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// proposingStrategy answers like fakeStrategy, as a model does: its answers are proposals.
+type proposingStrategy struct{ fakeStrategy }
+
+func (*proposingStrategy) proposes() {}
+
+// The llm strategy's answers are proposals (PLAN10 14).
+var _ proposer = (*llmStrategy)(nil)
+
+// TestProposalsAreMarkedAndNotRecorded: a model's answer is marked as a proposal, which the server
+// never lands, and no Recorder learns it, so that it can never come back as a rule's answer; a
+// rule's answer is not marked, and is recorded.
+func TestProposalsAreMarkedAndNotRecorded(t *testing.T) {
+	model := &proposingStrategy{fakeStrategy{fn: answer(protocol.ModeFile, "proposed\n")}}
+	rec := &recordingStrategy{fakeStrategy: fakeStrategy{fn: decline}}
+	r := newTestResolver(t, nil, Binding{Name: "rec", Strategy: rec}, Binding{Name: "llm", Strategy: model})
+	resp, err := r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Files) != 1 || !resp.Files[0].Proposal {
+		t.Fatalf("files %+v, want one proposal", resp.Files)
+	}
+	if len(rec.recorded) != 0 {
+		t.Fatalf("a proposal was recorded: %+v", rec.recorded)
+	}
+
+	rule := &recordingStrategy{fakeStrategy: fakeStrategy{fn: answer(protocol.ModeFile, "ruled\n")}}
+	r = newTestResolver(t, nil, Binding{Name: "rule", Strategy: rule})
+	resp, err = r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Files[0].Proposal || len(rule.recorded) != 1 {
+		t.Fatalf("rule answer: proposal %v, recorded %d", resp.Files[0].Proposal, len(rule.recorded))
+	}
+}

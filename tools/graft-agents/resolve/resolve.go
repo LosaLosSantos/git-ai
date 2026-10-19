@@ -450,12 +450,19 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
 			continue
 		}
-		r.record(ctx, f, res)
+		// A model resolution is a proposal: the server never lands it (PLAN10 14). It is not
+		// recorded either: a strategy that learns accepted answers (Recorder) would otherwise
+		// replay a model's resolution later as a rule's.
+		_, proposal := b.Strategy.(proposer)
+		if !proposal {
+			r.record(ctx, f, res)
+		}
 		return protocol.ResolvedFile{
-			Path:    f.Path,
-			Action:  res.Action,
-			Mode:    modeOf(res),
-			Content: contentOf(res),
+			Path:     f.Path,
+			Action:   res.Action,
+			Mode:     modeOf(res),
+			Content:  contentOf(res),
+			Proposal: proposal,
 		}, b.Name, nil, nil
 	}
 	return protocol.ResolvedFile{}, "", attempts, nil
