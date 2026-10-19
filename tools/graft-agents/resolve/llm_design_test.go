@@ -338,6 +338,24 @@ func TestLLMDesignRepairOnTheCompositionAndTheReport(t *testing.T) {
 	if err != nil || len(none.reqs) != 1 || res.Repairs != 0 || !strings.Contains(strings.Join(res.Report, "\n"), drop) {
 		t.Fatalf("err %v, calls %d, report %q", err, len(none.reqs), res.Report)
 	}
+
+	// An accepted answer is left alone when the repair is limited to broken answers: the finding is
+	// reported, nothing is asked again; a broken answer is still repaired.
+	only := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return llmFakeAnswer("O5\nline 6\n"), nil }}
+	res, err = ResolveLLM(context.Background(), only, f, LLMOptions{NoCompositionRepair: true})
+	if err != nil || len(only.reqs) != 1 || res.Repairs != 0 || !strings.Contains(strings.Join(res.Report, "\n"), drop) || !strings.Contains(string(res.Content), "O5\nline 6\n") {
+		t.Fatalf("err %v, calls %d, repairs %d, report %q", err, len(only.reqs), res.Repairs, res.Report)
+	}
+	brokenFirst := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
+		if i == 0 {
+			return llmFakeAnswer("<<<<<<< markers are not an answer\n"), nil
+		}
+		return llmFakeAnswer("O5\nT6\n"), nil
+	}}
+	res, err = ResolveLLM(context.Background(), brokenFirst, f, LLMOptions{NoCompositionRepair: true})
+	if err != nil || len(brokenFirst.reqs) != 2 || res.Repairs != 1 || !strings.Contains(string(res.Content), "O5\nT6\n") {
+		t.Fatalf("a broken answer was not repaired: err %v, calls %d", err, len(brokenFirst.reqs))
+	}
 }
 
 // TestLLMComposition: the check on regions, per case of its definition (llm_compose.go).
@@ -453,10 +471,11 @@ func TestLLMDesignAtTheResolver(t *testing.T) {
 
 	// The options of the design step come from the strategy table, on unless switched off.
 	for key, check := range map[string]func(LLMOptions) bool{
-		"symmetric_context": func(o LLMOptions) bool { return o.NoSymmetricContext },
-		"abstain":           func(o LLMOptions) bool { return o.NoAbstain },
-		"repair":            func(o LLMOptions) bool { return o.NoRepair },
-		"git_regions":       func(o LLMOptions) bool { return o.NoGitRegions },
+		"symmetric_context":  func(o LLMOptions) bool { return o.NoSymmetricContext },
+		"abstain":            func(o LLMOptions) bool { return o.NoAbstain },
+		"repair":             func(o LLMOptions) bool { return o.NoRepair },
+		"repair_composition": func(o LLMOptions) bool { return o.NoCompositionRepair },
+		"git_regions":        func(o LLMOptions) bool { return o.NoGitRegions },
 	} {
 		cfg := strings.Replace(wp19LLMConfig, `paths = ["*.txt", "**/*.txt"]`, "paths = [\"*.txt\"]\n"+key+" = false", 1)
 		s := wp19BuildStrategy(t, cfg)

@@ -27,6 +27,7 @@ import (
 //	symmetric_context = true       # optional: OURS' change and intent beside THEIRS' (PLAN10 15.10)
 //	abstain = true                 # optional: the model may answer that the two changes cannot both hold
 //	repair = true                  # optional: one repair round, driven by deterministic findings
+//	repair_composition = true      # optional: false = repair only a broken answer, never an accepted one
 //	git_regions = true             # optional: the regions are git's own merge (git merge-file), not our diff
 //	max_context_bytes = 4096       # optional: cap on the symmetric context of a region
 //	call_timeout = "120s"          # optional: bound on one model call (one region)
@@ -85,7 +86,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	if _, ok := spec.Options["min_confidence"]; ok {
 		return nil, fmt.Errorf("strategy %q: min_confidence is gone: the model reports no confidence and an answer is accepted on the checks alone; remove the option", spec.Name)
 	}
-	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions", "call_timeout", "symmetric_context", "abstain", "repair", "git_regions", "max_context_bytes"); err != nil {
+	if err := allowOnly(spec, "llm", "max_prompt_bytes", "context_lines", "max_answer_bytes", "max_regions", "call_timeout", "symmetric_context", "abstain", "repair", "repair_composition", "git_regions", "max_context_bytes"); err != nil {
 		return nil, err
 	}
 
@@ -107,7 +108,7 @@ func newLLMStrategy(spec StrategySpec) (Strategy, error) {
 	for _, o := range []struct {
 		key string
 		off *bool
-	}{{"symmetric_context", &opt.NoSymmetricContext}, {"abstain", &opt.NoAbstain}, {"repair", &opt.NoRepair}, {"git_regions", &opt.NoGitRegions}} {
+	}{{"symmetric_context", &opt.NoSymmetricContext}, {"abstain", &opt.NoAbstain}, {"repair", &opt.NoRepair}, {"repair_composition", &opt.NoCompositionRepair}, {"git_regions", &opt.NoGitRegions}} {
 		if v, ok := spec.Options[o.key]; ok {
 			on, isBool := v.(bool)
 			if !isBool {

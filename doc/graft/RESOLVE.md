@@ -852,6 +852,11 @@ own on the `[[strategy]]` table, on by default (PLAN10 15.10):
   (the composition check), the first syntax error of the file mapped to its
   region. A region is asked again once at most; the repaired answer is kept if
   it passes the rules and has fewer findings.
+- `repair_composition`: with `false` the repair round is spent only on an answer
+  that is broken (a rule it breaks, a syntax error of the assembled file) and
+  never on an accepted one whose composition check found a drop or a duplicate;
+  the finding is only reported. No effect when `repair` is `false`. It exists to
+  be measured (PLAN10 15.10) and is removed or becomes the rule once it is.
 
 A proposal also carries the composition report of its answer (what it keeps,
 drops and repeats of the two sides' changes, in exact words), as the start of

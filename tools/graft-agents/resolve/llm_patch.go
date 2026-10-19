@@ -715,7 +715,7 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		}
 		r.answer = region
 		comps[k] = llmCompose(r, r.start, region)
-		if !opt.NoRepair && !repaired[k] && len(comps[k].problems) > 0 {
+		if !opt.NoRepair && !opt.NoCompositionRepair && !repaired[k] && len(comps[k].problems) > 0 {
 			// The composition found a drop or a duplicate: one repair round, with the findings. The
 			// repaired answer replaces the first only if it is valid and has fewer findings.
 			_, _, region2, reason2, err2 := repair(k, material[k].head+region+material[k].tail, comps[k].problems)

@@ -81,6 +81,11 @@ type LLMOptions struct {
 	NoAbstain bool
 	// NoRepair makes no second call: an answer that the deterministic checks reject is rejected.
 	NoRepair bool
+	// NoCompositionRepair leaves an answer that the rules and the syntax accept alone: the repair
+	// round is then spent only on an answer that is broken (a rule it breaks, a syntax error of the
+	// assembled file), never on a drop or a duplicate that the composition check found in an
+	// accepted one. Without effect when NoRepair is set.
+	NoCompositionRepair bool
 	// MaxContextBytes caps the symmetric context of a region. Zero means the default.
 	MaxContextBytes int
 	// NoGitRegions takes the regions from our own line diff and not from git's merge (llmFileRegions).
