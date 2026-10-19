@@ -97,3 +97,19 @@ func TestOtherStrategiesAreNotSyntaxChecked(t *testing.T) {
 		t.Fatalf("union answer rejected: %v", err)
 	}
 }
+
+// TestLLMAnswerForFileTheGrammarCannotReadIsNotSyntaxChecked: when a side does not parse (Flow in
+// a .js file), the grammar cannot judge the file, so the answer is not rejected for its syntax.
+func TestLLMAnswerForFileTheGrammarCannotReadIsNotSyntaxChecked(t *testing.T) {
+	flow := func(v string) *protocol.Side {
+		return wp19Side(protocol.ModeFile, "// @flow\nimport type {N} from './n';\nconst x: ?string = "+v+";\n")
+	}
+	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
+		return wp19Answer("// @flow\nimport type {N} from './n';\nconst x: ?string = '2';\n"), nil
+	})
+	r := wp19Build(t, wp3Config)
+	f := protocol.FileConflict{Path: "a.js", Kind: protocol.KindContent, Base: flow("'0'"), Ours: flow("'1'"), Theirs: flow("'3'")}
+	if _, err := r.Resolve(context.Background(), wp19Request(f)); err != nil {
+		t.Fatalf("answer for a Flow file rejected: %v", err)
+	}
+}

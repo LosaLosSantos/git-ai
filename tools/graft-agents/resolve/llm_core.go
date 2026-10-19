@@ -372,10 +372,10 @@ func llmCheckAnswer(a llmAnswer, opt LLMOptions) error {
 }
 
 // llmHasConflictMarkers reports whether a line starts with a Git conflict
-// marker. It shares hasConflictMarkers, which follows the server-side answer
+// marker. It shares HasConflictMarkers, which follows the server-side answer
 // validation, so an answer the server would accept is never rejected here.
 func llmHasConflictMarkers(s string) bool {
-	return hasConflictMarkers([]byte(s))
+	return HasConflictMarkers([]byte(s))
 }
 
 func llmIsBinary(bs ...[]byte) bool {

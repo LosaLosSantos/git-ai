@@ -23,6 +23,22 @@ func normalize(content []byte) []byte {
 
 // judge reports whether a result equals the human resolution after normalization, and whether it
 // is byte-identical. A nil content is a deletion.
+// blankLinesOnly reports whether two contents differ only in blank lines once normalized:
+// a wrong result that is the human resolution with blank lines added or removed. It is reported
+// beside the wrong count, which it stays part of; indentation and every other character count.
+func blankLinesOnly(result, human []byte) bool {
+	strip := func(b []byte) string {
+		var out []string
+		for _, line := range strings.Split(string(normalize(b)), "\n") {
+			if line != "" {
+				out = append(out, line)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	return strip(result) == strip(human)
+}
+
 func judge(result, human []byte, resultDeleted, humanDeleted bool) (correct, exact bool) {
 	if resultDeleted || humanDeleted {
 		return resultDeleted == humanDeleted, resultDeleted == humanDeleted

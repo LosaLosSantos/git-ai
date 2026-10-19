@@ -19,8 +19,11 @@ type Counts struct {
 	Model     int `json:"model_error"`
 	NotRun    int `json:"not_run_cap"`
 	Abstained int `json:"abstained"`
-	// HumanSyntax counts the cases whose human resolution fails the syntax check.
-	HumanSyntax int `json:"human_fails_syntax"`
+	// BlankLinesOnly counts the wrong results that differ from the human resolution in blank
+	// lines only (part of Wrong); SyntaxUnchecked the accepted results the syntax check gave no
+	// verdict on, because a side does not parse.
+	BlankLinesOnly  int `json:"wrong_blank_lines_only"`
+	SyntaxUnchecked int `json:"syntax_unchecked"`
 }
 
 // Accepted is the number of results that would land: correct and wrong.
@@ -37,8 +40,11 @@ func (c Counts) ErrorRate() float64 {
 
 func (c *Counts) add(r Result) {
 	c.Cases++
-	if r.HumanSyntaxError != "" {
-		c.HumanSyntax++
+	if r.BlankLinesOnly {
+		c.BlankLinesOnly++
+	}
+	if r.SyntaxUnchecked {
+		c.SyntaxUnchecked++
 	}
 	switch r.Outcome {
 	case OutcomeCorrect:
@@ -168,12 +174,17 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	}
 	fmt.Fprintf(&b, "\nRows marked low n have fewer than %d cases; their rates are not significant. The llm strategy declines a modify-delete or mode conflict (a side is absent), which goes to the agent as abstained: the content row is what the model attempted.\n", LowN)
 	b.WriteString("\nThe error rate is wrong / (correct + wrong): the share of the results that would land and differ from the human resolution. Correct means equal after normalizing line endings and trailing whitespace; exact means byte-identical.\n")
-	syntaxParts := make([]string, 0, len(families))
-	for _, f := range families {
-		syntaxParts = append(syntaxParts, fmt.Sprintf("%s %d", f, rep.Families[f].HumanSyntax))
+	perFamily := func(value func(Counts) int) string {
+		parts := make([]string, 0, len(families))
+		for _, f := range families {
+			parts = append(parts, fmt.Sprintf("%s %d", f, value(rep.Families[f])))
+		}
+		return strings.Join(parts, ", ")
 	}
-	fmt.Fprintf(&b, "\nHuman resolutions that fail the syntax check themselves, where the check would reject the right answer: %d (%s).\n",
-		rep.Total.HumanSyntax, strings.Join(syntaxParts, ", "))
+	fmt.Fprintf(&b, "\nWrong results that differ from the human resolution in blank lines only (counted as wrong): %d (%s).\n",
+		rep.Total.BlankLinesOnly, perFamily(func(c Counts) int { return c.BlankLinesOnly }))
+	fmt.Fprintf(&b, "\nAccepted results the syntax check gave no verdict on, because a side does not parse with the grammar (a dialect such as Flow, or code the grammar does not cover): %d (%s).\n",
+		rep.Total.SyntaxUnchecked, perFamily(func(c Counts) int { return c.SyntaxUnchecked }))
 	if len(rep.NotSent) > 0 {
 		reasons := make([]string, 0, len(rep.NotSent))
 		for r := range rep.NotSent {

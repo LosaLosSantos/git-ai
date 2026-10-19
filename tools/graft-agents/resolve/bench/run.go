@@ -47,16 +47,18 @@ type Result struct {
 	Path     string `json:"path"`
 	Outcome  string `json:"outcome"`
 	Exact    bool   `json:"exact,omitempty"`
-	Strategy string `json:"strategy,omitempty"`
+	// BlankLinesOnly marks a wrong result that differs from the human resolution in blank lines
+	// only; it is still wrong, and the report counts it apart.
+	BlankLinesOnly bool `json:"blank_lines_only,omitempty"`
+	// SyntaxUnchecked marks an accepted resolution the syntax check gave no verdict on: a side
+	// does not parse, so the grammar cannot judge the file (syntax.CheckMerge).
+	SyntaxUnchecked bool   `json:"syntax_unchecked,omitempty"`
+	Strategy        string `json:"strategy,omitempty"`
 	// Answer is the action of an accepted resolution ("write" or "delete"); with
 	// Runner.AnswersDir its content is stored for audit and Rejudge.
 	Answer  string  `json:"answer,omitempty"`
 	Reason  string  `json:"reason,omitempty"`
 	Seconds float64 `json:"seconds"`
-	// HumanSyntaxError is set when the human resolution of a case that was sent fails the
-	// syntax check itself: the check would reject the right answer there (a grammar gap, or a
-	// human merge that did not parse).
-	HumanSyntaxError string `json:"human_syntax_error,omitempty"`
 }
 
 // Sample returns n cases of cases, stratified by family: each family's cases are shuffled with the
@@ -179,15 +181,6 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		return res, nil
 	}
 
-	if human != nil {
-		if err := syntax.Check(ctx, c.Path, human); err != nil {
-			if ctx.Err() != nil {
-				return res, ctx.Err()
-			}
-			res.HumanSyntaxError = err.Error()
-		}
-	}
-
 	oursMessage, err := g.message(ctx, c.Ours)
 	if err != nil {
 		return res, err
@@ -232,8 +225,28 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 			return res, err
 		}
 	}
+	if f.Action == protocol.ActionWrite {
+		if _, ok := syntax.LanguageOf(c.Path); ok {
+			checked, err := syntax.CheckMerge(ctx, c.Path, f.Content, sideBytes(sides["ours"]), sideBytes(sides["theirs"]))
+			if err != nil && ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			res.SyntaxUnchecked = !checked
+		}
+	}
 	judgeResult(&res, f.Content, f.Action == protocol.ActionDelete, human, c.HumanBlob == nil)
 	return res, nil
+}
+
+// sideBytes returns the content of a present side, nil for an absent one.
+func sideBytes(s *protocol.Side) []byte {
+	if s == nil {
+		return nil
+	}
+	if s.Content == nil {
+		return []byte{}
+	}
+	return s.Content
 }
 
 func answerPath(dir, id string) string { return filepath.Join(dir, id+".answer") }
@@ -242,10 +255,12 @@ func answerPath(dir, id string) string { return filepath.Join(dir, id+".answer")
 func judgeResult(res *Result, content []byte, deleted bool, human []byte, humanDeleted bool) {
 	correct, exact := judge(content, human, deleted, humanDeleted)
 	res.Exact = exact
+	res.BlankLinesOnly = false
 	if correct {
 		res.Outcome = OutcomeCorrect
 	} else {
 		res.Outcome = OutcomeWrong
+		res.BlankLinesOnly = !deleted && !humanDeleted && blankLinesOnly(content, human)
 	}
 }
 

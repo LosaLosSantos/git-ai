@@ -66,7 +66,8 @@ type Strategy interface {
 }
 
 // syntaxChecked is implemented by the strategies whose answers always get the syntax check
-// (package syntax): the llm strategy. The check runs before the configured checks.
+// (syntax.CheckMerge): the llm strategy. The check runs before the configured checks, and
+// rejects an answer that does not parse when both sides it merges parse.
 type syntaxChecked interface {
 	syntaxChecked()
 }
@@ -387,7 +388,7 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			continue
 		}
 		if _, ok := b.Strategy.(syntaxChecked); ok && res.Action == protocol.ActionWrite && res.Mode != protocol.ModeSymlink {
-			if err := syntax.Check(ctx, f.Path, res.Content); err != nil {
+			if _, err := syntax.CheckMerge(ctx, f.Path, res.Content, sideContent(f.Ours), sideContent(f.Theirs)); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return protocol.ResolvedFile{}, "", nil, ctxErr
 				}
@@ -510,18 +511,19 @@ func checkResolution(res Resolution, maxBytes int64) error {
 	if int64(len(res.Content)) > maxBytes {
 		return fmt.Errorf("content of %d bytes exceeds the %d byte limit", len(res.Content), maxBytes)
 	}
-	if !isBinary(res.Content) && hasConflictMarkers(res.Content) {
+	if !isBinary(res.Content) && HasConflictMarkers(res.Content) {
 		return errors.New("content contains conflict markers")
 	}
 	return nil
 }
 
-// hasConflictMarkers mirrors the server's acceptance rule
+// HasConflictMarkers reports whether content has a conflict marker line. It mirrors the
+// server's acceptance rule
 // (internal/graft/resolver/validate.go): a line is a conflict marker if it
 // starts with "<<<<<<< " or ">>>>>>> ", or if it is "=======" followed by
 // whitespace only. A trailing carriage return is ignored. A longer run of '='
 // such as a Markdown setext or RST title underline is not a marker.
-func hasConflictMarkers(content []byte) bool {
+func HasConflictMarkers(content []byte) bool {
 	for _, line := range bytes.Split(content, []byte("\n")) {
 		line = bytes.TrimSuffix(line, []byte{'\r'})
 		switch {

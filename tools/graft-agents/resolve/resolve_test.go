@@ -501,7 +501,7 @@ func TestHasConflictMarkers(t *testing.T) {
 		"<<<<<<< HEAD\n", "x\n=======\ny", ">>>>>>> branch\n",
 		"=======\r\n", "x\n=======  \t\ny\n", "<<<<<<< HEAD\r\n", "=======",
 	} {
-		if !hasConflictMarkers([]byte(s)) {
+		if !HasConflictMarkers([]byte(s)) {
 			t.Errorf("markers not found in %q", s)
 		}
 	}
@@ -509,7 +509,7 @@ func TestHasConflictMarkers(t *testing.T) {
 		"<<<<<<<HEAD\n", "a=======b\n", " ======= indented\n", "x >>>>>>> y\n", "",
 		"=======zz\n", "Changelog\n=========\n", "Title\n==========\r\nbody\n", "======== x\n",
 	} {
-		if hasConflictMarkers([]byte(s)) {
+		if HasConflictMarkers([]byte(s)) {
 			t.Errorf("false positive in %q", s)
 		}
 	}

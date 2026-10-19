@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // DefaultMaxMerges bounds the merges replayed per repository when the corpus sets no bound.
@@ -32,7 +33,10 @@ type MineStats struct {
 	// OneSide counts conflicting files whose human resolution is one of the two sides, which
 	// measures nothing about merging.
 	OneSide int `json:"one_side"`
-	Kept    int `json:"kept"`
+	// InvalidReference counts conflicting files whose human resolution is not a valid reference
+	// (invalidReference: committed conflict markers, or broken syntax where both sides parse).
+	InvalidReference int `json:"invalid_reference"`
+	Kept             int `json:"kept"`
 }
 
 // caseID returns the stable ID of a case.
@@ -44,6 +48,10 @@ func caseID(repo, merge, p string) string {
 // Mine replays the merges of repo, cloned at dir, and returns the cases: the conflicting files of
 // a benchmark family whose human resolution differs from both sides.
 func Mine(ctx context.Context, repo Repo, dir string, opts MineOptions) ([]Case, MineStats, error) {
+	// The validity of a human resolution needs the syntax check (invalidReference).
+	if !syntax.Available {
+		return nil, MineStats{}, syntax.ErrUnavailable
+	}
 	g := gitRepo{dir: dir}
 	maxMerges := repo.MaxMerges
 	if maxMerges <= 0 {
@@ -123,6 +131,14 @@ func Mine(ctx context.Context, repo Repo, dir string, opts MineOptions) ([]Case,
 				continue
 			}
 			c.Kind = kindOf(c)
+			reason, err := invalidReference(ctx, g, c)
+			if err != nil {
+				return nil, stats, fmt.Errorf("merge %s, %s: %w", merge, p, err)
+			}
+			if reason != "" {
+				stats.InvalidReference++
+				continue
+			}
 
 			stats.Kept++
 			cases = append(cases, c)

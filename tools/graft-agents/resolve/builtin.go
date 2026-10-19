@@ -87,6 +87,18 @@ func regularFile(s *protocol.Side) bool {
 	return s != nil && (s.Mode == protocol.ModeFile || s.Mode == protocol.ModeExecutable)
 }
 
+// sideContent returns the content of a regular side, and nil for an absent side or one that is
+// not a regular file (the syntax check skips those).
+func sideContent(s *protocol.Side) []byte {
+	if !regularFile(s) {
+		return nil
+	}
+	if s.Content == nil {
+		return []byte{}
+	}
+	return s.Content
+}
+
 // regularText reports whether a side is a regular file whose content is text
 // (no NUL byte, the same heuristic as git).
 func regularText(s *protocol.Side) bool {

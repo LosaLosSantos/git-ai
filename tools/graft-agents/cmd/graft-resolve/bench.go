@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -42,8 +43,12 @@ func runBench(args []string, stdout, stderr io.Writer) int {
 		return benchRun(ctx, args[1:], stdout, stderr)
 	case "rejudge":
 		return benchRejudge(ctx, args[1:], stdout, stderr)
+	case "syntax":
+		return benchSyntax(ctx, args[1:], stdout, stderr)
+	case "filter":
+		return benchFilter(ctx, args[1:], stdout, stderr)
 	}
-	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine, run or rejudge\n", args[0])
+	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine, run, rejudge, syntax or filter\n", args[0])
 	return 2
 }
 
@@ -62,6 +67,10 @@ func benchMine(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return 2
 	}
 
+	if !syntax.Available {
+		fmt.Fprintln(stderr, "graft-resolve bench mine: this graft-resolve was built without cgo, and mining checks the syntax of the human resolutions; build it with CGO_ENABLED=1 and a C compiler")
+		return 1
+	}
 	corpus, err := bench.LoadCorpus(*corpusPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "graft-resolve bench mine: %v\n", err)
@@ -314,4 +323,121 @@ func writeReport(report bench.Report, jsonOut, mdOut string, stdout io.Writer) e
 		out = io.MultiWriter(stdout, f)
 	}
 	return report.WriteMarkdown(out)
+}
+
+// benchSyntax runs the syntax check on every human resolution of a manifest, with no model call:
+//
+//	graft-resolve bench syntax --manifest FILE --clones DIR [--json-out FILE]
+//
+// It prints the checked and failed counts per language and every failure.
+func benchSyntax(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("graft-resolve bench syntax", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	manifestPath := fs.String("manifest", "", "manifest written by bench mine")
+	clones := fs.String("clones", "", "directory of the clones of the corpus repositories")
+	jsonOut := fs.String("json-out", "", "counts and failures as JSON")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *manifestPath == "" || *clones == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "graft-resolve bench syntax: --manifest and --clones are required")
+		return 2
+	}
+	if !syntax.Available {
+		fmt.Fprintln(stderr, "graft-resolve bench syntax: this graft-resolve was built without cgo; build it with CGO_ENABLED=1")
+		return 1
+	}
+	manifest, err := bench.LoadManifest(*manifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench syntax: %v\n", err)
+		return 1
+	}
+	stats, findings, err := bench.HumanSyntax(ctx, manifest.Cases, func(repo string) string { return bench.CloneDir(*clones, repo) })
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench syntax: %v\n", err)
+		return 1
+	}
+	if *jsonOut != "" {
+		data, err := json.MarshalIndent(map[string]any{"languages": stats, "failures": findings}, "", "  ")
+		if err == nil {
+			err = os.WriteFile(*jsonOut, append(data, '\n'), 0o644)
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "graft-resolve bench syntax: %v\n", err)
+			return 1
+		}
+	}
+	langs := make([]string, 0, len(stats))
+	for l := range stats {
+		langs = append(langs, l)
+	}
+	sort.Strings(langs)
+	for _, l := range langs {
+		s := stats[l]
+		fmt.Fprintf(stdout, "%s: %d with both sides parsing, %d of them fail (%.1f%%); %d with a side the grammar does not parse (no verdict)\n",
+			l, s.Checked, s.Failed, 100*float64(s.Failed)/float64(max(1, s.Checked)), s.Unchecked)
+	}
+	for _, f := range findings {
+		if f.Unchecked {
+			fmt.Fprintf(stdout, "no verdict: %s %s %s %s: %s\n", f.ID, f.Repo, f.Merge, f.Path, f.Reason)
+			continue
+		}
+		fmt.Fprintf(stdout, "fails: %s %s %s %s (conflict markers: %v): %s\n", f.ID, f.Repo, f.Merge, f.Path, f.Markers, f.Reason)
+	}
+	return 0
+}
+
+// benchFilter leaves out the cases of a manifest whose human resolution is not a valid reference
+// (bench mine applies the same rule to what it mines):
+//
+//	graft-resolve bench filter --manifest IN --clones DIR --manifest-out OUT
+func benchFilter(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("graft-resolve bench filter", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	manifestPath := fs.String("manifest", "", "manifest to filter")
+	clones := fs.String("clones", "", "directory of the clones of the corpus repositories")
+	outPath := fs.String("manifest-out", "", "filtered manifest to write")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *manifestPath == "" || *clones == "" || *outPath == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "graft-resolve bench filter: --manifest, --clones and --manifest-out are required")
+		return 2
+	}
+	manifest, err := bench.LoadManifest(*manifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench filter: %v\n", err)
+		return 1
+	}
+	kept, stats, err := bench.Filter(ctx, manifest.Cases, func(repo string) string { return bench.CloneDir(*clones, repo) })
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench filter: %v\n", err)
+		return 1
+	}
+	for repo, s := range manifest.Stats {
+		for reason, n := range stats {
+			if strings.HasPrefix(reason, repo+": ") {
+				s.InvalidReference += n
+				s.Kept -= n
+			}
+		}
+		manifest.Stats[repo] = s
+	}
+	manifest.Cases = kept
+	if err := bench.SaveManifest(*outPath, manifest); err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench filter: %v\n", err)
+		return 1
+	}
+	reasons := make([]string, 0, len(stats))
+	for r := range stats {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	left := 0
+	for _, r := range reasons {
+		fmt.Fprintf(stdout, "left out %d: %s\n", stats[r], r)
+		left += stats[r]
+	}
+	fmt.Fprintf(stdout, "%d of %d cases kept in %s\n", len(kept), len(kept)+left, *outPath)
+	return 0
 }

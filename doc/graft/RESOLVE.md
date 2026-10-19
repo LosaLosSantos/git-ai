@@ -275,13 +275,27 @@ asks for a JSON answer:
 - The answer must parse. graft-resolve parses it with the tree-sitter grammar
   of its language, chosen by extension: TypeScript (`.ts`, `.mts`, `.cts`),
   TSX (`.tsx`), JavaScript (`.js`, `.mjs`, `.cjs`, `.jsx`), Python (`.py`,
-  `.pyi`), Go (`.go`), Rust (`.rs`) and Java (`.java`). Any ERROR or MISSING
-  node rejects the answer, and the reason gives the line and column of the
-  first one. This is a parse, not a build: names, types and imports are not
+  `.pyi`), Go (`.go`), Rust (`.rs`) and Java (`.java`). The check asks
+  whether the merge broke the syntax: when both sides parse, an answer with
+  any ERROR or MISSING node is rejected, and the reason gives the line and
+  column of the first one. When a side does not parse, the grammar cannot
+  judge the file, and the answer gets the conflict-marker rule only. Examples:
+  Flow annotations in a `.js` file; files that a repository declares to be
+  another language; syntax newer than the grammar, such as a Java annotation
+  on varargs, or Rust's `dyn 'a + Trait`; test files that are invalid on
+  purpose. This is a parse, not a build: names, types and imports are not
   checked, and a few things a compiler refuses still parse (a JSX closing tag
   that does not match its opening tag, for one). Every other file gets the
   conflict-marker rule only. The check is always on for `llm` answers and
   does not apply to the other strategies.
+
+  Measured on the human resolutions of the benchmark corpus (3183 cases),
+  the check rejects none of the valid ones. 10 human resolutions fail it,
+  each with both sides parsing, and all 10 are broken: 6 were committed with
+  conflict markers, and 4 do not compile (confirmed with gofmt and by brace
+  count). The check gives no verdict on 83 files where a side does not parse:
+  76 JavaScript (Flow, and TypeScript test baselines), 3 Go (tests that are
+  invalid on purpose), 2 Java and 2 Rust (syntax newer than the grammar).
 - The configured checks still run afterwards.
 - For large files the strategy sends only the conflict hunks with context and
   reassembles the file locally.

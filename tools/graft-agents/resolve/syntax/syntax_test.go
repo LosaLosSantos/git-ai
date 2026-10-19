@@ -118,3 +118,35 @@ func TestCheckHonoursContext(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestCheckMergeJudgesOnlyWhatTheGrammarUnderstands(t *testing.T) {
+	ctx := context.Background()
+	good := []byte("package a\n\nvar x = 1\n")
+	bad := []byte("package a\n\nvar x = \n")
+
+	// Both sides parse: a result that does not parse is the merge's fault.
+	checked, err := CheckMerge(ctx, "a.go", bad, good, good)
+	var se *Error
+	if !checked || !errors.As(err, &se) {
+		t.Fatalf("checked %v, err %v: want a syntax error", checked, err)
+	}
+	if checked, err := CheckMerge(ctx, "a.go", good, good, good); !checked || err != nil {
+		t.Fatalf("checked %v, err %v: want a pass", checked, err)
+	}
+	// A side the grammar rejects: no verdict, whatever the result is.
+	if checked, err := CheckMerge(ctx, "a.go", bad, good, bad); checked || err != nil {
+		t.Fatalf("checked %v, err %v: want no verdict", checked, err)
+	}
+	// Flow is not JavaScript: a Flow file's sides do not parse, so it gets no verdict.
+	flow := []byte("// @flow\nimport type {Node} from './node';\nfunction f(x: ?string): number { return 1; }\n")
+	if checked, err := CheckMerge(ctx, "a.js", []byte("(("), flow, flow); checked || err != nil {
+		t.Fatalf("Flow: checked %v, err %v: want no verdict", checked, err)
+	}
+	// An absent side is skipped; a path without a grammar is not checked.
+	if checked, err := CheckMerge(ctx, "a.go", bad, nil, good); !checked || err == nil {
+		t.Fatalf("absent side: checked %v, err %v", checked, err)
+	}
+	if checked, err := CheckMerge(ctx, "a.md", bad, good, good); checked || err != nil {
+		t.Fatalf("no grammar: checked %v, err %v", checked, err)
+	}
+}

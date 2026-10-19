@@ -66,6 +66,30 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("syntax check: %s does not parse as %s: %s at line %d, column %d", e.Path, e.Language, what, e.Line, e.Column)
 }
 
+// CheckMerge checks that a merge result did not break the syntax: result must parse when every
+// side it merges parses. A side that does not parse means the grammar cannot judge this file
+// (a dialect it lacks, such as Flow in a .js file; a newer language version; a test of invalid
+// code): then the result is not checked and checked is false, and only the marker rule applies.
+// A path with no grammar is not checked either. A nil side (absent) is skipped.
+func CheckMerge(ctx context.Context, p string, result []byte, sides ...[]byte) (checked bool, err error) {
+	if _, ok := LanguageOf(p); !ok {
+		return false, nil
+	}
+	for _, side := range sides {
+		if side == nil {
+			continue
+		}
+		if err := Check(ctx, p, side); err != nil {
+			var se *Error
+			if errors.As(err, &se) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return true, Check(ctx, p, result)
+}
+
 // Check parses content as the language of p and returns an *Error for the first ERROR or MISSING
 // node of the tree. It returns nil when content parses, and when p has no grammar. It fails with
 // ctx's error when ctx ends during the parse.
