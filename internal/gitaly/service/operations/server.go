@@ -35,6 +35,9 @@ type Server struct {
 	localRepoFactory localrepo.Factory
 	// resolveCfg configures conflict resolution of UserLand.
 	resolveCfg config.GraftResolver
+	// checkBatchBytes, when set, replaces the bound of the file data of one check request
+	// (landCheckBatchBytes); only tests set it.
+	checkBatchBytes int64
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled.
 	conflictResolver *resolver.Client
 	// landLanes batches the UserLand requests of a branch. Nil disables batching, and every

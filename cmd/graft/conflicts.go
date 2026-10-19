@@ -10,6 +10,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -77,12 +79,14 @@ func printConflict(out io.Writer, c *gitalypb.LandConflict) {
 
 // conflictPath returns the file under sub of the conflicts directory for a conflicting path. It
 // refuses a path that would leave the directory or that this system cannot hold as a file name
-// under it: an absolute or unclean path, a backslash or a colon (a separator or a drive or stream
-// on Windows), a NUL, and any path filepath.IsLocal rejects once in the system's form (such as a
-// reserved name like NUL or COM1 on Windows).
+// under it: an absolute or unclean path, a backslash (a separator on Windows, so a path that names
+// two different files on two systems), a NUL, on Windows a colon (a drive or a stream), and any
+// path filepath.IsLocal rejects once in the system's form (such as a reserved name like NUL or
+// COM1 on Windows).
 func conflictPath(dir, sub, p string) (string, error) {
 	local := filepath.FromSlash(p)
-	if p == "" || path.IsAbs(p) || path.Clean(p) != p || strings.ContainsAny(p, "\\:\x00") || !filepath.IsLocal(local) {
+	if p == "" || path.IsAbs(p) || path.Clean(p) != p || strings.ContainsAny(p, "\\\x00") ||
+		(runtime.GOOS == "windows" && strings.Contains(p, ":")) || !filepath.IsLocal(local) {
 		return "", fmt.Errorf("conflicting path %q cannot be written into the conflicts directory on this system", p)
 	}
 	return filepath.Join(dir, sub, local), nil
@@ -104,25 +108,8 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 	}
 
 	blobs, missing := fetchSides(ctx, ws, c)
-	written := map[string]string{}
-	create := func(target, p string, data []byte) error {
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("conflicting paths %q and %q are the same file on this file system (names that differ only in case or Unicode normalization): resolve this conflict on a case-sensitive file system", written[target], p)
-		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-		written[target] = p
-		if _, err := f.Write(data); err != nil {
-			_ = f.Close()
-			return fmt.Errorf("%s: %w", p, err)
-		}
-		return f.Close()
-	}
+	w := conflictsWriter{written: map[string]string{}}
+	create := w.create
 
 	for _, f := range c.GetFiles() {
 		p := string(f.GetPath())
@@ -160,16 +147,7 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 		}
 		content := conflictFileContent(contents)
 		if !readable {
-			// Without every side there is no three-way merge: the file to edit is a side that
-			// can be read, or a conflict the agent must resolve.
-			switch {
-			case contents[1] != nil:
-				content = contents[1]
-			case contents[2] != nil:
-				content = contents[2]
-			default:
-				content = []byte(conflictsUnreadable)
-			}
+			content = conflictFileWithout(f, contents)
 		}
 		if err := create(target, p, content); err != nil {
 			return err
@@ -181,6 +159,85 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 		return err
 	}
 	return create(filepath.Join(dir, conflictsPackage), conflictsPackage, append(raw, '\n'))
+}
+
+// conflictsWriter creates the files of a conflicts directory, each once.
+type conflictsWriter struct {
+	// written maps each file created to its conflicting path, by the target folded to lower case,
+	// so that a collision on a case-insensitive file system names the path that took the file.
+	written map[string]string
+}
+
+// create writes a new file target for the conflicting path p. A target that exists already is
+// another conflicting path that this file system takes for the same file, which is an error.
+func (w conflictsWriter) create(target, p string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("%s: %w", p, err)
+	}
+	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		other, ok := w.written[strings.ToLower(target)]
+		if !ok {
+			other = "another conflicting path"
+		} else {
+			other = strconv.Quote(other)
+		}
+		return fmt.Errorf("conflicting paths %s and %q are the same file on this file system (names that differ only in case or Unicode normalization): resolve this conflict on a case-sensitive file system", other, p)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", p, err)
+	}
+	w.written[strings.ToLower(target)] = p
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("%s: %w", p, err)
+	}
+	return f.Close()
+}
+
+// conflictFileWithout is the file to edit when a present side cannot be read. Without the base it
+// is the two-way merge of the sides. Without ours or theirs it is a conflict the marker rule of the
+// server refuses until the agent resolves it: the side that can be read (named by its file under
+// sides/ when it is binary) against a note that the other is unavailable. A side is never dropped
+// silently.
+func conflictFileWithout(f *gitalypb.LandConflictFile, sides [3][]byte) []byte {
+	ours, theirs := sides[1], sides[2]
+	oursPresent, theirsPresent := f.GetOurs() != nil, f.GetTheirs() != nil
+	switch {
+	case ours != nil && theirs != nil:
+		return conflictFileContent([3][]byte{nil, ours, theirs})
+	case ours == nil && theirs == nil:
+		return []byte(conflictsUnreadable)
+	}
+	const unavailable = "unavailable, see conflict.json"
+	body := func(name string, b []byte) []byte {
+		if isBinaryContent(b) {
+			return []byte(fmt.Sprintf("(binary: see sides/%s/%s)\n", name, string(f.GetPath())))
+		}
+		if len(b) > 0 && b[len(b)-1] != '\n' {
+			return append(append([]byte{}, b...), '\n')
+		}
+		return b
+	}
+	var out bytes.Buffer
+	switch {
+	case ours == nil && oursPresent:
+		out.WriteString("<<<<<<< ours (the branch tip): " + unavailable + "\n=======\n")
+		out.Write(body("theirs", theirs))
+		out.WriteString(">>>>>>> theirs (the change)\n")
+	case theirs == nil && theirsPresent:
+		out.WriteString("<<<<<<< ours (the branch tip)\n")
+		out.Write(body("ours", ours))
+		out.WriteString("=======\n>>>>>>> theirs (the change): " + unavailable + "\n")
+	default:
+		// The side that is missing is absent (a deletion), and the one there is cannot be read
+		// apart from the base: the side there is, as for any deletion conflict.
+		if ours != nil {
+			return ours
+		}
+		return theirs
+	}
+	return out.Bytes()
 }
 
 // fetchSides reads the sides of the package that have an object ID, all at once. When the server

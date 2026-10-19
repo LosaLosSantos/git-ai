@@ -435,6 +435,25 @@ func TestCheck_runsForEveryActorAndFileCount(t *testing.T) {
 	require.ErrorContains(t, err, `actor "agent-7" may not request conflict resolution`)
 }
 
+// TestCheck_refusesARequestOverItsBound: a check request is bounded in bytes whatever its files;
+// one over MaxCheckRequestBytes is refused without running the resolver (the server splits an
+// agent's resolution below it).
+func TestCheck_refusesARequestOverItsBound(t *testing.T) {
+	requireUnix(t)
+
+	marker := filepath.Join(t.TempDir(), "ran")
+	cfg := commandConfig([]string{writeScript(t, fmt.Sprintf("touch '%s'\ncat > /dev/null\n", marker))})
+	cfg.MaxFileBytes = MaxCheckRequestBytes
+	client := newClient(t, cfg)
+
+	req := sampleRequest()
+	req.Files[0].Ours.Content = make([]byte, MaxCheckRequestBytes*3/4+1)
+	req.Resolution = validResponse("merged\n").Files
+	_, err := client.Check(testhelper.Context(t), req)
+	require.ErrorContains(t, err, "is over the bound")
+	require.NoFileExists(t, marker)
+}
+
 func TestResolve_RequestChecksDoNotRunTheResolver(t *testing.T) {
 	requireUnix(t)
 

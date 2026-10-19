@@ -45,14 +45,19 @@ const (
 	landMaxPackageCells = 64 << 20
 )
 
+// landModeGitlink is the mode of a submodule entry.
+const landModeGitlink = "160000"
+
 // Reasons of hunks_omitted and of an unavailable side.
 const (
-	landHunksTooLarge   = "a side is larger than max_file_bytes, so no diff is computed"
-	landHunksBinary     = "a side is binary, which has no line hunks"
-	landHunksDiffCost   = "the diff of the sides is over the cost bound of one file"
-	landHunksBudget     = "the package's bound on the sides it reads and diffs is used up"
-	landHunksPackage    = "the package would be over 4 MiB with its hunks"
-	landSideUnavailable = "the merge wrote this blob for the conflict (such as the content merge of a rename), and the repository does not keep it after the land fails"
+	landHunksTooLarge    = "a side is larger than max_file_bytes, so no diff is computed"
+	landHunksBinary      = "a side is binary, which has no line hunks"
+	landHunksDiffCost    = "the diff of the sides is over the cost bound of one file"
+	landHunksBudget      = "the package's bound on the sides it reads and diffs is used up"
+	landHunksPackage     = "the package would be over 4 MiB with its hunks"
+	landHunksUnavailable = "a side is unavailable, so the hunks would name lines the agent cannot read"
+	landSideGitlink      = "the side is a submodule (a gitlink), which names a commit, not a blob"
+	landSideUnavailable  = "the merge wrote this blob for the conflict (such as the content merge of a rename), and the repository does not keep it after the land fails"
 )
 
 // Reasons of the files the server does not send to the resolver, besides the content rules of
@@ -81,6 +86,8 @@ type landFileState struct {
 	// hunks are the file's hunks in the package, and hunksOmitted why they are absent or cut.
 	hunks        []*gitalypb.LandConflictHunk
 	hunksOmitted string
+	// unavailable is set when a present side's blob is not kept in the repository.
+	unavailable bool
 }
 
 // sent reports whether the file is sent to the resolver.
@@ -206,20 +213,18 @@ func (l landListing) conflictPackage(ctx context.Context, reason string) (*gital
 		return pkg, nil
 	}
 
-	if err := l.prepareHunks(ctx); err != nil {
-		return nil, err
-	}
+	// The sides first: a file with a side the agent cannot read gets no hunks.
 	listings := map[git.ObjectID]map[git.ObjectID][]string{}
-	for _, f := range l.files {
+	files := make([]*gitalypb.LandConflictFile, len(l.files))
+	for i, f := range l.files {
 		pf := &gitalypb.LandConflictFile{
 			Path:            []byte(f.conflict.path),
 			Kind:            landKindProto(f.kind),
 			Outcome:         f.outcome,
 			Reason:          landCutString(f.reason, landPackageReasonBytes),
 			SyntaxUnchecked: f.syntaxUnchecked,
-			Hunks:           f.hunks,
-			HunksOmitted:    f.hunksOmitted,
 		}
+		f.unavailable = false
 		for _, s := range []struct {
 			blob *landBlob
 			rev  git.ObjectID
@@ -228,20 +233,35 @@ func (l landListing) conflictPackage(ctx context.Context, reason string) (*gital
 			if s.blob == nil {
 				continue
 			}
-			kept, err := l.sideKept(ctx, listings, s.blob.oid, f.conflict.path, s.rev)
-			if err != nil {
-				return nil, err
-			}
 			side := &gitalypb.LandConflictSide{Mode: s.blob.mode}
-			if kept {
-				side.Oid = s.blob.oid.String()
-			} else {
-				side.Unavailable = landSideUnavailable
+			switch {
+			case s.blob.mode == landModeGitlink:
+				side.Unavailable = landSideGitlink
+			default:
+				kept, err := l.sideKept(ctx, listings, s.blob.oid, f.conflict.path, s.rev)
+				if err != nil {
+					return nil, err
+				}
+				if kept {
+					side.Oid = s.blob.oid.String()
+				} else {
+					side.Unavailable = landSideUnavailable
+				}
+			}
+			if side.Unavailable != "" {
+				f.unavailable = true
 			}
 			*s.dst = side
 		}
-		pkg.Files = append(pkg.Files, pf)
+		files[i] = pf
 	}
+	if err := l.prepareHunks(ctx); err != nil {
+		return nil, err
+	}
+	for i, f := range l.files {
+		files[i].Hunks, files[i].HunksOmitted = f.hunks, f.hunksOmitted
+	}
+	pkg.Files = files
 
 	if proto.Size(pkg) > landMaxPackageBytes {
 		for _, pf := range pkg.GetFiles() {
@@ -267,6 +287,10 @@ func (l landListing) prepareHunks(ctx context.Context) error {
 	for _, f := range l.files {
 		f.hunks, f.hunksOmitted = nil, ""
 		if f.kind != resolver.KindContent && f.kind != resolver.KindAddAdd {
+			continue
+		}
+		if f.unavailable {
+			f.hunksOmitted = landHunksUnavailable
 			continue
 		}
 		if !f.read {
@@ -356,16 +380,14 @@ func (l landListing) sideKept(ctx context.Context, listings map[git.ObjectID]map
 		info, err := l.repo.ReadObjectInfo(ctx, git.Revision(own.String()+":"+p))
 		var notFound localrepo.InvalidObjectError
 		switch {
-		case err == nil && info.Oid == blob:
+		case err == nil && info.Oid == blob && info.Type == "blob":
 			return true, nil
 		case err != nil && !errors.As(err, &notFound):
 			return false, fmt.Errorf("looking up %q in %s: %w", p, own, err)
 		}
 	}
-	revs := []git.ObjectID{l.tip, l.commitID}
-	if l.hasBase {
-		revs = append(revs, l.base)
-	}
+	// Every merge base is a kept tree: with a criss-cross history the base side may come from any.
+	revs := append([]git.ObjectID{l.tip, l.commitID}, l.mergeBases...)
 	for _, rev := range revs {
 		listing, ok := listings[rev]
 		if !ok {

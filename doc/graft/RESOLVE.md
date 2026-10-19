@@ -80,12 +80,15 @@ A client asks for resolution per call:
   directory mirrors the tree of the merge, so no repository path can collide
   with a side, another path's side or the package. A side the package gives no
   object ID (see `unavailable` below), or that the server cannot return, is
-  left out and reported; it fails neither its file nor the directory. The
-  file to edit is then the side there is, or, when no side can be read, a
-  conflict that the marker rule refuses until it is resolved. `DIR` must not
+  left out and reported; it fails neither its file nor the directory, and it is
+  never dropped silently. Without the base, the file to edit is the two-way
+  merge of the sides, with markers where they differ. Without ours or theirs,
+  it is a conflict between markers: the side there is (named by its file under
+  `sides/` when it is binary) against a note that the other is unavailable, so
+  that the marker rule refuses it until the agent resolves it. `DIR` must not
   hold a conflicts directory yet: one being edited is never overwritten. A
-  path that cannot be a file under `DIR` on this system (a backslash, a
-  colon, a name the system reserves) is an error, and so are two paths that
+  path that cannot be a file under `DIR` on this system (a backslash, on
+  Windows a colon or a name the system reserves) is an error, and so are two paths that
   the file system takes for one file (names that differ only in case on a
   case-insensitive file system). Edit the files under `DIR/files`, then
   `graft land --resolved DIR` lands them: a present file is written (with the
@@ -235,8 +238,11 @@ The server accepts an answer only if all of these hold:
   `REJECTED`, and the land fails with the package.
 - No symbolic link is named `.gitmodules`, `.gitattributes`, `.gitignore` or
   `.mailmap` in any directory, as git fsck and checkout require, nor any name
-  a file system takes for one of them (other case, the code points HFS+
-  ignores, NTFS trailing dots and spaces, streams and 8.3 short names).
+  a file system takes for one of them, by git's rules: other case and the
+  code points HFS+ ignores; on NTFS trailing dots and spaces, the 8.3 short
+  name (`GITMOD~1` to `~4`) and the hashed short names (such as `gi7eb~12`).
+  A name with an NTFS stream (`:stream`) is cut there first, which refuses
+  more than git does.
 - Every content is at most `max_file_bytes` after decoding.
 - Text files contain no conflict marker lines. A marker line is one that
   starts with `<<<<<<< ` or `>>>>>>> `, or one that is `=======` followed by
@@ -354,11 +360,13 @@ the error unchanged. The package holds:
   `CONFLICT (rename/delete)`, the text), which also describe a conflict that
   has no conflicting file.
 
-A side has a blob OID only when the blob is in the tree of the merge base,
-the tip or the landed commit, which the repository keeps. A side that the
-merge wrote for the conflict alone (such as the content merge of a renamed
-file) is discarded with the failed land, so it has no OID and `unavailable`
-says why; its hunks are still given.
+A side has a blob OID only when the blob is in the tree of a merge base, the
+tip or the landed commit, which the repository keeps. A side that the merge
+wrote for the conflict alone (such as the content merge of a renamed file, or
+the virtual base of a criss-cross history) is discarded with the failed land,
+so it has no OID and `unavailable` says why, as does a submodule side (a
+gitlink names a commit, not a blob). A file with an unavailable side has no
+hunks (`hunks_omitted` says so): they would name lines the agent cannot read.
 
 Each hunk gives line ranges of each side, 1-based and half-open (`[start,
 end)`), each counting the lines of the side it names. An empty range is an
@@ -394,6 +402,9 @@ content) or `delete`. The server accepts it only when:
 - every file passes the acceptance rules of an answer (modes, size, conflict
   markers, no symbolic link named like a file git reads from the tree), and
   writes a mode one of the conflict's sides has;
+- the merge has at most 1000 conflicting files, the bound of a package (a
+  merge with more cannot be resolved through a land, and nothing is read or
+  checked);
 - every conflicting path, and the actor, can be written in a commit trailer:
   one line of printable UTF-8 (otherwise `FailedPrecondition`; such a path is
   never sent to a resolver either, so its conflict cannot be resolved through
@@ -401,6 +412,12 @@ content) or `delete`. The server accepts it only when:
 - when a resolver is configured, the files that may be sent to it pass its
   `check`: the syntax check and the configured checks, as an `llm` answer.
   A check that cannot run fails the land, with the reason in the package.
+  The files go to the check in requests of at most 32 MiB of file data each
+  (about 43 MiB encoded, within the 64 MiB a check request may take and the
+  128 MiB graft-resolve reads by default), checked one after the other, so
+  that neither side holds more than one such request at a time. A single file
+  larger than that is a request of its own: raise graft-resolve's
+  `--max-request-bytes` with `max_file_bytes`.
   A file with a `syntax: unchecked` verdict lands, and is counted in
   `graft_land_resolution_syntax_unchecked_total`, once, when the land
   succeeds, and in the server log.
@@ -411,6 +428,12 @@ resolver checked it, `Graft-Checked-By: <resolver>`. Without a resolver there
 is no `Graft-Checked-By`: the resolution got only the conflict-marker rule and
 the server's structural validation. The resolution travels in the request, so
 the whole request is bounded by the 4 MiB gRPC message limit.
+
+Only the last paragraph of a commit message is its trailer block (git's rule,
+which `graft show`, `graft-verify` and superfan follow), and the server always
+writes the `Graft-*` trailers as that paragraph. Lines of a caller's
+`merge_message` that look like `Graft-*` trailers are part of an earlier
+paragraph, so they never count.
 
 ## Strategies of graft-resolve
 

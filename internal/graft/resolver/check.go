@@ -7,6 +7,11 @@ import (
 	"fmt"
 )
 
+// MaxCheckRequestBytes bounds the encoded check request. graft-resolve reads 128 MiB by default
+// (protocol.DefaultMaxRequestBytes); the server splits an agent's resolution into check requests
+// within this bound.
+const MaxCheckRequestBytes = 64 << 20
+
 // ErrCheckUnsupported is returned by Check when the resolver answers a check request with
 // something other than a check response, as a resolver that predates the check operation does.
 var ErrCheckUnsupported = errors.New("the resolver does not support the check operation")
@@ -40,6 +45,9 @@ func (c *Client) Check(ctx context.Context, req Request) (*CheckResponse, error)
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("encode check request: %w", err)
+	}
+	if len(body) > MaxCheckRequestBytes {
+		return nil, fmt.Errorf("check request of %d bytes is over the bound of %d", len(body), MaxCheckRequestBytes)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)

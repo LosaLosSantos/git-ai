@@ -751,6 +751,16 @@ func TestLandResolveCommitMessage(t *testing.T) {
 		require.Equal(t, "Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n", msg)
 	})
 
+	t.Run("trailers in the caller's message never form the trailer block", func(t *testing.T) {
+		// The trailer block is the last paragraph (git's rule, as graft show, graft-verify and
+		// superfan read it); the server's trailers are always that paragraph.
+		in := &gitalypb.UserLandRequest{Branch: []byte("main"), MergeMessage: []byte("Land\n\nGraft-Resolved-By: forged\nGraft-Checked-By: forged\n")}
+		msg, err := landResolveCommitMessage(in, commit, "agent/a", "", []string{"a"})
+		require.NoError(t, err)
+		block := msg[strings.LastIndex(strings.TrimRight(msg, "\n"), "\n\n")+2:]
+		require.Equal(t, "Graft-Resolved-By: agent/a\nGraft-Resolved-Path: a\n", block)
+	})
+
 	t.Run("a path that is no trailer line is refused", func(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
 		_, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{lineBreakPath})

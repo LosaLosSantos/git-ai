@@ -568,3 +568,17 @@ way.
     paths it cannot write on its system and paths the file system folds together, and
     never overwrites a conflicts directory; the memory backend refuses a resolution for
     another commit.
+* **Re-review of 54189d1** (PM: fix before R1).
+  * The re-land of an agent is bounded: a merge with more than 1000 conflicting files is refused
+    before anything is read, and its check goes in requests of at most 32 MiB of file data each,
+    checked one after the other (resolver.MaxCheckRequestBytes = 64 MiB encoded, which the client
+    also enforces), so that the server and graft-resolve hold one bounded request at a time.
+  * The CLI never drops a side: without the base the file to edit is the two-way merge; without
+    ours or theirs it is a conflict between markers (the side there is against a note), which the
+    marker rule refuses until the agent resolves it.
+  * A file with an unavailable side gets no hunks; the tree of every merge base counts as kept (a
+    criss-cross base side that is a real blob keeps its OID); a gitlink side is unavailable.
+  * Minors: the collision error names both paths; the colon is refused on Windows only; the NTFS
+    names follow git's rules, the hashed 8.3 forms included; only the last paragraph of a message
+    is its trailer block, and the server's trailers are always that paragraph (documented,
+    tested).

@@ -290,7 +290,9 @@ func TestValidateFile_specialFileSymlinks(t *testing.T) {
 	for _, name := range []string{
 		".gitmodules", "sub/.gitattributes", ".gitignore", ".mailmap",
 		".GITMODULES", ".gitmodules ", ".gitmodules...", ".gitmodules::$DATA",
-		"GITMOD~1", "gi7eba~4", "GI7D29~1", "maba30~2", "gitign~1",
+		"GITMOD~1", "gi7eba~4", "GI7D29~1", "maba30~2", "gitign~1", "gitmod~4 .",
+		// The hashed 8.3 forms: fewer letters of the stem, more digits, eight characters in all.
+		"gi7eb~12", "gi7e~123", "GI7EBA~9", "mabA3~12.",
 		// HFS+ ignores zero-width code points.
 		".git\u200cmodules", "\ufeff.gitattributes",
 	} {
@@ -300,7 +302,11 @@ func TestValidateFile_specialFileSymlinks(t *testing.T) {
 		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeRegular, Content: []byte("x")}, 1<<20), "%q", name)
 	}
 
-	for _, name := range []string{".gitmodules-old", "gitmodules", "GITMOD~A", "gitmod~10", "x.gitignore", "link"} {
+	for _, name := range []string{
+		".gitmodules-old", "gitmodules", "GITMOD~A", "gitmod~10", "x.gitignore", "link",
+		// git's short name takes ~1 to ~4; a hashed form is eight characters with its digits.
+		"gitmod~5", "gi7eba~0", "gi7eb~1x", "gi7eba~12x", "gi7ebx~1", "maba3~1.",
+	} {
 		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20), "%q", name)
 	}
 }

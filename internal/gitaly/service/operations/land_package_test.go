@@ -343,6 +343,68 @@ func TestUserLand_reland(t *testing.T) {
 		require.Len(t, resolverRequest(t, dir, 1).Resolution, 2)
 	})
 
+	t.Run("the check goes in bounded requests, one batch at a time", func(t *testing.T) {
+		t.Parallel()
+
+		// A bound of one byte: every file is a check request of its own, answered in turn.
+		dir, argv := resolverScript(t, `cp "$DIR/answer-$N.json" "$DIR/answer.json"`)
+		for n, p := range []string{"a", "b"} {
+			raw, err := json.Marshal(resolver.CheckResponse{
+				Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: "graft-resolve",
+				Files: []resolver.CheckFile{{Path: p, OK: true, Syntax: resolver.SyntaxUnchecked}},
+			})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("answer-%d.json", n+1)), raw, 0o600))
+		}
+		fx := newResolveFixture(t, config.GraftResolver{})
+		s := fx.server(t, enabledResolver(argv))
+		s.checkBatchBytes = 1
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+
+		res, err := s.landWithResolution(fx.ctx, req, fx.repo, fx.tip, fx.commit, fx.committer())
+		require.NoError(t, err)
+		require.Equal(t, 2, resolverCalls(t, dir))
+		for n, p := range []string{"a", "b"} {
+			check := resolverRequest(t, dir, n+1)
+			require.Len(t, check.Files, 1)
+			require.Equal(t, p, check.Files[0].Path)
+		}
+		require.Equal(t, 2, res.syntaxUnchecked, "the verdicts of every batch count")
+		commit, err := fx.repo.ReadCommit(fx.ctx, res.commit.Revision())
+		require.NoError(t, err)
+		require.Contains(t, string(commit.GetBody()), "Graft-Checked-By: graft-resolve\n")
+	})
+
+	t.Run("a merge with more conflicting files than a package lists is refused", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, "exit 1")
+		var base, tip, commit []gittest.TreeEntry
+		for i := 0; i <= landMaxPackageFiles; i++ {
+			p := fmt.Sprintf("f%04d", i)
+			base = append(base, gittest.TreeEntry{Mode: "100644", Path: p, Content: "base\n"})
+			tip = append(tip, gittest.TreeEntry{Mode: "100644", Path: p, Content: "ours\n"})
+			commit = append(commit, gittest.TreeEntry{Mode: "100644", Path: p, Content: "theirs\n"})
+		}
+		fx := newResolveFixtureWith(t, enabledResolver(argv), base, tip, commit)
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = &gitalypb.LandResolution{Tip: fx.tip.String(), Commit: fx.commit.String(), Files: []*gitalypb.LandResolvedFile{
+			{Path: []byte("f0000"), Action: gitalypb.LandResolvedFile_ACTION_DELETE},
+		}}
+
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		require.Empty(t, pkg.GetFiles())
+		require.Contains(t, pkg.GetReason(), fmt.Sprintf("more than the %d that a conflict package lists", landMaxPackageFiles))
+		require.Equal(t, 0, resolverCalls(t, dir), "nothing is read or checked")
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+	})
+
 	t.Run("a written mode that no side has is rejected", func(t *testing.T) {
 		t.Parallel()
 
@@ -580,9 +642,48 @@ func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
 		require.Equal(t, landSideUnavailable, c.GetOurs().GetUnavailable())
 		require.Equal(t, "100644", c.GetOurs().GetMode())
 		require.NotEmpty(t, c.GetTheirs().GetOid())
-		// The hunks were computed from the side while the request could still read it.
-		require.NotEmpty(t, c.GetHunks())
+		// No hunks: they would give line ranges of a side the agent cannot read.
+		require.Empty(t, c.GetHunks())
+		require.Equal(t, landHunksUnavailable, c.GetHunksOmitted())
 		requirePackageOIDsKept(t, fx, pkg)
+	})
+
+	t.Run("a submodule side is not a blob", func(t *testing.T) {
+		t.Parallel()
+
+		// The tip turns s into a submodule, the change edits it: the tip's side is a gitlink,
+		// which names a commit of another repository.
+		fx := newResolveFixture(t, config.GraftResolver{})
+		submodule := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithTreeEntries(gittest.TreeEntry{Mode: "100644", Path: "x", Content: "x\n"}))
+		baseTree := []gittest.TreeEntry{{Mode: "100644", Path: "s", Content: "base\n"}}
+		base := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithTreeEntries(baseTree...))
+		tip := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(base), gittest.WithBranch(git.DefaultBranch),
+			gittest.WithTreeEntries(gittest.TreeEntry{Mode: "160000", Path: "s", OID: submodule}))
+		commit := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(base),
+			gittest.WithTreeEntries(gittest.TreeEntry{Mode: "100644", Path: "s", Content: "theirs\n"}))
+		fx.base, fx.tip, fx.commit = base, tip, commit
+
+		req := fx.request("Land")
+		req.Strategy = gitalypb.UserLandRequest_STRATEGY_MERGE
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		// git records the distinct types on two paths: s holds the submodule, s~<label> the file.
+		s := packageFile(t, pkg, "s")
+		require.Equal(t, "160000", s.GetOurs().GetMode())
+		require.Empty(t, s.GetOurs().GetOid())
+		require.Equal(t, landSideGitlink, s.GetOurs().GetUnavailable())
+		require.Nil(t, s.GetTheirs())
+		var file *gitalypb.LandConflictFile
+		for _, f := range pkg.GetFiles() {
+			if strings.HasPrefix(string(f.GetPath()), "s~") {
+				file = f
+			}
+		}
+		require.NotNil(t, file, "the file side under its new name")
+		require.NotEmpty(t, file.GetBase().GetOid(), "a blob found under another name in a kept tree is kept")
+		require.NotEmpty(t, file.GetTheirs().GetOid())
 	})
 
 	t.Run("a criss-cross history", func(t *testing.T) {
@@ -592,16 +693,18 @@ func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
 		dir, argv := resolverScript(t, "")
 		writeAnswer(t, dir, validAnswer())
 		fx := newResolveFixture(t, enabledResolver(argv))
-		// Two branches merge each other: tip and commit have two merge bases, x and y, and both
-		// change a.
+		// Two branches merge each other: tip and commit have two merge bases, x and y. They agree
+		// on a, which tip and commit change differently, so the base side of a is x's (and y's)
+		// blob, a tree the repository keeps; they differ on b, which tip and commit both keep as
+		// "xy", so b does not conflict.
 		x := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
-			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "x\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "mid\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "x\n"}))
 		y := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
-			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "y\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "mid\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "y\n"}))
 		tip := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(x, y), gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
-			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "tip\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "tip\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "xy\n"}))
 		commit := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(y, x), gittest.WithTreeEntries(
-			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "commit\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "commit\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "xy\n"}))
 		fx.tip, fx.commit = tip, commit
 
 		req := fx.request("Land")
@@ -612,6 +715,8 @@ func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
 		require.NotNil(t, pkg)
 		require.Contains(t, pkg.GetReason(), "2 merge bases")
 		require.Len(t, pkg.GetFiles(), 1)
+		a := packageFile(t, pkg, "a")
+		require.NotEmpty(t, a.GetBase().GetOid(), "a base side in the trees of the merge bases is kept")
 		requirePackageOIDsKept(t, fx, pkg)
 		require.Equal(t, 0, resolverCalls(t, dir))
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, tip)

@@ -82,7 +82,7 @@ func validateFile(f ResponseFile, maxBytes int64) error {
 
 		if f.Mode == ModeSymlink {
 			if special := gitSpecialFile(path.Base(f.Path)); special != "" {
-				return fmt.Errorf("a symbolic link named %s is refused: git fsck and checkout do not allow %s, .gitmodules, .gitattributes, .gitignore and .mailmap to be symbolic links", path.Base(f.Path), special)
+				return fmt.Errorf("a symbolic link named %s is refused: it stands for %s, and git fsck and checkout do not allow .gitmodules, .gitattributes, .gitignore or .mailmap to be a symbolic link", path.Base(f.Path), special)
 			}
 		}
 
@@ -123,12 +123,14 @@ var gitSpecialFiles = []struct {
 }
 
 // gitSpecialFile returns the special file that the tree entry name stands for on some file
-// system, or "". git compares names the way the file systems that check out the tree do:
-//   - case-insensitively, and ignoring the code points that HFS+ ignores (zero-width and
-//     directional marks, U+FEFF);
-//   - on NTFS, also with trailing spaces and dots, an alternate data stream (":stream"), and as
-//     an 8.3 short name: the first six letters of the name, or the stem above, then "~" and a
-//     digit.
+// system, or "". It follows the rules git uses for these names:
+//   - HFS+: the name, ignoring the code points HFS+ ignores (zero-width and directional marks,
+//     U+FEFF), case-insensitively;
+//   - NTFS (ntfsSpecialName): the name followed by spaces and periods only, the 8.3 short name
+//     (the first six letters, "~" and a digit 1 to 4), and the hashed short name (up to six
+//     letters of the stem above, "~", a digit 1 to 9 and more digits, eight characters in all),
+//     each followed by spaces and periods only. An alternate data stream (":stream") is cut
+//     first, which refuses more than git does.
 func gitSpecialFile(name string) string {
 	folded := strings.ToLower(strings.Map(func(r rune) rune {
 		if hfsIgnorable(r) {
@@ -140,18 +142,51 @@ func gitSpecialFile(name string) string {
 	if i := strings.IndexByte(ntfs, ':'); i >= 0 {
 		ntfs = ntfs[:i]
 	}
-	ntfs = strings.TrimRight(ntfs, " .")
 	for _, s := range gitSpecialFiles {
-		if folded == s.name || ntfs == s.name {
+		if folded == s.name || ntfsSpecialName(ntfs, s.name[1:], s.shortHash) {
 			return s.name
-		}
-		for _, stem := range []string{s.name[1:7], s.shortHash} {
-			if len(ntfs) == len(stem)+2 && strings.HasPrefix(ntfs, stem+"~") && ntfs[len(stem)+1] >= '1' && ntfs[len(stem)+1] <= '9' {
-				return s.name
-			}
 		}
 	}
 	return ""
+}
+
+// ntfsSpecialName reports whether the lower-case name stands on NTFS for "." + dotName, whose
+// hashed 8.3 short name starts with shortHash (see gitSpecialFile).
+func ntfsSpecialName(name, dotName, shortHash string) bool {
+	if strings.HasPrefix(name, "."+dotName) {
+		return onlySpacesAndPeriods(name[1+len(dotName):])
+	}
+	if len(name) >= 8 && name[:6] == dotName[:6] && name[6] == '~' && name[7] >= '1' && name[7] <= '4' {
+		return onlySpacesAndPeriods(name[8:])
+	}
+	sawTilde := false
+	i := 0
+	for ; i < 8; i++ {
+		if i >= len(name) {
+			return false
+		}
+		c := name[i]
+		switch {
+		case sawTilde:
+			if c < '0' || c > '9' {
+				return false
+			}
+		case c == '~':
+			i++
+			if i >= len(name) || name[i] < '1' || name[i] > '9' {
+				return false
+			}
+			sawTilde = true
+		case i >= 6 || c != shortHash[i]:
+			return false
+		}
+	}
+	return onlySpacesAndPeriods(name[i:])
+}
+
+// onlySpacesAndPeriods reports whether s holds nothing but spaces and periods.
+func onlySpacesAndPeriods(s string) bool {
+	return strings.Trim(s, " .") == ""
 }
 
 // hfsIgnorable reports whether HFS+ ignores r when it compares names.

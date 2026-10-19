@@ -66,6 +66,11 @@ func (s *Server) landWithResolution(
 	if len(l.files) == 0 {
 		return landResolution{}, l.notAttempted(landNoConflictingFiles, nil)
 	}
+	// A merge with more conflicting files than a package lists cannot be resolved through a land,
+	// whatever the resolution: its package says so, and the land refuses it before reading anything.
+	if len(l.files) > landMaxPackageFiles {
+		return landResolution{}, l.notAttempted(fmt.Sprintf("the merge has %d conflicting files, more than the %d that a conflict package lists: it cannot be resolved through a land", len(l.files), landMaxPackageFiles), nil)
+	}
 	if r.GetTip() != tip.String() {
 		return landResolution{}, l.notAttempted(fmt.Sprintf("the branch tip moved from %s to %s since the resolution was made: resolve the conflicts of this package", r.GetTip(), tip), nil)
 	}
@@ -175,11 +180,25 @@ func landResolutionFiles(r *gitalypb.LandResolution, files []*landFileState) (ma
 	return resolved, ""
 }
 
+// landCheckBatchBytes bounds the file data (the sides and the resolution) of one check request:
+// half of resolver.MaxCheckRequestBytes, since base64 and JSON make the request about 4/3 of it.
+// A test may set a smaller bound on the server (checkBatchBytes).
+func (s *Server) landCheckBatchBytes() int64 {
+	if s.checkBatchBytes > 0 {
+		return s.checkBatchBytes
+	}
+	return resolver.MaxCheckRequestBytes / 2
+}
+
 // landCheckResolution runs the resolver's checks on the files of the resolution that may be sent
 // to the resolver (landClassify), and sets the outcome of each checked file that fails them to
 // REJECTED. It returns the checker's name for the Graft-Checked-By trailer, or "" when no file
-// could be sent, and the number of files accepted without a syntax verdict. The check fails
-// closed: a check that cannot run is a *landUnresolvedError with a fresh package.
+// could be sent, and the number of files accepted without a syntax verdict.
+//
+// The files go in check requests of at most landCheckBatchBytes of file data each, so that
+// neither the server nor graft-resolve holds more than one bounded request at a time: each batch
+// is read, checked and released before the next. Every batch must name the same checker. The
+// check fails closed: a check that cannot run is a *landUnresolvedError with a fresh package.
 func (s *Server) landCheckResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -188,68 +207,125 @@ func (s *Server) landCheckResolution(
 	actor string,
 	resolved map[string]resolver.ResponseFile,
 ) (string, int, error) {
-	if err := s.landClassify(ctx, repo, l.files, l.base, l.tip, l.commitID); err != nil {
+	batches, err := landCheckBatches(ctx, repo, l.files, resolved, s.landCheckBatchBytes())
+	if err != nil {
 		return "", 0, err
 	}
 
-	req := resolver.Request{
-		Repository: resolver.Repository{
-			Storage:      in.GetRepository().GetStorageName(),
-			RelativePath: in.GetRepository().GetRelativePath(),
-		},
-		Branch:   string(in.GetBranch()),
-		Tip:      l.tip.String(),
-		Commit:   l.commitID.String(),
-		Messages: resolver.Messages{Tip: l.tipMessage, Commit: l.commitMessage},
-		Actor:    actor,
-	}
-	if l.hasBase {
-		req.MergeBase = l.base.String()
-	}
-	var checked []*landFileState
+	checkedBy := ""
+	syntaxUnchecked, checkedFiles := 0, 0
 	var unchecked []string
-	for _, f := range l.files {
-		if !f.sent() {
-			// The file may not go to the resolver: it gets the server's rules only.
-			unchecked = append(unchecked, fmt.Sprintf("%s (%s)", f.conflict.path, f.reason))
-			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_UNSPECIFIED, ""
+	for _, batch := range batches {
+		if err := s.landClassify(ctx, repo, batch, l.base, l.tip, l.commitID); err != nil {
+			return "", 0, err
+		}
+		req := resolver.Request{
+			Repository: resolver.Repository{
+				Storage:      in.GetRepository().GetStorageName(),
+				RelativePath: in.GetRepository().GetRelativePath(),
+			},
+			Branch:   string(in.GetBranch()),
+			Tip:      l.tip.String(),
+			Commit:   l.commitID.String(),
+			Messages: resolver.Messages{Tip: l.tipMessage, Commit: l.commitMessage},
+			Actor:    actor,
+		}
+		if l.hasBase {
+			req.MergeBase = l.base.String()
+		}
+		var checked []*landFileState
+		for _, f := range batch {
+			if !f.sent() {
+				// The file may not go to the resolver: it gets the server's rules only.
+				unchecked = append(unchecked, fmt.Sprintf("%s (%s)", f.conflict.path, f.reason))
+				f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_UNSPECIFIED, ""
+				continue
+			}
+			req.Files = append(req.Files, landRequestFile(f))
+			req.Resolution = append(req.Resolution, resolved[f.conflict.path])
+			checked = append(checked, f)
+		}
+		// The sides of the batch are released once it is checked: the next batch reads its own, and
+		// a package reads again, within its own bounds, what its hunks need.
+		release := func() {
+			for _, f := range batch {
+				f.sides, f.read = [3][]byte{}, false
+			}
+		}
+		if len(checked) == 0 {
+			release()
 			continue
 		}
-		req.Files = append(req.Files, landRequestFile(f))
-		req.Resolution = append(req.Resolution, resolved[f.conflict.path])
-		checked = append(checked, f)
+
+		// Fail closed: a check that cannot run (an error, an answer that is no valid check
+		// response, a resolver that does not know the check operation) fails the land.
+		resp, err := s.conflictResolver.Check(ctx, req)
+		release()
+		if err != nil {
+			return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: %v", err), err)
+		}
+		if !landResolverNameValid(resp.Resolver) {
+			return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
+		}
+		if checkedBy != "" && resp.Resolver != checkedBy {
+			return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: its checks named the resolvers %q and %q", checkedBy, resp.Resolver), nil)
+		}
+		checkedBy = resp.Resolver
+		for i, v := range resp.Files {
+			f := checked[i]
+			if !v.OK {
+				f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, v.Reason
+				continue
+			}
+			if v.Syntax == resolver.SyntaxUnchecked {
+				f.syntaxUnchecked = true
+				syntaxUnchecked++
+			}
+		}
+		checkedFiles += len(checked)
 	}
-	if len(checked) == 0 {
+	if checkedFiles == 0 {
 		s.logger.WithField("unchecked", unchecked).InfoContext(ctx, "graft: no file of the agent's resolution may be sent to the resolver's checks")
 		return "", 0, nil
 	}
-
-	// Fail closed: a check that cannot run (an error, an answer that is no valid check response, a
-	// resolver that does not know the check operation) fails the land with a fresh package.
-	resp, err := s.conflictResolver.Check(ctx, req)
-	if err != nil {
-		return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: %v", err), err)
-	}
-	if !landResolverNameValid(resp.Resolver) {
-		return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
-	}
-	syntaxUnchecked := 0
-	for i, v := range resp.Files {
-		f := checked[i]
-		if !v.OK {
-			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, v.Reason
-			continue
-		}
-		if v.Syntax == resolver.SyntaxUnchecked {
-			f.syntaxUnchecked = true
-			syntaxUnchecked++
-		}
-	}
 	s.logger.WithFields(log.Fields{
-		"checked_by":       resp.Resolver,
-		"checked":          len(checked),
+		"checked_by":       checkedBy,
+		"checked":          checkedFiles,
+		"check_requests":   len(batches),
 		"syntax_unchecked": syntaxUnchecked,
 		"not_checked":      unchecked,
 	}).InfoContext(ctx, "graft: agent's resolution checked")
-	return resp.Resolver, syntaxUnchecked, nil
+	return checkedBy, syntaxUnchecked, nil
+}
+
+// landCheckBatches splits the files into batches of at most budget bytes of file data: the sizes
+// of their sides (from the object info, before reading) and of their resolution. A file larger than
+// the budget is a batch of its own; its sides are within max_file_bytes, or it is not sent.
+func landCheckBatches(ctx context.Context, repo *localrepo.Repo, files []*landFileState, resolved map[string]resolver.ResponseFile, budget int64) ([][]*landFileState, error) {
+	var batches [][]*landFileState
+	var cur []*landFileState
+	var size int64
+	for _, f := range files {
+		n := int64(len(resolved[f.conflict.path].Content))
+		for _, b := range []*landBlob{f.conflict.base, f.conflict.ours, f.conflict.theirs} {
+			if b == nil || (b.mode != resolver.ModeRegular && b.mode != resolver.ModeExecutable && b.mode != resolver.ModeSymlink) {
+				continue
+			}
+			info, err := repo.ReadObjectInfo(ctx, b.oid.Revision())
+			if err != nil {
+				return nil, fmt.Errorf("reading size of %q: %w", f.conflict.path, err)
+			}
+			n += info.Size
+		}
+		if len(cur) > 0 && size+n > budget {
+			batches = append(batches, cur)
+			cur, size = nil, 0
+		}
+		cur = append(cur, f)
+		size += n
+	}
+	if len(cur) > 0 {
+		batches = append(batches, cur)
+	}
+	return batches, nil
 }

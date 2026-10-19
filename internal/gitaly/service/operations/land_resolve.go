@@ -209,7 +209,9 @@ type landListing struct {
 	tip, commitID git.ObjectID
 	base          git.ObjectID
 	hasBase       bool
-	// bases is the number of merge bases; more than one is a criss-cross history.
+	// mergeBases are all the merge bases, and bases their number; more than one is a criss-cross
+	// history.
+	mergeBases                []git.ObjectID
 	bases                     int
 	mergedTree                git.ObjectID
 	conflicts                 []landFileConflict
@@ -234,9 +236,10 @@ var errLandNoConflicts = errors.New("the merge of the tip and the change is clea
 func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID git.ObjectID, maxFileBytes int64) (landListing, error) {
 	l := landListing{repo: repo, maxFileBytes: maxFileBytes, tip: tip, commitID: commitID}
 	var err error
-	if l.base, l.hasBase, l.bases, err = landMergeBase(ctx, repo, tip, commitID); err != nil {
+	if l.base, l.hasBase, l.mergeBases, err = landMergeBase(ctx, repo, tip, commitID); err != nil {
 		return l, err
 	}
+	l.bases = len(l.mergeBases)
 	var clean bool
 	if l.mergedTree, l.conflicts, l.messages, clean, err = landMergeTree(ctx, repo, tip, commitID, l.base, l.hasBase); err != nil {
 		return l, err
@@ -710,6 +713,9 @@ func landListTree(ctx context.Context, repo *localrepo.Repo, rev git.ObjectID) (
 		if !ok || len(parts) != 3 {
 			return nil, fmt.Errorf("unexpected ls-tree record %q", record)
 		}
+		if parts[1] != "blob" {
+			continue
+		}
 		oid, err := objectHash.FromHex(parts[2])
 		if err != nil {
 			return nil, fmt.Errorf("parsing object ID of %q: %w", p, err)
@@ -758,7 +764,7 @@ func landCommitBody(ctx context.Context, repo *localrepo.Repo, commit git.Object
 // history has several merge bases, whose number is returned: the base the resolver would be given
 // would differ from the base of the recursive merge strategy, so such landings are not resolved,
 // and hasBase is false.
-func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID) (base git.ObjectID, hasBase bool, bases int, err error) {
+func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID) (base git.ObjectID, hasBase bool, bases []git.ObjectID, err error) {
 	var stdout, stderr bytes.Buffer
 	if err := repo.ExecAndWait(ctx,
 		gitcmd.Command{Name: "merge-base", Flags: []gitcmd.Option{gitcmd.Flag{Name: "--all"}}, Args: []string{a.String(), b.String()}},
@@ -766,25 +772,26 @@ func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID)
 		gitcmd.WithStderr(&stderr),
 	); err != nil {
 		if exitStatus, ok := command.ExitStatus(err); ok && exitStatus == 1 {
-			return "", false, 0, nil
+			return "", false, nil, nil
 		}
-		return "", false, 0, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
-	}
-
-	all := strings.Fields(stdout.String())
-	if len(all) != 1 {
-		return "", false, len(all), nil
+		return "", false, nil, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
 	}
 
 	objectHash, err := repo.ObjectHash(ctx)
 	if err != nil {
-		return "", false, 0, fmt.Errorf("detecting object hash: %w", err)
+		return "", false, nil, fmt.Errorf("detecting object hash: %w", err)
 	}
-	base, err = objectHash.FromHex(all[0])
-	if err != nil {
-		return "", false, 0, fmt.Errorf("parsing merge base: %w", err)
+	for _, hex := range strings.Fields(stdout.String()) {
+		oid, err := objectHash.FromHex(hex)
+		if err != nil {
+			return "", false, nil, fmt.Errorf("parsing merge base: %w", err)
+		}
+		bases = append(bases, oid)
 	}
-	return base, true, 1, nil
+	if len(bases) != 1 {
+		return "", false, bases, nil
+	}
+	return bases[0], true, bases, nil
 }
 
 // landMergeTree runs merge-tree of tip and commitID. It returns the tree of the merge, which holds
