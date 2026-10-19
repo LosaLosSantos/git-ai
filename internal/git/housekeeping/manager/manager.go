@@ -1,6 +1,8 @@
 package manager
 
 import (
+	"time"
+
 	"context"
 	"sync"
 
@@ -198,10 +200,22 @@ type RepositoryManager struct {
 
 	// cacheFactory allows housekeeping to run in the context of an MVCC cache.
 	cacheFactory *mvcc.CacheFactory
+	// proposalTTL, when set, makes every housekeeping pass prune the proposal references of the
+	// land (refs/graft/proposals/) older than it, on every branch (WithGraftProposalTTL).
+	proposalTTL time.Duration
 }
 
 // Option configures a RepositoryManager.
 type Option func(*RepositoryManager)
+
+// WithGraftProposalTTL makes every housekeeping pass prune the proposals of the land
+// (proposals.Prune over refs/graft/proposals/) older than ttl and beyond the cap of each branch,
+// so that the proposals of idle and deleted branches expire too (PLAN10 14).
+func WithGraftProposalTTL(ttl time.Duration) Option {
+	return func(m *RepositoryManager) {
+		m.proposalTTL = ttl
+	}
+}
 
 // WithMVCCCacheSupport enables MVCC-snapshot-aware housekeeping for background
 // OptimizeRepository runs (daily maintenance, scheduled housekeeping) that do not

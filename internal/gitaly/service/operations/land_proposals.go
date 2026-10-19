@@ -3,12 +3,10 @@ package operations
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"path"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,8 +15,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
-	"github.com/feder-cr/git-ai/internal/git/updateref"
-	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/proposals"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/log"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -28,40 +25,18 @@ import (
 // reviews, edits or replaces, and lands as its own (PLAN10 14). The server keeps the proposals of a
 // failed land under a hidden reference, which the agent reads by object ID (GetObjects).
 
-const (
-	// landProposalRefPrefix is the hidden namespace of the proposals (git.InternalRefPrefixes).
-	landProposalRefPrefix = "refs/graft/proposals/"
-	// landMaxProposalsPerBranch bounds the proposal references kept for one branch.
-	landMaxProposalsPerBranch = 20
-)
-
-// landProposalPruneErrors counts the proposal references that could not be pruned after a land.
+// landProposalPruneErrors counts the prunings of proposal references that failed after a land.
 var landProposalPruneErrors = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "graft_land_proposal_prune_errors_total",
 	Help: "Prunings of the proposal references of a branch that failed after a land.",
 })
 
-// landProposalBranchDir is the directory of the proposal references of a branch: a hash of the
-// branch name, so that any branch name gives a valid and fixed-length component.
-func landProposalBranchDir(branch string) string {
-	sum := sha256.Sum256([]byte(branch))
-	return landProposalRefPrefix + hex.EncodeToString(sum[:])[:16] + "/"
-}
-
-// landProposalRef is the reference that keeps the proposals of the land of commit onto branch.
-func landProposalRef(branch string, commit git.ObjectID) git.ReferenceName {
-	return git.ReferenceName(landProposalBranchDir(branch) + commit.String())
-}
-
-// landProposalsError is the failure to keep a resolver's answer as proposals. The land fails with
-// Internal (landWithPackage): a package without the proposals would hide the answer.
-type landProposalsError struct{ err error }
-
-func (e *landProposalsError) Error() string {
-	return "keeping the resolver's answer as proposals: " + e.err.Error()
-}
-
-func (e *landProposalsError) Unwrap() error { return e.err }
+// landProposalWriteErrors counts the answers that could not be kept as proposals: the land still
+// fails with its package, whose files say "proposal not stored".
+var landProposalWriteErrors = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "graft_land_proposal_write_errors_total",
+	Help: "Resolver answers of a failed land that could not be kept as proposals.",
+})
 
 // landProposedReason is the reason of a file that a model resolved.
 const landProposedReason = "a model resolved the file: the server never lands a model's resolution, it proposes it (see proposal); land it, edited or not, as your own resolution"
@@ -106,6 +81,10 @@ func (s *Server) landWriteProposals(ctx context.Context, in *gitalypb.UserLandRe
 	// Who caused the proposals is in their commit, the trace of the reference: the update itself
 	// is the server's (landUpdateProposalRefs).
 	actor := landBatchActor(ctx, in)
+	// The date of the proposals' commit is the server's clock, never the request's timestamp:
+	// their age decides when they expire.
+	now := time.Now()
+	start := now
 	repo := s.localRepoFactory.Build(in.GetRepository())
 	tree := &localrepo.TreeEntry{Type: localrepo.Tree, Mode: "040000"}
 	byPath := make(map[string]*gitalypb.LandConflictProposal, len(answer.Files))
@@ -130,21 +109,21 @@ func (s *Server) landWriteProposals(ctx context.Context, in *gitalypb.UserLandRe
 	}
 	commit, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{
 		TreeID:         tree.OID,
-		Message:        fmt.Sprintf("graft: proposals for landing %s onto %s\n\nResolver: %s\nRequested-By: %s\n", l.commitID, l.tip, answer.Resolver, actor),
+		Message:        fmt.Sprintf("graft: proposals for landing %s onto %s\n\nResolver: %s\nRequested-By: %s\n", l.commitID, l.tip, landTrailerValueOrQuoted(answer.Resolver), landTrailerValueOrQuoted(actor)),
 		Parents:        []git.ObjectID{l.tip, l.commitID},
 		AuthorName:     committer.Name,
 		AuthorEmail:    committer.Email,
-		AuthorDate:     committer.When,
+		AuthorDate:     now,
 		CommitterName:  committer.Name,
 		CommitterEmail: committer.Email,
-		CommitterDate:  committer.When,
+		CommitterDate:  now,
 		GitConfig:      s.gitConfig,
 	})
 	if err != nil {
 		return "", fmt.Errorf("writing the commit of the proposals: %w", err)
 	}
 
-	ref := landProposalRef(string(in.GetBranch()), l.commitID)
+	ref := proposals.Ref(string(in.GetBranch()), l.commitID)
 	old, err := repo.GetReference(ctx, ref)
 	oldOID := git.ObjectID("")
 	switch {
@@ -160,10 +139,10 @@ func (s *Server) landWriteProposals(ctx context.Context, in *gitalypb.UserLandRe
 	if oldOID == "" {
 		oldOID = objectHash.ZeroOID
 	}
-	if err := s.landUpdateProposalRefs(ctx, repo, []landProposalRefOp{{name: ref, newOID: commit, oldOID: oldOID}}); err != nil {
+	if err := proposals.Update(ctx, repo, []proposals.Op{{Name: ref, NewOID: commit, OldOID: oldOID}}); err != nil {
 		return "", err
 	}
-	s.logger.WithFields(log.Fields{"ref": ref.String(), "actor": actor, "resolver": answer.Resolver}).InfoContext(ctx, "graft: kept the resolver's answer as proposals")
+	s.logger.WithFields(log.Fields{"ref": ref.String(), "actor": actor, "resolver": answer.Resolver, "seconds": time.Since(start).Seconds()}).InfoContext(ctx, "graft: kept the resolver's answer as proposals")
 
 	for _, f := range l.files {
 		f.proposal = byPath[f.conflict.path]
@@ -173,123 +152,6 @@ func (s *Server) landWriteProposals(ctx context.Context, in *gitalypb.UserLandRe
 		s.logger.WithError(err).WithField("branch", string(in.GetBranch())).ErrorContext(ctx, "graft: pruning the proposals of the branch failed")
 	}
 	return ref, nil
-}
-
-// landPruneProposals deletes the proposal references of a branch that are older than proposal_ttl
-// (by the committer date of their commit) or beyond the newest landMaxProposalsPerBranch, and drop,
-// when set: the proposal of a commit that landed. The deletions go through the reference
-// transaction, as the writes do.
-func (s *Server) landPruneProposals(ctx context.Context, repo *localrepo.Repo, branch string, drop git.ReferenceName) error {
-	ttl, err := s.resolveCfg.ProposalTTLOrDefault()
-	if err != nil {
-		return err
-	}
-	refs, err := repo.GetReferences(ctx, landProposalBranchDir(branch))
-	if err != nil {
-		return fmt.Errorf("listing the proposals of %q: %w", branch, err)
-	}
-	type dated struct {
-		name git.ReferenceName
-		when time.Time
-	}
-	var kept []dated
-	var remove []git.ReferenceName
-	now := time.Now()
-	for _, r := range refs {
-		if r.Name == drop {
-			remove = append(remove, r.Name)
-			continue
-		}
-		c, err := repo.ReadCommit(ctx, git.Revision(r.Target))
-		if err != nil {
-			return fmt.Errorf("reading %s: %w", r.Name, err)
-		}
-		when := c.GetCommitter().GetDate().AsTime()
-		if now.Sub(when) > ttl {
-			remove = append(remove, r.Name)
-			continue
-		}
-		kept = append(kept, dated{r.Name, when})
-	}
-	sort.Slice(kept, func(i, j int) bool { return kept[i].when.After(kept[j].when) })
-	for i := landMaxProposalsPerBranch; i < len(kept); i++ {
-		remove = append(remove, kept[i].name)
-	}
-	if len(remove) == 0 {
-		return nil
-	}
-	deletions := make([]landProposalRefOp, 0, len(remove))
-	for _, name := range remove {
-		deletions = append(deletions, landProposalRefOp{name: name, delete: true})
-	}
-	if err := s.landUpdateProposalRefs(ctx, repo, deletions); err != nil {
-		return fmt.Errorf("pruning proposals: %w", err)
-	}
-	return nil
-}
-
-// landProposalRefOp is one update of a proposal reference: to newOID from oldOID, or a deletion.
-type landProposalRefOp struct {
-	name           git.ReferenceName
-	newOID, oldOID git.ObjectID
-	delete         bool
-}
-
-// landUpdateProposalRefs is the one writer of the proposal references (PLAN10 14): it updates
-// only references of the form refs/graft/proposals/<16 hex of the branch>/<commit ID>, and refuses
-// anything else before git runs. It updates them as the server, without the identity of the
-// request, through the reference transaction like any update: the agent whose land made the
-// proposals may not write refs/graft/ itself (the reference-transaction hook reserves it), and
-// its policy does not judge the server's write. Who caused it is in the proposals' commit.
-func (s *Server) landUpdateProposalRefs(ctx context.Context, repo *localrepo.Repo, ops []landProposalRefOp) error {
-	for _, op := range ops {
-		if !landProposalRefNameValid(op.name) {
-			return fmt.Errorf("refusing to update %q: not a proposal reference", op.name)
-		}
-	}
-	ctx = identity.NewContext(ctx, identity.Identity{})
-	updater, err := updateref.New(ctx, repo)
-	if err != nil {
-		return fmt.Errorf("updating proposal references: %w", err)
-	}
-	defer func() { _ = updater.Close() }()
-	if err := updater.Start(); err != nil {
-		return fmt.Errorf("updating proposal references: %w", err)
-	}
-	for _, op := range ops {
-		if op.delete {
-			err = updater.Delete(op.name)
-		} else {
-			err = updater.Update(op.name, op.newOID, op.oldOID)
-		}
-		if err != nil {
-			return fmt.Errorf("updating %s: %w", op.name, err)
-		}
-	}
-	if err := updater.Commit(); err != nil {
-		return fmt.Errorf("updating proposal references: %w", err)
-	}
-	return nil
-}
-
-// landProposalRefNameValid reports whether name is refs/graft/proposals/<16 hex>/<object ID>.
-func landProposalRefNameValid(name git.ReferenceName) bool {
-	rest, ok := strings.CutPrefix(name.String(), landProposalRefPrefix)
-	if !ok {
-		return false
-	}
-	dir, commit, ok := strings.Cut(rest, "/")
-	return ok && len(dir) == 16 && landHex(dir) && (len(commit) == 40 || len(commit) == 64) && landHex(commit)
-}
-
-// landHex reports whether s is lower-case hexadecimal.
-func landHex(s string) bool {
-	for _, c := range s {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 // landPruneAfterLand prunes the proposals of the branch after a land that asked for resolution or
@@ -304,10 +166,78 @@ func (s *Server) landPruneAfterLand(ctx context.Context, in *gitalypb.UserLandRe
 	repo := s.localRepoFactory.Build(in.GetRepository())
 	drop := git.ReferenceName("")
 	if commitID, err := repo.ResolveRevision(ctx, git.Revision(in.GetCommitId()+"^{commit}")); err == nil {
-		drop = landProposalRef(string(in.GetBranch()), commitID)
+		drop = proposals.Ref(string(in.GetBranch()), commitID)
 	}
 	if err := s.landPruneProposals(ctx, repo, string(in.GetBranch()), drop); err != nil {
 		landProposalPruneErrors.Inc()
 		s.logger.WithError(err).WithField("branch", string(in.GetBranch())).ErrorContext(ctx, "graft: pruning the proposals of the branch failed after the land")
 	}
 }
+
+// landPruneProposals prunes the proposals of a branch (proposals.Prune), with drop when set.
+func (s *Server) landPruneProposals(ctx context.Context, repo *localrepo.Repo, branch string, drop git.ReferenceName) error {
+	ttl, err := s.resolveCfg.ProposalTTLOrDefault()
+	if err != nil {
+		return err
+	}
+	_, err = proposals.Prune(ctx, repo, proposals.BranchDir(branch), ttl, drop, time.Now())
+	return err
+}
+
+// landTrailerValueOrQuoted returns v when it is a valid trailer value (landTrailerValueValid), and
+// v quoted otherwise, so that a value the caller chose (the user ID of the request) can never add
+// a line to the proposals' message.
+func landTrailerValueOrQuoted(v string) string {
+	if landTrailerValueValid(v) {
+		return v
+	}
+	return strconv.QuoteToASCII(v)
+}
+
+// decideLand is the one decision point of a land that asked the server to resolve its conflicts
+// (PLAN10 15.4): it lands only when the resolver answered, the answer holds no model's resolution,
+// and every conflicting file is resolved. A file that proposes is never landed. This is where a
+// landing gate for model resolutions would live; today there is none.
+func decideLand(answer *resolver.Response, files []*landFileState) bool {
+	if answer == nil {
+		return false
+	}
+	if landAnswerProposes(answer) {
+		return false
+	}
+	for _, f := range files {
+		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			return false
+		}
+	}
+	return true
+}
+
+// landProposalsNotStored marks every file of the answer: its proposal was not stored, and why.
+func landProposalsNotStored(files []*landFileState, answer *resolver.Response, cause error) {
+	inAnswer := make(map[string]bool, len(answer.Files))
+	for _, f := range answer.Files {
+		inAnswer[f.Path] = true
+	}
+	for _, f := range files {
+		if !inAnswer[f.conflict.path] {
+			continue
+		}
+		f.proposal = nil
+		note := "proposal not stored: " + cause.Error()
+		if f.reason == "" {
+			f.reason = note
+		} else {
+			f.reason += "; " + note
+		}
+	}
+}
+
+// landPolicyDeniedError is the policy's refusal of a land that asked the server to resolve: the
+// agent may not update the branch, so nothing is resolved and no proposal is kept. err is the
+// refusal (PermissionDenied).
+type landPolicyDeniedError struct{ err error }
+
+func (e *landPolicyDeniedError) Error() string { return e.err.Error() }
+
+func (e *landPolicyDeniedError) Unwrap() error { return e.err }

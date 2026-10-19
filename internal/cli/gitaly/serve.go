@@ -533,8 +533,14 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 	defer func() { _ = mvccCacheFactory.Close(ctx) }()
 	prometheus.MustRegister(mvccCacheFactory)
 
+	// The proposals of the land expire in the housekeeping pass too, so that those of idle and
+	// deleted branches go (PLAN10 14). proposal_ttl was validated with the configuration.
+	proposalTTL, err := cfg.Graft.Land.Resolver.ProposalTTLOrDefault()
+	if err != nil {
+		return fmt.Errorf("graft land resolver: %w", err)
+	}
 	housekeepingManager := housekeepingmgr.New(cfg.Prometheus, logger, transactionManager, nil,
-		housekeepingmgr.WithMVCCCacheSupport(mvccCacheFactory))
+		housekeepingmgr.WithMVCCCacheSupport(mvccCacheFactory), housekeepingmgr.WithGraftProposalTTL(proposalTTL))
 	prometheus.MustRegister(housekeepingManager)
 
 	housekeepingMiddlewareConfig := housekeepingmw.DefaultMiddlewareConfig()

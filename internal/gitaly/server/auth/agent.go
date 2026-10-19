@@ -105,7 +105,14 @@ func InterceptorsWithAgentRPCs(conf gitalycfgauth.Config, agents []config.GraftA
 			if err := checkAgentRequest(ctx, req); err != nil {
 				return nil, err
 			}
-			return handler(ctx, req)
+			if err := checkAgentRefs(ctx, req); err != nil {
+				return nil, err
+			}
+			resp, err := handler(ctx, req)
+			if err == nil {
+				filterAgentRefs(ctx, resp)
+			}
+			return resp, err
 		})
 	}
 
@@ -176,7 +183,8 @@ func checkAgentRequest(ctx context.Context, req any) error {
 	return nil
 }
 
-// agentRequestGuardStream checks every message an agent sends on a stream.
+// agentRequestGuardStream checks every message an agent sends on a stream, and
+// removes from every message it receives the references it may not see.
 type agentRequestGuardStream struct {
 	grpc.ServerStream
 }
@@ -188,7 +196,16 @@ func (s *agentRequestGuardStream) RecvMsg(m any) error {
 		return err
 	}
 
-	return checkAgentRequest(s.Context(), m)
+	if err := checkAgentRequest(s.Context(), m); err != nil {
+		return err
+	}
+	return checkAgentRefs(s.Context(), m)
+}
+
+// SendMsg sends m without the references under refs/graft/ it lists.
+func (s *agentRequestGuardStream) SendMsg(m any) error {
+	filterAgentRefs(s.Context(), m)
+	return s.ServerStream.SendMsg(m)
 }
 
 // loadAgentCredentials validates the agent configuration and resolves every

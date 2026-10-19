@@ -24,6 +24,8 @@ sys.stdout.write("===== BEGIN PATCHED CODE %s =====\n%s===== END PATCHED CODE %s
 // TestPhase2ModelResolutionIsProposedThenLandedByTheAgent is decision 1 of PLAN10 14 end to end:
 // the real graft-resolve answers with its llm strategy, the server lands nothing and proposes the
 // answer in the conflict package, the SDK reads the proposal, and the agent lands it as its own.
+// The strategy is named "model", not "llm": the server's fallback on the resolver's name cannot
+// catch it, so the proposal flag that graft-resolve sets is what makes it a proposal.
 func TestPhase2ModelResolutionIsProposedThenLandedByTheAgent(t *testing.T) {
 	t.Parallel()
 
@@ -32,6 +34,7 @@ func TestPhase2ModelResolutionIsProposedThenLandedByTheAgent(t *testing.T) {
 	require.NoError(t, os.WriteFile(model, []byte(fakeModel), 0o600))
 	resolveConfig := filepath.Join(dir, "resolve.toml")
 	require.NoError(t, os.WriteFile(resolveConfig, []byte(`[[strategy]]
+name = "model"
 type = "llm"
 paths = ["shared-log.txt"]
 
@@ -72,7 +75,7 @@ model = "fake"
 	require.Len(t, pkg.GetFiles(), 1)
 	f := pkg.GetFiles()[0]
 	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome())
-	require.Contains(t, f.GetProposal().GetResolver(), "llm")
+	require.Equal(t, "graft-resolve/model", f.GetProposal().GetResolver(), "the name holds no \"llm\": the flag decided")
 
 	sides, err := repo.ConflictSides(ctx, pkg)
 	require.NoError(t, err)

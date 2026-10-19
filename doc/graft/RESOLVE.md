@@ -174,17 +174,24 @@ The proposals are kept under a hidden reference,
 `refs/graft/proposals/<first 16 hex of sha256(branch)>/<commit>`, named in the
 package's `proposal_ref`: a commit whose tree holds the proposed files by
 path, with parents `[tip, commit]`, whose message names the resolver and
-`Requested-By:` the actor of the land. One reference per branch and landed
+`Requested-By:` the actor of the land, and whose date is the server's clock
+(never the request's timestamp). One reference per branch and landed
 commit, replaced by every failed land of that commit. The server writes it
 itself, through the reference transaction like any update (and so the storage
 core in authoritative mode), and refuses to write any other reference this
-way. The agent reads the proposals by OID with `GetBlobs`; it cannot see the
-reference in an advertisement nor push to it, and no agent may update
-anything under `refs/graft/`, whatever the policy says. Every land that asks
-for resolution or brings one prunes the branch's proposals older than
-`proposal_ttl` (default 7 days) and keeps at most 20; the agent's land of the
-change drops that change's proposal. A proposal that cannot be written fails
-the land with `Internal`, never with a package that lacks it.
+way. The agent reads the proposals by OID with `GetBlobs`. Nothing under
+`refs/graft/` is visible to an agent: no ref RPC lists it or accepts a name
+under it, upload-pack does not advertise it, and no agent may update it,
+whatever the policy says (see [AGENT-SECURITY](AGENT-SECURITY.md)). An agent
+the policy does not let update the branch gets `PermissionDenied` before
+anything is resolved, and no proposal is kept for it. Every land that asks for
+resolution or brings one prunes the branch's proposals older than
+`proposal_ttl` (default 7 days) and keeps at most 20, and the housekeeping
+pass prunes those of every branch, idle or deleted ones included; the agent's
+land of the change drops that change's proposal. The proposals are an aid and
+the package is the contract: when they cannot be stored, the package still
+comes, each file of the answer saying `proposal not stored: <cause>`, and the
+failure is logged and counted (`graft_land_proposal_write_errors_total`).
 
 Every resolution is logged at info level as `graft: conflicts of land
 resolved`, with the branch, the tip, the landed commit, the merge commit, the

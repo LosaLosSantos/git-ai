@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/graft/agentrefs"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
@@ -451,7 +453,11 @@ func validatePositionalArg(arg string) error {
 }
 
 func hiddenReceivePackRefPrefixes(ctx context.Context) []GlobalOption {
-	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes))
+	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes)+1)
+	// An agent does not see refs/graft/ at all (agentrefs); others see what the prefixes allow.
+	if id, ok := identity.FromContext(ctx); ok && id.Source == identity.SourceAgent {
+		config = append(config, ConfigPair{Key: "receive.hideRefs", Value: agentrefs.HiddenPrefix})
+	}
 
 	for refPrefix, refType := range git.InternalRefPrefixes {
 		switch refType {
@@ -467,8 +473,13 @@ func hiddenReceivePackRefPrefixes(ctx context.Context) []GlobalOption {
 	return config
 }
 
-func hiddenUploadPackRefPrefixes(context.Context) []GlobalOption {
-	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes))
+func hiddenUploadPackRefPrefixes(ctx context.Context) []GlobalOption {
+	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes)+1)
+	// An agent does not see refs/graft/ at all (agentrefs), graft-verify's green references
+	// included, which other clients may fetch.
+	if id, ok := identity.FromContext(ctx); ok && id.Source == identity.SourceAgent {
+		config = append(config, ConfigPair{Key: "uploadpack.hideRefs", Value: agentrefs.HiddenPrefix})
+	}
 
 	for refPrefix, refType := range git.InternalRefPrefixes {
 		switch refType {

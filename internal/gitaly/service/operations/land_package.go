@@ -142,12 +142,12 @@ func (e *landUnresolvedError) Unwrap() error {
 // landWithPackage adds the conflict package of resolveErr, when it carries one, to the merge
 // conflict error of the land as a second detail, after UserLandError. Clients that know only
 // UserLandError see the error unchanged. A package that cannot be built (a side that cannot be
-// read), or a resolver's answer that cannot be kept as proposals, is an internal error: the merge
-// conflict alone would hide it.
+// read) is an internal error: the merge conflict alone would hide it. An agent the policy does not
+// let update the branch gets the policy's refusal, not a package.
 func landWithPackage(ctx context.Context, mergeConflict, resolveErr error) error {
-	var proposalsErr *landProposalsError
-	if errors.As(resolveErr, &proposalsErr) {
-		return structerr.NewInternal("%w", proposalsErr)
+	var denied *landPolicyDeniedError
+	if errors.As(resolveErr, &denied) {
+		return denied.err
 	}
 	var unresolved *landUnresolvedError
 	var se structerr.Error

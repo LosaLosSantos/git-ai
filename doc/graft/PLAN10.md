@@ -755,8 +755,9 @@ flag.
   of that commit. On every land of a branch that asks for or brings a resolution (a plain land pays
   nothing; only those lands write proposals) the server deletes the branch's proposal references
   older than `proposal_ttl` (default 7 days) and keeps at most 20 per branch; the agent's land of
-  the change drops its proposal. A proposal reference
-  that cannot be written fails the land with Internal, not with a package without proposals.
+  the change drops its proposal. When the proposals cannot be stored the package still goes to
+  the agent, each file of the answer saying "proposal not stored: <cause>" (logged and counted):
+  the proposals are an aid, the package is the contract (review ruling M2).
 * **(a) Authoritative storage mode (checked).** UserLand updates references through the
   reference-transaction hook (STORAGE.md, the voter): the proposal reference and its expiry
   deletions go through it like the branch, so in authoritative mode each is a changeset committed
@@ -800,6 +801,40 @@ flag.
   example policy that gives the agent no refs/graft/ rule: the server proposes, the SDK reads the
   proposal, the agent lands it as its own (Graft-Resolved-By: agent/<actor>), and the proposal
   reference is dropped.
+* **Review of e33a723 + b54b529 (PM rulings), implemented.**
+  * M1, condition 3: refs/graft/** is internal for agents. One rule (internal/graft/agentrefs),
+    applied once per transport: the agent guard of the gRPC server refuses a request whose
+    revision, reference or pattern names refs/graft/ (the short forms graft/proposals/... and
+    graft/green/..., which git completes to the server's namespaces, included; other graft/...
+    short names are branches, the workspace's temporary branches graft/<agent>/... among them,
+    which the first, broader rule refused and the suite caught), and removes such references
+    from every response; git
+    upload-pack and receive-pack hide the prefix from agents. A table-driven test classifies every
+    string or bytes field of every RPC agents may call by default (a new one fails it); RPCs added
+    with agent_rpcs are checked by field name. graft-verify's refs/graft/green/ stays advertised
+    to other callers: VERIFY.md documents it for consumers (the newest tested tip), which are not
+    agents; agents do not see it.
+  * M2: a proposal that cannot be stored no longer turns the conflict into Internal: the package
+    comes without it, each file of the answer saying "proposal not stored: <cause>", logged and
+    counted (graft_land_proposal_write_errors_total).
+  * M3: the proposals' commit is dated by the server's clock, never the request's timestamp; the
+    housekeeping pass prunes the proposals of every branch (WithGraftProposalTTL), so idle and
+    deleted branches expire, except in a repository housekept in a WAL transaction, where a
+    reference update would bypass the transaction (logged; those expire through their branch's
+    lands); an agent the policy does not let update the branch gets PermissionDenied before
+    anything is resolved, and no proposal is kept.
+  * m1: every deletion expects the target it read (internal/graft/proposals, the one writer and
+    the one pruner, used by UserLand and housekeeping). m2: decideLand is the one decision point,
+    with the guard "a file that proposes is never landed"; that is where a future gate lives.
+    m4: the Resolver and Requested-By values pass landTrailerValueValid, and are quoted
+    otherwise (the user ID is the caller's). m5: the e2e test names the llm strategy "model", so
+    the flag, not the name fallback, makes the proposal; the release note (the PM's file) says
+    that rerere entries recorded from llm answers before b54b529 must be cleared.
+  * m6, measured: writing the proposals adds a median of 97 ms (min 69, p90 113, max 134 ms on the
+    test machine) to the lane's hold; the resolver's own call, already in the lane for
+    resolve_conflicts, takes seconds. Moving both out of the lane, like the precheck of an agent's
+    resolution, is a step of its own.
+
 * **Amendment: Federico's product decision (2026-10-19, relayed by the PM).** "When the server AI
   is configured, the server always tries to resolve, and it LANDS its resolution by itself ONLY if
   the proposal passes every deterministic check: syntax, anchors, no markers, and the composition
@@ -854,12 +889,16 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
        list the conflicting files (bounded) -> one VERDICT per file (15.2)
          |
          v
+       agent may not update the branch (policy) -> PermissionDenied, nothing resolved
        decide: LAND only if every file is resolved by an operator rule (15.4)
          |-- yes -> operator verify.command; passes -> merge commit signed by the rules -> LAND
          |                                   fails  -> PACKAGE (every file REJECTED, reason)
          |-- no  -> PACKAGE to the agent (merge_conflict detail): sides by OID, hunks,
                     per-file outcome + reason, per-file proposal (+ its report, planned),
-                    the proposals kept under refs/graft/proposals/ (14)
+                    the proposals kept under refs/graft/proposals/ (14), or, when they
+                    cannot be stored, "proposal not stored: <cause>" on each file
+ every request and response of an agent: the refs/graft/ visibility filter (agentrefs);
+ git upload-pack / receive-pack of an agent: refs/graft/ hidden
                       |
                       v
                     the agent resolves (takes, edits or replaces the proposals) and
@@ -926,7 +965,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 ### 15.4 The one decision point
 
 ```
- decide (today: resolveLandConflicts, with landAnswerProposes; one function, planned: decideLand)
+ decideLand (resolveLandConflicts calls it; landAnswerProposes is its guard)
    every file resolved by an operator rule ...... LAND (then verify.command)
    anything else, including any model answer .... PACKAGE (the model's files are proposals)
  No other code path lands a model's resolution. No check disables itself: a configuration that
@@ -943,7 +982,8 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | resolver check, bounded slots | `landCheckResolution`, `landCheckSlotted`, `Client.AcquireCheckSlot` | operations/land_reland.go; graft/resolver/check.go |
 | LANE, re-land | `landAttempt`, `landingAttempt.decide`, `landWithResolution` | operations/land.go, land_attempt.go, land_reland.go |
 | 3-way merge, listing | `landingAttempt.decide`, `landListConflicts` | operations/land_attempt.go, land_resolve.go |
-| per-file verdicts, decide | `resolveLandConflicts`, `landAnswerProposes` (planned: `decideLand`) | operations/land_resolve.go, land_proposals.go |
+| per-file verdicts, decide | `resolveLandConflicts`, `decideLand`, `landAnswerProposes` | operations/land_resolve.go, land_proposals.go |
+| policy before resolving | `hook.CheckAgentPolicy`, `landPolicyDeniedError` | operations/land_resolve.go, land_proposals.go |
 | classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
 | operator rules, file checks | `Resolver.resolveFile`, `Resolver.runChecks`, `syntax.CheckMerge` | tools/graft-agents/resolve/resolve.go |
 | AI per file | `llmStrategy.Resolve`, `ResolveLLM`, `llmResolvePatch` | tools/.../resolve/llm_strategy.go, llm_core.go, llm_patch.go |
@@ -953,7 +993,10 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | verify.command | `landVerify`, `verifyRejected` | operations/land_verify.go, land_resolve.go |
 | merge commit, trailers | `landWriteResolution` | operations/land_resolve.go |
 | PACKAGE | `landWithPackage`, `landListing.conflictPackage` | operations/land_package.go |
-| proposals, hidden reference | `landWriteProposals`, `landUpdateProposalRefs`, `landPruneProposals` | operations/land_proposals.go |
+| proposals, hidden reference | `landWriteProposals`, `proposals.Update`, `proposals.Prune`, `landProposalsNotStored` | operations/land_proposals.go; graft/proposals |
+| proposals' expiry in housekeeping | `RepositoryManager.pruneGraftProposals` | git/housekeeping/manager/optimize_repository.go |
+| refs/graft/ visibility filter (agents) | `checkAgentRefs`, `filterAgentRefs`, `agentRefField`; `agentrefs.RevisionHidden` | gitaly/server/auth/agent_refs.go; graft/agentrefs |
+| refs/graft/ hidden from agents' git | `hiddenUploadPackRefPrefixes`, `hiddenReceivePackRefPrefixes` | git/gitcmd/command_description.go |
 | refs/graft/ reserved for the server | `graftReservedDenial` | gitaly/hook/referencetransaction.go |
 | composition report | (planned) | (planned: graft/resolver, with a parity-tested copy in tools/) |
 

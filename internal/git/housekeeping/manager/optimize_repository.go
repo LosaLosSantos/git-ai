@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/feder-cr/git-ai/internal/graft/proposals"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"os"
 	"time"
 
@@ -101,11 +104,18 @@ func (m *RepositoryManager) OptimizeRepository(
 		}
 
 		if tx != nil {
+			if m.proposalTTL > 0 {
+				// A reference update here would bypass the transaction: the proposals then expire
+				// only through the lands of their branch (PLAN10 14).
+				m.logger.InfoContext(ctx, "graft: proposal pruning skipped: the repository is housekept in a transaction")
+			}
 			return m.optimizeRepositoryWithTransaction(ctx, repo, cfg)
 		}
 
 		return m.withMVCCCache(ctx, repo, func(ctx context.Context) error {
-			return m.optimizeRepository(ctx, repo, cfg)
+			err := m.optimizeRepository(ctx, repo, cfg)
+			m.pruneGraftProposals(ctx, repo)
+			return err
 		})
 	}); err != nil {
 		return err
@@ -613,4 +623,28 @@ func (m *RepositoryManager) CleanStaleData(ctx context.Context, repo *localrepo.
 	}
 
 	return nil
+}
+
+// graftProposalPruneErrors counts the housekeeping passes whose pruning of the land's proposals
+// failed; the pass itself does not fail for it.
+var graftProposalPruneErrors = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "graft_housekeeping_proposal_prune_errors_total",
+	Help: "Housekeeping passes whose pruning of the proposal references of the land failed.",
+})
+
+// pruneGraftProposals prunes the proposals of the land on every branch (WithGraftProposalTTL). A
+// failure is logged and counted, and fails nothing: the proposals are an aid.
+func (m *RepositoryManager) pruneGraftProposals(ctx context.Context, repo *localrepo.Repo) {
+	if m.proposalTTL <= 0 {
+		return
+	}
+	n, err := proposals.Prune(ctx, repo, proposals.RefPrefix, m.proposalTTL, "", time.Now())
+	if err != nil {
+		graftProposalPruneErrors.Inc()
+		m.logger.WithError(err).ErrorContext(ctx, "graft: pruning the proposals of the land failed")
+		return
+	}
+	if n > 0 {
+		m.logger.WithField("pruned", n).InfoContext(ctx, "graft: pruned the expired proposals of the land")
+	}
 }

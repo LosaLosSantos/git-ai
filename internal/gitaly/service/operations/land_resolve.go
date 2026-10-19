@@ -17,6 +17,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -91,6 +92,12 @@ func (s *Server) resolveLandConflicts(
 	tip, commitID git.ObjectID,
 	committer git.Signature,
 ) (landResolution, error) {
+	// An agent that may not update the branch gets nothing resolved, and no proposal is kept for
+	// it: the policy decides on the actor and the reference alone, so it is checked first.
+	reference := git.NewReferenceNameFromBranchName(string(in.GetBranch()))
+	if err := hook.CheckAgentPolicy(ctx, s.graft, fmt.Sprintf("%s %s %s\n", tip, commitID, reference)); err != nil {
+		return landResolution{}, &landPolicyDeniedError{err: err}
+	}
 	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
 	if err != nil {
 		return landResolution{}, err
@@ -192,17 +199,23 @@ func (s *Server) resolveLandConflicts(
 		}
 	}
 
+	landed := decideLand(answer, files)
 	// An answer that does not land, because a model made part of it or another file is left, is
-	// kept for the agent: the files that rules resolved can be landed as they are. Failing to keep
-	// it fails the land with Internal, not with a package that lacks the proposals.
-	if answer != nil && (proposes || !landAllResolved(files)) {
+	// kept for the agent: the files that rules resolved can be landed as they are. The proposals
+	// are an aid and the package is the contract: when they cannot be kept, the package still goes
+	// to the agent, each file of the answer saying that its proposal was not stored, and the
+	// failure is logged and counted.
+	if answer != nil && !landed {
 		ref, err := s.landWriteProposals(ctx, in, l, answer, committer)
 		if err != nil {
-			return landResolution{}, &landProposalsError{err: err}
+			landProposalWriteErrors.Inc()
+			s.logger.WithError(err).WithField("branch", string(in.GetBranch())).ErrorContext(ctx, "graft: the resolver's answer could not be kept as proposals")
+			landProposalsNotStored(files, answer, err)
+		} else {
+			l.proposalRef = ref
 		}
-		l.proposalRef = ref
 	}
-	if answer == nil || !landAllResolved(files) {
+	if !landed {
 		return landResolution{}, l.unresolved("", landUnresolvedCause(files), resolveErr)
 	}
 

@@ -59,6 +59,18 @@ These can never be enabled, not even through `graft.agent_rpcs`:
 - `CleanupService`, `ObjectPoolService`, `HookService`, `InternalGitaly`,
   `PartitionService`.
 
+An agent does not see `refs/graft/` at all (`internal/graft/agentrefs`): the
+agent guard refuses a request whose revision, reference or pattern names a
+reference under it (including the short forms `graft/proposals/...` and
+`graft/green/...`, which git completes to the server's namespaces; other
+`graft/...` short names, such as the workspace's temporary branches, are
+branches), and removes such references from every response; git upload-pack and
+receive-pack hide the prefix from agents. A test classifies every string or
+bytes field of every RPC agents may call by default, so a new field cannot
+escape the filter; RPCs added with `graft.agent_rpcs` are checked by field
+name. Other callers still see graft-verify's green references, which are
+documented for consumers.
+
 Whatever the RPC and whatever the policy says, an agent never creates,
 updates or deletes a reference under `refs/graft/`: the reference-transaction
 hook refuses it, so a push, `UpdateReferences`, `DeleteRefs`, `WriteRef` or an

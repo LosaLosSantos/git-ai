@@ -2,6 +2,7 @@ package operations
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -9,12 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
-	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	gitalycfg "github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/proposals"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/helper/text"
+	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
@@ -33,7 +39,7 @@ func modelAnswer() resolver.Response {
 // "" when there is none.
 func proposalRefTarget(t *testing.T, fx resolveFixture) string {
 	t.Helper()
-	out, err := gittest.NewCommand(t, fx.cfg, "-C", fx.repoPath, "rev-parse", "--verify", "--quiet", landProposalRef(git.DefaultBranch, fx.commit).String()).Output()
+	out, err := gittest.NewCommand(t, fx.cfg, "-C", fx.repoPath, "rev-parse", "--verify", "--quiet", proposals.Ref(git.DefaultBranch, fx.commit).String()).Output()
 	if err != nil {
 		return ""
 	}
@@ -55,7 +61,7 @@ func TestUserLand_proposals(t *testing.T) {
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 		pkg := landConflictDetail(err)
 		require.NotNil(t, pkg)
-		require.Equal(t, landProposalRef(git.DefaultBranch, fx.commit).String(), pkg.GetProposalRef())
+		require.Equal(t, proposals.Ref(git.DefaultBranch, fx.commit).String(), pkg.GetProposalRef())
 
 		target := proposalRefTarget(t, fx)
 		require.NotEmpty(t, target, "the proposal reference exists")
@@ -178,7 +184,7 @@ func TestUserLand_proposals(t *testing.T) {
 		dir, argv := resolverScript(t, "")
 		writeAnswer(t, dir, modelAnswer())
 		fx := newResolveFixture(t, enabledResolver(argv))
-		branchDir := landProposalBranchDir(git.DefaultBranch)
+		branchDir := proposals.BranchDir(git.DefaultBranch)
 		now := time.Now()
 		// Proposal references are named by the commit they are for: fake commit IDs name these.
 		name := func(i int) string { return fmt.Sprintf("%s%040x", branchDir, i+1) }
@@ -194,26 +200,69 @@ func TestUserLand_proposals(t *testing.T) {
 
 		refs := strings.Fields(text.ChompBytes(gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "for-each-ref", "--format=%(refname)", branchDir)))
 		require.Len(t, refs, 20)
-		require.Contains(t, refs, landProposalRef(git.DefaultBranch, fx.commit).String(), "the newest is kept")
+		require.Contains(t, refs, proposals.Ref(git.DefaultBranch, fx.commit).String(), "the newest is kept")
 		require.NotContains(t, refs, name(100), "past proposal_ttl")
 		require.NotContains(t, refs, name(20), "the oldest beyond 20")
 		require.NotContains(t, refs, name(19), "the oldest beyond 20")
 		require.Contains(t, refs, name(18))
 	})
 
-	t.Run("a proposal reference that cannot be written fails the land with Internal", func(t *testing.T) {
+	t.Run("proposals that cannot be stored still give the package, saying so", func(t *testing.T) {
 		t.Parallel()
 
 		dir, argv := resolverScript(t, "")
 		writeAnswer(t, dir, modelAnswer())
 		fx := newResolveFixture(t, enabledResolver(argv))
 		// A reference where the branch's directory of proposals goes: the update cannot create it.
-		gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "update-ref", strings.TrimSuffix(landProposalBranchDir(git.DefaultBranch), "/"), fx.tip.String())
+		gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "update-ref", strings.TrimSuffix(proposals.BranchDir(git.DefaultBranch), "/"), fx.tip.String())
 
 		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
-		require.Equal(t, codes.Internal, status.Code(err), "err = %v", err)
-		require.Contains(t, err.Error(), "keeping the resolver's answer as proposals")
+		requireMergeConflict(t, err)
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg, "the package is the contract: it comes without the proposals")
+		require.Empty(t, pkg.GetProposalRef())
+		for _, p := range []string{"a", "b"} {
+			f := packageFile(t, pkg, p)
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
+			require.Nil(t, f.GetProposal(), p)
+			require.Contains(t, f.GetReason(), "proposal not stored: ", p)
+		}
+	})
+
+	t.Run("the proposals' date is the server's, not the request's", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, "")
+		writeAnswer(t, dir, modelAnswer())
+		fx := newResolveFixture(t, enabledResolver(argv))
+		req := fx.request("Land")
+		req.Timestamp = timestamppb.New(time.Now().Add(100 * 365 * 24 * time.Hour))
+
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		target := proposalRefTarget(t, fx)
+		require.NotEmpty(t, target)
+		date, err := strconv.ParseInt(text.ChompBytes(gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "log", "-1", "--format=%ct", target)), 10, 64)
+		require.NoError(t, err)
+		require.WithinDuration(t, time.Now(), time.Unix(date, 0), time.Hour, "a far-future request timestamp must not keep proposals alive")
+	})
+
+	t.Run("a requester the caller names cannot add lines to the proposals' message", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, "")
+		writeAnswer(t, dir, modelAnswer())
+		fx := newResolveFixture(t, enabledResolver(argv))
+		req := fx.request("Land")
+		req.User = proto.Clone(req.GetUser()).(*gitalypb.User)
+		req.User.GlId = "user-1\nGraft-Resolved-By: someone-else"
+
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		message := string(gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "log", "-1", "--format=%B", proposalRefTarget(t, fx)))
+		require.Contains(t, message, `Requested-By: "user-1\nGraft-Resolved-By: someone-else"`)
+		require.NotContains(t, message, "\nGraft-Resolved-By: someone-else\n")
 	})
 }
 
@@ -237,25 +286,53 @@ func TestLandAnswerProposes(t *testing.T) {
 	}
 }
 
-// TestLandUpdateProposalRefs_onlyProposalReferences: the one writer of the proposal references
-// refuses any other reference before git runs, whatever the caller passes.
-func TestLandUpdateProposalRefs_onlyProposalReferences(t *testing.T) {
+// TestDecideLand: the one decision point lands only an answer of rules that resolved every file;
+// a file that proposes is never landed, whatever else holds.
+func TestDecideLand(t *testing.T) {
 	t.Parallel()
 
-	fx := newResolveFixture(t, config.GraftResolver{})
-	s := fx.server(t, config.GraftResolver{})
-	valid := landProposalRef(git.DefaultBranch, fx.commit)
-	require.True(t, landProposalRefNameValid(valid))
-	for _, name := range []git.ReferenceName{
-		"refs/heads/main",
-		"refs/graft/green/main",
-		"refs/graft/proposals/x/" + git.ReferenceName(fx.commit.String()),
-		git.ReferenceName(strings.TrimSuffix(landProposalBranchDir(git.DefaultBranch), "/")),
-		git.ReferenceName(landProposalBranchDir(git.DefaultBranch) + "not-an-oid"),
-		git.ReferenceName(landProposalBranchDir(git.DefaultBranch) + fx.commit.String() + "/x"),
-	} {
-		err := s.landUpdateProposalRefs(fx.ctx, fx.repo, []landProposalRefOp{{name: valid, newOID: fx.tip, oldOID: gittest.DefaultObjectHash.ZeroOID}, {name: name, newOID: fx.tip, oldOID: gittest.DefaultObjectHash.ZeroOID}})
-		require.ErrorContains(t, err, "not a proposal reference", "%s", name)
+	resolved := func() []*landFileState {
+		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}}
 	}
-	require.Empty(t, proposalRefTarget(t, fx), "nothing was written")
+	rules := &resolver.Response{Resolver: "graft-resolve/trivial,union", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
+	require.True(t, decideLand(rules, resolved()), "rules resolved every file")
+	require.False(t, decideLand(nil, resolved()), "no answer")
+
+	left := resolved()
+	left[1].outcome = gitalypb.LandConflictFile_OUTCOME_NOT_SENT
+	require.False(t, decideLand(rules, left), "a file left to the agent")
+
+	flagged := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b", Proposal: true}}}
+	require.False(t, decideLand(flagged, resolved()), "a file that proposes, even with every outcome RESOLVED")
+	named := &resolver.Response{Resolver: "graft-resolve/trivial,llm", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
+	require.False(t, decideLand(named, resolved()), "a resolver that names the llm strategy")
+}
+
+// TestResolveLandConflicts_policyFirst: an agent the policy does not let update the branch gets
+// PermissionDenied before anything is resolved, and no proposal is kept for the branch.
+func TestResolveLandConflicts_policyFirst(t *testing.T) {
+	t.Parallel()
+
+	dir, argv := resolverScript(t, "")
+	writeAnswer(t, dir, modelAnswer())
+	fx := newResolveFixture(t, enabledResolver(argv))
+	s := fx.server(t, enabledResolver(argv))
+	s.graft = gitalycfg.Graft{Standalone: true, Policy: []gitalycfg.GraftPolicyRule{{Actor: "agent-7", Refs: []string{"refs/heads/other"}, Allow: true}}}
+	ctx := identity.NewContext(fx.ctx, identity.Identity{Name: "agent-7", Source: identity.SourceAgent})
+
+	_, err := s.resolveLandConflicts(ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
+	var denied *landPolicyDeniedError
+	require.ErrorAs(t, err, &denied)
+	merged := landWithPackage(ctx, structerr.NewFailedPrecondition("merge conflict"), err)
+	require.Equal(t, codes.PermissionDenied, status.Code(merged), "err = %v", merged)
+	require.Contains(t, merged.Error(), `policy denies "agent-7"`)
+	require.Equal(t, 0, resolverCalls(t, dir), "nothing was resolved")
+	require.Empty(t, proposalRefTarget(t, fx), "no proposal is kept")
+
+	// An agent the policy lets update the branch gets its proposals.
+	s.graft.Policy = []gitalycfg.GraftPolicyRule{{Actor: "agent-7", Refs: []string{"refs/heads/**"}, Allow: true}}
+	_, err = s.resolveLandConflicts(ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
+	var unresolved *landUnresolvedError
+	require.ErrorAs(t, err, &unresolved)
+	require.NotEmpty(t, proposalRefTarget(t, fx))
 }

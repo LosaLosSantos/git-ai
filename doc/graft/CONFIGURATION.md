@@ -196,7 +196,7 @@ cause.
 | `timeout` | string | `"120s"` | Bound on one resolver call (Go duration). |
 | `max_files` | int | `20` | Conflicted files per land. A land with more is not sent to the resolver. |
 | `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. At most 12566528 (about 12 MiB): one file, its three sides and its resolution, must fit one check request. |
-| `proposal_ttl` | string | `"168h"` | How long the proposals of a failed land are kept under `refs/graft/proposals/` (Go duration); at most 20 are kept per branch. |
+| `proposal_ttl` | string | `"168h"` | How long the proposals of a failed land are kept under `refs/graft/proposals/` (Go duration, by the server's clock); at most 20 are kept per branch. Lands with a resolution and the housekeeping pass prune them. |
 | `check_concurrency` | int | `2` | Checks of agents' resolutions that run at once in the Gitaly process, across all its listeners (one resolver client is shared by them); each holds a request of up to 64 MiB. A check waits for a free slot within its deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_check_slot_wait_seconds`. |
 | `paths_allow` | array of strings | empty (every path) | Globs of paths that may be sent to the resolver, with the syntax of policy refs. |
 | `paths_deny` | array of strings | empty | Globs of paths that are never sent. Deny wins over allow. |
