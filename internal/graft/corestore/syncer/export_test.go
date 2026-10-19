@@ -18,9 +18,10 @@ func LockBuild(dir string, afterOpen func(path string)) (*os.File, error) {
 }
 
 // SetTestHook installs a function called at the named points of a catch-up
-// ("fetched", "checked") and of a seed ("seed" before the pack is indexed,
-// "seeded" after, "installed" after the install). Only for tests; set it
-// before the first EnsureFresh.
+// ("fetched", "checked"), of a seed ("seed" before the pack is indexed,
+// "seeded" after, "installed" after the install) and of a sync round
+// ("synced" once it ended). Only for tests; set it before the first
+// EnsureFresh.
 func (s *Syncer) SetTestHook(hook func(point string)) {
 	s.testHook = hook
 }

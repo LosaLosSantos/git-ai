@@ -264,6 +264,8 @@ func (s *Syncer) EnsureFresh(ctx context.Context, repo storage.Repository) error
 
 			ticket := s.headReads.Add(1)
 			err := s.sync(syncCtx, key)
+			// The round has ended, and with it every read it started.
+			s.hook("synced")
 			if err != nil && syncCtx.Err() != nil {
 				// The budget ran out (lock contention, a slow database or bucket).
 				return ticket, structerr.NewUnavailable("storage core: sync of %s did not finish within %s: %v", key, timeout, err)
