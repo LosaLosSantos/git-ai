@@ -197,6 +197,24 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		return landStep{commit: commitID, tip: commitID}, nil
 	}
 
+	// A resolution from the caller lands as a merge commit of the tip and the change, when it was
+	// made against this tip; it replaces the server's attempt to merge or rebase.
+	if in.GetResolution() != nil {
+		res, err := a.server.landWithResolution(ctx, in, a.repo, tip, commitID, req.committer)
+		if err != nil {
+			var unresolved *landUnresolvedError
+			if errors.As(err, &unresolved) {
+				paths := make([][]byte, 0, len(unresolved.pkg.GetFiles()))
+				for _, f := range unresolved.pkg.GetFiles() {
+					paths = append(paths, f.GetPath())
+				}
+				return landStep{}, landWithPackage(landMergeConflictError(tip, commitID, paths, err), err)
+			}
+			return landStep{}, err
+		}
+		return landStep{commit: commitID, tip: res.commit, rewritten: true, resolution: &res}, nil
+	}
+
 	newTip, err := a.computeTip(ctx, in, plan, tip, commitID, req.committer)
 	var resolution *landResolution
 	if err != nil {
@@ -205,12 +223,13 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		}
 
 		// The conflict is resolved into a merge commit. When that fails, the request gets the
-		// merge conflict it would have got without resolution.
+		// merge conflict it would have got without resolution, with the conflict package as a
+		// second detail when the server listed the conflicts.
 		res, resolveErr := a.server.resolveLandConflicts(ctx, in, a.repo, tip, commitID, req.committer)
 		if resolveErr != nil {
 			a.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
 				Info("graft: conflict resolution of land failed")
-			return landStep{}, err
+			return landStep{}, landWithPackage(err, resolveErr)
 		}
 
 		resolution = &res

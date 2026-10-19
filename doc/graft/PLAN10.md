@@ -527,3 +527,12 @@ way.
   resolution whose encoded request would exceed it, with a clear error, instead of a
   transport failure.
 * **Order.** WP1 to WP4 first; WP96 of PLAN9 after them.
+* **Per-file outcomes of a refusal** (PM, WP6). The resolver protocol gains an optional
+  `files` list in the error response (HTTP 422 body, command-mode stdout): the outcome of
+  every requested file, `resolved`, `rejected` or `failed`. The server trusts it only
+  when it has exactly one entry per requested path with a known outcome, and otherwise
+  marks every sent file failed with the overall reason. Backward compatible both ways.
+* **Later improvement, not now** (PM). Since nothing lands partially, the files a
+  resolver resolved in a failed request are wasted work for the agent. The package could
+  offer the resolver's resolved content to the agent (for example as blobs written to the
+  repository, referenced by OID), so that the agent re-lands with it where it agrees.

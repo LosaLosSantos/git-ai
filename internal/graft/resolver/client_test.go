@@ -534,10 +534,42 @@ func TestResolve_ConcurrentCalls(t *testing.T) {
 	}
 }
 
-func TestRefusalReason(t *testing.T) {
+func TestParseRefusal(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, "no", refusalReason(strings.NewReader(`{"error":"no"}`)))
-	require.Equal(t, defaultRefusalReason, refusalReason(strings.NewReader(`not json`)))
-	require.Equal(t, defaultRefusalReason, refusalReason(strings.NewReader(`{"error":"   "}`)))
+	refusal, ok := parseRefusal([]byte(`{"error":"no"}`))
+	require.True(t, ok)
+	require.Equal(t, "no", refusal.Reason)
+	require.Nil(t, refusal.Files)
+
+	refusal, ok = parseRefusal([]byte(`{"error":"no","files":[{"path":"a","outcome":"rejected","reason":"syntax"}]}`))
+	require.True(t, ok)
+	require.Equal(t, []FileOutcome{{Path: "a", Outcome: OutcomeRejected, Reason: "syntax"}}, refusal.Files)
+
+	refusal, ok = parseRefusal([]byte(`{"error":"` + strings.Repeat("x", maxErrorBodyBytes+10) + `"}`))
+	require.True(t, ok)
+	require.Len(t, refusal.Reason, maxErrorBodyBytes)
+
+	for _, raw := range []string{`not json`, `{"error":"   "}`, `{"version":1,"files":[]}`} {
+		_, ok := parseRefusal([]byte(raw))
+		require.False(t, ok, raw)
+	}
+}
+
+func TestValidOutcomes(t *testing.T) {
+	t.Parallel()
+
+	req := Request{Files: []File{{Path: "a"}, {Path: "b"}}}
+	good := []FileOutcome{{Path: "b", Outcome: OutcomeFailed}, {Path: "a", Outcome: OutcomeResolved}}
+	require.Equal(t, good, validOutcomes(req, good), "any order")
+
+	for name, files := range map[string][]FileOutcome{
+		"missing":        {{Path: "a", Outcome: OutcomeResolved}},
+		"extra":          {{Path: "a", Outcome: OutcomeResolved}, {Path: "b", Outcome: OutcomeFailed}, {Path: "c", Outcome: OutcomeFailed}},
+		"duplicate":      {{Path: "a", Outcome: OutcomeResolved}, {Path: "a", Outcome: OutcomeFailed}},
+		"unknown path":   {{Path: "a", Outcome: OutcomeResolved}, {Path: "z", Outcome: OutcomeFailed}},
+		"unknown status": {{Path: "a", Outcome: OutcomeResolved}, {Path: "b", Outcome: "maybe"}},
+	} {
+		require.Nil(t, validOutcomes(req, files), name)
+	}
 }

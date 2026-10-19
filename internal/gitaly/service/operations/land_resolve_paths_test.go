@@ -84,15 +84,20 @@ func TestUserLand_fileDirectoryConflictIsNotResolved(t *testing.T) {
 	}
 }
 
-// TestLandResolveFiles_absentFromBothSides checks the fail-closed rule directly: a conflicting path
-// that is on neither side yields no request file, so no modify-delete without sides is sent.
-func TestLandResolveFiles_absentFromBothSides(t *testing.T) {
+// TestLandClassify_absentFromBothSides checks the fail-closed rule directly: a conflicting path
+// that is on neither side is not sent, so no modify-delete without sides reaches the resolver.
+func TestLandClassify_absentFromBothSides(t *testing.T) {
 	t.Parallel()
 
-	fx := newResolveFixture(t, config.GraftResolver{})
+	_, argv := resolverScript(t, "")
+	rcfg := enabledResolver(argv)
+	fx := newResolveFixture(t, rcfg)
+	s := fx.server(t, rcfg)
 
-	_, err := landResolveFiles(fx.ctx, fx.repo, []landFileConflict{{path: "x~" + fx.tip.String()}}, 1048576)
-	require.ErrorContains(t, err, "neither side of the merge")
+	f := &landFileState{conflict: landFileConflict{path: "x~" + fx.tip.String()}}
+	require.NoError(t, s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.tip, fx.commit))
+	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, f.outcome)
+	require.Equal(t, landNotSentNoSide, f.reason)
 }
 
 // TestUserLand_pathStartingWithDashIsResolved covers a conflicting path that starts with a dash.

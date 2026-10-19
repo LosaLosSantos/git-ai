@@ -168,6 +168,9 @@ func TestServeUnresolvedIs422WithError(t *testing.T) {
 	if !strings.Contains(e.Error, "code.go") {
 		t.Fatalf("error = %q", e.Error)
 	}
+	if len(e.Files) != 1 || e.Files[0].Path != "code.go" || e.Files[0].Outcome != protocol.OutcomeFailed {
+		t.Fatalf("files = %+v, want the outcome of code.go", e.Files)
+	}
 }
 
 func TestServeMalformedRequests(t *testing.T) {

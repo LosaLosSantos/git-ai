@@ -47,30 +47,34 @@ func (c *Client) callHTTP(ctx context.Context, body []byte, limit int64) ([]byte
 
 		return raw, nil
 	case http.StatusUnprocessableEntity:
-		return nil, &UnresolvableError{Reason: refusalReason(resp.Body)}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+		if err == nil {
+			if refusal, ok := parseRefusal(raw); ok {
+				return nil, refusal
+			}
+		}
+		return nil, &UnresolvableError{Reason: defaultRefusalReason}
 	default:
 		return nil, fmt.Errorf("resolver answered HTTP %d", resp.StatusCode)
 	}
 }
 
-// refusalReason extracts the "error" member of a 422 answer, falling back to
-// a generic reason when the body is not such an object.
-func refusalReason(body io.Reader) string {
-	raw, err := io.ReadAll(io.LimitReader(body, maxErrorBodyBytes))
-	if err != nil {
-		return defaultRefusalReason
-	}
-
-	var answer struct {
-		Error string `json:"error"`
-	}
+// parseRefusal reads an ErrorResponse: the body of a 422, or the stdout of a
+// command that exited non-zero. It reports false when raw is not such an
+// object with a non-empty error. The reason is cut to maxErrorBodyBytes; the
+// files are checked against the request by Resolve.
+func parseRefusal(raw []byte) (*UnresolvableError, bool) {
+	var answer ErrorResponse
 	if err := json.Unmarshal(raw, &answer); err != nil {
-		return defaultRefusalReason
+		return nil, false
 	}
 
-	if reason := strings.TrimSpace(answer.Error); reason != "" {
-		return reason
+	reason := strings.TrimSpace(answer.Error)
+	if reason == "" {
+		return nil, false
 	}
-
-	return defaultRefusalReason
+	if len(reason) > maxErrorBodyBytes {
+		reason = strings.ToValidUTF8(reason[:maxErrorBodyBytes], "")
+	}
+	return &UnresolvableError{Reason: reason, Files: answer.Files}, true
 }

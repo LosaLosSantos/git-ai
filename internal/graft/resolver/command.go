@@ -60,6 +60,11 @@ func (c *Client) callCommand(ctx context.Context, body []byte, limit int64) ([]b
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
+			// A refusal may carry an ErrorResponse on stdout, with the outcome of
+			// every file; otherwise the stderr is the reason.
+			if refusal, ok := parseRefusal(stdout.Bytes()); ok {
+				return nil, refusal
+			}
 			reason := strings.TrimSpace(stderr.String())
 			if reason == "" {
 				reason = fmt.Sprintf("resolver %s", exitErr.String())

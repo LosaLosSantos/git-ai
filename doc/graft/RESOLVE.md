@@ -66,13 +66,17 @@ A client asks for resolution per call:
 ## Flow
 
 1. `UserLand` attempts the land as usual (rebase or merge onto the tip).
-2. On a merge conflict, when every condition above holds, the server computes
-   for each conflicting path the base, ours and theirs sides (merge base of
-   the tip and the landed commit; blobs and modes read through the object
-   reader).
-3. It sends the request to the resolver (protocol below) and validates the
-   answer (see [Validation](#validation)).
-4. It builds the merged tree from the merge-tree result, writes the resolved
+2. On a merge conflict the server lists the conflicting files with their base,
+   ours and theirs sides (merge base of the tip and the landed commit; blobs
+   and modes read through the object reader). The whole request is refused
+   when resolution is not enabled, the actor may not resolve, there are more
+   than `max_files` files, or the history is criss-cross.
+3. It decides for each file whether it may be sent (see
+   [What is never sent](#what-is-never-sent)), sends the others to the
+   resolver in one request (protocol below), and validates the answer (see
+   [Validation](#validation)).
+4. Only when every file is resolved, it builds the merged tree from the
+   merge-tree result, writes the resolved
    files as new blobs or deletes them, and creates a merge commit with parents
    `[tip, commit]`. The message is `merge_message` or
    `Merge <short commit> into <branch>`. Trailers:
@@ -88,9 +92,12 @@ A client asks for resolution per call:
    in the meantime, the server retries from the top and resolves again
    against the new tip.
 
-Any failure (no resolver, denied path, invalid answer, timeout, unresolvable
-conflict) returns the normal `merge_conflict` error and the reason is logged.
-The branch is never left in a partial state.
+Otherwise (resolution disabled or refused, a file that is never sent, an
+invalid answer, a timeout, an unresolvable file) the land fails with the
+normal `merge_conflict` error, the reason is logged, and the error carries the
+conflict package as a second detail (see
+[The conflict package and the re-land](#the-conflict-package-and-the-re-land)).
+Nothing lands partially: the branch is never left in a partial state.
 
 Every resolution is logged at info level as `graft: conflicts of land
 resolved`, with the branch, the tip, the landed commit, the merge commit, the
@@ -145,9 +152,42 @@ Response (resolver to server):
 
 Failure signals:
 
-- The command exits non-zero. Its stderr is the reason.
-- HTTP `422` with `{"error": "..."}`. The conflict is unresolvable.
+- The command exits non-zero. Its stderr is the reason, unless its stdout is
+  an error response (below).
+- HTTP `422` with an error response. The conflict is unresolvable.
 - Any other HTTP status, or invalid JSON, is a failure.
+
+The error response may give the outcome of every file of the request:
+
+```json
+{"error": "unresolved conflict: ...",
+ "files": [{"path": "a/b.go", "outcome": "rejected", "reason": "syntax check: ..."},
+           {"path": "c.go", "outcome": "resolved"}]}
+```
+
+`outcome` is `resolved` (resolved, but the request was not resolved as a
+whole), `rejected` (a result failed a rule or a check) or `failed`. The server
+uses the list only when it has exactly one entry per requested path, each with
+a known outcome; otherwise every sent file fails with the overall reason.
+`graft-resolve` writes this response on a refusal, on stdout in command mode
+and as the 422 body in HTTP mode. A resolver without `files` keeps working.
+
+A second operation, `check`, asks the resolver to check an agent's resolution
+with the checks of its own answers (see
+[The conflict package and the re-land](#the-conflict-package-and-the-re-land)).
+The request is a resolve request with `"operation": "check"` and the agent's
+files in `resolution` (the shape of the response's `files`). The answer is:
+
+```json
+{"version": 1, "operation": "check", "resolver": "graft-resolve",
+ "files": [{"path": "a/b.go", "ok": false, "reason": "syntax check: ...", "syntax": "checked"}]}
+```
+
+with one verdict per file of `resolution`, in its order. `syntax` is
+`checked`, `unchecked` (a side does not parse with the grammar) or `none` (no
+grammar, or a deletion). An absent `operation` means `resolve`, so existing
+resolvers keep working; one that answers a `check` with anything but a check
+response makes the server refuse the resolution.
 
 ## Validation
 
@@ -169,6 +209,89 @@ The server accepts an answer only if all of these hold:
   nor refuses a file whose heading underlines are made of `=`.
 
 A rejected answer is a failure, not a partial merge.
+
+## What is never sent
+
+The server decides for each conflicting file, before the request, whether it
+may be sent. A file that may not goes to the agent, and the conflict package
+gives the reason. The other files are still sent. In order:
+
+1. The path: a line break or NUL byte (a commit trailer cannot carry it), not
+   valid UTF-8 (the protocol cannot carry it), or denied by `paths_allow` /
+   `paths_deny`, for the path and for every path a side comes from (a rename
+   brings a side from another path).
+2. The sides: no side under the name (a file/directory conflict), no base and
+   a missing side, or a side that is not a file (a submodule).
+3. large: a side over `max_file_bytes`, decided from its size before it is
+   read.
+4. binary: a NUL byte in a side.
+5. lockfile: the base name is `package-lock.json`, `yarn.lock`,
+   `pnpm-lock.yaml`, `poetry.lock`, `Cargo.lock`, `go.sum`, or one of
+   `lockfiles`.
+6. generated: `linguist-generated` is set for the path by the tip's
+   attributes (one `git check-attr --source <tip>` for all paths), or a side's
+   first 10 lines match `Code generated .* DO NOT EDIT\.`, `@generated`,
+   `DO NOT EDIT`, `(?i)auto-generated` or one of `generated_markers`.
+7. minified: the base name matches `*.min.js`, `*.min.mjs`, `*.min.css`,
+   `*.bundle.js` or one of `minified.globs`, or a side larger than 2 KiB has an
+   average line longer than `minified.average_line_bytes` (300) or a line
+   longer than `minified.longest_line_bytes` (5000).
+
+Secrets are not a reason: a file's content, secrets included, goes to the
+resolver when the rules above let it. Use `paths_deny` for paths that must
+never leave the server. `graft-resolve bench` applies the same rules (3 to 7);
+both are tested against `internal/graft/resolver/testdata/never-send.json`.
+
+## The conflict package and the re-land
+
+When a land with `resolve_conflicts` (or with a `resolution`) fails on its
+conflicts, the `merge_conflict` error carries a second detail after
+`UserLandError`: a `LandConflict`. Clients that know only `UserLandError` see
+the error unchanged. The package holds:
+
+- `tip`, `commit` and `merge_base` (empty when there is none);
+- both commit messages, cut to 4 KiB each, with `messages_truncated`;
+- `reason`, when the server did not attempt the request at all;
+- per file (at most `max_files`): the path, the kind, each side's blob OID and
+  mode, the conflicting hunks, the outcome and its reason (cut to 512 bytes).
+
+Each hunk gives line ranges of each side, 1-based and half-open (`[start,
+end)`), each counting the lines of the side it names. An empty range is an
+insertion point before line `start`. A file whose diff is too large to
+compute (more than about 2800 changed lines on a side) has no hunks. The
+outcomes are:
+
+| outcome | meaning |
+|---|---|
+| `NOT_SENT` | never sent (see above); the reason says why |
+| `REJECTED` | the result failed a rule or a check, e.g. a syntax error at line:column |
+| `FAILED` | the resolver failed on it: a model error, `AI budget exhausted`, no strategy applied |
+| `RESOLVED` | resolved, but the land failed because another file was not |
+| `NOT_ATTEMPTED` | the request was not attempted; see `reason` |
+
+The agent reads the sides by OID with `GetBlobs`, resolves every file, and
+lands again with `UserLandRequest.resolution` (field 11): the `tip` and
+`commit` of the package and, for every conflicting path, `write` (mode and
+content) or `delete`. The server accepts it only when:
+
+- `resolution.commit` equals `commit_id` (otherwise `InvalidArgument`);
+- `resolution.tip` is the branch's current tip (otherwise the land fails
+  with a fresh package for the new tip);
+- it resolves exactly the conflicting paths, each once;
+- every file passes the acceptance rules of an answer (modes, size, conflict
+  markers);
+- when a resolver is configured, the files that may be sent to it pass its
+  `check`: the syntax check and the configured checks, as an `llm` answer.
+  A check that cannot run fails the land, with the reason in the package.
+  A file with a `syntax: unchecked` verdict lands, and is counted in
+  `graft_land_resolution_syntax_unchecked_total` and the server log.
+
+The merge commit has parents `[tip, commit]` and the trailers
+`Graft-Resolved-By: agent/<actor>` (`agent` without an identity) and, when the
+resolver checked it, `Graft-Checked-By: <resolver>`. Without a resolver there
+is no `Graft-Checked-By`: the resolution got only the conflict-marker rule and
+the server's structural validation. The resolution travels in the request, so
+the whole request is bounded by the 4 MiB gRPC message limit.
 
 ## Strategies of graft-resolve
 

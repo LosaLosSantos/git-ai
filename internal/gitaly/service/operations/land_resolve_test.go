@@ -491,30 +491,55 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 
 	fx := newResolveFixture(t, config.GraftResolver{})
 
+	// A path the policy denies is not sent; the other conflicting file still is (PLAN10 3.4). The
+	// land fails, since nothing lands partially, and the package names the denied path.
 	for _, tc := range []struct {
-		desc        string
-		rcfg        func(config.GraftResolver) config.GraftResolver
-		errContains string
+		desc string
+		rcfg func(config.GraftResolver) config.GraftResolver
+	}{
+		{desc: "denied path", rcfg: func(r config.GraftResolver) config.GraftResolver { r.PathsDeny = []string{"a"}; return r }},
+		{desc: "path outside the allow list", rcfg: func(r config.GraftResolver) config.GraftResolver { r.PathsAllow = []string{"b"}; return r }},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir, argv := resolverScript(t, "")
+			writeAnswer(t, dir, resolver.Response{
+				Version:  resolver.ProtocolVersion,
+				Resolver: "graft-resolve/fake",
+				Files:    []resolver.ResponseFile{{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")}},
+			})
+			s := fx.server(t, tc.rcfg(enabledResolver(argv)))
+
+			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
+			var unresolved *landUnresolvedError
+			require.ErrorAs(t, err, &unresolved)
+			a := packageFile(t, unresolved.pkg, "a")
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, a.GetOutcome())
+			require.Equal(t, landNotSentDenied, a.GetReason())
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, unresolved.pkg, "b").GetOutcome())
+
+			require.Equal(t, 1, resolverCalls(t, dir))
+			req := resolverRequest(t, dir, 1)
+			require.Len(t, req.Files, 1, "the denied path never reaches the resolver")
+			require.Equal(t, "b", req.Files[0].Path)
+		})
+	}
+
+	// A refusal of the whole request is decided before the resolver is called, and every file is
+	// not attempted.
+	for _, tc := range []struct {
+		desc   string
+		rcfg   func(config.GraftResolver) config.GraftResolver
+		reason string
 	}{
 		{
-			desc:        "denied path",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.PathsDeny = []string{"a"}; return r },
-			errContains: `path "a" may not be sent to the resolver`,
+			desc:   "actor not allowed",
+			rcfg:   func(r config.GraftResolver) config.GraftResolver { r.Actors = []string{"someone-else"}; return r },
+			reason: "may not resolve conflicts",
 		},
 		{
-			desc:        "path outside the allow list",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.PathsAllow = []string{"docs/**"}; return r },
-			errContains: "may not be sent to the resolver",
-		},
-		{
-			desc:        "actor not allowed",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.Actors = []string{"someone-else"}; return r },
-			errContains: "may not resolve conflicts",
-		},
-		{
-			desc:        "more conflicting files than max_files",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.MaxFiles = 1; return r },
-			errContains: "exceed max_files",
+			desc:   "more conflicting files than max_files",
+			rcfg:   func(r config.GraftResolver) config.GraftResolver { r.MaxFiles = 1; return r },
+			reason: "exceed max_files",
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -523,8 +548,12 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 			s := fx.server(t, tc.rcfg(enabledResolver(argv)))
 
 			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
-			require.ErrorContains(t, err, tc.errContains)
-			// Policy is checked before the resolver is called.
+			var unresolved *landUnresolvedError
+			require.ErrorAs(t, err, &unresolved)
+			require.Contains(t, unresolved.pkg.GetReason(), tc.reason)
+			for _, f := range unresolved.pkg.GetFiles() {
+				require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, f.GetOutcome())
+			}
 			require.Equal(t, 0, resolverCalls(t, dir))
 		})
 	}
@@ -676,7 +705,7 @@ func TestLandResolveCommitMessage(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main"), MergeMessage: []byte("Custom\n\n")}
 		require.Equal(t,
 			"Custom\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", []string{"a", "dir/b c"}),
+			landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a", "dir/b c"}),
 		)
 	})
 
@@ -684,29 +713,29 @@ func TestLandResolveCommitMessage(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
 		require.Equal(t,
 			"Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", []string{"a"}),
+			landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a"}),
 		)
 	})
 }
 
-func TestLandConflictKind(t *testing.T) {
+func TestLandKindOf(t *testing.T) {
 	t.Parallel()
 
-	side := func(oid string) *resolver.Side { return &resolver.Side{OID: oid, Mode: "100644"} }
+	side := func(oid string) *landBlob { return &landBlob{mode: "100644", oid: git.ObjectID(oid)} }
 
 	for _, tc := range []struct {
 		desc string
-		file resolver.File
+		c    landFileConflict
 		want string
 	}{
-		{desc: "content", file: resolver.File{Base: side("b"), Ours: side("o"), Theirs: side("t")}, want: resolver.KindContent},
-		{desc: "add-add", file: resolver.File{Ours: side("o"), Theirs: side("t")}, want: resolver.KindAddAdd},
-		{desc: "modify-delete, theirs deleted", file: resolver.File{Base: side("b"), Ours: side("o")}, want: resolver.KindModifyDelete},
-		{desc: "modify-delete, ours deleted", file: resolver.File{Base: side("b"), Theirs: side("t")}, want: resolver.KindModifyDelete},
-		{desc: "mode", file: resolver.File{Base: side("b"), Ours: side("o"), Theirs: side("o")}, want: resolver.KindMode},
+		{desc: "content", c: landFileConflict{base: side("b"), ours: side("o"), theirs: side("t")}, want: resolver.KindContent},
+		{desc: "add-add", c: landFileConflict{ours: side("o"), theirs: side("t")}, want: resolver.KindAddAdd},
+		{desc: "modify-delete, theirs deleted", c: landFileConflict{base: side("b"), ours: side("o")}, want: resolver.KindModifyDelete},
+		{desc: "modify-delete, ours deleted", c: landFileConflict{base: side("b"), theirs: side("t")}, want: resolver.KindModifyDelete},
+		{desc: "mode", c: landFileConflict{base: side("b"), ours: side("o"), theirs: side("o")}, want: resolver.KindMode},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			require.Equal(t, tc.want, landConflictKind(tc.file))
+			require.Equal(t, tc.want, landKindOf(tc.c))
 		})
 	}
 }

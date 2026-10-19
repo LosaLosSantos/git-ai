@@ -191,10 +191,20 @@ here. The protocol, the validation rules and `graft-resolve` are described in
 | `paths_allow` | array of strings | empty (every path) | Globs of paths that may be sent to the resolver, with the syntax of policy refs. |
 | `paths_deny` | array of strings | empty | Globs of paths that are never sent. Deny wins over allow. |
 | `actors` | array of strings | empty (every caller that may land) | Globs of the identities that may request resolution: agent names, or `shared` for the shared token. Without `[[graft.agent]]` no caller has an identity, so a non-empty list admits nobody (the server warns at startup). |
+| `lockfiles` | array of strings | empty | Base names of lockfiles, besides the built-in `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `Cargo.lock` and `go.sum`. A conflicting lockfile is never sent to the resolver: it goes to the agent. |
+| `generated_markers` | array of strings | empty | Go regular expressions, besides the built-in `Code generated .* DO NOT EDIT\.`, `@generated`, `DO NOT EDIT` and `(?i)auto-generated`, searched in the first 10 lines of every side. A match marks the file generated, and it is never sent. A path that the tip's `.gitattributes` marks `linguist-generated` is generated as well. |
+| `minified.globs` | array of strings | empty | Base-name globs of minified files, besides the built-in `*.min.js`, `*.min.mjs`, `*.min.css` and `*.bundle.js`. Such files are never sent. |
+| `minified.average_line_bytes` | int | `300` | A side larger than 2 KiB whose average line is longer is minified. |
+| `minified.longest_line_bytes` | int | `5000` | A side larger than 2 KiB with a longer line is minified. |
+
+A file that is never sent goes to the agent with its reason in the conflict
+package: large (a side over `max_file_bytes`), binary (a NUL byte), lockfile,
+generated or minified, checked in that order (see [RESOLVE.md](RESOLVE.md)).
 
 Startup fails when both or neither of `command` and `url` are set, the URL has
-another scheme, `timeout` is not a duration, a bound is negative, or a glob is
-empty or invalid.
+another scheme, `timeout` is not a duration, a bound or a threshold is
+negative, a glob is empty or invalid, a lockfile is not a base name, or a
+generated marker is not a valid regular expression.
 
 ### `[graft.storage]`
 

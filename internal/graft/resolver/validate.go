@@ -64,6 +64,12 @@ func Validate(req *Request, resp *Response) error {
 	return nil
 }
 
+// ValidateFile applies the acceptance rules of Validate to one resolved file: the action, the
+// mode, the size and the conflict markers. The server applies it to an agent's resolution too.
+func ValidateFile(f ResponseFile, maxBytes int64) error {
+	return validateFile(f, maxBytes)
+}
+
 // validateFile checks one answered file.
 func validateFile(f ResponseFile, maxBytes int64) error {
 	switch f.Action {

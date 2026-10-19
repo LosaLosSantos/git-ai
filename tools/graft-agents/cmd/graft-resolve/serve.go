@@ -81,12 +81,24 @@ func newHandler(res *resolve.Resolver, token string) http.Handler {
 
 		ctx, cancel := context.WithTimeout(r.Context(), res.Timeout)
 		defer cancel()
+		if req.Operation == protocol.OperationCheck {
+			verdicts, err := res.Check(ctx, req)
+			switch {
+			case errors.Is(err, resolve.ErrInvalidRequest):
+				writeError(w, http.StatusBadRequest, err.Error())
+			case err != nil:
+				writeError(w, http.StatusInternalServerError, err.Error())
+			default:
+				writeJSON(w, http.StatusOK, verdicts)
+			}
+			return
+		}
 		resp, err := res.Resolve(ctx, req)
 		if err != nil {
 			var unresolved *resolve.UnresolvedError
 			switch {
 			case errors.As(err, &unresolved):
-				writeError(w, http.StatusUnprocessableEntity, err.Error())
+				writeJSON(w, http.StatusUnprocessableEntity, unresolved.Response())
 			case errors.Is(err, resolve.ErrInvalidRequest):
 				writeError(w, http.StatusBadRequest, err.Error())
 			default:

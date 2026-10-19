@@ -27,7 +27,8 @@ import (
 // resolve_conflicts, the conflicting files are sent to the configured resolver (the client of
 // internal/graft/resolver, which enforces the path and actor policy, the limits and every
 // acceptance rule of the answer). The answer is written into a merge commit with parents
-// [tip, commit]. Any failure leaves the original merge conflict in place.
+// [tip, commit]. Unless every file is resolved, the land fails with the original merge conflict
+// and the conflict package of land_package.go.
 
 // maxResolverNameBytes bounds the name of the resolver, which is written into a commit trailer.
 const maxResolverNameBytes = resolver.MaxResolverNameBytes
@@ -61,11 +62,15 @@ type landFileConflict struct {
 }
 
 // resolveLandConflicts lands commitID onto tip by resolving the files that conflict between the
-// two. The result is a merge commit with parents [tip, commitID]. An error means the conflict
-// could not be resolved, and the caller reports the original merge conflict.
+// two. The result is a merge commit with parents [tip, commitID].
 //
-// The policy is checked before any blob is read or the resolver is called: the actor, the number
-// of conflicting files and every path must be allowed.
+// Every conflicting file is decided on its own. A file that may not or cannot be sent (its path,
+// its sides, or the never-send rules of resolver.SendRules) goes to the agent; the others go to
+// the resolver in one request. Nothing lands partially: unless every file is resolved, the land
+// fails with a *landUnresolvedError, whose conflict package says what happened to each file. A
+// request the server does not attempt at all (resolution disabled, the actor not allowed, too many
+// files, a criss-cross history) also gets a package, with the reason. Any other error means the
+// conflicts could not even be listed, and the caller reports the merge conflict alone.
 func (s *Server) resolveLandConflicts(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -73,110 +78,237 @@ func (s *Server) resolveLandConflicts(
 	tip, commitID git.ObjectID,
 	committer git.Signature,
 ) (landResolution, error) {
-	if s.conflictResolver == nil {
-		return landResolution{}, errors.New("conflict resolution is not enabled")
+	l, err := landListConflicts(ctx, repo, tip, commitID)
+	if err != nil {
+		return landResolution{}, err
 	}
+	base, hasBase, conflicts, files := l.base, l.hasBase, l.conflicts, l.files
+	tipMessage, commitMessage := l.tipMessage, l.commitMessage
+	maxFiles := s.resolveCfg.MaxFilesOrDefault()
+	notAttempted := func(reason string) error { return l.notAttempted(maxFiles, reason, nil) }
+	criss := l.bases
 
 	// The actor is the authenticated identity only. The name in the request is chosen by the
 	// caller, so it must not decide who may resolve: without an identity the actor is empty and
 	// only an actor list that is empty (allows everyone) admits the request.
 	actor := identity.Actor(ctx, "")
-	if !s.conflictResolver.ActorAllowed(actor) {
-		return landResolution{}, fmt.Errorf("actor %q may not resolve conflicts", actor)
+	switch {
+	case s.conflictResolver == nil:
+		return landResolution{}, notAttempted("conflict resolution is not enabled on this server")
+	case !s.conflictResolver.ActorAllowed(actor):
+		return landResolution{}, notAttempted(fmt.Sprintf("actor %q may not resolve conflicts", actor))
+	case criss > 1:
+		return landResolution{}, notAttempted(fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", criss))
+	case len(conflicts) > maxFiles:
+		return landResolution{}, notAttempted(fmt.Sprintf("%d conflicting files exceed max_files %d", len(conflicts), maxFiles))
 	}
 
-	base, hasBase, err := landMergeBase(ctx, repo, tip, commitID)
-	if err != nil {
+	if err := s.landClassify(ctx, repo, files, base, tip, commitID); err != nil {
 		return landResolution{}, err
 	}
 
-	mergedTree, conflicts, err := landMergeTree(ctx, repo, tip, commitID, base, hasBase)
-	if err != nil {
-		return landResolution{}, err
-	}
-	// A clean merge tree is not resolved here. When rebasing, the conflict may come from an
-	// intermediate commit that a later commit of the change undoes, so the merge of the two ends
-	// is clean and the landing reports the merge conflict. This is a documented limitation.
-	if len(conflicts) == 0 {
-		return landResolution{}, errors.New("the merge of the tip and the change reports no conflicting files")
-	}
-	if len(conflicts) > s.resolveCfg.MaxFilesOrDefault() {
-		return landResolution{}, fmt.Errorf("%d conflicting files exceed max_files", len(conflicts))
-	}
-	paths := make([]string, 0, len(conflicts))
-	for _, c := range conflicts {
-		paths = append(paths, c.path)
-	}
-	for _, p := range paths {
-		// The paths end up in commit trailers, where a line break would inject trailers.
-		if !landTrailerSafe(p) {
-			return landResolution{}, fmt.Errorf("conflicting path %q cannot be resolved", p)
-		}
-		// Git paths are bytes, but the protocol carries them as JSON strings, which hold
-		// Unicode text only: the resolver would see another name and its answer could never
-		// match. Such conflicts are not resolved.
-		if !utf8.ValidString(p) {
-			return landResolution{}, fmt.Errorf("conflicting path %q is not valid UTF-8 and cannot be sent to the resolver", p)
-		}
-		if !s.conflictResolver.PathAllowed(p) {
-			return landResolution{}, fmt.Errorf("path %q may not be sent to the resolver", p)
+	var sent []resolver.File
+	for _, f := range files {
+		if f.sent() {
+			sent = append(sent, landRequestFile(f))
 		}
 	}
-	// A rename makes a side of a conflict come from another path than the name of the conflict,
-	// so the policy is applied to the path of every side as well.
-	if err := s.landCheckSourcePaths(ctx, repo, conflicts, base, tip, commitID); err != nil {
-		return landResolution{}, err
+
+	var resp *resolver.Response
+	var resolveErr error
+	if len(sent) > 0 {
+		req := resolver.Request{
+			Version: resolver.ProtocolVersion,
+			Repository: resolver.Repository{
+				Storage:      in.GetRepository().GetStorageName(),
+				RelativePath: in.GetRepository().GetRelativePath(),
+			},
+			Branch:   string(in.GetBranch()),
+			Tip:      tip.String(),
+			Commit:   commitID.String(),
+			Messages: resolver.Messages{Tip: tipMessage, Commit: commitMessage},
+			Actor:    actor,
+			Files:    sent,
+		}
+		if hasBase {
+			req.MergeBase = base.String()
+		}
+
+		// The client applies the timeout, the request policy and the acceptance rules of the answer.
+		resp, resolveErr = s.conflictResolver.Resolve(ctx, req)
+		switch {
+		case resolveErr == nil && !landResolverNameValid(resp.Resolver):
+			// The name is written into the commit trailers, so it must be a plain single-line name.
+			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
+			resp = nil
+		case resolveErr != nil:
+			landRefusalOutcomes(files, resolveErr)
+		default:
+			for _, f := range files {
+				if f.sent() {
+					f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
+				}
+			}
+		}
 	}
 
-	maxBytes := s.resolveCfg.MaxFileBytesOrDefault()
-	files, err := landResolveFiles(ctx, repo, conflicts, maxBytes)
-	if err != nil {
-		return landResolution{}, err
+	for _, f := range files {
+		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			return landResolution{}, l.unresolved(maxFiles, "", landUnresolvedCause(files), resolveErr)
+		}
 	}
 
-	tipMessage, err := landCommitBody(ctx, repo, tip)
-	if err != nil {
-		return landResolution{}, err
-	}
-	commitMessage, err := landCommitBody(ctx, repo, commitID)
-	if err != nil {
-		return landResolution{}, err
-	}
+	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, "")
+}
 
-	req := resolver.Request{
-		Version: resolver.ProtocolVersion,
-		Repository: resolver.Repository{
-			Storage:      in.GetRepository().GetStorageName(),
-			RelativePath: in.GetRepository().GetRelativePath(),
-		},
-		Branch:   string(in.GetBranch()),
-		Tip:      tip.String(),
-		Commit:   commitID.String(),
-		Messages: resolver.Messages{Tip: tipMessage, Commit: commitMessage},
-		Actor:    actor,
-		Files:    files,
-		Limits:   resolver.Limits{MaxFileBytes: maxBytes},
-	}
-	if hasBase {
-		req.MergeBase = base.String()
-	}
+// landListing is the conflicting files of the merge of a tip and a change, with what the conflict
+// package needs.
+type landListing struct {
+	tip, commitID git.ObjectID
+	base          git.ObjectID
+	hasBase       bool
+	// bases is the number of merge bases; more than one is a criss-cross history.
+	bases                     int
+	mergedTree                git.ObjectID
+	conflicts                 []landFileConflict
+	files                     []*landFileState
+	tipMessage, commitMessage string
+}
 
-	// The client applies the timeout, the request policy and the acceptance rules of the answer.
-	resp, err := s.conflictResolver.Resolve(ctx, req)
-	if err != nil {
-		return landResolution{}, fmt.Errorf("resolver failed: %w", err)
-	}
+// errLandNoConflicts is the error of landListConflicts when the merge is clean.
+var errLandNoConflicts = errors.New("the merge of the tip and the change reports no conflicting files")
 
-	// The name is written into the commit trailers, so it must be a plain single-line name.
-	if !landResolverNameValid(resp.Resolver) {
-		return landResolution{}, fmt.Errorf("resolver answer names an invalid resolver %q", resp.Resolver)
+// landListConflicts lists the files that conflict between tip and commitID. A clean merge is an
+// error: when rebasing, the conflict may come from an intermediate commit that a later commit of
+// the change undoes, so the merge of the two ends is clean and the landing reports the merge
+// conflict. This is a documented limitation.
+func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID git.ObjectID) (landListing, error) {
+	l := landListing{tip: tip, commitID: commitID}
+	var err error
+	if l.base, l.hasBase, l.bases, err = landMergeBase(ctx, repo, tip, commitID); err != nil {
+		return l, err
 	}
+	if l.mergedTree, l.conflicts, err = landMergeTree(ctx, repo, tip, commitID, l.base, l.hasBase); err != nil {
+		return l, err
+	}
+	if len(l.conflicts) == 0 {
+		return l, errLandNoConflicts
+	}
+	if l.tipMessage, err = landCommitBody(ctx, repo, tip); err != nil {
+		return l, err
+	}
+	if l.commitMessage, err = landCommitBody(ctx, repo, commitID); err != nil {
+		return l, err
+	}
+	for _, c := range l.conflicts {
+		l.files = append(l.files, &landFileState{conflict: c, kind: landKindOf(c)})
+	}
+	return l, nil
+}
 
+// unresolved returns the error of a land left unresolved, with its conflict package. err is the
+// error of the resolver or of the check that caused it, if any.
+func (l landListing) unresolved(maxFiles int, reason, cause string, err error) error {
+	return &landUnresolvedError{
+		pkg:   landPackage(l.tip, l.commitID, l.base, l.tipMessage, l.commitMessage, l.files, maxFiles, reason),
+		cause: cause,
+		err:   err,
+	}
+}
+
+// notAttempted returns the error of a land the server did not try to resolve at all, every file
+// NOT_ATTEMPTED and the package carrying the reason.
+func (l landListing) notAttempted(maxFiles int, reason string, err error) error {
+	for _, f := range l.files {
+		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, ""
+	}
+	return l.unresolved(maxFiles, reason, reason, err)
+}
+
+// landRequestFile is the file of the resolve request for a classified file that is sent.
+func landRequestFile(f *landFileState) resolver.File {
+	file := resolver.File{Path: f.conflict.path, Kind: f.kind}
+	for i, side := range []struct {
+		blob *landBlob
+		dst  **resolver.Side
+	}{{f.conflict.base, &file.Base}, {f.conflict.ours, &file.Ours}, {f.conflict.theirs, &file.Theirs}} {
+		if side.blob != nil {
+			*side.dst = &resolver.Side{OID: side.blob.oid.String(), Mode: side.blob.mode, Content: f.sides[i]}
+		}
+	}
+	return file
+}
+
+// landFailSent sets the outcome and reason of every file that was sent.
+func landFailSent(files []*landFileState, outcome gitalypb.LandConflictFile_Outcome, reason string) {
+	for _, f := range files {
+		if f.sent() {
+			f.outcome, f.reason = outcome, reason
+		}
+	}
+}
+
+// landRefusalOutcomes sets the outcome of the sent files from the resolver's failure. A refusal
+// with the outcome of every file (validated by the client) gives each its own; otherwise every
+// sent file failed with the error.
+func landRefusalOutcomes(files []*landFileState, err error) {
+	var refusal *resolver.UnresolvableError
+	if !errors.As(err, &refusal) || refusal.Files == nil {
+		landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("resolver failed: %v", err))
+		return
+	}
+	outcomes := make(map[string]resolver.FileOutcome, len(refusal.Files))
+	for _, o := range refusal.Files {
+		outcomes[o.Path] = o
+	}
+	for _, f := range files {
+		if !f.sent() {
+			continue
+		}
+		o := outcomes[f.conflict.path]
+		switch o.Outcome {
+		case resolver.OutcomeResolved:
+			f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
+		case resolver.OutcomeRejected:
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, o.Reason
+		default:
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_FAILED, o.Reason
+		}
+	}
+}
+
+// landUnresolvedCause summarizes for the log why the files were not all resolved.
+func landUnresolvedCause(files []*landFileState) string {
+	var parts []string
+	for _, f := range files {
+		if f.outcome == gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s %s", f.conflict.path, f.outcome, f.reason))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// landWriteResolution writes a resolution (the resolver's answer, or the agent's) into the merged
+// tree and commits it with parents [tip, commitID]; checkedBy names the resolver that checked an
+// agent's resolution, if one did. The commit message carries the trailers.
+func (s *Server) landWriteResolution(
+	ctx context.Context,
+	in *gitalypb.UserLandRequest,
+	repo *localrepo.Repo,
+	tip, commitID, mergedTree git.ObjectID,
+	committer git.Signature,
+	actor string,
+	resp *resolver.Response,
+	checkedBy string,
+) (landResolution, error) {
 	tree, err := repo.ReadTree(ctx, git.Revision(mergedTree.String()), localrepo.WithRecursive())
 	if err != nil {
 		return landResolution{}, fmt.Errorf("reading merged tree: %w", err)
 	}
+	paths := make([]string, 0, len(resp.Files))
 	for _, f := range resp.Files {
+		paths = append(paths, f.Path)
 		if f.Action == resolver.ActionDelete {
 			if err := tree.Delete(f.Path); err != nil && !errors.Is(err, localrepo.ErrEntryNotFound) {
 				return landResolution{}, fmt.Errorf("deleting %q: %w", f.Path, err)
@@ -199,7 +331,7 @@ func (s *Server) resolveLandConflicts(
 
 	newTip, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{
 		TreeID:         tree.OID,
-		Message:        landResolveCommitMessage(in, commitID, resp.Resolver, paths),
+		Message:        landResolveCommitMessage(in, commitID, resp.Resolver, checkedBy, paths),
 		Parents:        []git.ObjectID{tip, commitID},
 		AuthorName:     committer.Name,
 		AuthorEmail:    committer.Email,
@@ -228,11 +360,173 @@ func (s *Server) resolveLandConflicts(
 		"merge_commit": newTip.String(),
 		"actor":        actor,
 		"resolver":     resp.Resolver,
+		"checked_by":   checkedBy,
 		"paths":        paths,
 		"explanation":  landTruncate(resp.Explanation, maxLoggedExplanationBytes),
 	}).InfoContext(ctx, "graft: conflicts of land resolved")
 
 	return landResolution{commit: newTip, resolvedPaths: resolvedPaths, resolver: resp.Resolver}, nil
+}
+
+// landClassify decides, for every file, whether it may be sent to the resolver, and reads the
+// sides of those that may (and of those whose content decided against it, for the hunks of the
+// package). The order: the path (a commit trailer must carry it, the protocol must carry it, the
+// path policy must allow it and every path its sides come from), the shape of the sides, their
+// size (from the object info, before reading), then the content rules of resolver.SendRules, with
+// linguist-generated from the tip's attributes.
+func (s *Server) landClassify(
+	ctx context.Context,
+	repo *localrepo.Repo,
+	files []*landFileState,
+	base, tip, commitID git.ObjectID,
+) error {
+	rules := s.conflictResolver.SendRules()
+	listings := map[git.ObjectID]map[git.ObjectID][]string{}
+	for _, f := range files {
+		c := f.conflict
+		switch {
+		case !landTrailerSafe(c.path):
+			f.notSent(landNotSentTrailerUnsafe)
+			continue
+		case !utf8.ValidString(c.path):
+			f.notSent(landNotSentInvalidUTF8)
+			continue
+		case !s.conflictResolver.PathAllowed(c.path):
+			f.notSent(landNotSentDenied)
+			continue
+		case landShapeReason(c) != "":
+			f.notSent(landShapeReason(c))
+			continue
+		}
+		// A rename makes a side come from another path than the name of the conflict, so the
+		// policy is applied to the path of every side as well.
+		denied, err := s.landDeniedSource(ctx, repo, listings, c, base, tip, commitID)
+		if err != nil {
+			return err
+		}
+		if denied != "" {
+			f.notSent(denied)
+			continue
+		}
+
+		tooLarge := false
+		for _, b := range []*landBlob{c.base, c.ours, c.theirs} {
+			if b == nil {
+				continue
+			}
+			switch b.mode {
+			case resolver.ModeRegular, resolver.ModeExecutable, resolver.ModeSymlink:
+			default:
+				f.notSent(landNotSentNotAFile)
+			}
+			if !f.sent() {
+				break
+			}
+			info, err := repo.ReadObjectInfo(ctx, b.oid.Revision())
+			if err != nil {
+				return fmt.Errorf("reading size of %q: %w", c.path, err)
+			}
+			if rules.TooLarge(info.Size) {
+				tooLarge = true
+			}
+		}
+		if !f.sent() {
+			continue
+		}
+		if tooLarge {
+			f.notSent(resolver.NotSentLarge)
+			continue
+		}
+		for i, b := range []*landBlob{c.base, c.ours, c.theirs} {
+			if b == nil {
+				continue
+			}
+			content, err := repo.ReadObject(ctx, b.oid)
+			if err != nil {
+				return fmt.Errorf("reading blob of %q: %w", c.path, err)
+			}
+			if content == nil {
+				content = []byte{}
+			}
+			f.sides[i] = content
+		}
+		f.read = true
+	}
+
+	// The content rules, with linguist-generated read for every remaining path at once.
+	var candidates []string
+	for _, f := range files {
+		if f.sent() {
+			candidates = append(candidates, f.conflict.path)
+		}
+	}
+	generated, err := landGeneratedPaths(ctx, repo, tip, candidates)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if !f.sent() {
+			continue
+		}
+		if reason := rules.Reason(f.conflict.path, generated[f.conflict.path], f.sides[0], f.sides[1], f.sides[2]); reason != "" {
+			f.notSent(reason)
+		}
+	}
+	return nil
+}
+
+// landShapeReason returns why the shape of the sides keeps a conflict from the resolver, or "". A
+// file/directory conflict has no version of the file on either side under its name. A conflict
+// whose base is absent while one side is absent is not a conflict between two versions of a file,
+// since no merge produces it without a rename; it cannot be answered reliably, so it fails closed.
+func landShapeReason(c landFileConflict) string {
+	switch {
+	case c.ours == nil && c.theirs == nil:
+		return landNotSentNoSide
+	case c.base == nil && (c.ours == nil || c.theirs == nil):
+		return landNotSentNoBaseOneSide
+	}
+	return ""
+}
+
+// landDeniedSource returns the reason when a side of the conflict comes from a path that may not
+// be sent, and "" when every side's path may. merge-tree names a conflict after the path of the
+// merged tree, but with a rename a side comes from another path: the base and one side may live
+// under the old name. Without this check the content of a denied path could reach the resolver
+// under an allowed name.
+//
+// A side lives at the name of the conflict when the tree of its commit holds the same blob there.
+// Otherwise every path of that tree holding the blob is a possible source, and all of them must be
+// allowed. A side whose blob is in no path of its tree is not sent, nor is a base when the merge
+// has none to look it up in. Only trees are read, no blob.
+func (s *Server) landDeniedSource(
+	ctx context.Context,
+	repo *localrepo.Repo,
+	listings map[git.ObjectID]map[git.ObjectID][]string,
+	c landFileConflict,
+	base, tip, commitID git.ObjectID,
+) (string, error) {
+	for _, side := range []landSide{{c.base, base}, {c.ours, tip}, {c.theirs, commitID}} {
+		if side.blob == nil {
+			continue
+		}
+		if side.rev == "" {
+			return "the path has a base side but the merge has no merge base to find it in", nil
+		}
+		sources, err := landSourcePaths(ctx, repo, listings, side.rev, side.blob.oid, c.path)
+		if err != nil {
+			return "", err
+		}
+		if len(sources) == 0 {
+			return fmt.Sprintf("a side is in no path of %s", side.rev), nil
+		}
+		for _, p := range sources {
+			if !landTrailerSafe(p) || !s.conflictResolver.PathAllowed(p) {
+				return fmt.Sprintf("a side comes from path %q, which may not be sent to the resolver", p), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // landTrailerSafe reports whether s can be written as a single line of a commit trailer: it must
@@ -272,47 +566,9 @@ type landSide struct {
 	rev  git.ObjectID
 }
 
-// landCheckSourcePaths applies the path policy to the path every side of every conflict comes
-// from. merge-tree names a conflict after the path of the merged tree, but with a rename a side
-// comes from another path: the base and one side may live under the old name. Without this check
-// the content of a denied path could reach the resolver under an allowed name.
-//
-// A side lives at the name of the conflict when the tree of its commit holds the same blob there.
-// Otherwise every path of that tree holding the blob is a possible source, and all of them must
-// be allowed. A side whose blob is in no path of its tree is refused, as is any side when there is
-// no merge base to look it up in. Only trees are read, no blob.
-func (s *Server) landCheckSourcePaths(
-	ctx context.Context,
-	repo *localrepo.Repo,
-	conflicts []landFileConflict,
-	base, tip, commitID git.ObjectID,
-) error {
-	listings := map[git.ObjectID]map[git.ObjectID][]string{}
-	for _, c := range conflicts {
-		for _, side := range []landSide{{c.base, base}, {c.ours, tip}, {c.theirs, commitID}} {
-			if side.blob == nil {
-				continue
-			}
-			if side.rev == "" {
-				return fmt.Errorf("conflicting path %q has a base but the merge has none", c.path)
-			}
-
-			sources, err := landSourcePaths(ctx, repo, listings, side.rev, side.blob.oid, c.path)
-			if err != nil {
-				return err
-			}
-			for _, p := range sources {
-				if !landTrailerSafe(p) || !s.conflictResolver.PathAllowed(p) {
-					return fmt.Errorf("conflicting path %q comes from path %q, which may not be sent to the resolver", c.path, p)
-				}
-			}
-		}
-	}
-	return nil
-}
-
 // landSourcePaths returns the paths of the tree of rev that the blob of a side of the conflict p
-// may come from. listings caches the listing of every tree read, by commit.
+// may come from, none when the blob is in no path. listings caches the listing of every tree
+// read, by commit.
 func landSourcePaths(
 	ctx context.Context,
 	repo *localrepo.Repo,
@@ -338,11 +594,7 @@ func landSourcePaths(
 		listings[rev] = listing
 	}
 
-	sources := listing[blob]
-	if len(sources) == 0 {
-		return nil, fmt.Errorf("a side of conflicting path %q is in no path of %s", p, rev)
-	}
-	return sources, nil
+	return listing[blob], nil
 }
 
 // landListTree lists the tree of rev recursively and returns the paths of every object it holds.
@@ -391,7 +643,7 @@ func landListTree(ctx context.Context, repo *localrepo.Repo, rev git.ObjectID) (
 
 // landResolveCommitMessage returns the message of the resolution commit: the merge message or
 // the default one, followed by the Graft-Resolved trailers.
-func landResolveCommitMessage(in *gitalypb.UserLandRequest, commitID git.ObjectID, resolverName string, paths []string) string {
+func landResolveCommitMessage(in *gitalypb.UserLandRequest, commitID git.ObjectID, resolverName, checkedBy string, paths []string) string {
 	subject := strings.TrimRight(string(in.GetMergeMessage()), "\n")
 	if subject == "" {
 		subject = fmt.Sprintf("Merge %s into %s", landShortOID(commitID), string(in.GetBranch()))
@@ -401,6 +653,11 @@ func landResolveCommitMessage(in *gitalypb.UserLandRequest, commitID git.ObjectI
 	b.WriteString(subject)
 	b.WriteString("\n\n")
 	b.WriteString("Graft-Resolved-By: " + resolverName + "\n")
+	// An agent's resolution records whether the resolver's checks ran on it: without a resolver
+	// it got only the marker rule and the server's structural validation.
+	if checkedBy != "" {
+		b.WriteString("Graft-Checked-By: " + checkedBy + "\n")
+	}
 	for _, p := range paths {
 		b.WriteString("Graft-Resolved-Path: " + p + "\n")
 	}
@@ -426,10 +683,11 @@ func landCommitBody(ctx context.Context, repo *localrepo.Repo, commit git.Object
 	return string(c.GetBody()), nil
 }
 
-// landMergeBase returns the merge base of a and b. Unrelated histories have none. Criss-cross
-// histories have several merge bases, and the base the resolver is given would then differ from
-// the base of the recursive merge strategy. Such landings are not resolved.
-func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID) (git.ObjectID, bool, error) {
+// landMergeBase returns the merge base of a and b. Unrelated histories have none. A criss-cross
+// history has several merge bases, whose number is returned: the base the resolver would be given
+// would differ from the base of the recursive merge strategy, so such landings are not resolved,
+// and hasBase is false.
+func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID) (base git.ObjectID, hasBase bool, bases int, err error) {
 	var stdout, stderr bytes.Buffer
 	if err := repo.ExecAndWait(ctx,
 		gitcmd.Command{Name: "merge-base", Flags: []gitcmd.Option{gitcmd.Flag{Name: "--all"}}, Args: []string{a.String(), b.String()}},
@@ -437,28 +695,25 @@ func landMergeBase(ctx context.Context, repo *localrepo.Repo, a, b git.ObjectID)
 		gitcmd.WithStderr(&stderr),
 	); err != nil {
 		if exitStatus, ok := command.ExitStatus(err); ok && exitStatus == 1 {
-			return "", false, nil
+			return "", false, 0, nil
 		}
-		return "", false, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
+		return "", false, 0, fmt.Errorf("merge-base: %w, stderr: %q", err, stderr.String())
 	}
 
-	bases := strings.Fields(stdout.String())
-	if len(bases) == 0 {
-		return "", false, nil
-	}
-	if len(bases) > 1 {
-		return "", false, fmt.Errorf("the change has %d merge bases (criss-cross history), which are not resolved", len(bases))
+	all := strings.Fields(stdout.String())
+	if len(all) != 1 {
+		return "", false, len(all), nil
 	}
 
 	objectHash, err := repo.ObjectHash(ctx)
 	if err != nil {
-		return "", false, fmt.Errorf("detecting object hash: %w", err)
+		return "", false, 0, fmt.Errorf("detecting object hash: %w", err)
 	}
-	base, err := objectHash.FromHex(bases[0])
+	base, err = objectHash.FromHex(all[0])
 	if err != nil {
-		return "", false, fmt.Errorf("parsing merge base: %w", err)
+		return "", false, 0, fmt.Errorf("parsing merge base: %w", err)
 	}
-	return base, true, nil
+	return base, true, 1, nil
 }
 
 // landMergeTree runs merge-tree of tip and commitID. It returns the tree of the merge, which holds
@@ -554,97 +809,6 @@ func landMergeTree(
 	}
 
 	return treeOID, conflicts, nil
-}
-
-// landResolveFiles returns the base, ours and theirs versions of the conflicting files.
-func landResolveFiles(
-	ctx context.Context,
-	repo *localrepo.Repo,
-	conflicts []landFileConflict,
-	maxBytes int64,
-) ([]resolver.File, error) {
-	files := make([]resolver.File, 0, len(conflicts))
-	for _, c := range conflicts {
-		f := resolver.File{Path: c.path}
-
-		var err error
-		if f.Base, err = landReadSide(ctx, repo, c.base, c.path, maxBytes); err != nil {
-			return nil, err
-		}
-		if f.Ours, err = landReadSide(ctx, repo, c.ours, c.path, maxBytes); err != nil {
-			return nil, err
-		}
-		if f.Theirs, err = landReadSide(ctx, repo, c.theirs, c.path, maxBytes); err != nil {
-			return nil, err
-		}
-
-		if err := landCheckSides(f); err != nil {
-			return nil, err
-		}
-
-		f.Kind = landConflictKind(f)
-		files = append(files, f)
-	}
-	return files, nil
-}
-
-// landCheckSides rejects the shapes of the sides that the conflict cannot have for a file that
-// both ends can answer. A file/directory conflict has no version of the file on one side under
-// its name, so no side is present and the file is not sent. A conflict whose base is absent while
-// one side is absent is not a conflict between two versions of a file, since no merge produces it
-// without a rename. It cannot be answered reliably, so it fails closed.
-func landCheckSides(f resolver.File) error {
-	if f.Ours == nil && f.Theirs == nil {
-		return fmt.Errorf("conflicting path %q is on neither side of the merge, which is a file/directory conflict", f.Path)
-	}
-	if f.Base == nil && (f.Ours == nil || f.Theirs == nil) {
-		return fmt.Errorf("conflicting path %q has no base and a missing side, which is not resolved", f.Path)
-	}
-	return nil
-}
-
-// landReadSide reads the version of a conflicting file from its stage entry. It returns nil if the
-// side is absent. Sides that are not files, or larger than maxBytes, are an error because they
-// cannot be sent.
-func landReadSide(ctx context.Context, repo *localrepo.Repo, blob *landBlob, p string, maxBytes int64) (*resolver.Side, error) {
-	if blob == nil {
-		return nil, nil
-	}
-
-	switch blob.mode {
-	case resolver.ModeRegular, resolver.ModeExecutable, resolver.ModeSymlink:
-	default:
-		return nil, fmt.Errorf("path %q is not a file on one side of the conflict", p)
-	}
-
-	info, err := repo.ReadObjectInfo(ctx, blob.oid.Revision())
-	if err != nil {
-		return nil, fmt.Errorf("reading size of %q: %w", p, err)
-	}
-	if info.Size > maxBytes {
-		return nil, fmt.Errorf("file %q is %d bytes, larger than max_file_bytes", p, info.Size)
-	}
-
-	content, err := repo.ReadObject(ctx, blob.oid)
-	if err != nil {
-		return nil, fmt.Errorf("reading blob of %q: %w", p, err)
-	}
-
-	return &resolver.Side{OID: blob.oid.String(), Mode: blob.mode, Content: content}, nil
-}
-
-// landConflictKind classifies a conflicting file from the presence of its versions.
-func landConflictKind(f resolver.File) string {
-	switch {
-	case f.Ours == nil || f.Theirs == nil:
-		return resolver.KindModifyDelete
-	case f.Base == nil:
-		return resolver.KindAddAdd
-	case f.Ours.OID == f.Theirs.OID:
-		return resolver.KindMode
-	default:
-		return resolver.KindContent
-	}
 }
 
 // isLandMergeConflict reports whether a landing failed because the change does not apply cleanly

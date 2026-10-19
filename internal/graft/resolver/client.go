@@ -32,6 +32,36 @@ var ErrInvalidResponse = errors.New("invalid resolver response")
 // stderr or the 422 error message).
 type UnresolvableError struct {
 	Reason string
+	// Files are the resolver's outcomes per requested file, when it gave them
+	// (the "files" member of the refusal). Resolve keeps them only when there is
+	// exactly one per requested path, each with a known outcome; otherwise Files
+	// is nil and every file shares Reason.
+	Files []FileOutcome
+}
+
+// validOutcomes returns files when it has exactly one entry per requested path
+// with a known outcome, and nil otherwise: a malformed list is not trusted in
+// part.
+func validOutcomes(req Request, files []FileOutcome) []FileOutcome {
+	if len(files) != len(req.Files) {
+		return nil
+	}
+	want := make(map[string]bool, len(req.Files))
+	for _, f := range req.Files {
+		want[f.Path] = true
+	}
+	for _, f := range files {
+		switch f.Outcome {
+		case OutcomeResolved, OutcomeRejected, OutcomeFailed:
+		default:
+			return nil
+		}
+		if !want[f.Path] {
+			return nil
+		}
+		delete(want, f.Path)
+	}
+	return files
 }
 
 // Error implements error.
@@ -57,6 +87,13 @@ type Client struct {
 	pathsDeny    []string
 	actors       []string
 	httpClient   *http.Client
+	// sendRules decide the files that are never sent (SendRules).
+	sendRules *SendRules
+}
+
+// SendRules returns the rules of the files that are never sent to this resolver.
+func (c *Client) SendRules() *SendRules {
+	return c.sendRules
 }
 
 // New builds the resolver client from the configuration. It returns a nil
@@ -84,6 +121,10 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		return nil, errors.New("graft land resolver: max_files and max_file_bytes must not be negative")
 	}
 
+	rules, err := NewSendRules(cfg)
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
 		command:      slices.Clone(cfg.Command),
 		timeout:      timeout,
@@ -92,6 +133,7 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		pathsAllow:   slices.Clone(cfg.PathsAllow),
 		pathsDeny:    slices.Clone(cfg.PathsDeny),
 		actors:       slices.Clone(cfg.Actors),
+		sendRules:    rules,
 	}
 
 	if cfg.URL != "" {
@@ -165,6 +207,10 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 			return nil, fmt.Errorf("resolver timed out after %s: %w", c.timeout, ctx.Err())
 		}
 
+		var refusal *UnresolvableError
+		if errors.As(err, &refusal) {
+			refusal.Files = validOutcomes(req, refusal.Files)
+		}
 		return nil, err
 	}
 

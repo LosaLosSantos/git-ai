@@ -245,6 +245,36 @@ var ErrBudgetExhausted = errors.New("AI budget exhausted")
 // UnresolvedError reports files that stayed unresolved.
 type UnresolvedError struct {
 	Failures []Failure
+	// Resolved are the paths of the request that were resolved; nothing lands, since the request
+	// is answered as a whole.
+	Resolved []string
+}
+
+// maxOutcomeReasonBytes bounds the reason of one file in an ErrorResponse, as the server's
+// conflict package does.
+const maxOutcomeReasonBytes = 512
+
+// Response returns the refusal as the protocol's ErrorResponse, with the outcome of every file of
+// the request: resolved, rejected (a strategy's answer failed a rule or a check) or failed.
+func (e *UnresolvedError) Response() protocol.ErrorResponse {
+	out := protocol.ErrorResponse{Error: e.Error()}
+	for _, p := range e.Resolved {
+		out.Files = append(out.Files, protocol.FileOutcome{Path: p, Outcome: protocol.OutcomeResolved})
+	}
+	for _, f := range e.Failures {
+		outcome := protocol.OutcomeFailed
+		for _, a := range f.Attempts {
+			if a.Kind == AttemptRejected || a.Kind == AttemptCheckFailed {
+				outcome = protocol.OutcomeRejected
+			}
+		}
+		reason := strings.Join(f.Reasons, "; ")
+		if len(reason) > maxOutcomeReasonBytes {
+			reason = strings.ToValidUTF8(reason[:maxOutcomeReasonBytes], "")
+		}
+		out.Files = append(out.Files, protocol.FileOutcome{Path: f.Path, Outcome: outcome, Reason: reason})
+	}
+	return out
 }
 
 func (e *UnresolvedError) Error() string {
@@ -259,6 +289,12 @@ func (e *UnresolvedError) Error() string {
 // file stays unresolved, and an error wrapping ErrInvalidRequest for a
 // malformed request. Nothing is returned partially.
 func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.Response, error) {
+	if req.Operation != "" && req.Operation != protocol.OperationResolve {
+		return protocol.Response{}, fmt.Errorf("%w: operation %q is not %q", ErrInvalidRequest, req.Operation, protocol.OperationResolve)
+	}
+	if len(req.Resolution) > 0 {
+		return protocol.Response{}, fmt.Errorf("%w: a resolve request carries no resolution", ErrInvalidRequest)
+	}
 	if err := validateRequest(req); err != nil {
 		return protocol.Response{}, err
 	}
@@ -293,7 +329,11 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 		resp.Files = append(resp.Files, out)
 	}
 	if len(failures) > 0 {
-		return protocol.Response{}, &UnresolvedError{Failures: failures}
+		resolved := make([]string, 0, len(resp.Files))
+		for _, f := range resp.Files {
+			resolved = append(resolved, f.Path)
+		}
+		return protocol.Response{}, &UnresolvedError{Failures: failures, Resolved: resolved}
 	}
 
 	resp.Resolver = resolverName(used)

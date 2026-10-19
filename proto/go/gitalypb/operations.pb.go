@@ -197,6 +197,189 @@ func (UserLandRequest_Strategy) EnumDescriptor() ([]byte, []int) {
 	return file_operations_proto_rawDescGZIP(), []int{49, 0}
 }
 
+// Kind is the kind of the conflict.
+type LandConflictFile_Kind int32
+
+const (
+	// KIND_UNSPECIFIED is never sent.
+	LandConflictFile_KIND_UNSPECIFIED LandConflictFile_Kind = 0
+	// KIND_CONTENT: both sides changed the content.
+	LandConflictFile_KIND_CONTENT LandConflictFile_Kind = 1
+	// KIND_MODIFY_DELETE: one side changed the file, the other deleted it.
+	LandConflictFile_KIND_MODIFY_DELETE LandConflictFile_Kind = 2
+	// KIND_ADD_ADD: both sides added the file.
+	LandConflictFile_KIND_ADD_ADD LandConflictFile_Kind = 3
+	// KIND_MODE: the sides differ in mode only.
+	LandConflictFile_KIND_MODE LandConflictFile_Kind = 4
+)
+
+// Enum value maps for LandConflictFile_Kind.
+var (
+	LandConflictFile_Kind_name = map[int32]string{
+		0: "KIND_UNSPECIFIED",
+		1: "KIND_CONTENT",
+		2: "KIND_MODIFY_DELETE",
+		3: "KIND_ADD_ADD",
+		4: "KIND_MODE",
+	}
+	LandConflictFile_Kind_value = map[string]int32{
+		"KIND_UNSPECIFIED":   0,
+		"KIND_CONTENT":       1,
+		"KIND_MODIFY_DELETE": 2,
+		"KIND_ADD_ADD":       3,
+		"KIND_MODE":          4,
+	}
+)
+
+func (x LandConflictFile_Kind) Enum() *LandConflictFile_Kind {
+	p := new(LandConflictFile_Kind)
+	*p = x
+	return p
+}
+
+func (x LandConflictFile_Kind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LandConflictFile_Kind) Descriptor() protoreflect.EnumDescriptor {
+	return file_operations_proto_enumTypes[3].Descriptor()
+}
+
+func (LandConflictFile_Kind) Type() protoreflect.EnumType {
+	return &file_operations_proto_enumTypes[3]
+}
+
+func (x LandConflictFile_Kind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LandConflictFile_Kind.Descriptor instead.
+func (LandConflictFile_Kind) EnumDescriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{51, 0}
+}
+
+// Outcome is what the server did with the file.
+type LandConflictFile_Outcome int32
+
+const (
+	// OUTCOME_UNSPECIFIED is never sent.
+	LandConflictFile_OUTCOME_UNSPECIFIED LandConflictFile_Outcome = 0
+	// OUTCOME_NOT_SENT: the file was not sent to the resolver (reason: lockfile,
+	// binary, large, generated, minified, denied path, invalid UTF-8 path).
+	LandConflictFile_OUTCOME_NOT_SENT LandConflictFile_Outcome = 1
+	// OUTCOME_REJECTED: the resolver's result failed a check (reason: the check).
+	LandConflictFile_OUTCOME_REJECTED LandConflictFile_Outcome = 2
+	// OUTCOME_FAILED: the resolver failed on the file (reason: the error, such as a
+	// model error or "AI budget exhausted").
+	LandConflictFile_OUTCOME_FAILED LandConflictFile_Outcome = 3
+	// OUTCOME_RESOLVED: the file was resolved, but the land failed because another
+	// file was not.
+	LandConflictFile_OUTCOME_RESOLVED LandConflictFile_Outcome = 4
+	// OUTCOME_NOT_ATTEMPTED: the request was not resolved at all (see
+	// LandConflict.reason).
+	LandConflictFile_OUTCOME_NOT_ATTEMPTED LandConflictFile_Outcome = 5
+)
+
+// Enum value maps for LandConflictFile_Outcome.
+var (
+	LandConflictFile_Outcome_name = map[int32]string{
+		0: "OUTCOME_UNSPECIFIED",
+		1: "OUTCOME_NOT_SENT",
+		2: "OUTCOME_REJECTED",
+		3: "OUTCOME_FAILED",
+		4: "OUTCOME_RESOLVED",
+		5: "OUTCOME_NOT_ATTEMPTED",
+	}
+	LandConflictFile_Outcome_value = map[string]int32{
+		"OUTCOME_UNSPECIFIED":   0,
+		"OUTCOME_NOT_SENT":      1,
+		"OUTCOME_REJECTED":      2,
+		"OUTCOME_FAILED":        3,
+		"OUTCOME_RESOLVED":      4,
+		"OUTCOME_NOT_ATTEMPTED": 5,
+	}
+)
+
+func (x LandConflictFile_Outcome) Enum() *LandConflictFile_Outcome {
+	p := new(LandConflictFile_Outcome)
+	*p = x
+	return p
+}
+
+func (x LandConflictFile_Outcome) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LandConflictFile_Outcome) Descriptor() protoreflect.EnumDescriptor {
+	return file_operations_proto_enumTypes[4].Descriptor()
+}
+
+func (LandConflictFile_Outcome) Type() protoreflect.EnumType {
+	return &file_operations_proto_enumTypes[4]
+}
+
+func (x LandConflictFile_Outcome) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LandConflictFile_Outcome.Descriptor instead.
+func (LandConflictFile_Outcome) EnumDescriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{51, 1}
+}
+
+// Action is what becomes of the path.
+type LandResolvedFile_Action int32
+
+const (
+	// ACTION_UNSPECIFIED is rejected.
+	LandResolvedFile_ACTION_UNSPECIFIED LandResolvedFile_Action = 0
+	// ACTION_WRITE writes content with mode.
+	LandResolvedFile_ACTION_WRITE LandResolvedFile_Action = 1
+	// ACTION_DELETE deletes the path.
+	LandResolvedFile_ACTION_DELETE LandResolvedFile_Action = 2
+)
+
+// Enum value maps for LandResolvedFile_Action.
+var (
+	LandResolvedFile_Action_name = map[int32]string{
+		0: "ACTION_UNSPECIFIED",
+		1: "ACTION_WRITE",
+		2: "ACTION_DELETE",
+	}
+	LandResolvedFile_Action_value = map[string]int32{
+		"ACTION_UNSPECIFIED": 0,
+		"ACTION_WRITE":       1,
+		"ACTION_DELETE":      2,
+	}
+)
+
+func (x LandResolvedFile_Action) Enum() *LandResolvedFile_Action {
+	p := new(LandResolvedFile_Action)
+	*p = x
+	return p
+}
+
+func (x LandResolvedFile_Action) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (LandResolvedFile_Action) Descriptor() protoreflect.EnumDescriptor {
+	return file_operations_proto_enumTypes[5].Descriptor()
+}
+
+func (LandResolvedFile_Action) Type() protoreflect.EnumType {
+	return &file_operations_proto_enumTypes[5]
+}
+
+func (x LandResolvedFile_Action) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use LandResolvedFile_Action.Descriptor instead.
+func (LandResolvedFile_Action) EnumDescriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{56, 0}
+}
+
 // UserCreateBranchRequest is a request for the UserCreateBranch RPC.
 type UserCreateBranchRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -4543,8 +4726,19 @@ type UserLandRequest struct {
 	// fails with merge_conflict as usual) when no resolver is configured or the
 	// server policy does not allow it for the caller.
 	ResolveConflicts bool `protobuf:"varint,10,opt,name=resolve_conflicts,json=resolveConflicts,proto3" json:"resolve_conflicts,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// resolution lands commit_id with the caller's resolution of the conflicts that a
+	// LandConflict described, instead of asking the server's resolver. The server
+	// accepts it only when resolution.tip equals the current branch tip,
+	// resolution.commit equals commit_id, and resolution.files resolve exactly the
+	// paths that conflict at that tip, each once; otherwise the land fails with a
+	// fresh LandConflict. It is validated like a resolver answer (no conflict
+	// markers; modes 100644, 100755 or 120000; sizes; the syntax check when a
+	// resolver is configured) and lands as a merge commit with a
+	// Graft-Resolved-By: agent/<actor> trailer. The whole request is bounded by
+	// the 4 MiB gRPC message limit.
+	Resolution    *LandResolution `protobuf:"bytes,11,opt,name=resolution,proto3" json:"resolution,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *UserLandRequest) Reset() {
@@ -4647,6 +4841,561 @@ func (x *UserLandRequest) GetResolveConflicts() bool {
 	return false
 }
 
+func (x *UserLandRequest) GetResolution() *LandResolution {
+	if x != nil {
+		return x.Resolution
+	}
+	return nil
+}
+
+// LandConflict describes the conflicts of a land that the server did not resolve, so
+// that the caller can resolve them and land again with UserLandRequest.resolution. It
+// is sent as an additional detail of the error, next to UserLandError, when the
+// request set resolve_conflicts or resolution.
+type LandConflict struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// tip is the branch tip that the change was merged with.
+	Tip string `protobuf:"bytes,1,opt,name=tip,proto3" json:"tip,omitempty"`
+	// commit is the landed commit.
+	Commit string `protobuf:"bytes,2,opt,name=commit,proto3" json:"commit,omitempty"`
+	// merge_base is the merge base of tip and commit, empty for unrelated histories.
+	MergeBase string `protobuf:"bytes,3,opt,name=merge_base,json=mergeBase,proto3" json:"merge_base,omitempty"`
+	// tip_message is the message of the tip, cut to 4 KiB.
+	TipMessage []byte `protobuf:"bytes,4,opt,name=tip_message,json=tipMessage,proto3" json:"tip_message,omitempty"`
+	// commit_message is the message of the landed commit, cut to 4 KiB.
+	CommitMessage []byte `protobuf:"bytes,5,opt,name=commit_message,json=commitMessage,proto3" json:"commit_message,omitempty"`
+	// messages_truncated is set when a message was cut.
+	MessagesTruncated bool `protobuf:"varint,6,opt,name=messages_truncated,json=messagesTruncated,proto3" json:"messages_truncated,omitempty"`
+	// files are the conflicting files, at most max_files of them.
+	Files []*LandConflictFile `protobuf:"bytes,7,rep,name=files,proto3" json:"files,omitempty"`
+	// reason is set when the server did not try to resolve the request at all, for
+	// example because it has too many files or the actor may not resolve; it is cut to
+	// 512 bytes.
+	Reason        string `protobuf:"bytes,8,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LandConflict) Reset() {
+	*x = LandConflict{}
+	mi := &file_operations_proto_msgTypes[50]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandConflict) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandConflict) ProtoMessage() {}
+
+func (x *LandConflict) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[50]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandConflict.ProtoReflect.Descriptor instead.
+func (*LandConflict) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{50}
+}
+
+func (x *LandConflict) GetTip() string {
+	if x != nil {
+		return x.Tip
+	}
+	return ""
+}
+
+func (x *LandConflict) GetCommit() string {
+	if x != nil {
+		return x.Commit
+	}
+	return ""
+}
+
+func (x *LandConflict) GetMergeBase() string {
+	if x != nil {
+		return x.MergeBase
+	}
+	return ""
+}
+
+func (x *LandConflict) GetTipMessage() []byte {
+	if x != nil {
+		return x.TipMessage
+	}
+	return nil
+}
+
+func (x *LandConflict) GetCommitMessage() []byte {
+	if x != nil {
+		return x.CommitMessage
+	}
+	return nil
+}
+
+func (x *LandConflict) GetMessagesTruncated() bool {
+	if x != nil {
+		return x.MessagesTruncated
+	}
+	return false
+}
+
+func (x *LandConflict) GetFiles() []*LandConflictFile {
+	if x != nil {
+		return x.Files
+	}
+	return nil
+}
+
+func (x *LandConflict) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+// LandConflictFile is one conflicting file of a LandConflict.
+type LandConflictFile struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// path is the path of the conflict in the merged tree.
+	Path []byte `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	// kind is the kind of the conflict.
+	Kind LandConflictFile_Kind `protobuf:"varint,2,opt,name=kind,proto3,enum=gitaly.LandConflictFile_Kind" json:"kind,omitempty"`
+	// base, ours and theirs are the sides; an absent side is unset. ours is the tip's
+	// side, theirs the landed commit's.
+	Base *LandConflictSide `protobuf:"bytes,3,opt,name=base,proto3" json:"base,omitempty"`
+	// ours is the tip's side.
+	Ours *LandConflictSide `protobuf:"bytes,4,opt,name=ours,proto3" json:"ours,omitempty"`
+	// theirs is the landed commit's side.
+	Theirs *LandConflictSide `protobuf:"bytes,5,opt,name=theirs,proto3" json:"theirs,omitempty"`
+	// hunks are the conflicting regions, in order.
+	Hunks []*LandConflictHunk `protobuf:"bytes,6,rep,name=hunks,proto3" json:"hunks,omitempty"`
+	// outcome is what the server did with the file.
+	Outcome LandConflictFile_Outcome `protobuf:"varint,7,opt,name=outcome,proto3,enum=gitaly.LandConflictFile_Outcome" json:"outcome,omitempty"`
+	// reason explains the outcome, cut to 512 bytes.
+	Reason string `protobuf:"bytes,8,opt,name=reason,proto3" json:"reason,omitempty"`
+	// syntax_unchecked is set when a resolution of the file was accepted without a
+	// syntax verdict, because a side does not parse with the grammar of its language.
+	SyntaxUnchecked bool `protobuf:"varint,9,opt,name=syntax_unchecked,json=syntaxUnchecked,proto3" json:"syntax_unchecked,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *LandConflictFile) Reset() {
+	*x = LandConflictFile{}
+	mi := &file_operations_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandConflictFile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandConflictFile) ProtoMessage() {}
+
+func (x *LandConflictFile) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandConflictFile.ProtoReflect.Descriptor instead.
+func (*LandConflictFile) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{51}
+}
+
+func (x *LandConflictFile) GetPath() []byte {
+	if x != nil {
+		return x.Path
+	}
+	return nil
+}
+
+func (x *LandConflictFile) GetKind() LandConflictFile_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return LandConflictFile_KIND_UNSPECIFIED
+}
+
+func (x *LandConflictFile) GetBase() *LandConflictSide {
+	if x != nil {
+		return x.Base
+	}
+	return nil
+}
+
+func (x *LandConflictFile) GetOurs() *LandConflictSide {
+	if x != nil {
+		return x.Ours
+	}
+	return nil
+}
+
+func (x *LandConflictFile) GetTheirs() *LandConflictSide {
+	if x != nil {
+		return x.Theirs
+	}
+	return nil
+}
+
+func (x *LandConflictFile) GetHunks() []*LandConflictHunk {
+	if x != nil {
+		return x.Hunks
+	}
+	return nil
+}
+
+func (x *LandConflictFile) GetOutcome() LandConflictFile_Outcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return LandConflictFile_OUTCOME_UNSPECIFIED
+}
+
+func (x *LandConflictFile) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *LandConflictFile) GetSyntaxUnchecked() bool {
+	if x != nil {
+		return x.SyntaxUnchecked
+	}
+	return false
+}
+
+// LandConflictSide is one side of a conflicting file; its content is read by oid.
+type LandConflictSide struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// oid is the object ID of the blob.
+	Oid string `protobuf:"bytes,1,opt,name=oid,proto3" json:"oid,omitempty"`
+	// mode is the file mode.
+	Mode          string `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LandConflictSide) Reset() {
+	*x = LandConflictSide{}
+	mi := &file_operations_proto_msgTypes[52]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandConflictSide) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandConflictSide) ProtoMessage() {}
+
+func (x *LandConflictSide) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[52]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandConflictSide.ProtoReflect.Descriptor instead.
+func (*LandConflictSide) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{52}
+}
+
+func (x *LandConflictSide) GetOid() string {
+	if x != nil {
+		return x.Oid
+	}
+	return ""
+}
+
+func (x *LandConflictSide) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
+// LandConflictHunk is a conflicting region as line ranges of each side. Each range
+// counts the lines of the side it names (base of the base side's file, ours of the
+// tip's, theirs of the landed commit's), 1-based and half-open ([start, end)); an
+// empty range (start == end) is an insertion point before line start.
+type LandConflictHunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// base is the range in the base side.
+	Base *LineRange `protobuf:"bytes,1,opt,name=base,proto3" json:"base,omitempty"`
+	// ours is the range in the tip's side.
+	Ours *LineRange `protobuf:"bytes,2,opt,name=ours,proto3" json:"ours,omitempty"`
+	// theirs is the range in the landed commit's side.
+	Theirs        *LineRange `protobuf:"bytes,3,opt,name=theirs,proto3" json:"theirs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LandConflictHunk) Reset() {
+	*x = LandConflictHunk{}
+	mi := &file_operations_proto_msgTypes[53]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandConflictHunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandConflictHunk) ProtoMessage() {}
+
+func (x *LandConflictHunk) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[53]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandConflictHunk.ProtoReflect.Descriptor instead.
+func (*LandConflictHunk) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *LandConflictHunk) GetBase() *LineRange {
+	if x != nil {
+		return x.Base
+	}
+	return nil
+}
+
+func (x *LandConflictHunk) GetOurs() *LineRange {
+	if x != nil {
+		return x.Ours
+	}
+	return nil
+}
+
+func (x *LandConflictHunk) GetTheirs() *LineRange {
+	if x != nil {
+		return x.Theirs
+	}
+	return nil
+}
+
+// LineRange is a half-open range of 1-based lines.
+type LineRange struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// start is the first line of the range.
+	Start uint32 `protobuf:"varint,1,opt,name=start,proto3" json:"start,omitempty"`
+	// end is the line after the last line of the range.
+	End           uint32 `protobuf:"varint,2,opt,name=end,proto3" json:"end,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LineRange) Reset() {
+	*x = LineRange{}
+	mi := &file_operations_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LineRange) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LineRange) ProtoMessage() {}
+
+func (x *LineRange) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LineRange.ProtoReflect.Descriptor instead.
+func (*LineRange) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *LineRange) GetStart() uint32 {
+	if x != nil {
+		return x.Start
+	}
+	return 0
+}
+
+func (x *LineRange) GetEnd() uint32 {
+	if x != nil {
+		return x.End
+	}
+	return 0
+}
+
+// LandResolution is the caller's resolution of the conflicts of a LandConflict.
+type LandResolution struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// tip is the tip that the resolution was made against, from LandConflict.tip.
+	Tip string `protobuf:"bytes,1,opt,name=tip,proto3" json:"tip,omitempty"`
+	// commit is the landed commit, LandConflict.commit; it must equal commit_id.
+	Commit string `protobuf:"bytes,2,opt,name=commit,proto3" json:"commit,omitempty"`
+	// files resolve every conflicting path exactly once.
+	Files         []*LandResolvedFile `protobuf:"bytes,3,rep,name=files,proto3" json:"files,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LandResolution) Reset() {
+	*x = LandResolution{}
+	mi := &file_operations_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandResolution) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandResolution) ProtoMessage() {}
+
+func (x *LandResolution) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandResolution.ProtoReflect.Descriptor instead.
+func (*LandResolution) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *LandResolution) GetTip() string {
+	if x != nil {
+		return x.Tip
+	}
+	return ""
+}
+
+func (x *LandResolution) GetCommit() string {
+	if x != nil {
+		return x.Commit
+	}
+	return ""
+}
+
+func (x *LandResolution) GetFiles() []*LandResolvedFile {
+	if x != nil {
+		return x.Files
+	}
+	return nil
+}
+
+// LandResolvedFile resolves one conflicting path.
+type LandResolvedFile struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// path is the path of the conflict.
+	Path []byte `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	// action is what becomes of the path.
+	Action LandResolvedFile_Action `protobuf:"varint,2,opt,name=action,proto3,enum=gitaly.LandResolvedFile_Action" json:"action,omitempty"`
+	// mode is 100644, 100755 or 120000 for ACTION_WRITE.
+	Mode string `protobuf:"bytes,3,opt,name=mode,proto3" json:"mode,omitempty"`
+	// content is the file's content for ACTION_WRITE.
+	Content       []byte `protobuf:"bytes,4,opt,name=content,proto3" json:"content,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LandResolvedFile) Reset() {
+	*x = LandResolvedFile{}
+	mi := &file_operations_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LandResolvedFile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LandResolvedFile) ProtoMessage() {}
+
+func (x *LandResolvedFile) ProtoReflect() protoreflect.Message {
+	mi := &file_operations_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LandResolvedFile.ProtoReflect.Descriptor instead.
+func (*LandResolvedFile) Descriptor() ([]byte, []int) {
+	return file_operations_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *LandResolvedFile) GetPath() []byte {
+	if x != nil {
+		return x.Path
+	}
+	return nil
+}
+
+func (x *LandResolvedFile) GetAction() LandResolvedFile_Action {
+	if x != nil {
+		return x.Action
+	}
+	return LandResolvedFile_ACTION_UNSPECIFIED
+}
+
+func (x *LandResolvedFile) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
+func (x *LandResolvedFile) GetContent() []byte {
+	if x != nil {
+		return x.Content
+	}
+	return nil
+}
+
 // UserLandResponse is a response for the UserLand RPC.
 type UserLandResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -4683,7 +5432,7 @@ type UserLandResponse struct {
 
 func (x *UserLandResponse) Reset() {
 	*x = UserLandResponse{}
-	mi := &file_operations_proto_msgTypes[50]
+	mi := &file_operations_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4695,7 +5444,7 @@ func (x *UserLandResponse) String() string {
 func (*UserLandResponse) ProtoMessage() {}
 
 func (x *UserLandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_operations_proto_msgTypes[50]
+	mi := &file_operations_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4708,7 +5457,7 @@ func (x *UserLandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UserLandResponse.ProtoReflect.Descriptor instead.
 func (*UserLandResponse) Descriptor() ([]byte, []int) {
-	return file_operations_proto_rawDescGZIP(), []int{50}
+	return file_operations_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *UserLandResponse) GetBranchUpdate() *OperationBranchUpdate {
@@ -4799,7 +5548,7 @@ type UserLandError struct {
 
 func (x *UserLandError) Reset() {
 	*x = UserLandError{}
-	mi := &file_operations_proto_msgTypes[51]
+	mi := &file_operations_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4811,7 +5560,7 @@ func (x *UserLandError) String() string {
 func (*UserLandError) ProtoMessage() {}
 
 func (x *UserLandError) ProtoReflect() protoreflect.Message {
-	mi := &file_operations_proto_msgTypes[51]
+	mi := &file_operations_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4824,7 +5573,7 @@ func (x *UserLandError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UserLandError.ProtoReflect.Descriptor instead.
 func (*UserLandError) Descriptor() ([]byte, []int) {
-	return file_operations_proto_rawDescGZIP(), []int{51}
+	return file_operations_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *UserLandError) GetError() isUserLandError_Error {
@@ -4959,7 +5708,7 @@ type UserRebaseConfirmableRequest_Header struct {
 
 func (x *UserRebaseConfirmableRequest_Header) Reset() {
 	*x = UserRebaseConfirmableRequest_Header{}
-	mi := &file_operations_proto_msgTypes[52]
+	mi := &file_operations_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4971,7 +5720,7 @@ func (x *UserRebaseConfirmableRequest_Header) String() string {
 func (*UserRebaseConfirmableRequest_Header) ProtoMessage() {}
 
 func (x *UserRebaseConfirmableRequest_Header) ProtoReflect() protoreflect.Message {
-	mi := &file_operations_proto_msgTypes[52]
+	mi := &file_operations_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5079,7 +5828,7 @@ type UserApplyPatchRequest_Header struct {
 
 func (x *UserApplyPatchRequest_Header) Reset() {
 	*x = UserApplyPatchRequest_Header{}
-	mi := &file_operations_proto_msgTypes[53]
+	mi := &file_operations_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5091,7 +5840,7 @@ func (x *UserApplyPatchRequest_Header) String() string {
 func (*UserApplyPatchRequest_Header) ProtoMessage() {}
 
 func (x *UserApplyPatchRequest_Header) ProtoReflect() protoreflect.Message {
-	mi := &file_operations_proto_msgTypes[53]
+	mi := &file_operations_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5497,7 +6246,7 @@ const file_operations_proto_rawDesc = "" +
 	"\x10reference_update\x18\x02 \x01(\v2\x1c.gitaly.ReferenceUpdateErrorH\x00R\x0freferenceUpdate\x122\n" +
 	"\n" +
 	"path_error\x18\x03 \x01(\v2\x11.gitaly.PathErrorH\x00R\tpathErrorB\a\n" +
-	"\x05error\"\x8b\x04\n" +
+	"\x05error\"\xc3\x04\n" +
 	"\x0fUserLandRequest\x128\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\v2\x12.gitaly.RepositoryB\x04\x98\xc6,\x01R\n" +
@@ -5511,11 +6260,71 @@ const file_operations_proto_rawDesc = "" +
 	"\ttimestamp\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12#\n" +
 	"\rmerge_message\x18\t \x01(\fR\fmergeMessage\x12+\n" +
 	"\x11resolve_conflicts\x18\n" +
-	" \x01(\bR\x10resolveConflicts\"U\n" +
+	" \x01(\bR\x10resolveConflicts\x126\n" +
+	"\n" +
+	"resolution\x18\v \x01(\v2\x16.gitaly.LandResolutionR\n" +
+	"resolution\"U\n" +
 	"\bStrategy\x12\x1f\n" +
 	"\x1bSTRATEGY_REBASE_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTRATEGY_MERGE\x10\x01\x12\x14\n" +
-	"\x10STRATEGY_FF_ONLY\x10\x02\"\x83\x03\n" +
+	"\x10STRATEGY_FF_ONLY\x10\x02\"\x96\x02\n" +
+	"\fLandConflict\x12\x10\n" +
+	"\x03tip\x18\x01 \x01(\tR\x03tip\x12\x16\n" +
+	"\x06commit\x18\x02 \x01(\tR\x06commit\x12\x1d\n" +
+	"\n" +
+	"merge_base\x18\x03 \x01(\tR\tmergeBase\x12\x1f\n" +
+	"\vtip_message\x18\x04 \x01(\fR\n" +
+	"tipMessage\x12%\n" +
+	"\x0ecommit_message\x18\x05 \x01(\fR\rcommitMessage\x12-\n" +
+	"\x12messages_truncated\x18\x06 \x01(\bR\x11messagesTruncated\x12.\n" +
+	"\x05files\x18\a \x03(\v2\x18.gitaly.LandConflictFileR\x05files\x12\x16\n" +
+	"\x06reason\x18\b \x01(\tR\x06reason\"\x95\x05\n" +
+	"\x10LandConflictFile\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\fR\x04path\x121\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1d.gitaly.LandConflictFile.KindR\x04kind\x12,\n" +
+	"\x04base\x18\x03 \x01(\v2\x18.gitaly.LandConflictSideR\x04base\x12,\n" +
+	"\x04ours\x18\x04 \x01(\v2\x18.gitaly.LandConflictSideR\x04ours\x120\n" +
+	"\x06theirs\x18\x05 \x01(\v2\x18.gitaly.LandConflictSideR\x06theirs\x12.\n" +
+	"\x05hunks\x18\x06 \x03(\v2\x18.gitaly.LandConflictHunkR\x05hunks\x12:\n" +
+	"\aoutcome\x18\a \x01(\x0e2 .gitaly.LandConflictFile.OutcomeR\aoutcome\x12\x16\n" +
+	"\x06reason\x18\b \x01(\tR\x06reason\x12)\n" +
+	"\x10syntax_unchecked\x18\t \x01(\bR\x0fsyntaxUnchecked\"g\n" +
+	"\x04Kind\x12\x14\n" +
+	"\x10KIND_UNSPECIFIED\x10\x00\x12\x10\n" +
+	"\fKIND_CONTENT\x10\x01\x12\x16\n" +
+	"\x12KIND_MODIFY_DELETE\x10\x02\x12\x10\n" +
+	"\fKIND_ADD_ADD\x10\x03\x12\r\n" +
+	"\tKIND_MODE\x10\x04\"\x93\x01\n" +
+	"\aOutcome\x12\x17\n" +
+	"\x13OUTCOME_UNSPECIFIED\x10\x00\x12\x14\n" +
+	"\x10OUTCOME_NOT_SENT\x10\x01\x12\x14\n" +
+	"\x10OUTCOME_REJECTED\x10\x02\x12\x12\n" +
+	"\x0eOUTCOME_FAILED\x10\x03\x12\x14\n" +
+	"\x10OUTCOME_RESOLVED\x10\x04\x12\x19\n" +
+	"\x15OUTCOME_NOT_ATTEMPTED\x10\x05\"8\n" +
+	"\x10LandConflictSide\x12\x10\n" +
+	"\x03oid\x18\x01 \x01(\tR\x03oid\x12\x12\n" +
+	"\x04mode\x18\x02 \x01(\tR\x04mode\"\x8b\x01\n" +
+	"\x10LandConflictHunk\x12%\n" +
+	"\x04base\x18\x01 \x01(\v2\x11.gitaly.LineRangeR\x04base\x12%\n" +
+	"\x04ours\x18\x02 \x01(\v2\x11.gitaly.LineRangeR\x04ours\x12)\n" +
+	"\x06theirs\x18\x03 \x01(\v2\x11.gitaly.LineRangeR\x06theirs\"3\n" +
+	"\tLineRange\x12\x14\n" +
+	"\x05start\x18\x01 \x01(\rR\x05start\x12\x10\n" +
+	"\x03end\x18\x02 \x01(\rR\x03end\"j\n" +
+	"\x0eLandResolution\x12\x10\n" +
+	"\x03tip\x18\x01 \x01(\tR\x03tip\x12\x16\n" +
+	"\x06commit\x18\x02 \x01(\tR\x06commit\x12.\n" +
+	"\x05files\x18\x03 \x03(\v2\x18.gitaly.LandResolvedFileR\x05files\"\xd4\x01\n" +
+	"\x10LandResolvedFile\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\fR\x04path\x127\n" +
+	"\x06action\x18\x02 \x01(\x0e2\x1f.gitaly.LandResolvedFile.ActionR\x06action\x12\x12\n" +
+	"\x04mode\x18\x03 \x01(\tR\x04mode\x12\x18\n" +
+	"\acontent\x18\x04 \x01(\fR\acontent\"E\n" +
+	"\x06Action\x12\x16\n" +
+	"\x12ACTION_UNSPECIFIED\x10\x00\x12\x10\n" +
+	"\fACTION_WRITE\x10\x01\x12\x11\n" +
+	"\rACTION_DELETE\x10\x02\"\x83\x03\n" +
 	"\x10UserLandResponse\x12B\n" +
 	"\rbranch_update\x18\x01 \x01(\v2\x1d.gitaly.OperationBranchUpdateR\fbranchUpdate\x12(\n" +
 	"\x10landed_commit_id\x18\x02 \x01(\tR\x0elandedCommitId\x12\x1c\n" +
@@ -5570,233 +6379,256 @@ func file_operations_proto_rawDescGZIP() []byte {
 	return file_operations_proto_rawDescData
 }
 
-var file_operations_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
+var file_operations_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_operations_proto_msgTypes = make([]protoimpl.MessageInfo, 61)
 var file_operations_proto_goTypes = []any{
 	(UserRevertResponse_CreateTreeError)(0),     // 0: gitaly.UserRevertResponse.CreateTreeError
 	(UserCommitFilesActionHeader_ActionType)(0), // 1: gitaly.UserCommitFilesActionHeader.ActionType
 	(UserLandRequest_Strategy)(0),               // 2: gitaly.UserLandRequest.Strategy
-	(*UserCreateBranchRequest)(nil),             // 3: gitaly.UserCreateBranchRequest
-	(*UserCreateBranchResponse)(nil),            // 4: gitaly.UserCreateBranchResponse
-	(*UserCreateBranchError)(nil),               // 5: gitaly.UserCreateBranchError
-	(*UserUpdateBranchRequest)(nil),             // 6: gitaly.UserUpdateBranchRequest
-	(*UserUpdateBranchResponse)(nil),            // 7: gitaly.UserUpdateBranchResponse
-	(*UserDeleteBranchRequest)(nil),             // 8: gitaly.UserDeleteBranchRequest
-	(*UserDeleteBranchResponse)(nil),            // 9: gitaly.UserDeleteBranchResponse
-	(*UserDeleteBranchError)(nil),               // 10: gitaly.UserDeleteBranchError
-	(*UserDeleteTagRequest)(nil),                // 11: gitaly.UserDeleteTagRequest
-	(*UserDeleteTagResponse)(nil),               // 12: gitaly.UserDeleteTagResponse
-	(*UserCreateTagRequest)(nil),                // 13: gitaly.UserCreateTagRequest
-	(*UserCreateTagResponse)(nil),               // 14: gitaly.UserCreateTagResponse
-	(*UserCreateTagError)(nil),                  // 15: gitaly.UserCreateTagError
-	(*UserMergeBranchRequest)(nil),              // 16: gitaly.UserMergeBranchRequest
-	(*UserMergeBranchResponse)(nil),             // 17: gitaly.UserMergeBranchResponse
-	(*UserMergeBranchError)(nil),                // 18: gitaly.UserMergeBranchError
-	(*UserMergeToRefRequest)(nil),               // 19: gitaly.UserMergeToRefRequest
-	(*UserMergeToRefResponse)(nil),              // 20: gitaly.UserMergeToRefResponse
-	(*UserMergeToRefError)(nil),                 // 21: gitaly.UserMergeToRefError
-	(*UserRebaseToRefRequest)(nil),              // 22: gitaly.UserRebaseToRefRequest
-	(*UserRebaseToRefResponse)(nil),             // 23: gitaly.UserRebaseToRefResponse
-	(*OperationBranchUpdate)(nil),               // 24: gitaly.OperationBranchUpdate
-	(*UserFFBranchError)(nil),                   // 25: gitaly.UserFFBranchError
-	(*UserFFBranchRequest)(nil),                 // 26: gitaly.UserFFBranchRequest
-	(*UserFFBranchResponse)(nil),                // 27: gitaly.UserFFBranchResponse
-	(*UserCherryPickRequest)(nil),               // 28: gitaly.UserCherryPickRequest
-	(*UserCherryPickResponse)(nil),              // 29: gitaly.UserCherryPickResponse
-	(*UserCherryPickError)(nil),                 // 30: gitaly.UserCherryPickError
-	(*UserRevertRequest)(nil),                   // 31: gitaly.UserRevertRequest
-	(*UserRevertResponse)(nil),                  // 32: gitaly.UserRevertResponse
-	(*UserRevertError)(nil),                     // 33: gitaly.UserRevertError
-	(*UserCommitFilesActionHeader)(nil),         // 34: gitaly.UserCommitFilesActionHeader
-	(*UserCommitFilesAction)(nil),               // 35: gitaly.UserCommitFilesAction
-	(*UserCommitFilesRequestHeader)(nil),        // 36: gitaly.UserCommitFilesRequestHeader
-	(*UserCommitFilesRequest)(nil),              // 37: gitaly.UserCommitFilesRequest
-	(*UserCommitFilesResponse)(nil),             // 38: gitaly.UserCommitFilesResponse
-	(*UserCommitFilesError)(nil),                // 39: gitaly.UserCommitFilesError
-	(*UserRebaseConfirmableRequest)(nil),        // 40: gitaly.UserRebaseConfirmableRequest
-	(*UserRebaseConfirmableResponse)(nil),       // 41: gitaly.UserRebaseConfirmableResponse
-	(*UserSquashRequest)(nil),                   // 42: gitaly.UserSquashRequest
-	(*UserSquashResponse)(nil),                  // 43: gitaly.UserSquashResponse
-	(*UserRebaseConfirmableError)(nil),          // 44: gitaly.UserRebaseConfirmableError
-	(*UserSquashError)(nil),                     // 45: gitaly.UserSquashError
-	(*UserApplyPatchRequest)(nil),               // 46: gitaly.UserApplyPatchRequest
-	(*UserApplyPatchError)(nil),                 // 47: gitaly.UserApplyPatchError
-	(*UserApplyPatchResponse)(nil),              // 48: gitaly.UserApplyPatchResponse
-	(*UserUpdateSubmoduleRequest)(nil),          // 49: gitaly.UserUpdateSubmoduleRequest
-	(*UserUpdateSubmoduleResponse)(nil),         // 50: gitaly.UserUpdateSubmoduleResponse
-	(*UserUpdateSubmoduleError)(nil),            // 51: gitaly.UserUpdateSubmoduleError
-	(*UserLandRequest)(nil),                     // 52: gitaly.UserLandRequest
-	(*UserLandResponse)(nil),                    // 53: gitaly.UserLandResponse
-	(*UserLandError)(nil),                       // 54: gitaly.UserLandError
-	(*UserRebaseConfirmableRequest_Header)(nil), // 55: gitaly.UserRebaseConfirmableRequest.Header
-	(*UserApplyPatchRequest_Header)(nil),        // 56: gitaly.UserApplyPatchRequest.Header
-	(*Repository)(nil),                          // 57: gitaly.Repository
-	(*User)(nil),                                // 58: gitaly.User
-	(*Branch)(nil),                              // 59: gitaly.Branch
-	(*CustomHookError)(nil),                     // 60: gitaly.CustomHookError
-	(*AccessCheckError)(nil),                    // 61: gitaly.AccessCheckError
-	(*ReferenceUpdateError)(nil),                // 62: gitaly.ReferenceUpdateError
-	(*timestamppb.Timestamp)(nil),               // 63: google.protobuf.Timestamp
-	(*Tag)(nil),                                 // 64: gitaly.Tag
-	(*ReferenceExistsError)(nil),                // 65: gitaly.ReferenceExistsError
-	(*MergeConflictError)(nil),                  // 66: gitaly.MergeConflictError
-	(*GitCommit)(nil),                           // 67: gitaly.GitCommit
-	(*NotAncestorError)(nil),                    // 68: gitaly.NotAncestorError
-	(*ChangesAlreadyAppliedError)(nil),          // 69: gitaly.ChangesAlreadyAppliedError
-	(*IndexError)(nil),                          // 70: gitaly.IndexError
-	(*ResolveRevisionError)(nil),                // 71: gitaly.ResolveRevisionError
-	(*PathError)(nil),                           // 72: gitaly.PathError
+	(LandConflictFile_Kind)(0),                  // 3: gitaly.LandConflictFile.Kind
+	(LandConflictFile_Outcome)(0),               // 4: gitaly.LandConflictFile.Outcome
+	(LandResolvedFile_Action)(0),                // 5: gitaly.LandResolvedFile.Action
+	(*UserCreateBranchRequest)(nil),             // 6: gitaly.UserCreateBranchRequest
+	(*UserCreateBranchResponse)(nil),            // 7: gitaly.UserCreateBranchResponse
+	(*UserCreateBranchError)(nil),               // 8: gitaly.UserCreateBranchError
+	(*UserUpdateBranchRequest)(nil),             // 9: gitaly.UserUpdateBranchRequest
+	(*UserUpdateBranchResponse)(nil),            // 10: gitaly.UserUpdateBranchResponse
+	(*UserDeleteBranchRequest)(nil),             // 11: gitaly.UserDeleteBranchRequest
+	(*UserDeleteBranchResponse)(nil),            // 12: gitaly.UserDeleteBranchResponse
+	(*UserDeleteBranchError)(nil),               // 13: gitaly.UserDeleteBranchError
+	(*UserDeleteTagRequest)(nil),                // 14: gitaly.UserDeleteTagRequest
+	(*UserDeleteTagResponse)(nil),               // 15: gitaly.UserDeleteTagResponse
+	(*UserCreateTagRequest)(nil),                // 16: gitaly.UserCreateTagRequest
+	(*UserCreateTagResponse)(nil),               // 17: gitaly.UserCreateTagResponse
+	(*UserCreateTagError)(nil),                  // 18: gitaly.UserCreateTagError
+	(*UserMergeBranchRequest)(nil),              // 19: gitaly.UserMergeBranchRequest
+	(*UserMergeBranchResponse)(nil),             // 20: gitaly.UserMergeBranchResponse
+	(*UserMergeBranchError)(nil),                // 21: gitaly.UserMergeBranchError
+	(*UserMergeToRefRequest)(nil),               // 22: gitaly.UserMergeToRefRequest
+	(*UserMergeToRefResponse)(nil),              // 23: gitaly.UserMergeToRefResponse
+	(*UserMergeToRefError)(nil),                 // 24: gitaly.UserMergeToRefError
+	(*UserRebaseToRefRequest)(nil),              // 25: gitaly.UserRebaseToRefRequest
+	(*UserRebaseToRefResponse)(nil),             // 26: gitaly.UserRebaseToRefResponse
+	(*OperationBranchUpdate)(nil),               // 27: gitaly.OperationBranchUpdate
+	(*UserFFBranchError)(nil),                   // 28: gitaly.UserFFBranchError
+	(*UserFFBranchRequest)(nil),                 // 29: gitaly.UserFFBranchRequest
+	(*UserFFBranchResponse)(nil),                // 30: gitaly.UserFFBranchResponse
+	(*UserCherryPickRequest)(nil),               // 31: gitaly.UserCherryPickRequest
+	(*UserCherryPickResponse)(nil),              // 32: gitaly.UserCherryPickResponse
+	(*UserCherryPickError)(nil),                 // 33: gitaly.UserCherryPickError
+	(*UserRevertRequest)(nil),                   // 34: gitaly.UserRevertRequest
+	(*UserRevertResponse)(nil),                  // 35: gitaly.UserRevertResponse
+	(*UserRevertError)(nil),                     // 36: gitaly.UserRevertError
+	(*UserCommitFilesActionHeader)(nil),         // 37: gitaly.UserCommitFilesActionHeader
+	(*UserCommitFilesAction)(nil),               // 38: gitaly.UserCommitFilesAction
+	(*UserCommitFilesRequestHeader)(nil),        // 39: gitaly.UserCommitFilesRequestHeader
+	(*UserCommitFilesRequest)(nil),              // 40: gitaly.UserCommitFilesRequest
+	(*UserCommitFilesResponse)(nil),             // 41: gitaly.UserCommitFilesResponse
+	(*UserCommitFilesError)(nil),                // 42: gitaly.UserCommitFilesError
+	(*UserRebaseConfirmableRequest)(nil),        // 43: gitaly.UserRebaseConfirmableRequest
+	(*UserRebaseConfirmableResponse)(nil),       // 44: gitaly.UserRebaseConfirmableResponse
+	(*UserSquashRequest)(nil),                   // 45: gitaly.UserSquashRequest
+	(*UserSquashResponse)(nil),                  // 46: gitaly.UserSquashResponse
+	(*UserRebaseConfirmableError)(nil),          // 47: gitaly.UserRebaseConfirmableError
+	(*UserSquashError)(nil),                     // 48: gitaly.UserSquashError
+	(*UserApplyPatchRequest)(nil),               // 49: gitaly.UserApplyPatchRequest
+	(*UserApplyPatchError)(nil),                 // 50: gitaly.UserApplyPatchError
+	(*UserApplyPatchResponse)(nil),              // 51: gitaly.UserApplyPatchResponse
+	(*UserUpdateSubmoduleRequest)(nil),          // 52: gitaly.UserUpdateSubmoduleRequest
+	(*UserUpdateSubmoduleResponse)(nil),         // 53: gitaly.UserUpdateSubmoduleResponse
+	(*UserUpdateSubmoduleError)(nil),            // 54: gitaly.UserUpdateSubmoduleError
+	(*UserLandRequest)(nil),                     // 55: gitaly.UserLandRequest
+	(*LandConflict)(nil),                        // 56: gitaly.LandConflict
+	(*LandConflictFile)(nil),                    // 57: gitaly.LandConflictFile
+	(*LandConflictSide)(nil),                    // 58: gitaly.LandConflictSide
+	(*LandConflictHunk)(nil),                    // 59: gitaly.LandConflictHunk
+	(*LineRange)(nil),                           // 60: gitaly.LineRange
+	(*LandResolution)(nil),                      // 61: gitaly.LandResolution
+	(*LandResolvedFile)(nil),                    // 62: gitaly.LandResolvedFile
+	(*UserLandResponse)(nil),                    // 63: gitaly.UserLandResponse
+	(*UserLandError)(nil),                       // 64: gitaly.UserLandError
+	(*UserRebaseConfirmableRequest_Header)(nil), // 65: gitaly.UserRebaseConfirmableRequest.Header
+	(*UserApplyPatchRequest_Header)(nil),        // 66: gitaly.UserApplyPatchRequest.Header
+	(*Repository)(nil),                          // 67: gitaly.Repository
+	(*User)(nil),                                // 68: gitaly.User
+	(*Branch)(nil),                              // 69: gitaly.Branch
+	(*CustomHookError)(nil),                     // 70: gitaly.CustomHookError
+	(*AccessCheckError)(nil),                    // 71: gitaly.AccessCheckError
+	(*ReferenceUpdateError)(nil),                // 72: gitaly.ReferenceUpdateError
+	(*timestamppb.Timestamp)(nil),               // 73: google.protobuf.Timestamp
+	(*Tag)(nil),                                 // 74: gitaly.Tag
+	(*ReferenceExistsError)(nil),                // 75: gitaly.ReferenceExistsError
+	(*MergeConflictError)(nil),                  // 76: gitaly.MergeConflictError
+	(*GitCommit)(nil),                           // 77: gitaly.GitCommit
+	(*NotAncestorError)(nil),                    // 78: gitaly.NotAncestorError
+	(*ChangesAlreadyAppliedError)(nil),          // 79: gitaly.ChangesAlreadyAppliedError
+	(*IndexError)(nil),                          // 80: gitaly.IndexError
+	(*ResolveRevisionError)(nil),                // 81: gitaly.ResolveRevisionError
+	(*PathError)(nil),                           // 82: gitaly.PathError
 }
 var file_operations_proto_depIdxs = []int32{
-	57,  // 0: gitaly.UserCreateBranchRequest.repository:type_name -> gitaly.Repository
-	58,  // 1: gitaly.UserCreateBranchRequest.user:type_name -> gitaly.User
-	59,  // 2: gitaly.UserCreateBranchResponse.branch:type_name -> gitaly.Branch
-	60,  // 3: gitaly.UserCreateBranchError.custom_hook:type_name -> gitaly.CustomHookError
-	57,  // 4: gitaly.UserUpdateBranchRequest.repository:type_name -> gitaly.Repository
-	58,  // 5: gitaly.UserUpdateBranchRequest.user:type_name -> gitaly.User
-	57,  // 6: gitaly.UserDeleteBranchRequest.repository:type_name -> gitaly.Repository
-	58,  // 7: gitaly.UserDeleteBranchRequest.user:type_name -> gitaly.User
-	61,  // 8: gitaly.UserDeleteBranchError.access_check:type_name -> gitaly.AccessCheckError
-	62,  // 9: gitaly.UserDeleteBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	60,  // 10: gitaly.UserDeleteBranchError.custom_hook:type_name -> gitaly.CustomHookError
-	57,  // 11: gitaly.UserDeleteTagRequest.repository:type_name -> gitaly.Repository
-	58,  // 12: gitaly.UserDeleteTagRequest.user:type_name -> gitaly.User
-	57,  // 13: gitaly.UserCreateTagRequest.repository:type_name -> gitaly.Repository
-	58,  // 14: gitaly.UserCreateTagRequest.user:type_name -> gitaly.User
-	63,  // 15: gitaly.UserCreateTagRequest.timestamp:type_name -> google.protobuf.Timestamp
-	64,  // 16: gitaly.UserCreateTagResponse.tag:type_name -> gitaly.Tag
-	61,  // 17: gitaly.UserCreateTagError.access_check:type_name -> gitaly.AccessCheckError
-	62,  // 18: gitaly.UserCreateTagError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	60,  // 19: gitaly.UserCreateTagError.custom_hook:type_name -> gitaly.CustomHookError
-	65,  // 20: gitaly.UserCreateTagError.reference_exists:type_name -> gitaly.ReferenceExistsError
-	57,  // 21: gitaly.UserMergeBranchRequest.repository:type_name -> gitaly.Repository
-	58,  // 22: gitaly.UserMergeBranchRequest.user:type_name -> gitaly.User
-	63,  // 23: gitaly.UserMergeBranchRequest.timestamp:type_name -> google.protobuf.Timestamp
-	24,  // 24: gitaly.UserMergeBranchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	61,  // 25: gitaly.UserMergeBranchError.access_check:type_name -> gitaly.AccessCheckError
-	62,  // 26: gitaly.UserMergeBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	60,  // 27: gitaly.UserMergeBranchError.custom_hook:type_name -> gitaly.CustomHookError
-	66,  // 28: gitaly.UserMergeBranchError.merge_conflict:type_name -> gitaly.MergeConflictError
-	57,  // 29: gitaly.UserMergeToRefRequest.repository:type_name -> gitaly.Repository
-	58,  // 30: gitaly.UserMergeToRefRequest.user:type_name -> gitaly.User
-	63,  // 31: gitaly.UserMergeToRefRequest.timestamp:type_name -> google.protobuf.Timestamp
-	66,  // 32: gitaly.UserMergeToRefError.merge_conflict:type_name -> gitaly.MergeConflictError
-	57,  // 33: gitaly.UserRebaseToRefRequest.repository:type_name -> gitaly.Repository
-	58,  // 34: gitaly.UserRebaseToRefRequest.user:type_name -> gitaly.User
-	63,  // 35: gitaly.UserRebaseToRefRequest.timestamp:type_name -> google.protobuf.Timestamp
-	60,  // 36: gitaly.UserFFBranchError.custom_hook:type_name -> gitaly.CustomHookError
-	62,  // 37: gitaly.UserFFBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	57,  // 38: gitaly.UserFFBranchRequest.repository:type_name -> gitaly.Repository
-	58,  // 39: gitaly.UserFFBranchRequest.user:type_name -> gitaly.User
-	24,  // 40: gitaly.UserFFBranchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	57,  // 41: gitaly.UserCherryPickRequest.repository:type_name -> gitaly.Repository
-	58,  // 42: gitaly.UserCherryPickRequest.user:type_name -> gitaly.User
-	67,  // 43: gitaly.UserCherryPickRequest.commit:type_name -> gitaly.GitCommit
-	57,  // 44: gitaly.UserCherryPickRequest.start_repository:type_name -> gitaly.Repository
-	63,  // 45: gitaly.UserCherryPickRequest.timestamp:type_name -> google.protobuf.Timestamp
-	24,  // 46: gitaly.UserCherryPickResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	66,  // 47: gitaly.UserCherryPickError.cherry_pick_conflict:type_name -> gitaly.MergeConflictError
-	68,  // 48: gitaly.UserCherryPickError.target_branch_diverged:type_name -> gitaly.NotAncestorError
-	69,  // 49: gitaly.UserCherryPickError.changes_already_applied:type_name -> gitaly.ChangesAlreadyAppliedError
-	61,  // 50: gitaly.UserCherryPickError.access_check:type_name -> gitaly.AccessCheckError
-	57,  // 51: gitaly.UserRevertRequest.repository:type_name -> gitaly.Repository
-	58,  // 52: gitaly.UserRevertRequest.user:type_name -> gitaly.User
-	67,  // 53: gitaly.UserRevertRequest.commit:type_name -> gitaly.GitCommit
-	57,  // 54: gitaly.UserRevertRequest.start_repository:type_name -> gitaly.Repository
-	63,  // 55: gitaly.UserRevertRequest.timestamp:type_name -> google.protobuf.Timestamp
-	24,  // 56: gitaly.UserRevertResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	67,  // 0: gitaly.UserCreateBranchRequest.repository:type_name -> gitaly.Repository
+	68,  // 1: gitaly.UserCreateBranchRequest.user:type_name -> gitaly.User
+	69,  // 2: gitaly.UserCreateBranchResponse.branch:type_name -> gitaly.Branch
+	70,  // 3: gitaly.UserCreateBranchError.custom_hook:type_name -> gitaly.CustomHookError
+	67,  // 4: gitaly.UserUpdateBranchRequest.repository:type_name -> gitaly.Repository
+	68,  // 5: gitaly.UserUpdateBranchRequest.user:type_name -> gitaly.User
+	67,  // 6: gitaly.UserDeleteBranchRequest.repository:type_name -> gitaly.Repository
+	68,  // 7: gitaly.UserDeleteBranchRequest.user:type_name -> gitaly.User
+	71,  // 8: gitaly.UserDeleteBranchError.access_check:type_name -> gitaly.AccessCheckError
+	72,  // 9: gitaly.UserDeleteBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	70,  // 10: gitaly.UserDeleteBranchError.custom_hook:type_name -> gitaly.CustomHookError
+	67,  // 11: gitaly.UserDeleteTagRequest.repository:type_name -> gitaly.Repository
+	68,  // 12: gitaly.UserDeleteTagRequest.user:type_name -> gitaly.User
+	67,  // 13: gitaly.UserCreateTagRequest.repository:type_name -> gitaly.Repository
+	68,  // 14: gitaly.UserCreateTagRequest.user:type_name -> gitaly.User
+	73,  // 15: gitaly.UserCreateTagRequest.timestamp:type_name -> google.protobuf.Timestamp
+	74,  // 16: gitaly.UserCreateTagResponse.tag:type_name -> gitaly.Tag
+	71,  // 17: gitaly.UserCreateTagError.access_check:type_name -> gitaly.AccessCheckError
+	72,  // 18: gitaly.UserCreateTagError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	70,  // 19: gitaly.UserCreateTagError.custom_hook:type_name -> gitaly.CustomHookError
+	75,  // 20: gitaly.UserCreateTagError.reference_exists:type_name -> gitaly.ReferenceExistsError
+	67,  // 21: gitaly.UserMergeBranchRequest.repository:type_name -> gitaly.Repository
+	68,  // 22: gitaly.UserMergeBranchRequest.user:type_name -> gitaly.User
+	73,  // 23: gitaly.UserMergeBranchRequest.timestamp:type_name -> google.protobuf.Timestamp
+	27,  // 24: gitaly.UserMergeBranchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	71,  // 25: gitaly.UserMergeBranchError.access_check:type_name -> gitaly.AccessCheckError
+	72,  // 26: gitaly.UserMergeBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	70,  // 27: gitaly.UserMergeBranchError.custom_hook:type_name -> gitaly.CustomHookError
+	76,  // 28: gitaly.UserMergeBranchError.merge_conflict:type_name -> gitaly.MergeConflictError
+	67,  // 29: gitaly.UserMergeToRefRequest.repository:type_name -> gitaly.Repository
+	68,  // 30: gitaly.UserMergeToRefRequest.user:type_name -> gitaly.User
+	73,  // 31: gitaly.UserMergeToRefRequest.timestamp:type_name -> google.protobuf.Timestamp
+	76,  // 32: gitaly.UserMergeToRefError.merge_conflict:type_name -> gitaly.MergeConflictError
+	67,  // 33: gitaly.UserRebaseToRefRequest.repository:type_name -> gitaly.Repository
+	68,  // 34: gitaly.UserRebaseToRefRequest.user:type_name -> gitaly.User
+	73,  // 35: gitaly.UserRebaseToRefRequest.timestamp:type_name -> google.protobuf.Timestamp
+	70,  // 36: gitaly.UserFFBranchError.custom_hook:type_name -> gitaly.CustomHookError
+	72,  // 37: gitaly.UserFFBranchError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	67,  // 38: gitaly.UserFFBranchRequest.repository:type_name -> gitaly.Repository
+	68,  // 39: gitaly.UserFFBranchRequest.user:type_name -> gitaly.User
+	27,  // 40: gitaly.UserFFBranchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	67,  // 41: gitaly.UserCherryPickRequest.repository:type_name -> gitaly.Repository
+	68,  // 42: gitaly.UserCherryPickRequest.user:type_name -> gitaly.User
+	77,  // 43: gitaly.UserCherryPickRequest.commit:type_name -> gitaly.GitCommit
+	67,  // 44: gitaly.UserCherryPickRequest.start_repository:type_name -> gitaly.Repository
+	73,  // 45: gitaly.UserCherryPickRequest.timestamp:type_name -> google.protobuf.Timestamp
+	27,  // 46: gitaly.UserCherryPickResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	76,  // 47: gitaly.UserCherryPickError.cherry_pick_conflict:type_name -> gitaly.MergeConflictError
+	78,  // 48: gitaly.UserCherryPickError.target_branch_diverged:type_name -> gitaly.NotAncestorError
+	79,  // 49: gitaly.UserCherryPickError.changes_already_applied:type_name -> gitaly.ChangesAlreadyAppliedError
+	71,  // 50: gitaly.UserCherryPickError.access_check:type_name -> gitaly.AccessCheckError
+	67,  // 51: gitaly.UserRevertRequest.repository:type_name -> gitaly.Repository
+	68,  // 52: gitaly.UserRevertRequest.user:type_name -> gitaly.User
+	77,  // 53: gitaly.UserRevertRequest.commit:type_name -> gitaly.GitCommit
+	67,  // 54: gitaly.UserRevertRequest.start_repository:type_name -> gitaly.Repository
+	73,  // 55: gitaly.UserRevertRequest.timestamp:type_name -> google.protobuf.Timestamp
+	27,  // 56: gitaly.UserRevertResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
 	0,   // 57: gitaly.UserRevertResponse.create_tree_error_code:type_name -> gitaly.UserRevertResponse.CreateTreeError
-	66,  // 58: gitaly.UserRevertError.merge_conflict:type_name -> gitaly.MergeConflictError
-	69,  // 59: gitaly.UserRevertError.changes_already_applied:type_name -> gitaly.ChangesAlreadyAppliedError
-	60,  // 60: gitaly.UserRevertError.custom_hook:type_name -> gitaly.CustomHookError
-	68,  // 61: gitaly.UserRevertError.not_ancestor:type_name -> gitaly.NotAncestorError
+	76,  // 58: gitaly.UserRevertError.merge_conflict:type_name -> gitaly.MergeConflictError
+	79,  // 59: gitaly.UserRevertError.changes_already_applied:type_name -> gitaly.ChangesAlreadyAppliedError
+	70,  // 60: gitaly.UserRevertError.custom_hook:type_name -> gitaly.CustomHookError
+	78,  // 61: gitaly.UserRevertError.not_ancestor:type_name -> gitaly.NotAncestorError
 	1,   // 62: gitaly.UserCommitFilesActionHeader.action:type_name -> gitaly.UserCommitFilesActionHeader.ActionType
-	34,  // 63: gitaly.UserCommitFilesAction.header:type_name -> gitaly.UserCommitFilesActionHeader
-	57,  // 64: gitaly.UserCommitFilesRequestHeader.repository:type_name -> gitaly.Repository
-	58,  // 65: gitaly.UserCommitFilesRequestHeader.user:type_name -> gitaly.User
-	57,  // 66: gitaly.UserCommitFilesRequestHeader.start_repository:type_name -> gitaly.Repository
-	63,  // 67: gitaly.UserCommitFilesRequestHeader.timestamp:type_name -> google.protobuf.Timestamp
-	36,  // 68: gitaly.UserCommitFilesRequest.header:type_name -> gitaly.UserCommitFilesRequestHeader
-	35,  // 69: gitaly.UserCommitFilesRequest.action:type_name -> gitaly.UserCommitFilesAction
-	24,  // 70: gitaly.UserCommitFilesResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	61,  // 71: gitaly.UserCommitFilesError.access_check:type_name -> gitaly.AccessCheckError
-	70,  // 72: gitaly.UserCommitFilesError.index_update:type_name -> gitaly.IndexError
-	60,  // 73: gitaly.UserCommitFilesError.custom_hook:type_name -> gitaly.CustomHookError
-	55,  // 74: gitaly.UserRebaseConfirmableRequest.header:type_name -> gitaly.UserRebaseConfirmableRequest.Header
-	57,  // 75: gitaly.UserSquashRequest.repository:type_name -> gitaly.Repository
-	58,  // 76: gitaly.UserSquashRequest.user:type_name -> gitaly.User
-	58,  // 77: gitaly.UserSquashRequest.author:type_name -> gitaly.User
-	63,  // 78: gitaly.UserSquashRequest.timestamp:type_name -> google.protobuf.Timestamp
-	66,  // 79: gitaly.UserRebaseConfirmableError.rebase_conflict:type_name -> gitaly.MergeConflictError
-	61,  // 80: gitaly.UserRebaseConfirmableError.access_check:type_name -> gitaly.AccessCheckError
-	71,  // 81: gitaly.UserSquashError.resolve_revision:type_name -> gitaly.ResolveRevisionError
-	66,  // 82: gitaly.UserSquashError.rebase_conflict:type_name -> gitaly.MergeConflictError
-	56,  // 83: gitaly.UserApplyPatchRequest.header:type_name -> gitaly.UserApplyPatchRequest.Header
-	60,  // 84: gitaly.UserApplyPatchError.custom_hook:type_name -> gitaly.CustomHookError
-	24,  // 85: gitaly.UserApplyPatchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	57,  // 86: gitaly.UserUpdateSubmoduleRequest.repository:type_name -> gitaly.Repository
-	58,  // 87: gitaly.UserUpdateSubmoduleRequest.user:type_name -> gitaly.User
-	63,  // 88: gitaly.UserUpdateSubmoduleRequest.timestamp:type_name -> google.protobuf.Timestamp
-	24,  // 89: gitaly.UserUpdateSubmoduleResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	60,  // 90: gitaly.UserUpdateSubmoduleError.custom_hook:type_name -> gitaly.CustomHookError
-	62,  // 91: gitaly.UserUpdateSubmoduleError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	72,  // 92: gitaly.UserUpdateSubmoduleError.path_error:type_name -> gitaly.PathError
-	57,  // 93: gitaly.UserLandRequest.repository:type_name -> gitaly.Repository
-	58,  // 94: gitaly.UserLandRequest.user:type_name -> gitaly.User
+	37,  // 63: gitaly.UserCommitFilesAction.header:type_name -> gitaly.UserCommitFilesActionHeader
+	67,  // 64: gitaly.UserCommitFilesRequestHeader.repository:type_name -> gitaly.Repository
+	68,  // 65: gitaly.UserCommitFilesRequestHeader.user:type_name -> gitaly.User
+	67,  // 66: gitaly.UserCommitFilesRequestHeader.start_repository:type_name -> gitaly.Repository
+	73,  // 67: gitaly.UserCommitFilesRequestHeader.timestamp:type_name -> google.protobuf.Timestamp
+	39,  // 68: gitaly.UserCommitFilesRequest.header:type_name -> gitaly.UserCommitFilesRequestHeader
+	38,  // 69: gitaly.UserCommitFilesRequest.action:type_name -> gitaly.UserCommitFilesAction
+	27,  // 70: gitaly.UserCommitFilesResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	71,  // 71: gitaly.UserCommitFilesError.access_check:type_name -> gitaly.AccessCheckError
+	80,  // 72: gitaly.UserCommitFilesError.index_update:type_name -> gitaly.IndexError
+	70,  // 73: gitaly.UserCommitFilesError.custom_hook:type_name -> gitaly.CustomHookError
+	65,  // 74: gitaly.UserRebaseConfirmableRequest.header:type_name -> gitaly.UserRebaseConfirmableRequest.Header
+	67,  // 75: gitaly.UserSquashRequest.repository:type_name -> gitaly.Repository
+	68,  // 76: gitaly.UserSquashRequest.user:type_name -> gitaly.User
+	68,  // 77: gitaly.UserSquashRequest.author:type_name -> gitaly.User
+	73,  // 78: gitaly.UserSquashRequest.timestamp:type_name -> google.protobuf.Timestamp
+	76,  // 79: gitaly.UserRebaseConfirmableError.rebase_conflict:type_name -> gitaly.MergeConflictError
+	71,  // 80: gitaly.UserRebaseConfirmableError.access_check:type_name -> gitaly.AccessCheckError
+	81,  // 81: gitaly.UserSquashError.resolve_revision:type_name -> gitaly.ResolveRevisionError
+	76,  // 82: gitaly.UserSquashError.rebase_conflict:type_name -> gitaly.MergeConflictError
+	66,  // 83: gitaly.UserApplyPatchRequest.header:type_name -> gitaly.UserApplyPatchRequest.Header
+	70,  // 84: gitaly.UserApplyPatchError.custom_hook:type_name -> gitaly.CustomHookError
+	27,  // 85: gitaly.UserApplyPatchResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	67,  // 86: gitaly.UserUpdateSubmoduleRequest.repository:type_name -> gitaly.Repository
+	68,  // 87: gitaly.UserUpdateSubmoduleRequest.user:type_name -> gitaly.User
+	73,  // 88: gitaly.UserUpdateSubmoduleRequest.timestamp:type_name -> google.protobuf.Timestamp
+	27,  // 89: gitaly.UserUpdateSubmoduleResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	70,  // 90: gitaly.UserUpdateSubmoduleError.custom_hook:type_name -> gitaly.CustomHookError
+	72,  // 91: gitaly.UserUpdateSubmoduleError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	82,  // 92: gitaly.UserUpdateSubmoduleError.path_error:type_name -> gitaly.PathError
+	67,  // 93: gitaly.UserLandRequest.repository:type_name -> gitaly.Repository
+	68,  // 94: gitaly.UserLandRequest.user:type_name -> gitaly.User
 	2,   // 95: gitaly.UserLandRequest.strategy:type_name -> gitaly.UserLandRequest.Strategy
-	63,  // 96: gitaly.UserLandRequest.timestamp:type_name -> google.protobuf.Timestamp
-	24,  // 97: gitaly.UserLandResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
-	66,  // 98: gitaly.UserLandError.merge_conflict:type_name -> gitaly.MergeConflictError
-	68,  // 99: gitaly.UserLandError.not_ancestor:type_name -> gitaly.NotAncestorError
-	62,  // 100: gitaly.UserLandError.reference_update:type_name -> gitaly.ReferenceUpdateError
-	60,  // 101: gitaly.UserLandError.custom_hook:type_name -> gitaly.CustomHookError
-	61,  // 102: gitaly.UserLandError.access_check:type_name -> gitaly.AccessCheckError
-	57,  // 103: gitaly.UserRebaseConfirmableRequest.Header.repository:type_name -> gitaly.Repository
-	58,  // 104: gitaly.UserRebaseConfirmableRequest.Header.user:type_name -> gitaly.User
-	57,  // 105: gitaly.UserRebaseConfirmableRequest.Header.remote_repository:type_name -> gitaly.Repository
-	63,  // 106: gitaly.UserRebaseConfirmableRequest.Header.timestamp:type_name -> google.protobuf.Timestamp
-	57,  // 107: gitaly.UserApplyPatchRequest.Header.repository:type_name -> gitaly.Repository
-	58,  // 108: gitaly.UserApplyPatchRequest.Header.user:type_name -> gitaly.User
-	63,  // 109: gitaly.UserApplyPatchRequest.Header.timestamp:type_name -> google.protobuf.Timestamp
-	3,   // 110: gitaly.OperationService.UserCreateBranch:input_type -> gitaly.UserCreateBranchRequest
-	6,   // 111: gitaly.OperationService.UserUpdateBranch:input_type -> gitaly.UserUpdateBranchRequest
-	8,   // 112: gitaly.OperationService.UserDeleteBranch:input_type -> gitaly.UserDeleteBranchRequest
-	13,  // 113: gitaly.OperationService.UserCreateTag:input_type -> gitaly.UserCreateTagRequest
-	11,  // 114: gitaly.OperationService.UserDeleteTag:input_type -> gitaly.UserDeleteTagRequest
-	19,  // 115: gitaly.OperationService.UserMergeToRef:input_type -> gitaly.UserMergeToRefRequest
-	22,  // 116: gitaly.OperationService.UserRebaseToRef:input_type -> gitaly.UserRebaseToRefRequest
-	16,  // 117: gitaly.OperationService.UserMergeBranch:input_type -> gitaly.UserMergeBranchRequest
-	26,  // 118: gitaly.OperationService.UserFFBranch:input_type -> gitaly.UserFFBranchRequest
-	28,  // 119: gitaly.OperationService.UserCherryPick:input_type -> gitaly.UserCherryPickRequest
-	37,  // 120: gitaly.OperationService.UserCommitFiles:input_type -> gitaly.UserCommitFilesRequest
-	40,  // 121: gitaly.OperationService.UserRebaseConfirmable:input_type -> gitaly.UserRebaseConfirmableRequest
-	31,  // 122: gitaly.OperationService.UserRevert:input_type -> gitaly.UserRevertRequest
-	42,  // 123: gitaly.OperationService.UserSquash:input_type -> gitaly.UserSquashRequest
-	46,  // 124: gitaly.OperationService.UserApplyPatch:input_type -> gitaly.UserApplyPatchRequest
-	49,  // 125: gitaly.OperationService.UserUpdateSubmodule:input_type -> gitaly.UserUpdateSubmoduleRequest
-	52,  // 126: gitaly.OperationService.UserLand:input_type -> gitaly.UserLandRequest
-	4,   // 127: gitaly.OperationService.UserCreateBranch:output_type -> gitaly.UserCreateBranchResponse
-	7,   // 128: gitaly.OperationService.UserUpdateBranch:output_type -> gitaly.UserUpdateBranchResponse
-	9,   // 129: gitaly.OperationService.UserDeleteBranch:output_type -> gitaly.UserDeleteBranchResponse
-	14,  // 130: gitaly.OperationService.UserCreateTag:output_type -> gitaly.UserCreateTagResponse
-	12,  // 131: gitaly.OperationService.UserDeleteTag:output_type -> gitaly.UserDeleteTagResponse
-	20,  // 132: gitaly.OperationService.UserMergeToRef:output_type -> gitaly.UserMergeToRefResponse
-	23,  // 133: gitaly.OperationService.UserRebaseToRef:output_type -> gitaly.UserRebaseToRefResponse
-	17,  // 134: gitaly.OperationService.UserMergeBranch:output_type -> gitaly.UserMergeBranchResponse
-	27,  // 135: gitaly.OperationService.UserFFBranch:output_type -> gitaly.UserFFBranchResponse
-	29,  // 136: gitaly.OperationService.UserCherryPick:output_type -> gitaly.UserCherryPickResponse
-	38,  // 137: gitaly.OperationService.UserCommitFiles:output_type -> gitaly.UserCommitFilesResponse
-	41,  // 138: gitaly.OperationService.UserRebaseConfirmable:output_type -> gitaly.UserRebaseConfirmableResponse
-	32,  // 139: gitaly.OperationService.UserRevert:output_type -> gitaly.UserRevertResponse
-	43,  // 140: gitaly.OperationService.UserSquash:output_type -> gitaly.UserSquashResponse
-	48,  // 141: gitaly.OperationService.UserApplyPatch:output_type -> gitaly.UserApplyPatchResponse
-	50,  // 142: gitaly.OperationService.UserUpdateSubmodule:output_type -> gitaly.UserUpdateSubmoduleResponse
-	53,  // 143: gitaly.OperationService.UserLand:output_type -> gitaly.UserLandResponse
-	127, // [127:144] is the sub-list for method output_type
-	110, // [110:127] is the sub-list for method input_type
-	110, // [110:110] is the sub-list for extension type_name
-	110, // [110:110] is the sub-list for extension extendee
-	0,   // [0:110] is the sub-list for field type_name
+	73,  // 96: gitaly.UserLandRequest.timestamp:type_name -> google.protobuf.Timestamp
+	61,  // 97: gitaly.UserLandRequest.resolution:type_name -> gitaly.LandResolution
+	57,  // 98: gitaly.LandConflict.files:type_name -> gitaly.LandConflictFile
+	3,   // 99: gitaly.LandConflictFile.kind:type_name -> gitaly.LandConflictFile.Kind
+	58,  // 100: gitaly.LandConflictFile.base:type_name -> gitaly.LandConflictSide
+	58,  // 101: gitaly.LandConflictFile.ours:type_name -> gitaly.LandConflictSide
+	58,  // 102: gitaly.LandConflictFile.theirs:type_name -> gitaly.LandConflictSide
+	59,  // 103: gitaly.LandConflictFile.hunks:type_name -> gitaly.LandConflictHunk
+	4,   // 104: gitaly.LandConflictFile.outcome:type_name -> gitaly.LandConflictFile.Outcome
+	60,  // 105: gitaly.LandConflictHunk.base:type_name -> gitaly.LineRange
+	60,  // 106: gitaly.LandConflictHunk.ours:type_name -> gitaly.LineRange
+	60,  // 107: gitaly.LandConflictHunk.theirs:type_name -> gitaly.LineRange
+	62,  // 108: gitaly.LandResolution.files:type_name -> gitaly.LandResolvedFile
+	5,   // 109: gitaly.LandResolvedFile.action:type_name -> gitaly.LandResolvedFile.Action
+	27,  // 110: gitaly.UserLandResponse.branch_update:type_name -> gitaly.OperationBranchUpdate
+	76,  // 111: gitaly.UserLandError.merge_conflict:type_name -> gitaly.MergeConflictError
+	78,  // 112: gitaly.UserLandError.not_ancestor:type_name -> gitaly.NotAncestorError
+	72,  // 113: gitaly.UserLandError.reference_update:type_name -> gitaly.ReferenceUpdateError
+	70,  // 114: gitaly.UserLandError.custom_hook:type_name -> gitaly.CustomHookError
+	71,  // 115: gitaly.UserLandError.access_check:type_name -> gitaly.AccessCheckError
+	67,  // 116: gitaly.UserRebaseConfirmableRequest.Header.repository:type_name -> gitaly.Repository
+	68,  // 117: gitaly.UserRebaseConfirmableRequest.Header.user:type_name -> gitaly.User
+	67,  // 118: gitaly.UserRebaseConfirmableRequest.Header.remote_repository:type_name -> gitaly.Repository
+	73,  // 119: gitaly.UserRebaseConfirmableRequest.Header.timestamp:type_name -> google.protobuf.Timestamp
+	67,  // 120: gitaly.UserApplyPatchRequest.Header.repository:type_name -> gitaly.Repository
+	68,  // 121: gitaly.UserApplyPatchRequest.Header.user:type_name -> gitaly.User
+	73,  // 122: gitaly.UserApplyPatchRequest.Header.timestamp:type_name -> google.protobuf.Timestamp
+	6,   // 123: gitaly.OperationService.UserCreateBranch:input_type -> gitaly.UserCreateBranchRequest
+	9,   // 124: gitaly.OperationService.UserUpdateBranch:input_type -> gitaly.UserUpdateBranchRequest
+	11,  // 125: gitaly.OperationService.UserDeleteBranch:input_type -> gitaly.UserDeleteBranchRequest
+	16,  // 126: gitaly.OperationService.UserCreateTag:input_type -> gitaly.UserCreateTagRequest
+	14,  // 127: gitaly.OperationService.UserDeleteTag:input_type -> gitaly.UserDeleteTagRequest
+	22,  // 128: gitaly.OperationService.UserMergeToRef:input_type -> gitaly.UserMergeToRefRequest
+	25,  // 129: gitaly.OperationService.UserRebaseToRef:input_type -> gitaly.UserRebaseToRefRequest
+	19,  // 130: gitaly.OperationService.UserMergeBranch:input_type -> gitaly.UserMergeBranchRequest
+	29,  // 131: gitaly.OperationService.UserFFBranch:input_type -> gitaly.UserFFBranchRequest
+	31,  // 132: gitaly.OperationService.UserCherryPick:input_type -> gitaly.UserCherryPickRequest
+	40,  // 133: gitaly.OperationService.UserCommitFiles:input_type -> gitaly.UserCommitFilesRequest
+	43,  // 134: gitaly.OperationService.UserRebaseConfirmable:input_type -> gitaly.UserRebaseConfirmableRequest
+	34,  // 135: gitaly.OperationService.UserRevert:input_type -> gitaly.UserRevertRequest
+	45,  // 136: gitaly.OperationService.UserSquash:input_type -> gitaly.UserSquashRequest
+	49,  // 137: gitaly.OperationService.UserApplyPatch:input_type -> gitaly.UserApplyPatchRequest
+	52,  // 138: gitaly.OperationService.UserUpdateSubmodule:input_type -> gitaly.UserUpdateSubmoduleRequest
+	55,  // 139: gitaly.OperationService.UserLand:input_type -> gitaly.UserLandRequest
+	7,   // 140: gitaly.OperationService.UserCreateBranch:output_type -> gitaly.UserCreateBranchResponse
+	10,  // 141: gitaly.OperationService.UserUpdateBranch:output_type -> gitaly.UserUpdateBranchResponse
+	12,  // 142: gitaly.OperationService.UserDeleteBranch:output_type -> gitaly.UserDeleteBranchResponse
+	17,  // 143: gitaly.OperationService.UserCreateTag:output_type -> gitaly.UserCreateTagResponse
+	15,  // 144: gitaly.OperationService.UserDeleteTag:output_type -> gitaly.UserDeleteTagResponse
+	23,  // 145: gitaly.OperationService.UserMergeToRef:output_type -> gitaly.UserMergeToRefResponse
+	26,  // 146: gitaly.OperationService.UserRebaseToRef:output_type -> gitaly.UserRebaseToRefResponse
+	20,  // 147: gitaly.OperationService.UserMergeBranch:output_type -> gitaly.UserMergeBranchResponse
+	30,  // 148: gitaly.OperationService.UserFFBranch:output_type -> gitaly.UserFFBranchResponse
+	32,  // 149: gitaly.OperationService.UserCherryPick:output_type -> gitaly.UserCherryPickResponse
+	41,  // 150: gitaly.OperationService.UserCommitFiles:output_type -> gitaly.UserCommitFilesResponse
+	44,  // 151: gitaly.OperationService.UserRebaseConfirmable:output_type -> gitaly.UserRebaseConfirmableResponse
+	35,  // 152: gitaly.OperationService.UserRevert:output_type -> gitaly.UserRevertResponse
+	46,  // 153: gitaly.OperationService.UserSquash:output_type -> gitaly.UserSquashResponse
+	51,  // 154: gitaly.OperationService.UserApplyPatch:output_type -> gitaly.UserApplyPatchResponse
+	53,  // 155: gitaly.OperationService.UserUpdateSubmodule:output_type -> gitaly.UserUpdateSubmoduleResponse
+	63,  // 156: gitaly.OperationService.UserLand:output_type -> gitaly.UserLandResponse
+	140, // [140:157] is the sub-list for method output_type
+	123, // [123:140] is the sub-list for method input_type
+	123, // [123:123] is the sub-list for extension type_name
+	123, // [123:123] is the sub-list for extension extendee
+	0,   // [0:123] is the sub-list for field type_name
 }
 
 func init() { file_operations_proto_init() }
@@ -5887,7 +6719,7 @@ func file_operations_proto_init() {
 		(*UserUpdateSubmoduleError_ReferenceUpdate)(nil),
 		(*UserUpdateSubmoduleError_PathError)(nil),
 	}
-	file_operations_proto_msgTypes[51].OneofWrappers = []any{
+	file_operations_proto_msgTypes[58].OneofWrappers = []any{
 		(*UserLandError_MergeConflict)(nil),
 		(*UserLandError_NotAncestor)(nil),
 		(*UserLandError_ReferenceUpdate)(nil),
@@ -5899,8 +6731,8 @@ func file_operations_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_operations_proto_rawDesc), len(file_operations_proto_rawDesc)),
-			NumEnums:      3,
-			NumMessages:   54,
+			NumEnums:      6,
+			NumMessages:   61,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

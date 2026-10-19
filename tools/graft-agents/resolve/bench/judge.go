@@ -84,16 +84,19 @@ const (
 )
 
 // notSentReason returns why the file at p with the given sides would not be sent to the resolver,
-// or "" when it would be. generated reports linguist-generated for the path.
+// or "" when it would be. generated reports linguist-generated for the path. It mirrors the
+// server's SendRules.Reason (internal/graft/resolver/sendrules.go), rule for rule and in the same
+// order (large first: the server decides it from the size, before reading); both are tested
+// against internal/graft/resolver/testdata/never-send.json.
 func notSentReason(p string, sides [][]byte, maxBytes int64, generated bool) string {
-	for _, s := range sides {
-		if bytes.IndexByte(s, 0) >= 0 {
-			return NotSentBinary
-		}
-	}
 	for _, s := range sides {
 		if int64(len(s)) > maxBytes {
 			return NotSentLarge
+		}
+	}
+	for _, s := range sides {
+		if bytes.IndexByte(s, 0) >= 0 {
+			return NotSentBinary
 		}
 	}
 	if lockfiles[path.Base(p)] {
@@ -136,16 +139,24 @@ func firstLines(s []byte, n int) []byte {
 	return s[:end]
 }
 
+// looksMinified reports whether a side larger than minifiedMinBytes has an average line longer
+// than minifiedAverageLine or a line longer than minifiedLongestLine. It is the server's rule
+// (internal/graft/resolver/sendrules.go): a final newline does not start another line.
 func looksMinified(s []byte) bool {
 	if len(s) <= minifiedMinBytes {
 		return false
 	}
-	lines := bytes.Split(s, []byte("\n"))
-	longest := 0
-	for _, l := range lines {
-		if len(l) > longest {
-			longest = len(l)
+	lines := bytes.Count(s, []byte{'\n'})
+	if len(s) > 0 && s[len(s)-1] != '\n' {
+		lines++
+	}
+	if lines > 0 && len(s)/lines > minifiedAverageLine {
+		return true
+	}
+	for _, line := range bytes.Split(s, []byte{'\n'}) {
+		if len(line) > minifiedLongestLine {
+			return true
 		}
 	}
-	return longest > minifiedLongestLine || len(s)/len(lines) > minifiedAverageLine
+	return false
 }

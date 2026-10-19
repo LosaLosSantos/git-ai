@@ -47,7 +47,9 @@ const (
 // Ours is the current branch tip side, Theirs the change being landed. Any
 // side may be nil (absent).
 type Request struct {
-	Version    int        `json:"version"`
+	Version int `json:"version"`
+	// Operation is OperationResolve (also when absent) or OperationCheck.
+	Operation  string     `json:"operation,omitempty"`
 	Repository Repository `json:"repository"`
 	Branch     string     `json:"branch"`
 	Tip        string     `json:"tip"`
@@ -56,7 +58,73 @@ type Request struct {
 	Messages   Messages   `json:"messages"`
 	Actor      string     `json:"actor"`
 	Files      []File     `json:"files"`
-	Limits     Limits     `json:"limits"`
+	// Resolution is, for OperationCheck only, the agent's resolution of Files to check.
+	Resolution []ResponseFile `json:"resolution,omitempty"`
+	Limits     Limits         `json:"limits"`
+}
+
+// Operations of a request.
+const (
+	// OperationResolve asks the resolver to resolve Files; an absent operation means it.
+	OperationResolve = "resolve"
+	// OperationCheck asks the resolver to check an agent's Resolution of Files with the checks of
+	// its own answers, and to answer a CheckResponse.
+	OperationCheck = "check"
+)
+
+// CheckResponse is the answer to an OperationCheck request: one verdict per file of the
+// resolution, in its order.
+type CheckResponse struct {
+	Version   int    `json:"version"`
+	Operation string `json:"operation"`
+	// Resolver names the checker, for the Graft-Checked-By trailer.
+	Resolver string      `json:"resolver"`
+	Files    []CheckFile `json:"files"`
+}
+
+// Syntax verdicts of a CheckFile.
+const (
+	// SyntaxChecked: both sides parse, and so does the resolution.
+	SyntaxChecked = "checked"
+	// SyntaxUnchecked: a side does not parse with the grammar, so the resolution got no syntax
+	// verdict.
+	SyntaxUnchecked = "unchecked"
+	// SyntaxNone: the path has no grammar, or the file is deleted.
+	SyntaxNone = "none"
+)
+
+// CheckFile is the verdict on one file of a resolution.
+type CheckFile struct {
+	Path   string `json:"path"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+	Syntax string `json:"syntax"`
+}
+
+// ErrorResponse is the body of a refusal: the HTTP 422 answer, or the stdout of
+// a command that exits non-zero. Files is optional.
+type ErrorResponse struct {
+	Error string        `json:"error"`
+	Files []FileOutcome `json:"files,omitempty"`
+}
+
+// Outcomes of a file in a refusal.
+const (
+	// OutcomeResolved: the resolver resolved the file, but not every file of
+	// the request.
+	OutcomeResolved = "resolved"
+	// OutcomeRejected: the resolver's result for the file failed a check.
+	OutcomeRejected = "rejected"
+	// OutcomeFailed: the resolver failed on the file (a model error, a spent
+	// budget, no strategy applying).
+	OutcomeFailed = "failed"
+)
+
+// FileOutcome is what the resolver did with one file of a refused request.
+type FileOutcome struct {
+	Path    string `json:"path"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // Repository identifies the repository the conflict belongs to.

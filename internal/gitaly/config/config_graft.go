@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -300,6 +301,57 @@ type GraftResolver struct {
 	// shared token. Without [[graft.agent]] callers have no identity, and a
 	// non-empty list admits nobody. The user of the request is never used.
 	Actors []string `json:"actors" toml:"actors,omitempty"`
+	// Lockfiles are base names of lockfiles, besides the built-in ones
+	// (package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock, Cargo.lock,
+	// go.sum). A conflicting lockfile is never sent to the resolver: it goes to
+	// the agent.
+	Lockfiles []string `json:"lockfiles" toml:"lockfiles,omitempty"`
+	// GeneratedMarkers are Go regular expressions, besides the built-in ones,
+	// searched in the first 10 lines of every side of a conflicting file; a
+	// match marks the file generated, and it is never sent to the resolver. A
+	// path that the tip's .gitattributes marks linguist-generated is generated
+	// as well.
+	GeneratedMarkers []string `json:"generated_markers" toml:"generated_markers,omitempty"`
+	// Minified tells minified files apart; they are never sent to the resolver.
+	Minified GraftResolverMinified `json:"minified" toml:"minified,omitempty"`
+}
+
+// GraftResolverMinified are the rules that mark a conflicting file minified.
+type GraftResolverMinified struct {
+	// Globs are base-name globs (path.Match syntax), besides the built-in ones
+	// (*.min.js, *.min.mjs, *.min.css, *.bundle.js), of minified files.
+	Globs []string `json:"globs" toml:"globs,omitempty"`
+	// AverageLineBytes: a side larger than 2 KiB whose average line is longer
+	// is minified. Zero means DefaultGraftResolverMinifiedAverageLineBytes.
+	AverageLineBytes int `json:"average_line_bytes" toml:"average_line_bytes,omitempty"`
+	// LongestLineBytes: a side larger than 2 KiB with a longer line is
+	// minified. Zero means DefaultGraftResolverMinifiedLongestLineBytes.
+	LongestLineBytes int `json:"longest_line_bytes" toml:"longest_line_bytes,omitempty"`
+}
+
+const (
+	// DefaultGraftResolverMinifiedAverageLineBytes is the default
+	// GraftResolverMinified.AverageLineBytes.
+	DefaultGraftResolverMinifiedAverageLineBytes = 300
+	// DefaultGraftResolverMinifiedLongestLineBytes is the default
+	// GraftResolverMinified.LongestLineBytes.
+	DefaultGraftResolverMinifiedLongestLineBytes = 5000
+)
+
+// AverageLineBytesOrDefault returns AverageLineBytes or its default.
+func (m GraftResolverMinified) AverageLineBytesOrDefault() int {
+	if m.AverageLineBytes > 0 {
+		return m.AverageLineBytes
+	}
+	return DefaultGraftResolverMinifiedAverageLineBytes
+}
+
+// LongestLineBytesOrDefault returns LongestLineBytes or its default.
+func (m GraftResolverMinified) LongestLineBytesOrDefault() int {
+	if m.LongestLineBytes > 0 {
+		return m.LongestLineBytes
+	}
+	return DefaultGraftResolverMinifiedLongestLineBytes
 }
 
 const (
@@ -379,6 +431,30 @@ func (r GraftResolver) validate() error {
 				return fmt.Errorf("graft land resolver: glob %q: %w", glob, err)
 			}
 		}
+	}
+	for _, name := range r.Lockfiles {
+		if name == "" || strings.ContainsRune(name, '/') {
+			return fmt.Errorf("graft land resolver: lockfile %q must be a base name", name)
+		}
+	}
+	for _, expr := range r.GeneratedMarkers {
+		if expr == "" {
+			return fmt.Errorf("graft land resolver: empty generated marker")
+		}
+		if _, err := regexp.Compile(expr); err != nil {
+			return fmt.Errorf("graft land resolver: generated marker %q: %w", expr, err)
+		}
+	}
+	for _, glob := range r.Minified.Globs {
+		if glob == "" || strings.ContainsRune(glob, '/') {
+			return fmt.Errorf("graft land resolver: minified glob %q must be a non-empty base-name glob", glob)
+		}
+		if _, err := path.Match(glob, ""); err != nil {
+			return fmt.Errorf("graft land resolver: minified glob %q: %w", glob, err)
+		}
+	}
+	if r.Minified.AverageLineBytes < 0 || r.Minified.LongestLineBytes < 0 {
+		return fmt.Errorf("graft land resolver: minified thresholds must not be negative")
 	}
 	return nil
 }
