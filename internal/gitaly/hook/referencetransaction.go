@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -263,7 +264,7 @@ func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git
 
 	if metaErr != nil {
 		release()
-		m.logger.WithError(metaErr).ErrorContext(ctx, "recording changesets: reading changelog metadata")
+		m.reportLostChangesets(ctx, updates, fmt.Errorf("reading changelog metadata: %w", metaErr))
 		return
 	}
 
@@ -278,11 +279,13 @@ func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git
 		release()
 		cache := mvcc.CacheByCommitHandle(graftMeta.MVCCCommit)
 		if cache == nil || !cache.AfterCommit(func() {
-			if _, err := changelog.Append(repoPath, record.Meta, record.Updates); err != nil {
+			if err := appendChangesetGroupRecovering(repoPath, []changelog.Record{record}); err != nil {
 				m.reportLostChangesets(ctx, updates, err)
 			}
 		}) {
-			m.logger.ErrorContext(ctx, "recording changesets: the MVCC cache that commits the updates is gone, not recording them")
+			// The cache committed or was cleaned up before the updates could be registered for
+			// its commit, so whether they were published cannot be told: they are not recorded.
+			m.reportLostChangesets(ctx, updates, errors.New("the MVCC cache that commits the updates is gone"))
 		}
 		return
 	}

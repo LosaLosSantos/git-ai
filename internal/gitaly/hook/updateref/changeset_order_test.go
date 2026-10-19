@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook"
@@ -41,6 +43,67 @@ func (m *pausingHookManager) ReferenceTransactionHook(ctx context.Context, state
 	}
 
 	return m.Manager.ReferenceTransactionHook(ctx, state, env, bytes.NewReader(changes))
+}
+
+// invocationRecordingHookManager records the changelog invocation of every reference-transaction
+// hook call, by phase.
+type invocationRecordingHookManager struct {
+	hook.Manager
+	mu          sync.Mutex
+	invocations map[hook.ReferenceTransactionState][]string
+}
+
+func (m *invocationRecordingHookManager) ReferenceTransactionHook(ctx context.Context, state hook.ReferenceTransactionState, env []string, stdin io.Reader) error {
+	meta, err := gitcmd.ChangelogMetaFromEnv(env)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.invocations[state] = append(m.invocations[state], meta.Invocation)
+	m.mu.Unlock()
+
+	return m.Manager.ReferenceTransactionHook(ctx, state, env, stdin)
+}
+
+// TestUpdaterWithHooks_changesetInvocation checks that a call of UpdateReference drives the
+// reference-transaction hook with an invocation of its own, the same in every phase, so that the
+// changeset log tells its transaction apart from one with the same updates (hook.changesetTicketKey).
+func TestUpdaterWithHooks_changesetInvocation(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	logger := testhelper.NewLogger(t)
+	locator := config.NewLocator(cfg)
+	gitCmdFactory := gittest.NewCommandFactory(t, cfg)
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{
+		SkipCreationViaService: true,
+	})
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"), gittest.WithMessage("base"))
+	a := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithMessage("a"))
+
+	manager := &invocationRecordingHookManager{
+		Manager: hook.NewManager(cfg, locator, logger, gitCmdFactory, nil, nil, gitlab.NewMockClient(
+			t, gitlab.MockAllowed, gitlab.MockPreReceive, gitlab.MockPostReceive,
+		), hook.NewPostReceiveRegistry()),
+		invocations: map[hook.ReferenceTransactionState][]string{},
+	}
+	updater := updateref.NewUpdaterWithHooks(cfg, logger, locator, manager, gitCmdFactory, nil)
+
+	reference := git.ReferenceName("refs/heads/main")
+	require.NoError(t, updater.UpdateReference(ctx, repo, gittest.TestUser, nil, reference, a, base))
+	require.NoError(t, updater.UpdateReference(ctx, repo, gittest.TestUser, nil, reference, base, a))
+
+	phases := []hook.ReferenceTransactionState{hook.ReferenceTransactionPreparing, hook.ReferenceTransactionPrepared, hook.ReferenceTransactionCommitted}
+	for call := 0; call < 2; call++ {
+		invocation := manager.invocations[hook.ReferenceTransactionPrepared][call]
+		require.NotEmpty(t, invocation, "call %d has an invocation", call)
+		for _, phase := range phases {
+			require.Equal(t, invocation, manager.invocations[phase][call], "call %d, phase %v", call, phase)
+		}
+	}
+	require.NotEqual(t, manager.invocations[hook.ReferenceTransactionPrepared][0], manager.invocations[hook.ReferenceTransactionPrepared][1])
 }
 
 func TestUpdaterWithHooks_changesetOrder(t *testing.T) {

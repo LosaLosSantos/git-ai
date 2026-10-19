@@ -1,6 +1,7 @@
 package changelog
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sync"
@@ -94,6 +95,28 @@ func TestAppend_lockWaitIsBounded(t *testing.T) {
 	_, err = Append(repoPath, Meta{Operation: "test"}, []Update{{Reference: "refs/heads/c", OldOID: zeroOID, NewOID: oidC}})
 	require.NoError(t, err)
 	require.Equal(t, []string{"a@1", "c@2"}, sequencesAndReferences(t, repoPath))
+}
+
+// TestAppend_checksTheLastEntryOfACacheOfTheSameSize: a cache without a tail and a file of the same
+// size are not enough. The line before the cache's end must still hold the cache's last entry,
+// otherwise the state is loaded again.
+func TestAppend_checksTheLastEntryOfACacheOfTheSameSize(t *testing.T) {
+	t.Parallel()
+
+	repoPath := newRepoPath(t)
+	path := Path(repoPath)
+	_, err := Append(repoPath, Meta{Operation: "test"}, []Update{{Reference: "refs/heads/a", OldOID: zeroOID, NewOID: oidA}})
+	require.NoError(t, err)
+
+	// The file now ends with another entry of the same length: sequence 7 instead of 1.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, 1, bytes.Count(data, []byte(`"sequence":1,`)))
+	require.NoError(t, os.WriteFile(path, bytes.Replace(data, []byte(`"sequence":1,`), []byte(`"sequence":7,`), 1), 0o644))
+
+	_, err = Append(repoPath, Meta{Operation: "test"}, []Update{{Reference: "refs/heads/b", OldOID: zeroOID, NewOID: oidB}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"a@7", "b@8"}, sequencesAndReferences(t, repoPath), "the append follows the entry in the file")
 }
 
 // TestAppend_doesNotTrustACacheWithATail is the overlap of two processes during a graceful

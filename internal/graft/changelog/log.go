@@ -326,9 +326,11 @@ func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
 //     the repository itself, so entries written there would be lost.
 //   - Each Gitaly node keeps its own log and its own sequences. Behind Praefect,
 //     reads may be routed to a replica whose log lags or differs.
-//   - The wait for the lock is bounded by lockWaitTimeout: an append that does
-//     not get it fails. An fsync that never returns is not bounded: its append
-//     holds the lock, and the appends after it fail at lockWaitTimeout.
+//   - Each wait for the lock file is bounded by lockWaitTimeout: an append that
+//     does not get it fails. The appends of this process queue on the state's
+//     mutex before that wait, which is not bounded. An fsync that never returns
+//     is not bounded either: its append holds the lock, and the appends of other
+//     processes fail at lockWaitTimeout.
 func AppendGroup(repoPath string, records []Record) ([][]Entry, error) {
 	entries := make([][]Entry, len(records))
 
@@ -813,11 +815,13 @@ var syncDir = func(dir string) error {
 	return d.Sync()
 }
 
-// lockWaitTimeout bounds the wait for the log's lock file, which another process holds for one
-// append. A holder that never releases it would otherwise block every append and every reader of
-// the repository's log: the wait fails instead, and the appends see the error (their updates are
-// reported lost). Each wait that failed keeps a goroutine and a descriptor until the holder
-// releases the lock. Tests lower it.
+// lockWaitTimeout bounds one wait for the log's lock file, which another process holds for one
+// append. A holder that never releases it would otherwise block that wait forever: it fails
+// instead, and an append sees the error (its updates are reported lost). The bound is per wait
+// for the lock file, not per call: the appends and readers of this process that wait for the
+// state's mutex (s.mu) behind such a wait are not bounded by it, and each then waits for the
+// lock file in turn. A wait that failed keeps its goroutine, blocked in flock(2) on an OS
+// thread, and its descriptor until the holder releases the lock. Tests lower it.
 var lockWaitTimeout = 30 * time.Second
 
 // lockFile takes an exclusive flock on the file at path and returns the

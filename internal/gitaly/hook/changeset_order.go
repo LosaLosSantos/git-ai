@@ -3,6 +3,7 @@ package hook
 import (
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -130,7 +131,8 @@ var changesetTickets = struct {
 // changesetQueueKey returns the key of the queue of the repository: its storage and relative
 // path, which every hook payload of the repository carries, whatever its object directories.
 func changesetQueueKey(repo storage.Repository) string {
-	return repo.GetStorageName() + "\x00" + repo.GetRelativePath()
+	// Cleaned as GetRepoPath joins it, so that a.git, ./a.git and a.git/ share one queue.
+	return repo.GetStorageName() + "\x00" + filepath.Clean(repo.GetRelativePath())
 }
 
 // changesetTicketKey returns the key of the transaction that the git process with the given
@@ -259,8 +261,7 @@ func recordChangeset(queueKey, repoPath, invocation string, changes []byte, reco
 	if ticket == nil {
 		changesetTickets.Unlock()
 		changelogUnorderedRecordsTotal.Inc()
-		_, err := appendChangesetGroup(repoPath, []changelog.Record{record})
-		return err
+		return appendChangesetGroupRecovering(repoPath, []changelog.Record{record})
 	}
 	ticket.record = &record
 	q.signal()

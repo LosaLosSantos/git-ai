@@ -423,7 +423,7 @@ the running tip, so it cannot delay or block the other requests of its batch.
 
 The runs of `examples/graft/demo/acceptance-phase4.sh` on the phase 4b trees
 (three benchmark windows; full tables, phases and the machine in
-[BENCH.md](BENCH.md#measured-phase-4b-results)) **meet the phase 4a acceptance**,
+[BENCH.md](BENCH.md#batched-landing-phase-4b)) **meet the phase 4a acceptance**,
 the stretch goal included: one attempt per landed change, only planned conflicts
 fail, and p99 with batching on is below off at every size. The final tree
 (`9bf4742`, window 3):
