@@ -124,15 +124,15 @@ and retries its own compare-and-swap, up to 20 attempts. Measured with
 [`acceptance-phase4.sh`](examples/graft/demo/acceptance-phase4.sh) on one
 16-core machine, two runs:
 
-| 50 agents, 250 changes | classic | gitai |
+| 50 agents, 250 changes, no conflict resolver | classic | gitai |
 |---|---|---|
 | changes landed | 100-101 | 200 |
 | attempts per landed change | 27 | 1.0 |
 | lands per minute | 240-272 | 1,862-2,544 |
 | p99 latency | 6.3-7.0 s | 1.5-1.8 s |
 
-The 50 changes gitai does not land are the planned conflicts: these runs use no
-conflict resolver. With the deterministic resolver of
+The 50 changes gitai does not land are the planned conflicts, returned to their
+agents: these runs use no conflict resolver. With the deterministic resolver of
 [`resolve.toml`](examples/graft/demo/resolve.toml) every conflict is resolved
 and all 250 changes land. Details and more sizes in [BENCH.md](doc/graft/BENCH.md).
 
