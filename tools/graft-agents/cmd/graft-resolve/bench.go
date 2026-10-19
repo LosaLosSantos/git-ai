@@ -40,8 +40,10 @@ func runBench(args []string, stdout, stderr io.Writer) int {
 		return benchMine(ctx, args[1:], stdout, stderr)
 	case "run":
 		return benchRun(ctx, args[1:], stdout, stderr)
+	case "rejudge":
+		return benchRejudge(ctx, args[1:], stdout, stderr)
 	}
-	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine or run\n", args[0])
+	fmt.Fprintf(stderr, "graft-resolve bench: unknown subcommand %q, want mine, run or rejudge\n", args[0])
 	return 2
 }
 
@@ -124,6 +126,7 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	seed := fs.Int64("seed", 1, "seed of the sample")
 	label := fs.String("label", "", "name of the run in the report")
 	jsonOut := fs.String("json-out", "", "report as JSON")
+	answersDir := fs.String("answers-dir", "", "keep every accepted resolution here, for audit and bench rejudge (local: third-party code)")
 	mdOut := fs.String("md-out", "", "report as Markdown")
 	maxUSD := fs.Float64("max-usd", 0, "hard cap on the AI spend of the run in USD (required when the chain has an llm strategy)")
 	pricingSource := fs.String("pricing", "openrouter", "where the model's price comes from: openrouter (read at run time) or fixed (the two price flags)")
@@ -202,9 +205,16 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 
 	cases := bench.Sample(manifest.Cases, *sample, *seed)
+	if *answersDir != "" {
+		if err := os.MkdirAll(*answersDir, 0o700); err != nil {
+			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+			return 1
+		}
+	}
 	runner := bench.Runner{
-		Resolver: res,
-		Clone:    func(repo string) string { return bench.CloneDir(*clones, repo) },
+		Resolver:   res,
+		AnswersDir: *answersDir,
+		Clone:      func(repo string) string { return bench.CloneDir(*clones, repo) },
 		Progress: func(done, total int, r bench.Result) {
 			fmt.Fprintf(stderr, "[%d/%d] %s %s %s: %s %s\n", done, total, r.Family, r.Repo, r.Path, r.Outcome, r.Reason)
 		},
@@ -220,27 +230,7 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		report.SpendUSD, report.MaxUSD, report.Pricing = snap.SpentUSD, *maxUSD, pricing
 	}
 
-	if *jsonOut != "" {
-		data, err := json.MarshalIndent(report, "", "  ")
-		if err == nil {
-			err = os.WriteFile(*jsonOut, append(data, '\n'), 0o644)
-		}
-		if err != nil {
-			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
-			return 1
-		}
-	}
-	out := stdout
-	if *mdOut != "" {
-		f, err := os.Create(*mdOut)
-		if err != nil {
-			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
-			return 1
-		}
-		defer f.Close()
-		out = io.MultiWriter(stdout, f)
-	}
-	if err := report.WriteMarkdown(out); err != nil {
+	if err := writeReport(report, *jsonOut, *mdOut, stdout); err != nil {
 		fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 		return 1
 	}
@@ -249,4 +239,79 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 	return 0
+}
+
+// benchRejudge judges the stored answers of a run again, with no model call:
+//
+//	graft-resolve bench rejudge --report-in FILE --manifest FILE --clones DIR --answers-dir DIR
+//	                            [--json-out FILE] [--md-out FILE]
+//
+// The report keeps everything of the run (label, spend, pricing, the results that were not
+// accepted) and recomputes the outcome of every accepted resolution.
+func benchRejudge(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("graft-resolve bench rejudge", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	reportIn := fs.String("report-in", "", "JSON report of the run")
+	manifestPath := fs.String("manifest", "", "manifest of the run")
+	clones := fs.String("clones", "", "directory of the clones of the corpus repositories")
+	answersDir := fs.String("answers-dir", "", "answers kept by the run (bench run --answers-dir)")
+	jsonOut := fs.String("json-out", "", "report as JSON")
+	mdOut := fs.String("md-out", "", "report as Markdown")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *reportIn == "" || *manifestPath == "" || *clones == "" || *answersDir == "" || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "graft-resolve bench rejudge: --report-in, --manifest, --clones and --answers-dir are required")
+		return 2
+	}
+	raw, err := os.ReadFile(*reportIn)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench rejudge: %v\n", err)
+		return 1
+	}
+	var old bench.Report
+	if err := json.Unmarshal(raw, &old); err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench rejudge: %s: %v\n", *reportIn, err)
+		return 1
+	}
+	manifest, err := bench.LoadManifest(*manifestPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench rejudge: %v\n", err)
+		return 1
+	}
+	results, err := bench.Rejudge(ctx, old.Results, manifest.Cases, func(repo string) string { return bench.CloneDir(*clones, repo) }, *answersDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench rejudge: %v\n", err)
+		return 1
+	}
+	report := bench.NewReport(old.Label, results)
+	report.SpendUSD, report.MaxUSD, report.Pricing = old.SpendUSD, old.MaxUSD, old.Pricing
+	if err := writeReport(report, *jsonOut, *mdOut, stdout); err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench rejudge: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// writeReport writes report as JSON to jsonOut and as Markdown to stdout and mdOut, when set.
+func writeReport(report bench.Report, jsonOut, mdOut string, stdout io.Writer) error {
+	if jsonOut != "" {
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(jsonOut, append(data, '\n'), 0o644); err != nil {
+			return err
+		}
+	}
+	out := stdout
+	if mdOut != "" {
+		f, err := os.Create(mdOut)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		out = io.MultiWriter(stdout, f)
+	}
+	return report.WriteMarkdown(out)
 }

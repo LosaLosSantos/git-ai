@@ -128,6 +128,58 @@ func TestBenchRunRefusesUnreadablePrice(t *testing.T) {
 	}
 }
 
+// TestBenchAnswersAndRejudge keeps the answers of a run, then judges them again without the
+// model: the same answer gives the same outcome, and a changed answer is judged anew.
+func TestBenchAnswersAndRejudge(t *testing.T) {
+	work, _, clones, manifest := mineFixture(t)
+	cfg := modelConfig(t, work)
+	answers := filepath.Join(work, "answers")
+	reportIn := filepath.Join(work, "run.json")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"bench", "run", "--config", cfg, "--manifest", manifest, "--clones", clones, "--max-usd", "1",
+		"--pricing", "fixed", "--input-usd-per-million", "1", "--output-usd-per-million", "1",
+		"--answers-dir", answers, "--json-out", reportIn}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("run exited %d: %s", code, stderr.String())
+	}
+	var rep bench.Report
+	raw, _ := os.ReadFile(reportIn)
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Total.Correct != 1 || rep.Results[0].Answer != "write" {
+		t.Fatalf("run report %+v", rep)
+	}
+	stored, err := os.ReadFile(filepath.Join(answers, rep.Results[0].ID+".answer"))
+	if err != nil || string(stored) != "x = 2 + 3\n" {
+		t.Fatalf("stored answer %q, %v", stored, err)
+	}
+
+	rejudge := func() bench.Report {
+		t.Helper()
+		out := filepath.Join(t.TempDir(), "rejudged.json")
+		var stdout, stderr bytes.Buffer
+		if code := run([]string{"bench", "rejudge", "--report-in", reportIn, "--manifest", manifest, "--clones", clones,
+			"--answers-dir", answers, "--json-out", out}, nil, &stdout, &stderr); code != 0 {
+			t.Fatalf("rejudge exited %d: %s", code, stderr.String())
+		}
+		var r bench.Report
+		raw, _ := os.ReadFile(out)
+		if err := json.Unmarshal(raw, &r); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	if r := rejudge(); r.Total.Correct != 1 || r.SpendUSD != rep.SpendUSD || r.Label != rep.Label {
+		t.Fatalf("rejudged %+v", r)
+	}
+	if err := os.WriteFile(filepath.Join(answers, rep.Results[0].ID+".answer"), []byte("x = 5\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r := rejudge(); r.Total.Wrong != 1 || r.Total.Correct != 0 {
+		t.Fatalf("rejudged a changed answer %+v", r.Total)
+	}
+}
+
 func TestBenchRunFixedPricing(t *testing.T) {
 	work, _, clones, manifest := mineFixture(t)
 	cfg := modelConfig(t, work)

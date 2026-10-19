@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -37,17 +39,20 @@ const (
 
 // Result is the outcome of one case.
 type Result struct {
-	ID       string  `json:"id"`
-	Repo     string  `json:"repo"`
-	Family   string  `json:"family"`
-	Language string  `json:"language"`
-	Kind     string  `json:"kind"`
-	Path     string  `json:"path"`
-	Outcome  string  `json:"outcome"`
-	Exact    bool    `json:"exact,omitempty"`
-	Strategy string  `json:"strategy,omitempty"`
-	Reason   string  `json:"reason,omitempty"`
-	Seconds  float64 `json:"seconds"`
+	ID       string `json:"id"`
+	Repo     string `json:"repo"`
+	Family   string `json:"family"`
+	Language string `json:"language"`
+	Kind     string `json:"kind"`
+	Path     string `json:"path"`
+	Outcome  string `json:"outcome"`
+	Exact    bool   `json:"exact,omitempty"`
+	Strategy string `json:"strategy,omitempty"`
+	// Answer is the action of an accepted resolution ("write" or "delete"); with
+	// Runner.AnswersDir its content is stored for audit and Rejudge.
+	Answer  string  `json:"answer,omitempty"`
+	Reason  string  `json:"reason,omitempty"`
+	Seconds float64 `json:"seconds"`
 	// HumanSyntaxError is set when the human resolution of a case that was sent fails the
 	// syntax check itself: the check would reject the right answer there (a grammar gap, or a
 	// human merge that did not parse).
@@ -109,6 +114,11 @@ type Runner struct {
 	MaxFileBytes int64
 	// Progress, when set, is called after each case.
 	Progress func(done, total int, r Result)
+	// AnswersDir, when set, keeps every accepted resolution: <AnswersDir>/<case ID>.answer holds
+	// the resolved content (no file for a deletion), so that the judge can be audited and the
+	// same answers judged again (Rejudge) without new model calls. The directory holds
+	// third-party code and stays local.
+	AnswersDir string
 }
 
 // Run replays every case and returns the results in the order of cases.
@@ -216,14 +226,70 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 
 	f := resp.Files[0]
 	res.Strategy = strings.TrimPrefix(resp.Resolver, "graft-resolve/")
-	correct, exact := judge(f.Content, human, f.Action == protocol.ActionDelete, c.HumanBlob == nil)
+	res.Answer = f.Action
+	if r.AnswersDir != "" && f.Action != protocol.ActionDelete {
+		if err := os.WriteFile(answerPath(r.AnswersDir, c.ID), f.Content, 0o600); err != nil {
+			return res, err
+		}
+	}
+	judgeResult(&res, f.Content, f.Action == protocol.ActionDelete, human, c.HumanBlob == nil)
+	return res, nil
+}
+
+func answerPath(dir, id string) string { return filepath.Join(dir, id+".answer") }
+
+// judgeResult sets the outcome of an accepted resolution from the judge.
+func judgeResult(res *Result, content []byte, deleted bool, human []byte, humanDeleted bool) {
+	correct, exact := judge(content, human, deleted, humanDeleted)
 	res.Exact = exact
 	if correct {
 		res.Outcome = OutcomeCorrect
 	} else {
 		res.Outcome = OutcomeWrong
 	}
-	return res, nil
+}
+
+// Rejudge judges the stored answers of results again (Runner.AnswersDir), with no model call:
+// the outcome of every accepted resolution (correct or wrong) is recomputed from its stored
+// answer and the human resolution; every other result is kept as it is. It is how a fix of the
+// judge is applied to a run that was already paid for.
+func Rejudge(ctx context.Context, results []Result, cases []Case, clone func(repo string) string, answersDir string) ([]Result, error) {
+	byID := make(map[string]Case, len(cases))
+	for _, c := range cases {
+		byID[c.ID] = c
+	}
+	out := make([]Result, len(results))
+	for i, res := range results {
+		out[i] = res
+		if res.Outcome != OutcomeCorrect && res.Outcome != OutcomeWrong {
+			continue
+		}
+		c, ok := byID[res.ID]
+		if !ok {
+			return nil, fmt.Errorf("rejudge: case %s is not in the manifest", res.ID)
+		}
+		if res.Answer == "" {
+			return nil, fmt.Errorf("rejudge: case %s has no stored answer (the run kept no answers)", res.ID)
+		}
+		g := gitRepo{dir: clone(c.Repo)}
+		var human []byte
+		if c.HumanBlob != nil {
+			var err error
+			if human, err = g.blob(ctx, c.HumanBlob.OID); err != nil {
+				return nil, err
+			}
+		}
+		deleted := res.Answer == protocol.ActionDelete
+		var content []byte
+		if !deleted {
+			var err error
+			if content, err = os.ReadFile(answerPath(answersDir, res.ID)); err != nil {
+				return nil, fmt.Errorf("rejudge: %w", err)
+			}
+		}
+		judgeResult(&out[i], content, deleted, human, c.HumanBlob == nil)
+	}
+	return out, nil
 }
 
 // classifyFailure returns the outcome of a file that the chain did not resolve: the last attempt
