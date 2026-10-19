@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
@@ -54,11 +55,12 @@ func TestWriteConflictsRefusesAnExistingDirectory(t *testing.T) {
 	require.ErrorContains(t, err, "already holds a conflicts directory")
 }
 
-// TestConflictsWriterNamesBothPathsOfACollision: the second of two paths that the file system
-// takes for one file finds that file in place, and the error names both paths. The file system of
-// the test does not fold case, so README.md is made to be readme.md by a symbolic link: the
+// TestConflictsWriterRefusesAnExistingFileWithoutOverwriting: the writer creates every file anew,
+// so the second of two paths that the file system takes for one file finds that file in place: it
+// is refused, the error names both paths, and the first file is not overwritten. The file system
+// of the test does not fold case, so README.md is made to be readme.md by a symbolic link: the
 // collision goes through the file system, as a case-insensitive one would make it.
-func TestConflictsWriterNamesBothPathsOfACollision(t *testing.T) {
+func TestConflictsWriterRefusesAnExistingFileWithoutOverwriting(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -132,6 +134,18 @@ func TestConflictFileFor(t *testing.T) {
 			sides: [3][]byte{nil, nil, []byte("added by theirs")},
 			want:  []string{"<<<<<<< ours (the branch tip): unavailable, gone\n||||||| base: none, both sides added the file\n=======\nadded by theirs\n>>>>>>> theirs (the change)\n"},
 		},
+		{
+			// No base and one side (a file/directory conflict, or a rename): the note says what
+			// the sides are, not that both sides added the file.
+			name: "no base and ours absent", file: file(nil, nil, side),
+			sides: [3][]byte{nil, nil, []byte("theirs\n")},
+			want:  []string{"<<<<<<< ours (the branch tip): absent\n||||||| base: none\n=======\ntheirs\n>>>>>>> theirs (the change)\n"},
+		},
+		{
+			name: "no base and theirs absent", file: file(nil, side, nil),
+			sides: [3][]byte{nil, []byte("ours\n"), nil},
+			want:  []string{"<<<<<<< ours (the branch tip)\nours\n||||||| base: none\n=======\n>>>>>>> theirs (the change): absent\n"},
+		},
 	} {
 		got := string(conflictFileFor(tc.file, tc.sides))
 		for _, w := range tc.want {
@@ -150,6 +164,13 @@ func writePackage(t *testing.T, dir string, c *gitalypb.LandConflict) {
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "files"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "conflict.json"), raw, 0o644))
+}
+
+// TestConflictPointerPrefixIsTheServers: the pointer line the CLI writes is the one the server's
+// validation refuses.
+func TestConflictPointerPrefixIsTheServers(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, resolver.ConflictPointerPrefix, conflictPointerPrefix)
 }
 
 // TestReadResolutionRefusesAPointerLine: a file whose binary pointer the agent left in place is

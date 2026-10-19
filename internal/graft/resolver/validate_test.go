@@ -310,3 +310,27 @@ func TestValidateFile_specialFileSymlinks(t *testing.T) {
 		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20), "%q", name)
 	}
 }
+
+// TestValidateFile_pointerLine: a written file holding the pointer line of a binary side, as
+// graft land --conflicts-dir writes it, is refused, text or binary; the prefix elsewhere in a line
+// is content like any other.
+func TestValidateFile_pointerLine(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"alone":            ConflictPointerPrefix + "the binary ours side is sides/ours/c.bin\n",
+		"after text":       "x\n" + ConflictPointerPrefix + "the binary theirs side is sides/theirs/c.bin",
+		"in binary":        "\x00bin\n" + ConflictPointerPrefix + "the binary ours side is sides/ours/c.bin\n",
+		"with a CR ending": "x\r\n" + ConflictPointerPrefix + "p\r\n",
+	} {
+		err := ValidateFile(ResponseFile{Path: "c.bin", Action: ActionWrite, Mode: ModeRegular, Content: []byte(content)}, 1<<20)
+		require.ErrorContains(t, err, "the pointer to a binary side", name)
+	}
+	require.NoError(t, ValidateFile(ResponseFile{Path: "c.txt", Action: ActionWrite, Mode: ModeRegular, Content: []byte("see " + ConflictPointerPrefix + "x\n")}, 1<<20))
+
+	// Validate applies it to a resolver's answer too.
+	req := &Request{Files: []File{{Path: "c.bin"}}, Limits: Limits{MaxFileBytes: 1 << 20}}
+	err := Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{{Path: "c.bin", Action: ActionWrite, Mode: ModeRegular, Content: []byte(ConflictPointerPrefix + "p\n")}}})
+	require.ErrorIs(t, err, ErrInvalidResponse)
+	require.ErrorContains(t, err, "the pointer to a binary side")
+}

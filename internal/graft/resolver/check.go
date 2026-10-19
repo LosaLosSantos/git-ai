@@ -5,22 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 )
 
 // MaxCheckRequestBytes bounds the encoded check request. graft-resolve reads 128 MiB by default
 // (protocol.DefaultMaxRequestBytes); the server splits an agent's resolution into check requests
 // within this bound.
-const MaxCheckRequestBytes = 64 << 20
+const MaxCheckRequestBytes = config.GraftResolverMaxCheckRequestBytes
 
 // CheckBatchBytes bounds the file data of one check request: the sides and the resolution of its
 // files, plus CheckFileOverheadBytes for each. base64 makes the contents 4/3 larger, and the
-// request's envelope takes at most maxEnvelopeBytes, so the request stays within
-// MaxCheckRequestBytes.
-const CheckBatchBytes = (MaxCheckRequestBytes - maxEnvelopeBytes) * 3 / 4
+// request's envelope takes at most config.GraftResolverCheckEnvelopeBytes, so the request stays
+// within MaxCheckRequestBytes.
+const CheckBatchBytes = config.GraftResolverCheckBatchBytes
 
 // MaxCheckFileBytes is the largest max_file_bytes a resolver can have: one file, its three sides
-// and its resolution, must fit one check request.
-const MaxCheckFileBytes = CheckBatchBytes/4 - 4<<10
+// and its resolution, must fit one check request. The configuration refuses a larger one.
+const MaxCheckFileBytes = config.GraftResolverMaxCheckFileBytes
 
 // CheckFileOverheadBytes is what a file adds to a check request besides its contents: its path,
 // written in the file and in the resolution, escaped in JSON (at most 6 bytes a byte), and the
@@ -33,12 +39,60 @@ func CheckFileOverheadBytes(path string) int64 {
 // something other than a check response, as a resolver that predates the check operation does.
 var ErrCheckUnsupported = errors.New("the resolver does not support the check operation")
 
-// Check asks the resolver to check an agent's resolution of the request's files with the checks
+// checkSlotWait is the time the checks of agents' resolutions waited for a check slot.
+var checkSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "graft_resolver_check_slot_wait_seconds",
+	Help:    "Time a check of an agent's resolution waited for one of the resolver's check slots.",
+	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
+})
+
+// CheckSlot is the right to send one check request at a time: the client runs at most
+// check_concurrency checks at once (AcquireCheckSlot). Release it when the request is done.
+type CheckSlot struct {
+	c        *Client
+	released bool
+}
+
+// AcquireCheckSlot waits for a check slot. The wait counts against the deadline of ctx: when ctx
+// ends first, it fails, and the check fails closed.
+func (c *Client) AcquireCheckSlot(ctx context.Context) (*CheckSlot, error) {
+	if c == nil {
+		return nil, ErrDisabled
+	}
+	start := time.Now()
+	select {
+	case c.checkSlots <- struct{}{}:
+		checkSlotWait.Observe(time.Since(start).Seconds())
+		return &CheckSlot{c: c}, nil
+	case <-ctx.Done():
+		checkSlotWait.Observe(time.Since(start).Seconds())
+		return nil, fmt.Errorf("waiting for a check slot of the resolver: %w", ctx.Err())
+	}
+}
+
+// Release gives the slot back; a second call does nothing.
+func (s *CheckSlot) Release() {
+	if s == nil || s.released {
+		return
+	}
+	s.released = true
+	<-s.c.checkSlots
+}
+
+// Check sends one check request with the slot (Client.check).
+func (s *CheckSlot) Check(ctx context.Context, req Request) (*CheckResponse, error) {
+	if s == nil || s.released {
+		return nil, errors.New("check without a check slot")
+	}
+	return s.c.check(ctx, req)
+}
+
+// check asks the resolver to check an agent's resolution of the request's files with the checks
 // of its own answers (OperationCheck). It returns the response, with one verdict per file of
 // req.Resolution in its order. It fails closed: an error, a refusal, or an answer that is not a
 // check response with one verdict per file in order is an error, and the caller must not land the
 // resolution.
-func (c *Client) Check(ctx context.Context, req Request) (*CheckResponse, error) {
+func (c *Client) check(ctx context.Context, req Request) (*CheckResponse, error) {
 	if c == nil {
 		return nil, ErrDisabled
 	}

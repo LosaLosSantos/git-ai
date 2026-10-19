@@ -97,6 +97,8 @@ type Client struct {
 	pathsDeny    []string
 	actors       []string
 	httpClient   *http.Client
+	// checkSlots bounds the checks of agents' resolutions that run at once (CheckSlot).
+	checkSlots chan struct{}
 	// sendRules decide the files that are never sent (SendRules).
 	sendRules *SendRules
 }
@@ -127,8 +129,8 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		return nil, err
 	}
 
-	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 {
-		return nil, errors.New("graft land resolver: max_files and max_file_bytes must not be negative")
+	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 {
+		return nil, errors.New("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")
 	}
 	// The check of an agent's resolution sends a file's three sides and its resolution in one
 	// request, which must fit its bound.
@@ -149,6 +151,7 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		pathsDeny:    slices.Clone(cfg.PathsDeny),
 		actors:       slices.Clone(cfg.Actors),
 		sendRules:    rules,
+		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
 	}
 
 	if cfg.URL != "" {
@@ -310,4 +313,4 @@ func (c *Client) outputLimit(n int) int64 {
 }
 
 // maxEnvelopeBytes is the fixed allowance on top of the per-file output bound.
-const maxEnvelopeBytes = 64 << 10
+const maxEnvelopeBytes = config.GraftResolverCheckEnvelopeBytes

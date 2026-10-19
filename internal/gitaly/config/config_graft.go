@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"strings"
@@ -317,6 +319,10 @@ type GraftResolver struct {
 	// Verify runs a command on the merged tree of every resolution before it
 	// lands (a resolver's answer or an agent's resolution). Off by default.
 	Verify GraftResolverVerify `json:"verify" toml:"verify,omitempty"`
+	// CheckConcurrency bounds the checks of agents' resolutions that run at once on this server:
+	// each holds a check request of up to GraftResolverMaxCheckRequestBytes. Zero means
+	// DefaultGraftResolverCheckConcurrency.
+	CheckConcurrency int `json:"check_concurrency" toml:"check_concurrency,omitempty"`
 }
 
 // GraftResolverVerify is the optional verification of a resolution: Command
@@ -407,6 +413,20 @@ const (
 	DefaultGraftResolverMaxFileBytes = 1 << 20
 )
 
+// The bounds of the check of an agent's resolution (internal/graft/resolver, check.go): a check
+// request is at most GraftResolverMaxCheckRequestBytes encoded, so one file, its three sides and
+// its resolution in base64 with a path of a few KiB, fits one request when max_file_bytes is at
+// most GraftResolverMaxCheckFileBytes.
+const (
+	GraftResolverMaxCheckRequestBytes = 64 << 20
+	// GraftResolverCheckEnvelopeBytes is what a check request holds besides its files.
+	GraftResolverCheckEnvelopeBytes = 64 << 10
+	// GraftResolverCheckBatchBytes bounds the file data of one check request: base64 makes it 4/3.
+	GraftResolverCheckBatchBytes = (GraftResolverMaxCheckRequestBytes - GraftResolverCheckEnvelopeBytes) * 3 / 4
+	// GraftResolverMaxCheckFileBytes is the largest max_file_bytes.
+	GraftResolverMaxCheckFileBytes = GraftResolverCheckBatchBytes/4 - 4<<10
+)
+
 // Validate reports malformed policy rules at load time: an invalid Actor or
 // Refs glob, or an empty Refs entry (which would never match, so a deny rule
 // written that way would silently never fire).
@@ -461,14 +481,34 @@ func (r GraftResolver) validate() error {
 	if (len(r.Command) == 0) == (r.URL == "") {
 		return fmt.Errorf("graft land resolver: exactly one of command and url must be set")
 	}
-	if r.URL != "" && !strings.HasPrefix(r.URL, "http://") && !strings.HasPrefix(r.URL, "https://") {
-		return fmt.Errorf("graft land resolver: url %q must start with http:// or https://", r.URL)
+	if len(r.Command) > 0 && r.Command[0] == "" {
+		return fmt.Errorf("graft land resolver: empty command")
+	}
+	if r.URL != "" {
+		u, err := url.Parse(r.URL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("graft land resolver: url %q must be an http or https URL with a host", r.URL)
+		}
+		if r.TokenFile != "" {
+			raw, err := os.ReadFile(r.TokenFile)
+			if err != nil {
+				return fmt.Errorf("graft land resolver: read token file: %w", err)
+			}
+			if strings.TrimSpace(string(raw)) == "" {
+				return fmt.Errorf("graft land resolver: token file %q is empty", r.TokenFile)
+			}
+		}
 	}
 	if _, err := r.TimeoutOrDefault(); err != nil {
 		return err
 	}
-	if r.MaxFiles < 0 || r.MaxFileBytes < 0 {
-		return fmt.Errorf("graft land resolver: max_files and max_file_bytes must not be negative")
+	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 {
+		return fmt.Errorf("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")
+	}
+	// The check of an agent's resolution sends a file's three sides and its resolution in one
+	// request, which must fit its bound.
+	if mfb := r.MaxFileBytesOrDefault(); mfb > GraftResolverMaxCheckFileBytes {
+		return fmt.Errorf("graft land resolver: max_file_bytes %d is too large: the check of a resolution sends a file's three sides and its resolution in one request of at most %d bytes, so max_file_bytes can be at most %d", mfb, GraftResolverMaxCheckRequestBytes, GraftResolverMaxCheckFileBytes)
 	}
 	for _, list := range [][]string{r.PathsAllow, r.PathsDeny, r.Actors} {
 		for _, glob := range list {
@@ -518,6 +558,17 @@ func (r GraftResolver) TimeoutOrDefault() (time.Duration, error) {
 		return 0, fmt.Errorf("graft land resolver: invalid timeout %q", r.Timeout)
 	}
 	return d, nil
+}
+
+// DefaultGraftResolverCheckConcurrency is the default of GraftResolver.CheckConcurrency.
+const DefaultGraftResolverCheckConcurrency = 2
+
+// CheckConcurrencyOrDefault returns CheckConcurrency or its default.
+func (r GraftResolver) CheckConcurrencyOrDefault() int {
+	if r.CheckConcurrency > 0 {
+		return r.CheckConcurrency
+	}
+	return DefaultGraftResolverCheckConcurrency
 }
 
 // MaxFilesOrDefault returns MaxFiles or its default.

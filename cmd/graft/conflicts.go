@@ -225,7 +225,9 @@ func fetchSides(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandCo
 }
 
 // conflictPointerPrefix starts the line that stands in the file to edit for a binary side, which
-// the file cannot embed. graft land --resolved refuses a file that still holds such a line.
+// the file cannot embed. graft land --resolved refuses a file that still holds such a line, early
+// and naming the directory of the sides; the server refuses it too (resolver.ConflictPointerPrefix,
+// which it equals: the CLI does not link the resolver package).
 const conflictPointerPrefix = "graft-conflict-pointer: "
 
 // conflictFileFor is the file an agent edits for a conflicting file of the package, given the
@@ -247,10 +249,14 @@ func conflictFileFor(f *gitalypb.LandConflictFile, sides [3][]byte) []byte {
 
 	side := func(i int) (note string, body []byte) {
 		switch {
-		case present[i] == nil && i == 0:
+		case present[i] == nil && i == 0 && present[1] != nil && present[2] != nil:
 			return ": none, both sides added the file", nil
-		case present[i] == nil:
+		case present[i] == nil && i == 0:
+			return ": none", nil
+		case present[i] == nil && present[0] != nil:
 			return ": deleted", nil
+		case present[i] == nil:
+			return ": absent", nil
 		case sides[i] == nil:
 			reason := present[i].GetUnavailable()
 			if reason == "" {

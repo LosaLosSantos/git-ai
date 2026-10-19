@@ -426,7 +426,7 @@ func TestCheck_runsForEveryActorAndFileCount(t *testing.T) {
 	cfg.Actors = []string{"someone-else"}
 	client := newClient(t, cfg)
 
-	resp, err := client.Check(testhelper.Context(t), req)
+	resp, err := checkWithSlot(t, client, req)
 	require.NoError(t, err)
 	require.Len(t, resp.Files, 2)
 
@@ -455,9 +455,43 @@ func TestCheck_refusesARequestOverItsBound(t *testing.T) {
 		side.Content = big
 	}
 	req.Resolution = validResponse("merged\n").Files
-	_, err := client.Check(testhelper.Context(t), req)
+	_, err := checkWithSlot(t, client, req)
 	require.ErrorContains(t, err, "is over the bound")
 	require.NoFileExists(t, marker)
+}
+
+// TestCheck_aFileAtTheBoundFitsOneRequest: with max_file_bytes at MaxCheckFileBytes, the largest
+// the configuration accepts (one byte more is refused there: TestGraftResolverValidateBuildable), a file whose three sides and
+// resolution are all that large, with a path of 4 KiB that JSON escapes at six bytes a byte, fits
+// one check request.
+func TestCheck_aFileAtTheBoundFitsOneRequest(t *testing.T) {
+	requireUnix(t)
+
+	path := strings.Repeat("<", 4<<10)
+	big := make([]byte, MaxCheckFileBytes)
+	for i := range big {
+		big[i] = 'x'
+	}
+	req := sampleRequest()
+	req.Files = []File{{
+		Path: path, Kind: KindContent,
+		Base:   &Side{OID: "b1", Mode: ModeRegular, Content: big},
+		Ours:   &Side{OID: "o1", Mode: ModeRegular, Content: big},
+		Theirs: &Side{OID: "t1", Mode: ModeRegular, Content: big},
+	}}
+	req.Resolution = []ResponseFile{{Path: path, Action: ActionWrite, Mode: ModeRegular, Content: big}}
+
+	answer, err := json.Marshal(CheckResponse{
+		Version: ProtocolVersion, Operation: OperationCheck, Resolver: "graft-resolve",
+		Files: []CheckFile{{Path: path, OK: true, Syntax: SyntaxNone}},
+	})
+	require.NoError(t, err)
+	cfg := commandConfig(cannedCommand(t, answer))
+	cfg.MaxFileBytes = MaxCheckFileBytes
+
+	resp, err := checkWithSlot(t, newClient(t, cfg), req)
+	require.NoError(t, err)
+	require.Len(t, resp.Files, 1)
 }
 
 func TestResolve_RequestChecksDoNotRunTheResolver(t *testing.T) {
@@ -627,4 +661,68 @@ func TestValidOutcomes(t *testing.T) {
 	} {
 		require.Nil(t, validOutcomes(req, files), name)
 	}
+}
+
+// checkWithSlot sends one check request with a check slot, as the server does.
+func checkWithSlot(t *testing.T, client *Client, req Request) (*CheckResponse, error) {
+	t.Helper()
+	slot, err := client.AcquireCheckSlot(testhelper.Context(t))
+	require.NoError(t, err)
+	defer slot.Release()
+	return slot.Check(testhelper.Context(t), req)
+}
+
+// TestAcquireCheckSlot_boundsTheChecksAtOnce: at most check_concurrency slots are held at once; a
+// wait for one counts against the caller's deadline and fails when it ends; a released slot frees
+// its place once, and cannot check any more.
+func TestAcquireCheckSlot_boundsTheChecksAtOnce(t *testing.T) {
+	cfg := commandConfig([]string{"/bin/true"})
+	cfg.CheckConcurrency = 2
+	client := newClient(t, cfg)
+	ctx := testhelper.Context(t)
+
+	first, err := client.AcquireCheckSlot(ctx)
+	require.NoError(t, err)
+	second, err := client.AcquireCheckSlot(ctx)
+	require.NoError(t, err)
+
+	// Both slots are held: a third waits until its deadline, then fails.
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = client.AcquireCheckSlot(waitCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "waiting for a check slot of the resolver")
+
+	// A slot released twice frees one place only, and checks no more.
+	first.Release()
+	first.Release()
+	_, err = first.Check(ctx, sampleRequest())
+	require.ErrorContains(t, err, "check without a check slot")
+
+	third, err := client.AcquireCheckSlot(ctx)
+	require.NoError(t, err)
+	waitCtx2, cancel2 := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel2()
+	_, err = client.AcquireCheckSlot(waitCtx2)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// A waiting acquire gets the slot released while it waits.
+	got := make(chan error, 1)
+	go func() {
+		slot, err := client.AcquireCheckSlot(ctx)
+		if err == nil {
+			slot.Release()
+		}
+		got <- err
+	}()
+	second.Release()
+	require.NoError(t, <-got)
+	third.Release()
+}
+
+// TestAcquireCheckSlot_defaultConcurrency: without check_concurrency, the client holds
+// DefaultGraftResolverCheckConcurrency slots.
+func TestAcquireCheckSlot_defaultConcurrency(t *testing.T) {
+	client := newClient(t, commandConfig([]string{"/bin/true"}))
+	require.Equal(t, config.DefaultGraftResolverCheckConcurrency, cap(client.checkSlots))
 }

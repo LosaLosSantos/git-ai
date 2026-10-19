@@ -179,6 +179,14 @@ never calls a language model: it calls the program or HTTP endpoint configured
 here. The protocol, the validation rules and `graft-resolve` are described in
 [RESOLVE.md](RESOLVE.md).
 
+A resolver configuration the server could not use is a startup error: an empty
+`command`, a `url` that is not an `http` or `https` URL with a host, a
+`token_file` that cannot be read or is empty, a bad `timeout`, a negative
+bound, or a `max_file_bytes` over the bound of a check request. A configured
+resolver is never treated as no resolver: if it cannot be built later (its
+token file removed, say), every land that needs it fails closed, with the
+cause.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch. When false, `resolve_conflicts` in a land request is ignored. |
@@ -187,7 +195,8 @@ here. The protocol, the validation rules and `graft-resolve` are described in
 | `token_file` | string | empty | For `url`: file with the bearer token, read at startup. |
 | `timeout` | string | `"120s"` | Bound on one resolver call (Go duration). |
 | `max_files` | int | `20` | Conflicted files per land. A land with more is not sent to the resolver. |
-| `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. |
+| `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. At most 12566528 (about 12 MiB): one file, its three sides and its resolution, must fit one check request. |
+| `check_concurrency` | int | `2` | Checks of agents' resolutions that run at once on this server; each holds a request of up to 64 MiB. A check waits for a free slot within its deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_check_slot_wait_seconds`. |
 | `paths_allow` | array of strings | empty (every path) | Globs of paths that may be sent to the resolver, with the syntax of policy refs. |
 | `paths_deny` | array of strings | empty | Globs of paths that are never sent. Deny wins over allow. |
 | `actors` | array of strings | empty (every caller that may land) | Globs of the identities that may request resolution: agent names, or `shared` for the shared token. Without `[[graft.agent]]` no caller has an identity, so a non-empty list admits nobody (the server warns at startup). |

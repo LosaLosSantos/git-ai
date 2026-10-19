@@ -9,6 +9,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
@@ -111,10 +113,12 @@ func (s *Server) landReviewResolution(ctx context.Context, in *gitalypb.UserLand
 }
 
 // landPrecheck is the check of an agent's resolution, run before the land enters its lane
-// (landPrecheckResolution): for the tip and the commit it was run against, the result.
+// (landPrecheckResolution): for the tip and the commit it was run against, the result; or, when
+// no check was run because the lane refuses or answers the land without one, why (skipped).
 type landPrecheck struct {
 	tip, commit git.ObjectID
 	result      landCheckResult
+	skipped     string
 }
 
 // landPrecheckResolution runs the resolver's checks of the request's resolution before the land
@@ -125,8 +129,10 @@ type landPrecheck struct {
 // The whole check has one deadline, the resolver's timeout: every check request uses what remains
 // of it, and its expiry fails the check closed.
 //
-// It returns nil when there is nothing to check: no resolver, or a resolution the land refuses
-// before checking (the lane reports why).
+// The check runs in the quarantine repo, which the caller discards: the merge it computes leaves no
+// object behind. A resolution for a tip the branch has left, or for a change that already landed,
+// is not checked (skipped): the lane refuses or answers it. It returns nil when no resolver is
+// configured. A failure to check is the result's failure, with its cause, which the lane reports.
 func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLandRequest, repo *localrepo.Repo) (*landPrecheck, error) {
 	if s.conflictResolver == nil {
 		return nil, nil
@@ -137,16 +143,40 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 	}
 	tip, err := objectHash.FromHex(in.GetResolution().GetTip())
 	if err != nil {
-		return nil, nil
+		return &landPrecheck{skipped: fmt.Sprintf("its tip %q is no object ID", in.GetResolution().GetTip())}, nil
 	}
 	commitID, err := repo.ResolveRevision(ctx, git.Revision(in.GetCommitId()+"^{commit}"))
 	if err != nil {
-		return nil, nil
+		return &landPrecheck{skipped: fmt.Sprintf("commit_id %q does not resolve to a commit", in.GetCommitId())}, nil
 	}
+
+	// A resolution for a tip the branch has left, or for a change that already landed, needs no
+	// check: the lane refuses or answers it at once, as it reads the tip again under the lane.
+	branch, err := repo.GetReference(ctx, git.NewReferenceNameFromBranchName(string(in.GetBranch())))
+	switch {
+	case errors.Is(err, git.ErrReferenceNotFound):
+		return &landPrecheck{skipped: fmt.Sprintf("branch %q does not exist", string(in.GetBranch()))}, nil
+	case err != nil:
+		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("reading the branch: %v", err), failureErr: err}}, nil
+	case git.ObjectID(branch.Target) != tip:
+		return &landPrecheck{skipped: fmt.Sprintf("the branch was at %s, not at the tip of the resolution", branch.Target)}, nil
+	}
+	if landed, err := repo.IsAncestor(ctx, commitID.Revision(), tip.Revision()); err != nil {
+		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("checking whether the change already landed: %v", err), failureErr: err}}, nil
+	} else if landed {
+		return &landPrecheck{skipped: "the change had already landed"}, nil
+	}
+
 	review, err := s.landReviewResolution(ctx, in, repo, tip, commitID)
 	if err != nil || review.rejected {
-		// The lane refuses it the same way, before any check.
-		return nil, nil
+		// A refusal of the resolution (its package, or an invalid argument or failed precondition)
+		// is repeated by the lane before any check. Any other error is a failure to check it.
+		var unresolved *landUnresolvedError
+		code := status.Code(err)
+		if err == nil || errors.As(err, &unresolved) || code == codes.InvalidArgument || code == codes.FailedPrecondition {
+			return &landPrecheck{skipped: "the land refuses the resolution before checking it"}, nil
+		}
+		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("listing the conflicts: %v", err), failureErr: err}}, nil
 	}
 
 	timeout, err := s.resolveCfg.TimeoutOrDefault()
@@ -155,10 +185,7 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result, err := s.landCheckResolution(ctx, in, repo, review.listing, review.actor, review.resolved)
-	if err != nil {
-		return nil, err
-	}
+	result := s.landCheckResolution(ctx, in, repo, review.listing, review.actor, review.resolved)
 	return &landPrecheck{tip: tip, commit: commitID, result: result}, nil
 }
 
@@ -187,9 +214,16 @@ func (s *Server) landWithResolution(
 	l, rejected := review.listing, review.rejected
 
 	checkedBy, syntaxUnchecked := "", 0
-	if !rejected && s.conflictResolver != nil {
-		if precheck == nil || precheck.tip != tip || precheck.commit != commitID {
-			return landResolution{}, l.notAttempted(fmt.Sprintf("the resolution could not be checked: it was not checked against tip %s and commit %s before the land", tip, commitID), nil)
+	if !rejected && (s.conflictResolver != nil || s.resolverErr != nil) {
+		switch {
+		case s.conflictResolver == nil:
+			return landResolution{}, l.notAttempted(fmt.Sprintf("the resolution could not be checked: the configured resolver cannot be built: %v", s.resolverErr), s.resolverErr)
+		case precheck == nil:
+			return landResolution{}, l.notAttempted("the resolution could not be checked: it was not checked before the land", nil)
+		case precheck.skipped != "":
+			return landResolution{}, l.notAttempted(fmt.Sprintf("the resolution could not be checked: it was not checked before the land, since %s", precheck.skipped), nil)
+		case precheck.tip != tip || precheck.commit != commitID:
+			return landResolution{}, l.notAttempted(fmt.Sprintf("the resolution could not be checked: it was checked against tip %s and commit %s, not tip %s and commit %s", precheck.tip, precheck.commit, tip, commitID), nil)
 		}
 		res := precheck.result
 		for _, f := range l.files {
@@ -315,11 +349,13 @@ func (s *Server) landCheckBatchBytes() int64 {
 
 // landCheckResolution runs the resolver's checks on the files of the resolution that may be sent
 // to the resolver (landClassify). The files go in check requests of at most landCheckBatchBytes of
-// file data each, so that neither the server nor graft-resolve holds more than one bounded
-// request at a time: each batch is read, checked and released before the next, and every batch must
-// name the same checker. The listing and the attributes of the trees are read once for all batches.
-// The requests carry no commit message: the checks judge the files. A check that cannot run (ctx
-// expired included) stops the checks: the result says why, with the verdicts found before.
+// file data each: for each, a check slot of the resolver is taken first (resolver.Client bounds the
+// checks that run at once, and waiting for a slot counts against the deadline of ctx), then the
+// sides of the batch are read, checked and released, so that no more than one bounded request is
+// held at a time. Every batch must name the same checker. The listing and the attributes of the
+// trees are read once for all batches. The requests carry no commit message: the checks judge the
+// files. Anything that stops the checks (a request that fails, a git error, the deadline) is the
+// result's failure, with the verdicts found before: the check fails closed.
 func (s *Server) landCheckResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -327,68 +363,42 @@ func (s *Server) landCheckResolution(
 	l landListing,
 	actor string,
 	resolved map[string]resolver.ResponseFile,
-) (landCheckResult, error) {
+) landCheckResult {
 	result := landCheckResult{verdicts: map[string]landCheckVerdict{}}
+	fail := func(what string, err error) landCheckResult {
+		result.failure, result.failureErr = fmt.Sprintf("%s: %v", what, err), err
+		return result
+	}
 	batches, err := landCheckBatches(ctx, repo, l.files, resolved, s.landCheckBatchBytes())
 	if err != nil {
-		return result, err
+		return fail("sizing the check requests", err)
 	}
-	cache := newLandClassifyCache(l.files)
+	cache := newLandClassifyCache(l.files, l.tip)
 
 	var unchecked []string
 	for _, batch := range batches {
-		if err := s.landClassify(ctx, repo, batch, l.base, l.tip, l.commitID, cache); err != nil {
-			return result, err
+		slot, err := s.conflictResolver.AcquireCheckSlot(ctx)
+		if err != nil {
+			return fail("waiting for the resolver", err)
 		}
-		req := resolver.Request{
-			Repository: resolver.Repository{
-				Storage:      in.GetRepository().GetStorageName(),
-				RelativePath: in.GetRepository().GetRelativePath(),
-			},
-			Branch: string(in.GetBranch()),
-			Tip:    l.tip.String(),
-			Commit: l.commitID.String(),
-			Actor:  actor,
-		}
-		if l.hasBase {
-			req.MergeBase = l.base.String()
-		}
-		var checked []*landFileState
-		for _, f := range batch {
-			if !f.sent() {
-				// The file may not go to the resolver: it gets the server's rules only.
-				unchecked = append(unchecked, fmt.Sprintf("%s (%s)", f.conflict.path, f.reason))
-				f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_UNSPECIFIED, ""
-				continue
-			}
-			req.Files = append(req.Files, landRequestFile(f))
-			req.Resolution = append(req.Resolution, resolved[f.conflict.path])
-			checked = append(checked, f)
-		}
+		checked, resp, err := s.landCheckBatch(ctx, in, repo, l, actor, resolved, batch, cache, slot, &unchecked)
+		slot.Release()
 		// The sides of the batch are released once it is checked: the next batch reads its own, and
 		// a package reads again, within its own bounds, what its hunks need.
-		release := func() {
-			for _, f := range batch {
-				f.sides, f.read = [3][]byte{}, false
-			}
+		for _, f := range batch {
+			f.sides, f.read = [3][]byte{}, false
 		}
-		if len(checked) == 0 {
-			release()
-			continue
-		}
-
-		resp, err := s.conflictResolver.Check(ctx, req)
-		release()
 		switch {
 		case err != nil:
-			result.failure, result.failureErr = err.Error(), err
+			return fail("checking", err)
+		case resp == nil:
+			continue
 		case !landResolverNameValid(resp.Resolver):
 			result.failure = fmt.Sprintf("the check names an invalid resolver %q", resp.Resolver)
+			return result
 		case result.checkedBy != "" && resp.Resolver != result.checkedBy:
 			result.failure = fmt.Sprintf("its checks named the resolvers %q and %q", result.checkedBy, resp.Resolver)
-		}
-		if result.failure != "" {
-			return result, nil
+			return result
 		}
 		result.checkedBy = resp.Resolver
 		for i, v := range resp.Files {
@@ -401,7 +411,7 @@ func (s *Server) landCheckResolution(
 	}
 	if len(result.verdicts) == 0 {
 		s.logger.WithField("unchecked", unchecked).InfoContext(ctx, "graft: no file of the agent's resolution may be sent to the resolver's checks")
-		return result, nil
+		return result
 	}
 	s.logger.WithFields(log.Fields{
 		"checked_by":     result.checkedBy,
@@ -409,7 +419,57 @@ func (s *Server) landCheckResolution(
 		"check_requests": len(batches),
 		"not_checked":    unchecked,
 	}).InfoContext(ctx, "graft: agent's resolution checked")
-	return result, nil
+	return result
+}
+
+// landCheckBatch reads and checks one batch of files with a check slot taken. It returns the files
+// sent, in the order of the verdicts, and the check's answer, nil when no file of the batch may be
+// sent; the files that may not are added to unchecked.
+func (s *Server) landCheckBatch(
+	ctx context.Context,
+	in *gitalypb.UserLandRequest,
+	repo *localrepo.Repo,
+	l landListing,
+	actor string,
+	resolved map[string]resolver.ResponseFile,
+	batch []*landFileState,
+	cache *landClassifyCache,
+	slot *resolver.CheckSlot,
+	unchecked *[]string,
+) ([]*landFileState, *resolver.CheckResponse, error) {
+	if err := s.landClassify(ctx, repo, batch, l.base, l.tip, l.commitID, cache); err != nil {
+		return nil, nil, err
+	}
+	req := resolver.Request{
+		Repository: resolver.Repository{
+			Storage:      in.GetRepository().GetStorageName(),
+			RelativePath: in.GetRepository().GetRelativePath(),
+		},
+		Branch: string(in.GetBranch()),
+		Tip:    l.tip.String(),
+		Commit: l.commitID.String(),
+		Actor:  actor,
+	}
+	if l.hasBase {
+		req.MergeBase = l.base.String()
+	}
+	var checked []*landFileState
+	for _, f := range batch {
+		if !f.sent() {
+			// The file may not go to the resolver: it gets the server's rules only.
+			*unchecked = append(*unchecked, fmt.Sprintf("%s (%s)", f.conflict.path, f.reason))
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_UNSPECIFIED, ""
+			continue
+		}
+		req.Files = append(req.Files, landRequestFile(f))
+		req.Resolution = append(req.Resolution, resolved[f.conflict.path])
+		checked = append(checked, f)
+	}
+	if len(checked) == 0 {
+		return nil, nil, nil
+	}
+	resp, err := slot.Check(ctx, req)
+	return checked, resp, err
 }
 
 // landCheckBatches splits the files into batches of at most budget bytes of file data: the sizes

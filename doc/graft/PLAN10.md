@@ -598,6 +598,36 @@ way.
     conflict holding every side (pointer lines for binary sides, the text of text sides, notes for
     deleted and unavailable ones). --resolved refuses a pointer line, and a path that is a file on
     none of its sides can only be deleted.
+* **Review of e661706** (PM: fix before R1).
+  * N1. A resolver configuration the server could not build is a startup error (config
+    validation: empty command, URL without http(s) or host, unreadable or empty token file,
+    max_file_bytes over the check bound, negative bounds). If resolver.New still fails at run time,
+    the server keeps the error (resolverErr) and every land that needs the resolver fails closed
+    with it: no path turns a configured resolver into "no resolver".
+  * N2. The precheck runs in an object quarantine that UserLand discards. Before, merge-tree wrote
+    the merged trees and the blobs with markers into the repository's own objects, unreachable,
+    until gc, in every storage mode (off, shadow, authoritative: all keep objects in the local
+    repository; they never reached the bucket, whose packs carry only the objects that new
+    reference values reach). The lane still merges again in its own quarantine: reusing the precheck's tree
+    would mean keeping its objects; correctness first.
+  * N3. resolver.Client holds check_concurrency slots (default 2); a check takes one per request,
+    its wait counts against the check's deadline, and its expiry fails closed; the wait is the
+    histogram graft_resolver_check_slot_wait_seconds. The client's check is reachable only through
+    a slot.
+  * N4. Before any check the precheck reads the branch: a tip other than resolution.tip, or a change
+    already landed, is not checked; the lane, which reads the tip again under the lane, refuses it
+    (tip moved) or answers it (already landed).
+  * N5. A failure of the precheck is the result's failure with its cause (a git error, the slot
+    wait, a request), which the package reports, still failing closed; a precheck that was skipped,
+    or made for another tip or commit, says so.
+  * Partial 5: everything that stops the check between or during batches keeps the verdicts found
+    before, the rest not attempted, and the land gets the package. Partial 7: the CLI's base note
+    says "both sides added the file" only when both sides are there. Partial 8: tests for several
+    files in one request, a file at the bound with a 4 KiB path fitting one request (one byte more
+    refused by the configuration), and the collision test named for what it tests.
+  * The classify cache is fixed to the land's tip and paths when made; another tip or path is an
+    error. The pointer-line rule is in the server's validation (resolver.ConflictPointerPrefix), so
+    clients of the SDK get it; the CLI keeps its earlier message.
 
 ## 13. Prompt first (PM and Federico, approved)
 

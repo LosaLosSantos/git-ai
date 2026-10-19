@@ -38,8 +38,11 @@ type Server struct {
 	// checkBatchBytes, when set, replaces the bound of the file data of one check request
 	// (landCheckBatchBytes); only tests set it.
 	checkBatchBytes int64
-	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled.
+	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
+	// or when the configured resolver cannot be built: then resolverErr says why, and every land
+	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).
 	conflictResolver *resolver.Client
+	resolverErr      error
 	// landLanes batches the UserLand requests of a branch. Nil disables batching, and every
 	// request then lands on its own. The lanes are shared by all servers of the process.
 	landLanes *landBatchLanes
@@ -55,11 +58,12 @@ type Server struct {
 func NewServer(deps *service.Dependencies) *Server {
 	resolveCfg := deps.GetCfg().Graft.Land.Resolver
 
-	conflictResolver, err := resolver.New(resolveCfg)
-	if err != nil {
-		// An invalid resolver configuration disables resolution rather than the server. Landings
-		// that ask for resolution then fail with the merge conflict, as without resolution.
-		deps.GetLogger().WithError(err).Error("graft: conflict resolution of land is disabled")
+	// The configuration is validated at startup (config.GraftResolver.validate), so New fails
+	// only when something changed since (a token file removed, say). A configured resolver is then
+	// never treated as no resolver: resolverErr makes every land that needs it fail closed.
+	conflictResolver, resolverErr := resolver.New(resolveCfg)
+	if resolverErr != nil {
+		deps.GetLogger().WithError(resolverErr).Error("graft: the conflict resolver of land cannot be built: lands that need it fail")
 		conflictResolver = nil
 	}
 	if conflictResolver != nil && resolverActorsUnmatchable(deps.GetCfg().Graft) {
@@ -80,6 +84,7 @@ func NewServer(deps *service.Dependencies) *Server {
 		localRepoFactory: deps.GetRepositoryFactory(),
 		resolveCfg:       resolveCfg,
 		conflictResolver: conflictResolver,
+		resolverErr:      resolverErr,
 		shutdownCtx:      deps.GetShutdownContext(),
 		storageSync:      deps.GetGraftStorageSyncer(),
 	}

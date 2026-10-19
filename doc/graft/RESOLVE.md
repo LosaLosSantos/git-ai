@@ -38,6 +38,12 @@ actors = ["builder", "planner"]
   `max_files` bounds a request for an AI resolution only: the conflict package
   lists every conflicting file, and the check of an agent's resolution covers
   all its files.
+- `check_concurrency` (default 2): the checks of agents' resolutions that run
+  at once (see the check below).
+- A configuration the server could not use is a startup error (see
+  [CONFIGURATION](CONFIGURATION.md)). A configured resolver is never treated
+  as no resolver: if it cannot be built later, every land that needs it fails
+  closed, and the package says why.
 - `paths_allow`, `paths_deny`: glob lists with the same semantics as policy
   refs (`**` as a suffix matches any depth). A conflict in a denied path, or
   in a path that is not allowed, is not sent to the resolver. Apart from the
@@ -87,10 +93,13 @@ A client asks for resolution per call:
   or unavailable, a diff too large) it is one conflict between diff3 markers
   that holds every side: the text of each text side, and for a binary side a
   `graft-conflict-pointer:` line naming its file under `sides/`, with a note on
-  the marker line of a side that is binary, deleted or unavailable. The marker
+  the marker line of a side that is binary, deleted (absent, with a base),
+  absent (without a base) or unavailable, and on the base's marker line `none`,
+  with "both sides added the file" only when both sides are there. The marker
   rule of the server refuses it until the agent resolves it, and
   `graft land --resolved` refuses a file that still holds a pointer line, so
-  that a pointer can never land in place of a binary side. `DIR` must not
+  that a pointer can never land in place of a binary side; the server refuses
+  such a line too, so a client of the SDK gets the same rule. `DIR` must not
   hold a conflicts directory yet: one being edited is never overwritten. A
   path that cannot be a file under `DIR` on this system (a backslash, on
   Windows a colon or a name the system reserves) is an error, and so are two paths that
@@ -408,8 +417,9 @@ content) or `delete`. The server accepts it only when:
   with a fresh package for the new tip);
 - it resolves exactly the conflicting paths, each once;
 - every file passes the acceptance rules of an answer (modes, size, conflict
-  markers, no symbolic link named like a file git reads from the tree), and
-  writes a mode one of the conflict's sides has;
+  markers, no `graft-conflict-pointer:` line, no symbolic link named like a
+  file git reads from the tree), and writes a mode one of the conflict's sides
+  has;
 - the merge has at most 1000 conflicting files, the bound of a package (a
   merge with more cannot be resolved through a land, and nothing is read or
   checked);
@@ -419,20 +429,27 @@ content) or `delete`. The server accepts it only when:
   a land);
 - when a resolver is configured, the files that may be sent to it pass its
   `check`: the syntax check and the configured checks, as an `llm` answer.
-  A check that cannot run fails the land, with the reason in the package.
+  A check that cannot run fails the land, with its cause in the package.
   The check runs before the land enters the branch's lane, against the tip
   the resolution was made against, so that no branch is held while an
   external process runs; the lane only applies its verdicts (if the branch
   moved meanwhile, the resolution is refused with a fresh package, as it would
-  be anyway). The whole check has one deadline, the resolver's `timeout`:
-  every check request uses what remains of it, and its expiry fails the check
-  closed. The files go to the check in requests of at most 48 MiB of file data
+  be anyway). It merges the tip and the change in an object quarantine that is
+  then discarded, so it leaves no object in the repository, in every storage
+  mode. When the branch is no longer at `resolution.tip`, or the change has
+  already landed, nothing is checked: the lane refuses the resolution (tip
+  moved) or answers at once (already landed), reading the tip again itself.
+  At most `check_concurrency` checks run at once; a check waits for a slot
+  within its deadline. The whole check has one deadline, the resolver's
+  `timeout`: the wait for a slot and every check request use what remains of
+  it, and its expiry fails the check closed. The files go to the check in requests of at most 48 MiB of file data
   each (sides and resolutions, within the 64 MiB a check request may take
   once encoded, and the 128 MiB graft-resolve reads by default), checked one
   after the other, so that neither side holds more than one such request at a
   time; the requests carry no commit message. One file, its three sides and
   its resolution, must fit one request, so the server refuses at startup a
-  `max_file_bytes` over about 12 MiB. When a check request fails, the files
+  `max_file_bytes` over about 12 MiB. When the check stops (a request that
+  fails, a git error while reading the next files, the deadline), the files
   checked before keep their verdict and the others are not attempted.
   A file with a `syntax: unchecked` verdict lands, and is counted in
   `graft_land_resolution_syntax_unchecked_total`, once, when the land
@@ -825,6 +842,7 @@ in blank lines only, and the accepted results that got no syntax verdict.
 | resolver answer (stdout or HTTP body), and a refusal's error response | 2 × `max_file_bytes` × files in the request + 64 KiB | server |
 | reason of a refusal (stderr, or `error` of the error response) | 4 KiB | server |
 | check answer | 64 KiB + 8 KiB per file | server |
+| checks of agents' resolutions at once | 2 | `check_concurrency` |
 | verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |
 | land request with an agent's resolution | 4 MiB, the gRPC message limit | server; the SDK refuses larger ones |

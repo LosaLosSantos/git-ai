@@ -75,8 +75,17 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	// The check of an agent's resolution runs an external process: it runs here, before the land
 	// enters its lane, so that no branch is held while it runs (landPrecheckResolution).
 	var precheck *landPrecheck
-	if in.GetResolution() != nil {
-		if precheck, err = s.landPrecheckResolution(ctx, in, s.localRepoFactory.Build(in.GetRepository())); err != nil {
+	if in.GetResolution() != nil && s.conflictResolver != nil {
+		// The precheck merges the tip and the change, which writes objects: it works in a
+		// quarantine that is discarded, so that it leaves nothing in the repository, whatever the
+		// storage mode.
+		_, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, in.GetRepository())
+		if err != nil {
+			return nil, err
+		}
+		precheck, err = s.landPrecheckResolution(ctx, in, quarantineRepo)
+		cleanup()
+		if err != nil {
 			return nil, err
 		}
 	}

@@ -109,6 +109,8 @@ func (s *Server) resolveLandConflicts(
 	switch {
 	case len(files) == 0:
 		return landResolution{}, notAttempted(landNoConflictingFiles)
+	case s.conflictResolver == nil && s.resolverErr != nil:
+		return landResolution{}, notAttempted(fmt.Sprintf("conflict resolution is configured, but its resolver cannot be built: %v", s.resolverErr))
 	case s.conflictResolver == nil:
 		return landResolution{}, notAttempted("conflict resolution is not enabled on this server")
 	case !s.conflictResolver.ActorAllowed(actor):
@@ -119,7 +121,7 @@ func (s *Server) resolveLandConflicts(
 		return landResolution{}, notAttempted(fmt.Sprintf("%d conflicting files exceed max_files %d", len(conflicts), maxFiles))
 	}
 
-	if err := s.landClassify(ctx, repo, files, base, tip, commitID, newLandClassifyCache(files)); err != nil {
+	if err := s.landClassify(ctx, repo, files, base, tip, commitID, newLandClassifyCache(files, tip)); err != nil {
 		return landResolution{}, err
 	}
 
@@ -477,6 +479,9 @@ func (s *Server) landClassify(
 	base, tip, commitID git.ObjectID,
 	cache *landClassifyCache,
 ) error {
+	if cache.tip != tip {
+		return fmt.Errorf("classifying the conflicts: the cache is for tip %s, not %s", cache.tip, tip)
+	}
 	rules := s.conflictResolver.SendRules()
 	listings := cache.listings
 	for _, f := range files {
@@ -557,7 +562,7 @@ func (s *Server) landClassify(
 			candidates = append(candidates, f.conflict.path)
 		}
 	}
-	generated, err := cache.generatedPaths(ctx, repo, tip, candidates)
+	generated, err := cache.generatedPaths(ctx, repo, candidates)
 	if err != nil {
 		return err
 	}
@@ -572,32 +577,42 @@ func (s *Server) landClassify(
 	return nil
 }
 
-// landClassifyCache holds what landClassify reads from the trees, for every call of one land: the
-// listings of the trees (by revision) and the linguist-generated attribute of the paths, read once
-// for all the paths of the land.
+// landClassifyCache holds what landClassify reads from the trees, for every call of one land onto
+// one tip: the listings of the trees (by revision) and the linguist-generated attribute of the
+// paths of the land, read at the tip once for all of them. Both the tip and the paths are fixed
+// when it is made: a call for another tip, or for a path that is not one of the land, is an error.
 type landClassifyCache struct {
 	listings  map[git.ObjectID]map[git.ObjectID][]string
+	tip       git.ObjectID
 	paths     []string
+	known     map[string]bool
 	generated map[string]bool
 }
 
-// newLandClassifyCache returns the cache of the land of files.
-func newLandClassifyCache(files []*landFileState) *landClassifyCache {
-	c := &landClassifyCache{listings: map[git.ObjectID]map[git.ObjectID][]string{}}
+// newLandClassifyCache returns the cache of the land of files onto tip.
+func newLandClassifyCache(files []*landFileState, tip git.ObjectID) *landClassifyCache {
+	c := &landClassifyCache{listings: map[git.ObjectID]map[git.ObjectID][]string{}, tip: tip, known: map[string]bool{}}
 	for _, f := range files {
 		c.paths = append(c.paths, f.conflict.path)
+		c.known[f.conflict.path] = true
 	}
 	return c
 }
 
-// generatedPaths returns the linguist-generated attribute of the paths (all of them paths of the
-// land), read at rev with one git check-attr for every path of the land, on first use.
-func (c *landClassifyCache) generatedPaths(ctx context.Context, repo *localrepo.Repo, rev git.ObjectID, paths []string) (map[string]bool, error) {
+// generatedPaths returns the linguist-generated attribute at the tip of the land of paths, every
+// one a path of the land. The attributes of all the paths of the land are read on first use, with
+// one git check-attr.
+func (c *landClassifyCache) generatedPaths(ctx context.Context, repo *localrepo.Repo, paths []string) (map[string]bool, error) {
+	for _, p := range paths {
+		if !c.known[p] {
+			return nil, fmt.Errorf("classifying the conflicts: %q is not a conflicting path of the land", p)
+		}
+	}
 	if len(paths) == 0 {
 		return map[string]bool{}, nil
 	}
 	if c.generated == nil {
-		generated, err := landGeneratedPaths(ctx, repo, rev, c.paths)
+		generated, err := landGeneratedPaths(ctx, repo, c.tip, c.paths)
 		if err != nil {
 			return nil, err
 		}

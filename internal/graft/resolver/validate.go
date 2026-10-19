@@ -17,7 +17,8 @@ import (
 //   - every written mode is one of 100644, 100755, 120000;
 //   - no written content exceeds req.Limits.MaxFileBytes;
 //   - no written text file (content without NUL bytes) contains a conflict
-//     marker line ("<<<<<<< ", "=======", ">>>>>>> " at line start).
+//     marker line ("<<<<<<< ", "=======", ">>>>>>> " at line start);
+//   - no written file contains a line starting with ConflictPointerPrefix.
 //
 // Violations are reported wrapping ErrInvalidResponse. A request without a
 // positive req.Limits.MaxFileBytes is a caller error and is reported without
@@ -66,8 +67,14 @@ func Validate(req *Request, resp *Response) error {
 	return nil
 }
 
+// ConflictPointerPrefix starts the line that graft land --conflicts-dir writes in the file to
+// edit in place of a binary side, which that file cannot embed. A resolution that still holds such
+// a line would land the pointer instead of the side, so no written file may hold one.
+const ConflictPointerPrefix = "graft-conflict-pointer: "
+
 // ValidateFile applies the acceptance rules of Validate to one resolved file: the action, the
-// mode, the size and the conflict markers. The server applies it to an agent's resolution too.
+// mode, the size, the conflict markers and the pointer lines. The server applies it to an agent's
+// resolution too.
 func ValidateFile(f ResponseFile, maxBytes int64) error {
 	return validateFile(f, maxBytes)
 }
@@ -92,6 +99,10 @@ func validateFile(f ResponseFile, maxBytes int64) error {
 
 		if !isBinary(f.Content) && hasConflictMarker(f.Content) {
 			return errors.New("content contains a conflict marker line")
+		}
+
+		if hasConflictPointer(f.Content) {
+			return fmt.Errorf("content contains a line starting with %q, the pointer to a binary side that graft land --conflicts-dir writes: the side was not put in its place", ConflictPointerPrefix)
 		}
 
 		return nil
@@ -211,6 +222,23 @@ func validMode(mode string) bool {
 // isBinary reports whether content is treated as binary: it holds a NUL byte.
 func isBinary(content []byte) bool {
 	return bytes.IndexByte(content, 0) >= 0
+}
+
+// hasConflictPointer reports whether a line of content starts with ConflictPointerPrefix.
+func hasConflictPointer(content []byte) bool {
+	prefix := []byte(ConflictPointerPrefix)
+	for len(content) > 0 {
+		line := content
+		if i := bytes.IndexByte(content, '\n'); i >= 0 {
+			line, content = content[:i], content[i+1:]
+		} else {
+			content = nil
+		}
+		if bytes.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasConflictMarker reports whether a line of content starts with a conflict

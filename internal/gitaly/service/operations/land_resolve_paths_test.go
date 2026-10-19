@@ -1,6 +1,7 @@
 package operations
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -95,9 +96,32 @@ func TestLandClassify_absentFromBothSides(t *testing.T) {
 	s := fx.server(t, rcfg)
 
 	f := &landFileState{conflict: landFileConflict{path: "x~" + fx.tip.String()}}
-	require.NoError(t, s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.tip, fx.commit, newLandClassifyCache([]*landFileState{f})))
+	require.NoError(t, s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.tip, fx.commit, newLandClassifyCache([]*landFileState{f}, fx.tip)))
 	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, f.outcome)
 	require.Equal(t, landNotSentNoSide, f.reason)
+}
+
+// TestLandClassifyCache_isForOneLand: the cache is made for the paths of one land onto one tip.
+// landClassify with another tip, and the attributes of a path that is not one of the land, are
+// errors, not answers for the wrong revision or path.
+func TestLandClassifyCache_isForOneLand(t *testing.T) {
+	t.Parallel()
+
+	_, argv := resolverScript(t, "")
+	rcfg := enabledResolver(argv)
+	fx := newResolveFixture(t, rcfg)
+	s := fx.server(t, rcfg)
+
+	f := &landFileState{conflict: landFileConflict{path: "a"}}
+	cache := newLandClassifyCache([]*landFileState{f}, fx.tip)
+	err := s.landClassify(fx.ctx, fx.repo, []*landFileState{f}, fx.base, fx.commit, fx.commit, cache)
+	require.ErrorContains(t, err, fmt.Sprintf("the cache is for tip %s, not %s", fx.tip, fx.commit))
+
+	_, err = cache.generatedPaths(fx.ctx, fx.repo, []string{"a", "c"})
+	require.ErrorContains(t, err, `"c" is not a conflicting path of the land`)
+	generated, err := cache.generatedPaths(fx.ctx, fx.repo, []string{"a"})
+	require.NoError(t, err)
+	require.False(t, generated["a"])
 }
 
 // TestUserLand_pathStartingWithDashIsResolved covers a conflicting path that starts with a dash.

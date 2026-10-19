@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,4 +73,63 @@ func TestGraftResolverMinifiedDefaults(t *testing.T) {
 	m = GraftResolverMinified{AverageLineBytes: 10, LongestLineBytes: 20}
 	require.Equal(t, 10, m.AverageLineBytesOrDefault())
 	require.Equal(t, 20, m.LongestLineBytesOrDefault())
+}
+
+// TestGraftResolverValidateBuildable: a resolver configuration that the server could not build is
+// a startup error, not a resolver turned off: an empty command, a URL that is no http or https URL
+// with a host, a token file that cannot be read or is empty, a negative check_concurrency, or a
+// max_file_bytes over the bound of a check request.
+func TestGraftResolverValidateBuildable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	token := filepath.Join(dir, "token")
+	require.NoError(t, os.WriteFile(token, []byte("secret\n"), 0o600))
+	empty := filepath.Join(dir, "empty")
+	require.NoError(t, os.WriteFile(empty, []byte(" \n"), 0o600))
+
+	byURL := GraftResolver{Enabled: true, URL: "https://resolver.example:8443/resolve", TokenFile: token}
+	require.NoError(t, byURL.validate())
+
+	// max_file_bytes may be exactly the bound, not one byte more.
+	atBound := GraftResolver{Enabled: true, Command: []string{"graft-resolve"}, MaxFileBytes: GraftResolverMaxCheckFileBytes}
+	require.NoError(t, atBound.validate())
+
+	for name, tc := range map[string]struct {
+		r    GraftResolver
+		want string
+	}{
+		"empty command":       {GraftResolver{Command: []string{""}}, "empty command"},
+		"url without scheme":  {GraftResolver{URL: "resolver.example/resolve"}, "http or https URL with a host"},
+		"url of another kind": {GraftResolver{URL: "ftp://resolver.example/"}, "http or https URL with a host"},
+		"url without host":    {GraftResolver{URL: "http:///resolve"}, "http or https URL with a host"},
+		"missing token file":  {GraftResolver{URL: "https://resolver.example/", TokenFile: filepath.Join(dir, "absent")}, "read token file"},
+		"empty token file":    {GraftResolver{URL: "https://resolver.example/", TokenFile: empty}, "is empty"},
+		"negative check_concurrency": {
+			GraftResolver{Command: []string{"graft-resolve"}, CheckConcurrency: -1}, "must not be negative",
+		},
+		"max_file_bytes over the bound": {
+			GraftResolver{Command: []string{"graft-resolve"}, MaxFileBytes: GraftResolverMaxCheckFileBytes + 1}, "max_file_bytes",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc.r.Enabled = true
+			err := tc.r.validate()
+			require.Error(t, err)
+			require.True(t, strings.Contains(err.Error(), tc.want), "error %q lacks %q", err, tc.want)
+		})
+	}
+
+	require.Equal(t, DefaultGraftResolverCheckConcurrency, GraftResolver{}.CheckConcurrencyOrDefault())
+	require.Equal(t, 5, GraftResolver{CheckConcurrency: 5}.CheckConcurrencyOrDefault())
+}
+
+// TestGraftResolverCheckBounds: a file of GraftResolverMaxCheckFileBytes, its three sides and its
+// resolution, with a path of about 4 KiB, fits one check batch, and so one request.
+func TestGraftResolverCheckBounds(t *testing.T) {
+	t.Parallel()
+
+	const path = 4 << 10
+	require.LessOrEqual(t, int64(4*GraftResolverMaxCheckFileBytes+path), int64(GraftResolverCheckBatchBytes))
+	require.LessOrEqual(t, int64(GraftResolverCheckBatchBytes)*4/3+GraftResolverCheckEnvelopeBytes, int64(GraftResolverMaxCheckRequestBytes))
 }
