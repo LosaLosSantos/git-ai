@@ -1533,3 +1533,47 @@ The chooser prompt is our own wording. First on a family-stratified 100 outside 
 and two cheap screened models; per pick and per file: precision under both judges, coverage, the share of
 NEEDS-MERGE, agreement-gated precision (2 of 3 and 3 of 3 agree), and cost. Then once on the 300 for the
 chosen gate. The result goes here when it is in.
+
+**Result (2026-10-19, measured; the chooser is not a path to 5% wrong outside java).** Everything below is offline of the
+product: `ceiling.py`, `ceiling2.py`, `chooser.py`, `agree_dm.py`, `dm_probe.py`, `dm_screen.sh` (kept so the measurement can
+be rerun on agent-conflict data; they live in `c1-work/scripts/`, outside the repository), the data in
+`c1-work/run/chooser/`. Tuning half = 244 files outside the 300 (family-stratified,
+spring-boot capped at 30; python 13, go 100, ts-js 100, other java 1); `tune200` = 200 of them. The confirmation half and the
+300 were NOT run: the tuning half produced no candidate gate, so there was nothing to confirm (the protocol freezes tau
+before the confirmation halves, and no tau had a Wilson upper bound <= 5%).
+
+* **Jev 1.14, alone** (two orders averaged, same argmax required; $0.0445 for the 244 files). Pick accuracy against the human's
+  pick 56.4% on 282 matched regions, ECE 0.149; calibration holds only at the top (p 0.8-0.9: accuracy 0.88, n = 24). The
+  averaged probability never exceeds ~0.85, so tau 0.9 lands nothing. By tau: 0.5 lands 72 of 244 files at 48.6% precision;
+  0.7 lands 33 at 78.8%; 0.8 lands 21 at 95.2% (Wilson upper wrong 22.7%). **Without spring-boot** (214 files): tau 0.5 lands
+  45 at 20.0%, tau 0.7 lands 8 at 12.5%, tau 0.8 lands 1. All the precision is spring-boot java: java tau 0.7 lands 25 of 31
+  files, 25 correct, against "always THEIRS" at 27 of 31 correct with full coverage. go 13%, ts-js 26%, python 0% at tau 0.5.
+* **All 19 decision models on OpenRouter** (every model with output modality `decisions` except aliases, `:free` variants and
+  the behaviour-scoring span-01; one probe call each, then `tune200` x 2 orders; $0.864 booked in all, no model above $0.12).
+  All 19 accept the request shape of the Jev probe (scaledown wants the state as a string; context limits are respected by
+  a size check: kev-4b 8k, clef-flash 24k, d1-ultra / microsoft / tev1 32k, oversized files count as not landed).
+  Accuracy is the region pick against the human's (NEEDS-MERGE counts as a class; about half of the regions are "other", so
+  50% is the floor): d1-ultra 76.2% (ECE 0.115), pplx-decider-v1.2 74.0% (ECE 0.058, the best calibrated), clef 73.6% (no
+  order bias at all: shift 0.004), mercury-decide 69.8%, solar-decide and -flash 63.4%, scaledown 62.1%, kev-4b 61.4%,
+  pplx-decider-flash 59.6%, jev-1.14 58.7%, luna-decisions 56.6%, d1 56.2%, tev1 53.2%, jev-1.13 50.2%, span-02 48.5%,
+  microsoft-decision-1 48.1%, drex-1.5 45.1%, clef-flash 42.1%, clef-omni 36.2%, drex-2.0 35.7%. The order effect of the first
+  option (mean |p_fwd - p_rev| of the chosen option) is 0.00-0.26, largest for span-02 (0.25), drex-1.5 (0.26), solar-decide
+  (0.21) and tev1 (0.20); latency p50 0.3-1.3 s, p95 up to 3.9 s (d1-ultra) and 11.6 s (solar-decide).
+  Coverage at zero wrong in the subset: d1-ultra 24 files (12.0%, tau 0.84; 23 of them spring-boot), jev-1.14 17 (all
+  spring-boot), pplx-v1.2 3, every other model 0-1. **No model reaches a Wilson upper bound <= 5% at any tau** (it needs
+  about 75 landed files with none wrong; the best model lands 24).
+* **Agreement of the best models** (the file lands iff all agree on every region, no NEEDS-MERGE, min p >= tau): d1-ultra +
+  pplx-v1.2 at tau 0.8 lands 26 files, 26 correct (upper wrong 12.9%), 25 of them spring-boot; d1-ultra + jev-1.14 at tau 0.7
+  lands 26, 26 correct (25 spring-boot); the triples at tau 0.7 land 20 of 20 correct (19 spring-boot). Outside spring-boot the
+  agreeing models still err: the best pair (d1-ultra + pplx) lands 7 non-spring files at tau 0.7 with 4 correct.
+* **Reading.** On this corpus a chooser built on any of these decision models is a **java / spring-boot selector** that the constant
+  policy "always THEIRS" already covers (87% right at full coverage); outside java no model or combination comes near 5%,
+  because in about 70% of the go and ts-js regions the human wrote something that is none of the four picks (the free
+  ceiling above), and where the models agree on a pick they are wrong about half of the time. Judge A (reference-based, tolerant of
+  whitespace and order) was not run on any assembled file: no gate had a candidate to judge. It would not change the
+  picture: an assembled file is built from the sides' own lines, so it differs from the human's file when the human
+  wrote something else (human-new or human-outside, 15 of the 40 wrong answers of Sol in the writer benchmark), not by
+  whitespace drift. The arms (b1) a logprob chooser with qwen3.8-flash
+  and (b2) a Luna vote were not run: Luna and Sol have no logprobs on any OpenRouter endpoint, and the screening above
+  supersedes them. The decision models are therefore not a way to a landing rule for the human corpus; whether they behave
+  differently on agent-versus-agent conflicts is open and needs conflicts with a recorded resolution (AgenticFlict has none).
