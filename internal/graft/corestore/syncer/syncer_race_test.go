@@ -37,6 +37,7 @@ func (e *env) commitFrom(t *testing.T, id int64, node string, src source, update
 		defer func() { require.NoError(t, pack.Remove()) }()
 		if !pack.Empty() {
 			in.PackKey = corestore.NewPackKey(id, pack.SHA256)
+			in.PackDeadline = time.Now().Add(time.Hour)
 			in.PackBytes = pack.Size
 			rc, err := pack.Open()
 			require.NoError(t, err)

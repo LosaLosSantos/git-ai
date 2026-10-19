@@ -393,11 +393,35 @@ func (s *Store) GetRepository(ctx context.Context, key corestore.RepoKey) (cores
 		return corestore.Repository{}, corestore.ErrRepositoryNotFound
 	}
 
-	r, err := s.selectRepository(ctx, s.db, "storage = ? AND relative_path = ?", []any{key.Storage, key.RelativePath}, false)
-	if err != nil {
-		return corestore.Repository{}, err
+	// The database time of the read (Repository.ReadAt): Postgres reads its
+	// clock in the same statement; SQLite's clock is the host's, read before.
+	readAt := time.Now().UTC()
+	query := "SELECT " + repoColumns + " FROM graft_repositories WHERE storage = ? AND relative_path = ?"
+	if s.dialect == Postgres {
+		query = "SELECT " + repoColumns + ", clock_timestamp() FROM graft_repositories WHERE storage = ? AND relative_path = ?"
 	}
-	return toRepository(r), nil
+	row := s.db.QueryRowContext(ctx, s.bind(query), key.Storage, key.RelativePath)
+	var clock any
+	r, err := scanRepoState(func(dest ...any) error {
+		if s.dialect == Postgres {
+			dest = append(dest, &clock)
+		}
+		return row.Scan(dest...)
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return corestore.Repository{}, corestore.ErrRepositoryNotFound
+	}
+	if err != nil {
+		return corestore.Repository{}, fmt.Errorf("select repository: %w", err)
+	}
+	if s.dialect == Postgres {
+		if readAt, err = scanTime(clock); err != nil {
+			return corestore.Repository{}, fmt.Errorf("read the database time: %w", err)
+		}
+	}
+	repo := toRepository(r)
+	repo.ReadAt = readAt
+	return repo, nil
 }
 
 // DeleteRepository implements corestore.MetaStore.

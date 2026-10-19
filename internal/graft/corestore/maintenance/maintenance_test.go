@@ -103,6 +103,7 @@ func (e *env) changeset(updates []corestore.RefUpdate, tips ...git.ObjectID) {
 	in := corestore.ChangesetInput{RepoID: e.repo.ID, Updates: updates, Operation: "test", Actor: "tester", NodeID: "node-a"}
 	if !pack.Empty() {
 		in.PackKey = corestore.NewPackKey(e.repo.ID, pack.SHA256)
+		in.PackDeadline = time.Now().Add(time.Hour)
 		rc, err := pack.Open()
 		require.NoError(e.t, err)
 		require.NoError(e.t, e.core.Blobs.Put(ctx, in.PackKey, rc))

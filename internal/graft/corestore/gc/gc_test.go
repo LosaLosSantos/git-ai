@@ -99,7 +99,7 @@ func (e *env) commit(key string) uint64 {
 		Operation: "test",
 		Actor:     "tester",
 		NodeID:    "node-a",
-		PackKey:   key,
+		PackKey:   key, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: 1,
 	})
 	require.NoError(e.t, err)
@@ -111,9 +111,9 @@ func (e *env) checkpoint(seq uint64) string {
 	e.t.Helper()
 	key := e.upload(e.repo.ID)
 	_, created, err := e.core.Meta.CreateCheckpoint(e.ctx, e.repo.ID, corestore.CheckpointInput{
-		Seq:       seq,
-		Refs:      map[string]corestore.Target{"refs/heads/main": corestore.Target(strings.Repeat("a", 40))},
-		PackKey:   key,
+		Seq:     seq,
+		Refs:    map[string]corestore.Target{"refs/heads/main": corestore.Target(strings.Repeat("a", 40))},
+		PackKey: key, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: 1,
 	})
 	require.NoError(e.t, err)

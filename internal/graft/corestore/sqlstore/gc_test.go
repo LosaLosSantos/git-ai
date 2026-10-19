@@ -38,7 +38,7 @@ func commitPack(ctx context.Context, s *sqlstore.Store, repoID int64, u corestor
 		Operation: "test",
 		Actor:     "tester",
 		NodeID:    "node-a",
-		PackKey:   packKey,
+		PackKey:   packKey, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: 1,
 	})
 }
@@ -170,7 +170,7 @@ func TestCheckpointLifecycle(t *testing.T) {
 			"refs/heads/main":      oid(2),
 			"refs/tags/\xff\xfev1": oid(7),
 		}
-		in := corestore.CheckpointInput{Seq: 2, Refs: refs, PackKey: ownedKey(repo.ID, "checkpoint 2"), PackBytes: 42}
+		in := corestore.CheckpointInput{Seq: 2, Refs: refs, PackKey: ownedKey(repo.ID, "checkpoint 2"), PackDeadline: time.Now().Add(time.Hour), PackBytes: 42}
 
 		cp, created, err := s.CreateCheckpoint(ctx, repo.ID, in)
 		require.NoError(t, err)
@@ -191,22 +191,22 @@ func TestCheckpointLifecycle(t *testing.T) {
 
 		// A second build at the same sequence keeps the first checkpoint and its pack.
 		again, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-			Seq: 2, Refs: refs, PackKey: ownedKey(repo.ID, "another build of 2"),
+			Seq: 2, Refs: refs, PackKey: ownedKey(repo.ID, "another build of 2"), PackDeadline: time.Now().Add(time.Hour),
 		})
 		require.NoError(t, err)
 		require.False(t, created)
 		require.Equal(t, cp, again)
 
 		for name, bad := range map[string]corestore.CheckpointInput{
-			"sequence 0":            {Seq: 0, Refs: refs, PackKey: ownedKey(repo.ID, "x")},
-			"beyond the head":       {Seq: 4, Refs: refs, PackKey: ownedKey(repo.ID, "x")},
-			"older than the newest": {Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "x")},
-			"legacy pack key":       {Seq: 3, Refs: refs, PackKey: legacyKey(repo.ID, "x")},
-			"another repository":    {Seq: 3, Refs: refs, PackKey: ownedKey(repo.ID+1000, "x")},
+			"sequence 0":            {Seq: 0, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"beyond the head":       {Seq: 4, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"older than the newest": {Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"legacy pack key":       {Seq: 3, Refs: refs, PackKey: legacyKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"another repository":    {Seq: 3, Refs: refs, PackKey: ownedKey(repo.ID+1000, "x"), PackDeadline: time.Now().Add(time.Hour)},
 			"no pack key":           {Seq: 3, Refs: refs},
-			"no references":         {Seq: 3, PackKey: ownedKey(repo.ID, "x")},
-			"absent target":         {Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": ""}, PackKey: ownedKey(repo.ID, "x")},
-			"empty name":            {Seq: 3, Refs: map[string]corestore.Target{"": oid(1)}, PackKey: ownedKey(repo.ID, "x")},
+			"no references":         {Seq: 3, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"absent target":         {Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": ""}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
+			"empty name":            {Seq: 3, Refs: map[string]corestore.Target{"": oid(1)}, PackKey: ownedKey(repo.ID, "x"), PackDeadline: time.Now().Add(time.Hour)},
 		} {
 			_, _, err := s.CreateCheckpoint(ctx, repo.ID, bad)
 			require.Error(t, err, name)
@@ -217,7 +217,7 @@ func TestCheckpointLifecycle(t *testing.T) {
 		}
 
 		cp3, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-			Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": oid(3)}, PackKey: ownedKey(repo.ID, "checkpoint 3"),
+			Seq: 3, Refs: map[string]corestore.Target{"refs/heads/main": oid(3)}, PackKey: ownedKey(repo.ID, "checkpoint 3"), PackDeadline: time.Now().Add(time.Hour),
 		})
 		require.NoError(t, err)
 		require.True(t, created)
@@ -236,7 +236,7 @@ func TestCheckpointLifecycle(t *testing.T) {
 		require.False(t, deleted)
 
 		_, _, err = s.CreateCheckpoint(ctx, repo.ID+1000, corestore.CheckpointInput{
-			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID+1000, "unknown"),
+			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID+1000, "unknown"), PackDeadline: time.Now().Add(time.Hour),
 		})
 		require.ErrorIs(t, err, corestore.ErrRepositoryNotFound)
 	})
@@ -252,7 +252,7 @@ func TestSyncBoundaryUsesTheDatabaseClock(t *testing.T) {
 
 		for seq := uint64(1); seq <= 3; seq++ {
 			_, _, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-				Seq: seq, Refs: map[string]corestore.Target{"refs/heads/main": oid(int(seq))}, PackKey: ownedKey(repo.ID, fmt.Sprint(seq)),
+				Seq: seq, Refs: map[string]corestore.Target{"refs/heads/main": oid(int(seq))}, PackKey: ownedKey(repo.ID, fmt.Sprint(seq)), PackDeadline: time.Now().Add(time.Hour),
 			})
 			require.NoError(t, err)
 		}
@@ -394,7 +394,7 @@ func TestDeleteRepositoryRecordsTombstone(t *testing.T) {
 
 		// Rows of milestone 3 go with the repository.
 		_, _, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-			Seq: 2, Refs: map[string]corestore.Target{"refs/heads/main": oid(2)}, PackKey: ownedKey(repo.ID, "cp"),
+			Seq: 2, Refs: map[string]corestore.Target{"refs/heads/main": oid(2)}, PackKey: ownedKey(repo.ID, "cp"), PackDeadline: time.Now().Add(time.Hour),
 		})
 		require.NoError(t, err)
 		require.NoError(t, s.RecordOrphans(ctx, repo.ID, []string{ownedKey(repo.ID, "orphan")}))
@@ -703,7 +703,7 @@ func TestLockOrderConcurrentWriters(t *testing.T) {
 				}
 
 				cp, created, err := a.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-					Seq: head, Refs: refs, PackKey: ownedKey(repo.ID, fmt.Sprint("checkpoint ", head)),
+					Seq: head, Refs: refs, PackKey: ownedKey(repo.ID, fmt.Sprint("checkpoint ", head)), PackDeadline: time.Now().Add(time.Hour),
 				})
 				switch {
 				case err == nil && created:

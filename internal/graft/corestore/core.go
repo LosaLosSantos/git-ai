@@ -126,28 +126,38 @@ type PackUpload struct {
 	// upload plus WriteDeadline(). It keeps the monotonic clock reading of that
 	// read, so that it is compared on the monotonic clock.
 	Deadline time.Time
+	// DBDeadline is the same deadline on the database clock: the record's
+	// ReadAt plus WriteDeadline(). The commit of the row that references the
+	// pack checks it in its transaction (ChangesetInput.PackDeadline,
+	// CheckpointInput.PackDeadline): the monotonic clock stops while the host
+	// is suspended or the VM paused, the database clock does not.
+	DBDeadline time.Time
 }
 
 // UploadPack uploads the pack read from r (size bytes whose SHA-256 is sum)
-// under a new owned key of the repository. readAt is the time of a read of the
-// repository record that found the repository, taken before that read and
-// before the upload; the upload must end before readAt + WriteDeadline(), else
-// it is cancelled (nothing is stored) and the error wraps ErrPackDeadline. It is
-// the only way the storage core uploads a pack (doc/graft/PLAN7.md, RULE 26).
-func (c *Core) UploadPack(ctx context.Context, repoID int64, readAt time.Time, sum [32]byte, size int64, r io.Reader) (PackUpload, error) {
+// under a new owned key of the repository. record was returned by a read of the
+// repository record that found the repository (GetRepository: its ReadAt is
+// the database time of that read), and readAt is the time taken before that
+// read; the upload must end before readAt + WriteDeadline(), else it is
+// cancelled (nothing is stored) and the error wraps ErrPackDeadline. It is the
+// only way the storage core uploads a pack (doc/graft/PLAN7.md, RULE 26).
+func (c *Core) UploadPack(ctx context.Context, record Repository, readAt time.Time, sum [32]byte, size int64, r io.Reader) (PackUpload, error) {
 	if c.GCGrace <= 0 || c.GCMargin <= 0 || c.WriteDeadline() <= 0 {
 		return PackUpload{}, fmt.Errorf("storage core: invalid write deadline: gc_grace %s, gc_margin %s", c.GCGrace, c.GCMargin)
+	}
+	if record.ReadAt.IsZero() {
+		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: the record carries no database read time", record.ID)
 	}
 
 	deadline := readAt.Add(c.WriteDeadline())
 	if !time.Now().Before(deadline) {
-		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: %w", repoID, ErrPackDeadline)
+		return PackUpload{}, fmt.Errorf("storage core: upload a pack of repository %d: %w", record.ID, ErrPackDeadline)
 	}
 
 	putCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	key := NewPackKey(repoID, sum)
+	key := NewPackKey(record.ID, sum)
 	if err := c.Blobs.Put(putCtx, key, r); err != nil {
 		if ctx.Err() == nil && errors.Is(putCtx.Err(), context.DeadlineExceeded) {
 			return PackUpload{}, fmt.Errorf("storage core: upload %q: %w: %w", key, ErrPackDeadline, err)
@@ -155,7 +165,7 @@ func (c *Core) UploadPack(ctx context.Context, repoID int64, readAt time.Time, s
 		return PackUpload{}, fmt.Errorf("storage core: upload %q: %w", key, err)
 	}
 
-	return PackUpload{Key: key, Bytes: size, Deadline: deadline}, nil
+	return PackUpload{Key: key, Bytes: size, Deadline: deadline, DBDeadline: record.ReadAt.Add(c.WriteDeadline())}, nil
 }
 
 // CommitContext returns ctx bounded by the upload's deadline, for the commit of

@@ -259,7 +259,7 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 		return nil, nil
 	}
 
-	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, readAt, updates)
+	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -457,21 +457,22 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 	if prepared != nil && prepared.ok && prepared.repoID == record.ID && prepared.usable(time.Now()) {
 		pack = prepared.pack
 	} else {
-		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record.ID, readAt, updates)
+		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
 		if err != nil {
 			return v.unavailable(err)
 		}
 	}
 
 	in := corestore.ChangesetInput{
-		RepoID:    record.ID,
-		Updates:   refUpdates,
-		Operation: meta.Operation,
-		Actor:     meta.Actor,
-		NodeID:    v.core.NodeID,
-		Force:     shadow,
-		PackKey:   pack.Key,
-		PackBytes: pack.Bytes,
+		RepoID:       record.ID,
+		Updates:      refUpdates,
+		Operation:    meta.Operation,
+		Actor:        meta.Actor,
+		NodeID:       v.core.NodeID,
+		Force:        shadow,
+		PackKey:      pack.Key,
+		PackBytes:    pack.Bytes,
+		PackDeadline: pack.DBDeadline,
 	}
 
 	if err := v.fault(faultAfterUpload); err != nil {
@@ -678,7 +679,8 @@ func newTips(updates []inputUpdate) []git.ObjectID {
 // local reference reaches (invariant I1, gitops.BuildPack); in shadow mode,
 // everything that the values the database records reach (buildPackAgainst),
 // because local references can hold values the storage core never recorded.
-func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, repoID int64, readAt time.Time, updates []inputUpdate) (corestore.PackUpload, error) {
+func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, record corestore.Repository, readAt time.Time, updates []inputUpdate) (corestore.PackUpload, error) {
+	repoID := record.ID
 	tips := newTips(updates)
 	if len(tips) == 0 {
 		return corestore.PackUpload{}, nil
@@ -720,7 +722,7 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 	}
 	defer func() { _ = r.Close() }()
 
-	upload, err := v.core.UploadPack(ctx, repoID, readAt, pack.SHA256, pack.Size, r)
+	upload, err := v.core.UploadPack(ctx, record, readAt, pack.SHA256, pack.Size, r)
 	if err != nil {
 		return corestore.PackUpload{}, err
 	}

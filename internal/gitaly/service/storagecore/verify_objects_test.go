@@ -59,7 +59,7 @@ func TestVerifyRepositoryReportsObjectsMissingFromStorage(t *testing.T) {
 			Actor:     "tester",
 			NodeID:    "node-a",
 			Force:     true,
-			PackKey:   key,
+			PackKey:   key, PackDeadline: time.Now().Add(time.Hour),
 			PackBytes: pack.Size,
 		})
 		require.NoError(t, err)
@@ -100,7 +100,7 @@ func (h *harness) checkpointAtHead(repoID int64) corestore.Checkpoint {
 	require.NoError(h.t, h.core.Blobs.Put(h.ctx, key, f))
 	require.NoError(h.t, f.Close())
 
-	cp, created, err := h.core.Meta.CreateCheckpoint(h.ctx, repoID, corestore.CheckpointInput{Seq: seq, Refs: refs, PackKey: key, PackBytes: pack.Size})
+	cp, created, err := h.core.Meta.CreateCheckpoint(h.ctx, repoID, corestore.CheckpointInput{Seq: seq, Refs: refs, PackKey: key, PackDeadline: time.Now().Add(time.Hour), PackBytes: pack.Size})
 	require.NoError(h.t, err)
 	require.True(h.t, created)
 	return cp

@@ -23,6 +23,10 @@ type ChangesetInput struct {
 	// objects, empty when there are none. PackBytes is its size.
 	PackKey   string
 	PackBytes int64
+	// PackDeadline is the write deadline of the pack on the database clock
+	// (PackUpload.DBDeadline). A changeset with a pack is committed only before
+	// it, checked in the commit's transaction; one without it is refused.
+	PackDeadline time.Time
 	// Changelog, when not nil, appends one changelog entry per effective update
 	// of a branch or tag (IsChangelogRef), in the order of Updates, in the same
 	// transaction. The entries get the next changelog sequences, the actual
@@ -80,6 +84,9 @@ type CheckpointInput struct {
 	// pack, PackBytes its size.
 	PackKey   string
 	PackBytes int64
+	// PackDeadline is the write deadline of the pack on the database clock
+	// (PackUpload.DBDeadline), checked in the record's transaction.
+	PackDeadline time.Time
 }
 
 var (

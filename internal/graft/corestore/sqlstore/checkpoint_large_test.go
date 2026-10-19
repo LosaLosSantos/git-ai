@@ -60,7 +60,7 @@ func TestCheckpointOfManyReferences(t *testing.T) {
 
 		began := time.Now()
 		_, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
-			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "large checkpoint"), PackBytes: 1,
+			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "large checkpoint"), PackDeadline: time.Now().Add(time.Hour), PackBytes: 1,
 		})
 		took := time.Since(began)
 		close(done)

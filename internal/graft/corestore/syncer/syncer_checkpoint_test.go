@@ -41,7 +41,7 @@ func (e *env) checkpoint(t *testing.T, id int64, src source) corestore.Checkpoin
 	require.NoError(t, e.core.Blobs.Put(e.ctx, key, rc))
 	require.NoError(t, rc.Close())
 
-	cp, created, err := e.core.Meta.CreateCheckpoint(e.ctx, id, corestore.CheckpointInput{Seq: seq, Refs: refs, PackKey: key, PackBytes: pack.Size})
+	cp, created, err := e.core.Meta.CreateCheckpoint(e.ctx, id, corestore.CheckpointInput{Seq: seq, Refs: refs, PackKey: key, PackDeadline: time.Now().Add(time.Hour), PackBytes: pack.Size})
 	require.NoError(t, err)
 	require.True(t, created)
 	return cp

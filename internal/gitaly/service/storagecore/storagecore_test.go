@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -198,7 +199,7 @@ func (h *harness) commitElsewhere(repoID int64, ref string) git.ObjectID {
 		Operation: "test",
 		Actor:     "other-node",
 		NodeID:    "node-b",
-		PackKey:   key,
+		PackKey:   key, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: pack.Size,
 	})
 	require.NoError(h.t, err)

@@ -131,6 +131,12 @@ type Repository struct {
 	// LogSeq is the sequence of the last changelog entry, 0 when there is none.
 	LogSeq    uint64
 	CreatedAt time.Time
+	// ReadAt is the database time of the read that returned the record (set by
+	// GetRepository), at or before the read. A pack uploaded after the read is
+	// first observable by garbage collection after ReadAt, so a row that
+	// references it is committed before ReadAt + Core.WriteDeadline() on the
+	// database clock (PackUpload.DBDeadline, checked in the commit).
+	ReadAt time.Time
 }
 
 // Changeset is one recorded changeset of the write-ahead log.

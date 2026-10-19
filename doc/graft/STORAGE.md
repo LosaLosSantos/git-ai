@@ -357,12 +357,18 @@ How it stays safe:
 - Every "how old" decision uses the database clock: Postgres's `now()`; with
   SQLite, the host clock, since SQLite serves one host. The clocks of the
   nodes never decide.
-- A writer measures its deadline on its own monotonic clock, so the steps of
-  a node's wall clock do not matter. The assumption is that, over `gc_grace`,
-  the writer's clock runs at most `gc_margin` slower than the database's, a
-  forward jump of the database clock included. With the defaults, 5 minutes
-  over an hour. Do not step the database host's clock forward by more than
-  `gc_margin`.
+- The writer's deadline is checked on the database clock, in the commit's own
+  transaction. The deadline is the database time of the record read that
+  preceded the upload plus `gc_grace − gc_margin`. Garbage collection observes
+  a pack it may delete on the same clock, and only after that read. So a
+  committed row never references a deleted pack, however long the writer
+  stopped: a suspended host, a paused VM, a long garbage-collection pause of
+  the process.
+  - The writer also stops its upload early on its own monotonic clock. That
+    only saves work; it is not what makes it safe.
+  - The one assumption left is that the database clock does not step backward
+    by more than `gc_margin` (5 minutes by default). A forward step is safe:
+    it makes the commit check refuse earlier.
 - `gc_grace` must also be greater than `sync_timeout + gc_margin`, so that a
   sync that started from an older checkpoint never meets a pack deleted under
   it.

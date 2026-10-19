@@ -191,6 +191,7 @@ func (e *env) changeset(t *testing.T, id int64, src source, updates []corestore.
 		require.NoError(t, e.core.Blobs.Put(e.ctx, key, rc))
 		require.NoError(t, rc.Close())
 		in.PackKey = key
+		in.PackDeadline = time.Now().Add(time.Hour)
 		in.PackBytes = pack.Size
 	}
 

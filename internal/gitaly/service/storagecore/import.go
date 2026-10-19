@@ -162,18 +162,22 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	var upload corestore.PackUpload
 	if !pack.Empty() {
 		readAt := time.Now()
-		if _, err := core.Meta.GetRepository(ctx, key); err != nil {
+		record, err := core.Meta.GetRepository(ctx, key)
+		if err != nil {
 			if errors.Is(err, corestore.ErrRepositoryNotFound) {
 				return nil, errRegistrationRemoved()
 			}
 			return nil, structerr.NewUnavailable("storage core: %w; %s", err, resumeHint)
+		}
+		if record.ID != reg.repo.ID {
+			return nil, errRegistrationRemoved()
 		}
 
 		f, err := pack.Open()
 		if err != nil {
 			return nil, structerr.NewInternal("open pack: %w; %s", err, resumeHint)
 		}
-		upload, err = core.UploadPack(ctx, reg.repo.ID, readAt, pack.SHA256, pack.Size, f)
+		upload, err = core.UploadPack(ctx, record, readAt, pack.SHA256, pack.Size, f)
 		_ = f.Close()
 		if err != nil {
 			return nil, structerr.NewUnavailable("storage core: upload pack: %w; %s", err, resumeHint)
@@ -197,13 +201,14 @@ func (s *server) ImportRepository(ctx context.Context, req *gitalypb.ImportRepos
 	defer cancel()
 
 	res, err := core.Meta.CommitChangeset(commitCtx, corestore.ChangesetInput{
-		RepoID:    reg.repo.ID,
-		Updates:   updates,
-		Operation: importOperation,
-		Actor:     identity.Actor(ctx, importOperation),
-		NodeID:    core.NodeID,
-		PackKey:   upload.Key,
-		PackBytes: upload.Bytes,
+		RepoID:       reg.repo.ID,
+		Updates:      updates,
+		Operation:    importOperation,
+		Actor:        identity.Actor(ctx, importOperation),
+		NodeID:       core.NodeID,
+		PackKey:      upload.Key,
+		PackBytes:    upload.Bytes,
+		PackDeadline: upload.DBDeadline,
 	})
 	if err != nil {
 		var conflict *corestore.ErrRefConflict

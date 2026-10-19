@@ -3,6 +3,7 @@ package syncer_test
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -119,7 +120,7 @@ func testSyncerIncompleteImport(t *testing.T, dialect sqlstore.Dialect, backend 
 		Operation: "import",
 		Actor:     "tester",
 		NodeID:    "node-a",
-		PackKey:   packKey,
+		PackKey:   packKey, PackDeadline: time.Now().Add(time.Hour),
 		PackBytes: pack.Size,
 	})
 	require.NoError(t, err)

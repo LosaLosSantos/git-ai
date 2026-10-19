@@ -167,6 +167,7 @@ func (e *env) changeset(t *testing.T, id int64, src source, updates []corestore.
 	}
 	if !pack.Empty() {
 		in.PackKey = corestore.NewPackKey(id, pack.SHA256)
+		in.PackDeadline = time.Now().Add(time.Hour)
 		rc, err := pack.Open()
 		require.NoError(t, err)
 		require.NoError(t, e.core.Blobs.Put(e.ctx, in.PackKey, rc))

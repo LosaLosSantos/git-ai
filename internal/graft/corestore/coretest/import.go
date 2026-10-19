@@ -54,12 +54,13 @@ func Import(tb testing.TB, core *corestore.Core, repo *localrepo.Repo, repoProto
 	var upload corestore.PackUpload
 	if !pack.Empty() {
 		readAt := time.Now()
-		_, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repoProto))
+		record, err := core.Meta.GetRepository(ctx, corestore.KeyOf(repoProto))
 		require.NoError(tb, err)
+		require.Equal(tb, registered.ID, record.ID)
 
 		f, err := pack.Open()
 		require.NoError(tb, err)
-		upload, err = core.UploadPack(ctx, registered.ID, readAt, pack.SHA256, pack.Size, f)
+		upload, err = core.UploadPack(ctx, record, readAt, pack.SHA256, pack.Size, f)
 		require.NoError(tb, err)
 		require.NoError(tb, f.Close())
 	}
@@ -74,13 +75,14 @@ func Import(tb testing.TB, core *corestore.Core, repo *localrepo.Repo, repoProto
 	defer cancel()
 
 	res, err := core.Meta.CommitChangeset(commitCtx, corestore.ChangesetInput{
-		RepoID:    registered.ID,
-		Updates:   updates,
-		Operation: "import",
-		Actor:     "import",
-		NodeID:    core.NodeID,
-		PackKey:   upload.Key,
-		PackBytes: upload.Bytes,
+		RepoID:       registered.ID,
+		Updates:      updates,
+		Operation:    "import",
+		Actor:        "import",
+		NodeID:       core.NodeID,
+		PackKey:      upload.Key,
+		PackBytes:    upload.Bytes,
+		PackDeadline: upload.DBDeadline,
 	})
 	require.NoError(tb, err)
 	require.Equal(tb, uint64(1), res.Seq, "the import is changeset 1")

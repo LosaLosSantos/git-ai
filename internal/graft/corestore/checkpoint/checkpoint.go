@@ -165,7 +165,7 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 	if err != nil {
 		return corestore.Checkpoint{}, false, structerr.NewInternal("open the checkpoint pack: %w", err)
 	}
-	upload, err := c.core.UploadPack(ctx, record.ID, readAt, pack.SHA256, pack.Size, f)
+	upload, err := c.core.UploadPack(ctx, current, readAt, pack.SHA256, pack.Size, f)
 	if closeErr := f.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
@@ -184,10 +184,11 @@ func (c *Checkpointer) Create(ctx context.Context, repo *gitalypb.Repository) (c
 	defer cancel()
 
 	cp, created, err := c.core.Meta.CreateCheckpoint(commitCtx, record.ID, corestore.CheckpointInput{
-		Seq:       seq,
-		Refs:      refs,
-		PackKey:   upload.Key,
-		PackBytes: upload.Bytes,
+		Seq:          seq,
+		Refs:         refs,
+		PackKey:      upload.Key,
+		PackBytes:    upload.Bytes,
+		PackDeadline: upload.DBDeadline,
 	})
 	if err != nil {
 		return corestore.Checkpoint{}, false, errRepository(err)

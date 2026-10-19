@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -164,7 +165,7 @@ func TestAuthoritativeServer(t *testing.T) {
 					Operation: "land",
 					Actor:     "other-node",
 					NodeID:    "node-b",
-					PackKey:   key,
+					PackKey:   key, PackDeadline: time.Now().Add(time.Hour),
 					PackBytes: pack.Size,
 				})
 				return err
