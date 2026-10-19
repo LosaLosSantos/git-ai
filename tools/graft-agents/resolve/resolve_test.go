@@ -24,6 +24,17 @@ func (s *fakeStrategy) Resolve(_ context.Context, f File, _ protocol.Request) (R
 	return s.fn(f)
 }
 
+// IsRule: the fake stands for a rule (RuleStrategy); the tests of a model use proposingStrategy, and the
+// tests of a strategy that says nothing use externalStrategy.
+func (s *fakeStrategy) IsRule() bool { return true }
+
+// externalStrategy is a strategy as another package registers it: it implements Strategy and nothing else.
+type externalStrategy struct{}
+
+func (externalStrategy) Resolve(context.Context, File, protocol.Request) (Resolution, bool, error) {
+	return Resolution{Action: protocol.ActionWrite, Mode: protocol.ModeFile, Content: []byte("external\n")}, true, nil
+}
+
 // recordingStrategy also implements Recorder.
 type recordingStrategy struct {
 	fakeStrategy
@@ -591,10 +602,47 @@ func TestConcurrentResolve(t *testing.T) {
 // proposingStrategy answers like fakeStrategy, as a model does: its answers are proposals.
 type proposingStrategy struct{ fakeStrategy }
 
-func (*proposingStrategy) proposes() {}
+// IsRule: not a rule.
+func (*proposingStrategy) IsRule() bool { return false }
 
-// The llm strategy's answers are proposals (PLAN10 14).
-var _ proposer = (*llmStrategy)(nil)
+// TestStrategyOriginDefaultsToModel: fail-safe at the resolver's layer. A strategy that another
+// package registers (RegisterStrategy) and does not say it is a rule gives a model's answers: origin
+// "model", a proposal, not recorded. The built-in rules, and a command that is configured as one,
+// are rules; the llm strategy and a command configured as a model are not.
+func TestStrategyOriginDefaultsToModel(t *testing.T) {
+	rec := &recordingStrategy{fakeStrategy: fakeStrategy{fn: decline}}
+	r := newTestResolver(t, nil, Binding{Name: "rec", Strategy: rec}, Binding{Name: "ext", Strategy: externalStrategy{}})
+	resp, err := r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Files) != 1 || resp.Files[0].Origin != protocol.OriginModel || !resp.Files[0].Proposal {
+		t.Fatalf("files %+v, want one answer of origin %q", resp.Files, protocol.OriginModel)
+	}
+	if len(rec.recorded) != 0 {
+		t.Fatalf("an external strategy's answer was recorded: %+v", rec.recorded)
+	}
+
+	for name, s := range map[string]Strategy{
+		"trivial": trivial{}, "union": union{}, "rerere": rerere{dir: t.TempDir()},
+		"command":       command{argv: []string{"x"}},
+		"command-model": command{argv: []string{"x"}, model: true},
+		"llm":           &llmStrategy{},
+		"external":      externalStrategy{},
+	} {
+		want := protocol.OriginModel
+		switch name {
+		case "trivial", "union", "rerere", "command":
+			want = protocol.OriginRule
+		}
+		if got := originOf(s); got != want {
+			t.Errorf("%s: origin %q, want %q", name, got, want)
+		}
+	}
+}
+
+// The llm strategy's answers are a model's (PLAN10 14): it is not a RuleStrategy.
+var _ = func() bool { _, rule := Strategy(&llmStrategy{}).(RuleStrategy); return !rule }()
 
 // TestProposalsAreMarkedAndNotRecorded: a model's answer is marked as a proposal, which the server
 // lands only after verification, and no Recorder learns it, so that it can never come back as a rule's answer; a

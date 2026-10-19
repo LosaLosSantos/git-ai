@@ -134,7 +134,7 @@ func (s *Server) landPrecheckInQuarantine(ctx context.Context, in *gitalypb.User
 // Retrying within the RPC would read the same tip again, so the conflict is reported to the
 // client instead and the client has to retry the landing.
 func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
-	snapshotPinned := mvcc.CacheFromContext(ctx) != nil
+	snapshotPinned := landSnapshotPinned(ctx)
 
 	maxAttempts := int(in.GetMaxAttempts())
 	if maxAttempts == 0 {
@@ -153,8 +153,8 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 			return nil, err
 		}
 
-		if attempt >= maxAttempts || snapshotPinned {
-			return nil, landKeptMoving(in, pre, conflict, attempt)
+		if err := landLostRace(in, pre, conflict, attempt, maxAttempts, snapshotPinned); err != nil {
+			return nil, err
 		}
 
 		if err := waitLandBackoff(ctx, attempt); err != nil {
@@ -407,6 +407,27 @@ func landMergeConflictError(tip, commitID git.ObjectID, conflictingFiles [][]byt
 // cause: the branch moved on): UserLand goes out again, and at its deadline the agent gets the
 // proposals, not an error about a branch it has nothing to do with. The others get
 // landKeptMovingError.
+// landSnapshotPinned reports whether the RPC reads a snapshot that is pinned for all of it (MVCC).
+func landSnapshotPinned(ctx context.Context) bool {
+	return mvcc.CacheFromContext(ctx) != nil
+}
+
+// landLostRace decides what a landing attempt that lost the compare-and-swap does next: nil to
+// attempt again, or the error that ends the land. On a pinned snapshot a new attempt in the RPC
+// would read the same tip and build the same tree, so the land ends with the retryable
+// FailedPrecondition for the client to retry, whatever the land holds: not even a model's
+// resolution is handed back to be verified again, as that would verify the same tree once more.
+// Otherwise the attempts run out at max_attempts and the land ends as landKeptMoving says.
+func landLostRace(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempt, maxAttempts int, pinned bool) error {
+	switch {
+	case pinned:
+		return landKeptMovingError(in, conflict, attempt)
+	case attempt >= maxAttempts:
+		return landKeptMoving(in, pre, conflict, attempt)
+	}
+	return nil
+}
+
 func landKeptMoving(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempts int) error {
 	if pre.hasModel() {
 		return &landNeedsResolution{tip: conflict.newOID, commit: git.ObjectID(in.GetCommitId()), moved: true}

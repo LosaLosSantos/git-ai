@@ -377,3 +377,40 @@ func TestCommandInChainWithRerereRecording(t *testing.T) {
 		t.Fatalf("rerere did not reuse the recorded answer: %+v", second)
 	}
 }
+
+// TestCommandStrategyOrigin: a command is a rule unless it is configured as a model (origin = "model"),
+// for the command that calls a model; any other origin is refused.
+func TestCommandStrategyOrigin(t *testing.T) {
+	argv := toAny(helperArgv("copy", "{ours}", "{out}"))
+	for origin, want := range map[string]string{"": protocol.OriginRule, "rule": protocol.OriginRule, "model": protocol.OriginModel} {
+		opts := map[string]any{"command": argv}
+		if origin != "" {
+			opts["origin"] = origin
+		}
+		s, err := newCommand(StrategySpec{Name: "cmd", Type: "command", Options: opts})
+		if err != nil {
+			t.Fatalf("origin %q: %v", origin, err)
+		}
+		if got := originOf(s); got != want {
+			t.Errorf("origin %q: %q, want %q", origin, got, want)
+		}
+	}
+	if _, err := newCommand(StrategySpec{Name: "cmd", Type: "command", Options: map[string]any{"command": argv, "origin": "ai"}}); err == nil ||
+		!strings.Contains(err.Error(), "origin must be") {
+		t.Fatalf("origin ai: %v", err)
+	}
+
+	// Through a resolver: a command configured as a model gives a proposal, which is not recorded.
+	s, err := newCommand(StrategySpec{Name: "cmd", Type: "command", Options: map[string]any{"command": argv, "origin": "model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newTestResolver(t, nil, Binding{Name: "cmd", Strategy: s})
+	resp, err := r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Files) != 1 || resp.Files[0].Origin != protocol.OriginModel || !resp.Files[0].Proposal {
+		t.Fatalf("files %+v", resp.Files)
+	}
+}

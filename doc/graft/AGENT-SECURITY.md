@@ -234,6 +234,16 @@ start from), and a separate unprivileged user. The post-merge test command of
 `graft-verify` ([VERIFY](VERIFY.md)) runs the same kind of code on the tip and
 has the same advice. Without a `verify.command` nothing of a model's lands.
 
+What counts as a model's answer is fail-safe on both sides. The server treats any
+file that is not marked `origin: "rule"` as a model's. `graft-resolve` marks as a
+rule only the strategies that say so (trivial, union, rerere, and a `command`
+that is not configured with `origin = "model"`); every other strategy, including
+one registered from another package, is a model. A third-party resolver, or a
+strategy that claims to be a rule, is the operator's trust: a `command` that
+calls an AI and is left as a rule lands without the verification. The rerere
+store of v0.1.0 and v0.2.0 may hold model answers; its entries without an origin
+are never replayed as rules (see [RESOLVE](RESOLVE.md)).
+
 - Automatic conflict resolution is off by default and can be limited to
   specific actors and paths (see [RESOLVE](RESOLVE.md)).
 - The verifier writes the green ref and reverts with the operator credential,

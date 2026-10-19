@@ -234,6 +234,13 @@ func (s *Server) landResolveAt(
 			if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, combined); err != nil {
 				return l, nil, err
 			}
+			// The command may already have passed on this very tree, in an earlier round: whatever brought
+			// the land back (a snapshot that reads the same tip, a tip that moved to the same tree),
+			// verifying it again would hold the repository's slot for minutes for the same answer.
+			if pre.isVerified(tree) {
+				verified = tree
+				break
+			}
 			var verifyErr *landVerifyError
 			switch err := s.landVerifyOutOfLane(ctx, in.GetRepository(), repo, tree); {
 			case err == nil:

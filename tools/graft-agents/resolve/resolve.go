@@ -72,6 +72,31 @@ type syntaxChecked interface {
 	syntaxChecked()
 }
 
+// RuleStrategy is implemented by the strategies whose answers are a rule's: deterministic code
+// that the operator trusts (trivial, union, rerere, and command unless it is configured as a
+// model). Their resolutions land on the server without the operator's verify.command.
+//
+// The default is the other way round, fail-safe at this layer: a strategy that does not
+// implement RuleStrategy, or whose IsRule says false, is a MODEL. That is the llm strategy and
+// every strategy that another package registers with RegisterStrategy. Its answers are marked
+// origin "model", and the server lands them only if verify.command passed on the exact merged
+// tree (PLAN10 14, 15.9). A strategy that implements RuleStrategy claims that its answers are
+// a rule's, and that claim is the operator's trust: do not write it for anything that asks a
+// model, or reads what a model wrote.
+type RuleStrategy interface {
+	Strategy
+	// IsRule reports whether the answers of this strategy are a rule's.
+	IsRule() bool
+}
+
+// originOf is the origin of the answers of s: a rule's only when s says so.
+func originOf(s Strategy) string {
+	if r, ok := s.(RuleStrategy); ok && r.IsRule() {
+		return protocol.OriginRule
+	}
+	return protocol.OriginModel
+}
+
 // Recorder is implemented by strategies that want to learn accepted answers.
 type Recorder interface {
 	Record(ctx context.Context, f File, res Resolution) error
@@ -451,16 +476,13 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			continue
 		}
 		// A model resolution is a proposal: the server lands it only after verify.command passed on
-		// the tree that lands (PLAN10 14, 15.9). It is not
-		// recorded either: a strategy that learns accepted answers (Recorder) would otherwise
-		// replay a model's resolution later as a rule's.
-		_, proposal := b.Strategy.(proposer)
+		// the tree that lands (PLAN10 14, 15.9). It is not recorded either: a strategy that learns
+		// accepted answers (Recorder) would otherwise replay a model's resolution later as a
+		// rule's. What is not a rule (originOf) is a model.
+		origin := originOf(b.Strategy)
+		proposal := origin == protocol.OriginModel
 		if !proposal {
 			r.record(ctx, f, res)
-		}
-		origin := protocol.OriginRule
-		if proposal {
-			origin = protocol.OriginModel
 		}
 		return protocol.ResolvedFile{
 			Path:     f.Path,

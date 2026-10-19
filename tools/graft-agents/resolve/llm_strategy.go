@@ -180,14 +180,6 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 // syntaxChecked marks the llm answers for the syntax check (resolveFile).
 func (s *llmStrategy) syntaxChecked() {}
 
-// proposer marks a strategy whose results are proposals: those of a model, which the server
-// proposes to the agent, and lands only when verify.command passed on the tree that lands
-// (PLAN10 14, 15.9).
-type proposer interface{ proposes() }
-
-// proposes marks the llm answers as proposals (resolveFile).
-func (s *llmStrategy) proposes() {}
-
 // llmBytes keeps an empty side distinct from an absent one: ResolveLLM treats
 // nil as absent.
 func llmBytes(b []byte) []byte {

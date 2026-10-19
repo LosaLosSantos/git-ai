@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
@@ -27,11 +28,30 @@ type rerere struct {
 	dir string
 }
 
+// rerereVersion is the version of the entries this code writes and replays. Version 1 had no
+// version and no origin: the entries of v0.1.0 and v0.2.0 recorded the llm answers as well, so
+// nothing can tell a rule's entry from a model's among them. They are never replayed as a rule's.
+const rerereVersion = 2
+
 type storedResolution struct {
+	// Version is rerereVersion; absent (0) in the entries written before it.
+	Version int `json:"version,omitempty"`
+	// Origin is who made the answer: protocol.OriginRule, the only one that is recorded.
+	Origin  string `json:"origin,omitempty"`
 	Action  string `json:"action"`
 	Mode    string `json:"mode,omitempty"`
 	Content []byte `json:"content"`
 }
+
+// rerereLegacy is called once per process, the first time the store shows an entry that is not
+// of the current version or not of a rule's: such an entry is skipped, and this is the line that
+// tells the operator why. Tests replace it.
+var rerereLegacy = func(dir string) {
+	fmt.Fprintf(os.Stderr, "graft-resolve: rerere store %s has entries of an older version or of no known rule origin; "+
+		"they are not replayed (clear the store to remove them)\n", dir)
+}
+
+var rerereLegacyOnce sync.Once
 
 func newRerere(spec StrategySpec) (Strategy, error) {
 	if err := allowOnly(spec, "dir"); err != nil {
@@ -63,6 +83,10 @@ func rerereKey(f File) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// IsRule: rerere replays only the answers of rules (RuleStrategy); an entry of another origin, or
+// of no origin, is never replayed (see Resolve).
+func (rerere) IsRule() bool { return true }
+
 func (r rerere) entryPath(key string) string {
 	return filepath.Join(r.dir, key+".json")
 }
@@ -78,6 +102,13 @@ func (r rerere) Resolve(_ context.Context, f File, _ protocol.Request) (Resoluti
 	var s storedResolution
 	if err := json.Unmarshal(data, &s); err != nil {
 		return Resolution{}, false, fmt.Errorf("corrupt rerere entry: %w", err)
+	}
+	// Fail-safe: only an entry that says it is a rule's, in a version this code knows, is a rule's
+	// answer. The older entries may be a model's (v0.1.0 and v0.2.0 recorded them too), and the
+	// conflict goes on to the next strategy.
+	if s.Version != rerereVersion || s.Origin != protocol.OriginRule {
+		rerereLegacyOnce.Do(func() { rerereLegacy(r.dir) })
+		return Resolution{}, false, nil
 	}
 	res := Resolution{Action: s.Action, Mode: s.Mode, Content: s.Content}
 	switch s.Action {
@@ -95,7 +126,7 @@ func (r rerere) Resolve(_ context.Context, f File, _ protocol.Request) (Resoluti
 
 // Record stores an accepted resolution.
 func (r rerere) Record(_ context.Context, f File, res Resolution) error {
-	data, err := json.Marshal(storedResolution{Action: res.Action, Mode: res.Mode, Content: res.Content})
+	data, err := json.Marshal(storedResolution{Version: rerereVersion, Origin: protocol.OriginRule, Action: res.Action, Mode: res.Mode, Content: res.Content})
 	if err != nil {
 		return err
 	}

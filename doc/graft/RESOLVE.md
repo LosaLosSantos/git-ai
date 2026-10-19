@@ -176,9 +176,14 @@ resolution"). Without a `verify.command` the server never lands what a model
 resolved: the agent decides. Every resolved file says what made it, in `origin`
 (see "Response"): `rule` or `model`. The check is fail-safe: a file is a rule's
 only when it says so, and anything else is a model's, whatever the name of the
-resolver. graft-resolve marks the files of trivial, union, rerere and the
-command strategies as `rule` and those of its `llm` strategy as `model` (with
-the older `"proposal": true`). A land of an answer that holds a model's file and
+resolver. graft-resolve is fail-safe in the same way, one layer before the
+server: it marks the files of trivial, union, rerere and the command strategies
+(unless a command is configured as a model, see below) as `rule`, and every other
+strategy's files as `model`, with the older `"proposal": true`: the `llm`
+strategy, and every strategy that is registered from another package. A
+strategy is a rule only when it says so, by implementing the exported
+`resolve.RuleStrategy`; that claim is the operator's trust, and is never to be
+made for a strategy that asks a model or reads what a model wrote. A land of an answer that holds a model's file and
 does not land (no
 `verify.command`, a verification that failed, or none finished in time) fails
 with the package: the model's files are
@@ -640,9 +645,33 @@ the error response on stdout and the reason on stderr).
 |-----------|----------|
 | `trivial` | One side equals the base, both sides are identical, the sides differ only in whitespace, or both sides deleted the file. |
 | `union`   | Concatenates the non-overlapping changes of both sides for configured globs, for example `CHANGELOG.md`. |
-| `rerere`  | Reuses a stored resolution keyed by the SHA-256 of the base, ours and theirs contents. Every resolution that passes checks is recorded. |
+| `rerere`  | Reuses a stored resolution keyed by the SHA-256 of the base, ours and theirs contents. Every resolution of a rule that passes checks is recorded, with its version and origin; a model's resolution is never recorded. |
 | `command` | Runs an external merge tool with `{base} {ours} {theirs} {out}` placeholders in temporary files. |
 | `llm`     | Optional, see [AI resolvers](#ai-resolvers). |
+
+**A `command` that calls a model is a model.** A command is a rule by default: it
+is trusted as deterministic code, and its files land without the operator's
+verification of the tree. A command that asks an AI (a wrapper around a model
+API, a coding agent), or that reads what one wrote, must be configured with
+`origin = "model"`:
+
+```toml
+[[strategy]]
+name = "agent-merge"
+type = "command"
+command = ["/usr/local/bin/ai-merge", "{base}", "{ours}", "{theirs}", "{out}"]
+origin = "model"   # its files are proposals, and land only if verify.command passes
+```
+
+`origin` is `"rule"` (the default) or `"model"`. A model command's answers are
+not recorded by `rerere`.
+
+**The `rerere` store and the upgrade.** Entries are versioned and record their
+origin. The stores of v0.1.0 and v0.2.0 recorded the `llm` answers as well, with
+no origin: after an upgrade `graft-resolve` never replays an entry without
+a version and an origin as a rule's answer (it skips it, and says so once on
+stderr: the conflict goes on to the next strategy). Clear the store on upgrade
+to drop the old entries: `rm -r <dir of the rerere strategy>`.
 
 Checks are per-glob commands run on the resolved file in a temporary
 directory, with `{file}` replaced by the file name. A failing check rejects

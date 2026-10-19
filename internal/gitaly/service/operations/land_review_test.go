@@ -15,6 +15,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/git/mvcc"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
@@ -186,4 +187,39 @@ func TestLandStoppedReason(t *testing.T) {
 	require.Equal(t, "could not verify before the branch moved again", landStoppedReason(&landNeedsResolution{unverified: "tree"}, time.Minute))
 	require.Equal(t, "the files changed again before they could be resolved", landStoppedReason(&landNeedsResolution{paths: []string{"a"}}, time.Minute))
 	require.Equal(t, "the time ran out before the conflicts were resolved (deadline of 2m0s)", landStoppedReason(nil, 2*time.Minute))
+}
+
+// pinnedCache stands for the cache of an MVCC snapshot: only its presence in the context matters here.
+type pinnedCache struct{ mvcc.Cache }
+
+// TestLandLostRace: what a landing attempt that lost the compare-and-swap does next. On a pinned (MVCC)
+// snapshot a new attempt reads the same tip and builds the same tree, so the land ends at once with
+// the retryable FailedPrecondition, also when it holds a model's resolution: handing that back would
+// verify the same tree again. Off MVCC the attempts run until max_attempts, and then a model's
+// resolution is handed back, as landKeptMoving says.
+func TestLandLostRace(t *testing.T) {
+	t.Parallel()
+
+	in := &gitalypb.UserLandRequest{Branch: []byte("main"), CommitId: strings.Repeat("c", 40)}
+	conflict := landConflict{reference: "refs/heads/main", oldOID: git.ObjectID(strings.Repeat("1", 40)), newOID: git.ObjectID(strings.Repeat("2", 40))}
+	model := &landPreResolution{
+		verdicts: landVerdicts{{path: "a"}: {file: resolver.ResponseFile{Path: "a", Origin: resolver.OriginModel}}},
+	}
+
+	ctx := context.Background()
+	require.False(t, landSnapshotPinned(ctx))
+	require.True(t, landSnapshotPinned(mvcc.ContextWithCache(ctx, pinnedCache{})))
+
+	for _, attempt := range []int{1, 5} {
+		err := landLostRace(in, model, conflict, attempt, 20, true)
+		var need *landNeedsResolution
+		require.False(t, errors.As(err, &need), "attempt %d", attempt)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err), "attempt %d", attempt)
+		require.ErrorContains(t, err, "kept moving")
+	}
+
+	require.NoError(t, landLostRace(in, model, conflict, 3, 20, false), "an attempt that can be retried")
+	var need *landNeedsResolution
+	require.ErrorAs(t, landLostRace(in, model, conflict, 20, 20, false), &need, "the last attempt hands a model's resolution back")
+	require.ErrorContains(t, landLostRace(in, &landPreResolution{}, conflict, 20, 20, false), "kept moving")
 }

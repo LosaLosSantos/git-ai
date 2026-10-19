@@ -29,6 +29,9 @@ func newUnion(spec StrategySpec) (Strategy, error) {
 	return union{}, nil
 }
 
+// IsRule: union is a rule (RuleStrategy).
+func (union) IsRule() bool { return true }
+
 func (union) Resolve(_ context.Context, f File, _ protocol.Request) (Resolution, bool, error) {
 	if !regularFile(f.Ours) || !regularFile(f.Theirs) || f.Ours.Mode != f.Theirs.Mode {
 		return Resolution{}, false, nil

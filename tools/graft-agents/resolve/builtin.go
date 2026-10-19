@@ -38,6 +38,9 @@ func newTrivial(spec StrategySpec) (Strategy, error) {
 	return trivial{}, nil
 }
 
+// IsRule: trivial is a rule (RuleStrategy).
+func (trivial) IsRule() bool { return true }
+
 func (trivial) Resolve(_ context.Context, f File, _ protocol.Request) (Resolution, bool, error) {
 	switch {
 	case sameSide(f.Ours, f.Theirs):

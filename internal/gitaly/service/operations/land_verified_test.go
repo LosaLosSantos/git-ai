@@ -641,3 +641,26 @@ func TestUserLand_verifiedModelResolution_aBusyRepositoryEndsInProposals(t *test
 	require.NoError(t, err)
 	other.Release()
 }
+
+// TestUserLand_verifiedModelResolution_aTreeThatPassedIsNotVerifiedAgain: when a land comes back to the
+// pre-resolution with the tree that verify.command already passed on (a snapshot that reads the same tip
+// again, a tip that moved to the same tree), the command does not run again: it takes minutes and holds
+// the repository's one verification slot. The resolver is not called again either.
+func TestUserLand_verifiedModelResolution_aTreeThatPassedIsNotVerifiedAgain(t *testing.T) {
+	t.Parallel()
+
+	rdir, rargv := resolverScript(t, "")
+	writeAnswer(t, rdir, modelAnswer())
+	vdir, vargv := countingVerify(t, "exit 0")
+	rcfg := withVerify(enabledResolver(rargv), vargv, "")
+	fx := newResolveFixture(t, rcfg)
+	s := fx.server(t, rcfg)
+	s.locator = config.NewLocator(fx.cfg) // the land quarantines the objects it makes
+
+	pre := newLandPreResolution()
+	for round := 1; round <= 3; round++ {
+		require.NoError(t, s.landPreResolve(fx.ctx, fx.request("Land"), fx.committer(), pre), "round %d", round)
+	}
+	require.Equal(t, 1, verifyRuns(t, vdir), "the command ran once for the tree, not once per round")
+	require.Equal(t, 1, resolverCalls(t, rdir))
+}
