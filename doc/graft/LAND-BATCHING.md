@@ -483,8 +483,11 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
   an exponential backoff from 100 ms to 2 s with full jitter, stopped by the
   context), and reports the retries in `LandResult.UnavailableRetries`. A client
   that does not use the SDK must do the same: retry `Unavailable`, and only
-  `Unavailable`, with a bounded backoff. A land is safe to retry: a change that
-  already reached the branch is reported as already landed.
+  `Unavailable`, with a bounded backoff. A land is safe to retry after a lost
+  response: with a merge, a fast-forward or a resolved land the change is
+  reported as already landed; with a rebase the change is replayed onto the tip,
+  comes out empty, and the branch is left unchanged (a change that a later
+  commit reverted in between is replayed again, as a cherry-pick would be).
 - A land that arrives alone waits up to `window` before its batch runs. Set
   `window = "0s"` to remove the wait, or `disabled = true` to remove batching.
 - Requests that do not qualify (see *When a land is batched*) run unbatched and

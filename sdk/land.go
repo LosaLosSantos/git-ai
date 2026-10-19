@@ -70,12 +70,19 @@ type LandOptions struct {
 // backoff with full jitter: before retry n it waits a random time between zero
 // and min(Cap, Base x 2^(n-1)). A context that ends stops the waiting.
 //
-// A land is safe to retry: the server lands a change by compare-and-swap, and
-// a change that already reached the branch, for example because the response
-// of an earlier call was lost, is reported as AlreadyLanded instead of being
-// landed again. A retried land with ResolveConflicts may run the conflict
-// resolver again, a model included, for the same conflict; LandResult reports
-// the retries (UnavailableRetries), so that this cost is visible.
+// A land is safe to retry when the response of an earlier call was lost after
+// the server landed the change: the server lands by compare-and-swap, and the
+// retry finds the change on the branch. With LandMerge, LandFastForwardOnly or
+// ResolveConflicts, Commit is then reachable from the tip, and the retry is
+// reported as AlreadyLanded. With LandRebase the branch holds a rebased copy,
+// not Commit itself: the retry replays the change onto the tip, every commit
+// of it comes out empty and is dropped, and the branch is left unchanged; the
+// result then has LandedCommitID equal to the tip, Rewritten false and
+// AlreadyLanded false. A change that a later commit reverted in between is
+// replayed again, as git's cherry-pick would. A retried land with
+// ResolveConflicts may run the conflict resolver again, a model included, for
+// the same conflict; LandResult reports the retries (UnavailableRetries), so
+// that this cost is visible.
 type UnavailableRetry struct {
 	// Disabled turns the retries off: Land returns Unavailable at once.
 	Disabled bool
