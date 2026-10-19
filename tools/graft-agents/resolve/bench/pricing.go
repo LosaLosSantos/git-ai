@@ -49,17 +49,33 @@ type openRouterEndpoints struct {
 	Data struct {
 		ID        string `json:"id"`
 		Endpoints []struct {
-			Name    string            `json:"name"`
-			Pricing map[string]string `json:"pricing"`
+			Name    string                     `json:"name"`
+			Pricing map[string]json.RawMessage `json:"pricing"`
 		} `json:"endpoints"`
 	} `json:"data"`
+}
+
+// openRouterPrice reads one price, given as a JSON string (OpenRouter's usual form) or number.
+func openRouterPrice(raw json.RawMessage) (float64, error) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strconv.ParseFloat(s, 64)
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, fmt.Errorf("%s is neither a string nor a number", raw)
+	}
+	return f, nil
 }
 
 // OpenRouterPricing reads the prices of model from OpenRouter's endpoints API
 // (GET <api>/models/<model>/endpoints, public). It fails when the model is unknown, has no
 // endpoint, or an endpoint lacks a prompt or completion price, or lists one that is not a
 // non-negative number: the run must not start on a price it cannot read.
-func OpenRouterPricing(ctx context.Context, client *http.Client, api, model string) (Pricing, error) {
+//
+// maxPromptTokens is an upper bound of the prompt of one call; an override tier whose
+// min_prompt_tokens is above it is left out, since it cannot apply. 0 counts every tier.
+func OpenRouterPricing(ctx context.Context, client *http.Client, api, model string, maxPromptTokens int) (Pricing, error) {
 	parts := strings.Split(model, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return Pricing{}, fmt.Errorf("pricing: model %q is not author/slug", model)
@@ -89,30 +105,61 @@ func OpenRouterPricing(ctx context.Context, client *http.Client, api, model stri
 		return Pricing{}, fmt.Errorf("pricing: %s lists no endpoint for %s", source, model)
 	}
 
+	// The prices used are prompt, completion, internal_reasoning and request. "overrides" lists
+	// tiers (for very long prompts, say) with prices of their own: those that can apply count
+	// towards the highest price too. A discount is ignored, which can only overstate the cost, and so are the prices of
+	// what the run never uses (web search, images, cache reads and writes).
 	p := Pricing{Model: model, Source: source, FetchedAt: time.Now().UTC(), Endpoints: len(doc.Data.Endpoints)}
-	for _, e := range doc.Data.Endpoints {
+	take := func(endpoint string, prices map[string]json.RawMessage, required bool) error {
 		for _, f := range []struct {
 			key      string
 			required bool
 			dst      *float64
 		}{
-			{"prompt", true, &p.Prompt},
-			{"completion", true, &p.Completion},
+			{"prompt", required, &p.Prompt},
+			{"completion", required, &p.Completion},
 			{"internal_reasoning", false, &p.Reasoning},
 			{"request", false, &p.Request},
 		} {
-			raw, ok := e.Pricing[f.key]
+			raw, ok := prices[f.key]
 			if !ok {
 				if f.required {
-					return Pricing{}, fmt.Errorf("pricing: endpoint %q of %s has no %s price", e.Name, model, f.key)
+					return fmt.Errorf("pricing: endpoint %q of %s has no %s price", endpoint, model, f.key)
 				}
 				continue
 			}
-			v, err := strconv.ParseFloat(raw, 64)
+			v, err := openRouterPrice(raw)
 			if err != nil || v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
-				return Pricing{}, fmt.Errorf("pricing: endpoint %q of %s has the %s price %q, not a non-negative number", e.Name, model, f.key, raw)
+				return fmt.Errorf("pricing: endpoint %q of %s has the %s price %s, not a non-negative number", endpoint, model, f.key, raw)
 			}
 			*f.dst = math.Max(*f.dst, v)
+		}
+		return nil
+	}
+	for _, e := range doc.Data.Endpoints {
+		if err := take(e.Name, e.Pricing, true); err != nil {
+			return Pricing{}, err
+		}
+		if raw, ok := e.Pricing["overrides"]; ok {
+			var tiers []map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &tiers); err != nil {
+				return Pricing{}, fmt.Errorf("pricing: endpoint %q of %s: overrides: %w", e.Name, model, err)
+			}
+			for _, tier := range tiers {
+				// A tier that starts above the largest possible prompt never applies.
+				if raw, ok := tier["min_prompt_tokens"]; ok && maxPromptTokens > 0 {
+					min, err := openRouterPrice(raw)
+					if err != nil {
+						return Pricing{}, fmt.Errorf("pricing: endpoint %q of %s: min_prompt_tokens %s: %w", e.Name, model, raw, err)
+					}
+					if min > float64(maxPromptTokens) {
+						continue
+					}
+				}
+				if err := take(e.Name+" (override)", tier, false); err != nil {
+					return Pricing{}, err
+				}
+			}
 		}
 	}
 	if p.Prompt == 0 && p.Completion == 0 {

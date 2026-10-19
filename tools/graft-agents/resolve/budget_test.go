@@ -332,6 +332,20 @@ func TestLLMStrategyBudgetConfigRejects(t *testing.T) {
 	}
 }
 
+func TestResolverLLMMaxPromptTokens(t *testing.T) {
+	r := wp19Build(t, wp19LLMConfig)
+	if got, want := r.LLMMaxPromptTokens(), defaultLLMMaxPromptBytes+2*llmMaxMessageBytes+64<<10; got != want {
+		t.Fatalf("bound = %d, want %d", got, want)
+	}
+	r = wp19Build(t, strings.Replace(wp19LLMConfig, "type = \"llm\"\n", "type = \"llm\"\nmax_prompt_bytes = 1000\n", 1))
+	if got := r.LLMMaxPromptTokens(); got != 1000+2*llmMaxMessageBytes+64<<10 {
+		t.Fatalf("bound with max_prompt_bytes 1000 = %d", got)
+	}
+	if n := wp19Build(t, "[[strategy]]\ntype = \"union\"\npaths = [\"*.txt\"]\n").LLMMaxPromptTokens(); n != 0 {
+		t.Fatalf("bound without llm = %d", n)
+	}
+}
+
 func TestResolverUseBudget(t *testing.T) {
 	wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
 		res := wp19Answer("merged\n")

@@ -121,6 +121,20 @@ func (r *Resolver) LLMModels() map[string]string {
 	return out
 }
 
+// LLMMaxPromptTokens returns an upper bound of the input tokens of one model call of r's llm
+// strategies, counted like the budget's worst case: one token per byte. A prompt holds file data
+// within max_prompt_bytes (whole file or one region), the two commit messages, the system prompt,
+// the schema and the framing; 64 KiB covers all but the file data.
+func (r *Resolver) LLMMaxPromptTokens() int {
+	n := 0
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			n = max(n, s.opt.MaxPromptBytes+2*llmMaxMessageBytes+64<<10)
+		}
+	}
+	return n
+}
+
 // Budgets returns the budgets of r's strategies, by strategy name.
 func (r *Resolver) Budgets() map[string]*Budget {
 	out := map[string]*Budget{}

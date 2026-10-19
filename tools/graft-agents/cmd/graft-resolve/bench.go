@@ -177,7 +177,7 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			for m := range distinct {
 				model = m
 			}
-			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model)
+			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model, res.LLMMaxPromptTokens())
 			if err != nil {
 				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 				return 1
