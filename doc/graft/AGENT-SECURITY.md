@@ -81,6 +81,35 @@ agents may call by default, so a new field cannot escape the filter; RPCs added
 with `graft.agent_rpcs` are checked by field name. Other callers still see
 graft-verify's green references, which are documented for consumers.
 
+Revisions reach git one per line on its standard input, so the line is what git
+reads, not what the request said. Four layers keep that from being a way past
+the hiding:
+
+1. **Input validation (every caller).** A revision with an ASCII control
+   character (below space, or DEL) is refused with `InvalidArgument`, the
+   pseudo-revisions `--glob=`, `--branches=` and `--tags=` and their patterns
+   included, and so is a line feed or carriage return in the path of a
+   path-scoped revision (`rev:path`). Before this, those patterns took any bytes,
+   and `--glob=x` followed by a line feed and `refs/graft/green/main` was a
+   second revision, naming a hidden reference that the request check had read as
+   part of the pattern. Compatibility: this applies to other callers too. A
+   control character in a revision never named a reference (`git
+   check-ref-format` forbids them), and a line break in the path of
+   `ListBlobs` or `ListLFSPointers` could not be read by `git rev-list --stdin`
+   as a path anyway. The three RPCs whose revisions git reads NUL-delimited
+   (`git cat-file -Z`: `CheckObjectsExist`, `DiffBlobs`, `CheckBlobsGenerated`) keep
+   accepting a line break in a path (`AllowLineBreaksInPath`), as their tests
+   require. A path with a tab, a space or other special characters is allowed
+   everywhere.
+2. **The sink.** `gitpipe.Revlist`, the one place that joins revisions into
+   `git rev-list --stdin`, refuses a revision with a line feed, a carriage return
+   or a NUL, whatever its caller validated.
+3. **The filter reads lines as git does.** The `--exclude-hidden` flag is put
+   before a line that git reads as `--all` or `--glob=...`: without its line
+   feed and the carriage return before it, and cut at the first NUL.
+4. **The request check splits at the same separators.** `RevisionHidden` also
+   splits at line feed, carriage return, tab and NUL.
+
 What the hiding covers, and what it does not: it covers the reference **names**
 under `refs/graft/` and the reachability that goes through them. An agent can
 neither address those references nor walk to their objects through them, so it

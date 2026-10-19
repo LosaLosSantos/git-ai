@@ -95,10 +95,21 @@ func readsRevisionsFromStdin(sc Command) bool {
 	return false
 }
 
+// gitStdinLine returns the line of a revision list on git's stdin as git reads it: without its line
+// feed and the carriage return before it (strbuf_getline), and cut at the first NUL, which ends a
+// C string. A filter that compares anything else would be told "--all\r" is not "--all" when git
+// takes it for "--all".
+func gitStdinLine(line string) string {
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	line, _, _ = strings.Cut(line, "\x00")
+	return line
+}
+
 // excludeHiddenRefsOnStdin is the stdin of a command that reads revisions there, one per line,
-// with excludeHiddenFlag on a line of its own before each --all and --glob=<pattern>. A line "--"
-// ends the revisions: paths follow, which are left alone. It reads r as it is read, a line at a
-// time, and runs nothing of its own.
+// with excludeHiddenFlag on a line of its own before each --all and --glob=<pattern>, the lines
+// parsed as git parses them (gitStdinLine). A line "--" ends the revisions: paths follow, which are
+// left alone. It reads r as it is read, a line at a time, and runs nothing of its own.
 func excludeHiddenRefsOnStdin(r io.Reader) io.Reader {
 	return &excludeHiddenReader{in: bufio.NewReader(r)}
 }
@@ -118,7 +129,7 @@ func (r *excludeHiddenReader) Read(p []byte) (int, error) {
 		}
 		var line string
 		line, r.err = r.in.ReadString('\n')
-		revision := strings.TrimSuffix(line, "\n")
+		revision := gitStdinLine(line)
 		if !r.paths && (revision == "--all" || strings.HasPrefix(revision, "--glob=")) {
 			r.pending = append(r.pending, excludeHiddenFlag+"\n"...)
 		}

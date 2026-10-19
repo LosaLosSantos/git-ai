@@ -147,7 +147,8 @@ func validateCheckBlobsGeneratedRequest(req *gitalypb.CheckBlobsGeneratedRequest
 	}
 
 	for _, blob := range req.GetBlobs() {
-		if err := git.ValidateRevision(blob.GetRevision(), git.AllowPathScopedRevision()); err != nil {
+		// git-cat-file reads the revisions NUL-delimited (-Z), so a line break in a path is data.
+		if err := git.ValidateRevision(blob.GetRevision(), git.AllowPathScopedRevision(), git.AllowLineBreaksInPath()); err != nil {
 			return err
 		}
 

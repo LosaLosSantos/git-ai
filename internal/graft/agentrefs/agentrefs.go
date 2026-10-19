@@ -23,8 +23,9 @@ func Hidden(ref string) bool {
 }
 
 // RevisionHidden reports whether a revision, reference or pattern an agent sends names a reference
-// under HiddenPrefix: a part of its revision (before a ":path", between "..", "...", "^", "~", "@{"
-// or "=", as in --glob=<pattern>) that starts with refs/graft/, or with graft/<namespace>/ for a namespace of the server
+// under HiddenPrefix: a part of its revision (before a ":path", between "..", "...", "^", "~", "@{",
+// "=" as in --glob=<pattern>, or a space, line break, tab or NUL, which git takes as the end of a
+// revision or of a line) that starts with refs/graft/, or with graft/<namespace>/ for a namespace of the server
 // (ServerNamespaces), which git completes to refs/graft/<namespace>/. Other short names under
 // graft/ are branches (the workspace's temporary branches are graft/<agent>/...): git completes
 // them under refs/heads/, since nothing else exists under refs/graft/. The path after the first
@@ -32,7 +33,8 @@ func Hidden(ref string) bool {
 func RevisionHidden(rev string) bool {
 	rev, _, _ = strings.Cut(rev, ":")
 	for _, part := range strings.FieldsFunc(rev, func(r rune) bool {
-		return r == '.' || r == '^' || r == '~' || r == '@' || r == '{' || r == '}' || r == ' ' || r == '='
+		return r == '.' || r == '^' || r == '~' || r == '@' || r == '{' || r == '}' || r == ' ' || r == '=' ||
+			r == '\n' || r == '\r' || r == '\t' || r == 0
 	}) {
 		part = strings.TrimPrefix(part, "!")
 		if strings.HasPrefix(part, HiddenPrefix) {

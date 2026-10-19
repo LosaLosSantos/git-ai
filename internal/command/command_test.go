@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/iotest"
@@ -268,6 +269,35 @@ func TestNew_stdinFilter(t *testing.T) {
 		require.FailNow(t, "the writes blocked on a process that exited")
 	}
 	require.NoError(t, cmd.Wait())
+}
+
+// TestNew_stdinFilterStartsAfterTheProcess: a command that fails to start leaves no goroutine that
+// copies a filtered stdin: the copy, which blocks until the writer is closed, starts only when the
+// process did.
+func TestNew_stdinFilterStartsAfterTheProcess(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	var filtered atomic.Bool
+	filter := func(r io.Reader) io.Reader {
+		filtered.Store(true)
+		return r
+	}
+
+	_, err := New(ctx, testhelper.SharedLogger(t), []string{"/no/such/binary"}, WithSetupStdin(), WithStdinFilter(filter))
+	require.Error(t, err)
+	time.Sleep(200 * time.Millisecond)
+	require.False(t, filtered.Load(), "the filter ran although the process never started")
+
+	// And it does run once the process started.
+	var buf bytes.Buffer
+	cmd, err := New(ctx, testhelper.SharedLogger(t), []string{"cat"}, WithSetupStdin(), WithStdinFilter(filter), WithStdout(&buf))
+	require.NoError(t, err)
+	_, err = fmt.Fprint(cmd, "x")
+	require.NoError(t, err)
+	require.NoError(t, cmd.Wait())
+	require.True(t, filtered.Load())
+	require.Equal(t, "x", buf.String())
 }
 
 func TestCommand_closeStdin(t *testing.T) {

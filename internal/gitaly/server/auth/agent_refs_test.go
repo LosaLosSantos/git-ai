@@ -50,9 +50,13 @@ func TestAgentRefFields_everyAllowedRPCIsClassified(t *testing.T) {
 							unclassified = append(unclassified, string(m.FullName())+"."+string(fd.Name())+" ("+method+")")
 						}
 					case protoreflect.MessageKind, protoreflect.GroupKind:
-						if !fd.IsMap() {
-							walk(fd.Message())
+						if fd.IsMap() {
+							// The filter does not look into maps: a map field of an agent RPC must be
+							// classified, and given its handling, when one appears.
+							unclassified = append(unclassified, string(fd.FullName())+" (map field, "+method+")")
+							continue
 						}
+						walk(fd.Message())
 					}
 				}
 			}
@@ -90,6 +94,11 @@ func TestCheckAgentRefs(t *testing.T) {
 		"FindBranch of a branch named graft/": {&gitalypb.FindBranchRequest{Name: []byte("graft/x")}, false},
 		"UserCommitFiles content":             {&gitalypb.UserCommitFilesRequest{UserCommitFilesRequestPayload: &gitalypb.UserCommitFilesRequest_Action{Action: &gitalypb.UserCommitFilesAction{UserCommitFilesActionPayload: &gitalypb.UserCommitFilesAction_Content{Content: []byte("see refs/graft/green/main")}}}}, false},
 		"GetObjects of an object ID":          {&gitalypb.GetObjectsRequest{Oids: []string{"0123456789abcdef0123456789abcdef01234567"}}, false},
+		"ListCommits, a name after a line":    {&gitalypb.ListCommitsRequest{Revisions: []string{"--glob=x\nrefs/graft/proposals/0123456789abcdef/1"}}, true},
+		"ListCommits, a short name after one": {&gitalypb.ListCommitsRequest{Revisions: []string{"--branches=x\ngraft/proposals/0123456789abcdef/1"}}, true},
+		"ListBlobs, a name after a line":      {&gitalypb.ListBlobsRequest{Revisions: []string{"--glob=x\nrefs/graft/green/main"}}, true},
+		"ListCommits, a name after a CR":      {&gitalypb.ListCommitsRequest{Revisions: []string{"--glob=x\rrefs/graft/green/main"}}, true},
+		"ListCommits, a name after a NUL":     {&gitalypb.ListCommitsRequest{Revisions: []string{"--glob=x\x00refs/graft/green/main"}}, true},
 	} {
 		err := checkAgentRefs(agentContext(), tc.req)
 		if tc.denied {

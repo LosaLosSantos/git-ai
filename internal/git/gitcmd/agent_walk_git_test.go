@@ -83,6 +83,22 @@ func TestAgentWalk_leavesHiddenRefsOut(t *testing.T) {
 		})
 	}
 
+	// Lines that git reads as "--all" or "--glob=...", written so that a filter that compares
+	// anything else lets them through (review of b985c82): a carriage return, a NUL.
+	for desc, stdin := range map[string]string{
+		"--all with a carriage return": "--all\r\n",
+		"--all with a NUL":             "--all\x00\n",
+		"--all with a NUL and text":    "--all\x00junk\n",
+		"--glob with a carriage":       "--glob=refs/*\r\n",
+		"--glob after another line":    "main\n--glob=refs/*\r\n",
+	} {
+		t.Run("stdin "+desc, func(t *testing.T) {
+			sc := gitcmd.Command{Name: "rev-list", Flags: []gitcmd.Option{gitcmd.Flag{Name: "--stdin"}}}
+			require.NotContains(t, run(t, agent, sc, stdin), secret.String())
+			require.Contains(t, run(t, ctx, sc, stdin), secret.String(), "another caller's walk reaches it")
+		})
+	}
+
 	t.Run("--branches is left alone", func(t *testing.T) {
 		out := run(t, agent, gitcmd.Command{Name: "rev-list", Args: []string{"--branches"}}, "")
 		require.Contains(t, out, main.String())

@@ -67,6 +67,45 @@ func TestExcludeHiddenRefs(t *testing.T) {
 	require.Contains(t, args, excludeHiddenFlag)
 }
 
+// TestGitStdinLine: a line is what git reads: without its line feed, without the carriage return
+// before it, and cut at the first NUL.
+func TestGitStdinLine(t *testing.T) {
+	t.Parallel()
+
+	for in, want := range map[string]string{
+		"--all":             "--all",
+		"--all\n":           "--all",
+		"--all\r\n":         "--all",
+		"--all\r":           "--all",
+		"--all\x00":         "--all",
+		"--all\x00\n":       "--all",
+		"--all\x00junk\r\n": "--all",
+		"--all\r\r\n":       "--all\r",
+		"--glob=x\x00y\n":   "--glob=x",
+		"main\n":            "main",
+		"":                  "",
+	} {
+		require.Equal(t, want, gitStdinLine(in), "%q", in)
+	}
+}
+
+// TestExcludeHiddenRefsOnStdin_linesAsGitReadsThem: the lines "--all\r", "--all\x00" and the like are
+// "--all" to git, so each gets the flag before it, and "--glob=" with them too.
+func TestExcludeHiddenRefsOnStdin_linesAsGitReadsThem(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range []string{"--all\r", "--all\x00", "--all\x00junk", "--glob=refs/*\r", "--glob=refs/*\x00x"} {
+		out, err := io.ReadAll(excludeHiddenRefsOnStdin(strings.NewReader("main\n" + line + "\nmain2\n")))
+		require.NoError(t, err)
+		require.Equal(t, "main\n"+excludeHiddenFlag+"\n"+line+"\nmain2\n", string(out), "%q", line)
+	}
+
+	// After a line "--" with a carriage return too, the lines are paths.
+	out, err := io.ReadAll(excludeHiddenRefsOnStdin(strings.NewReader("--\r\n--all\n")))
+	require.NoError(t, err)
+	require.Equal(t, "--\r\n--all\n", string(out))
+}
+
 // TestExcludeHiddenRefsOnStdin: on stdin, the flag goes on a line before each --all and --glob=,
 // until the line "--" after which paths follow; the stream is otherwise unchanged, read in any
 // chunks, and an error of the input reaches the reader.

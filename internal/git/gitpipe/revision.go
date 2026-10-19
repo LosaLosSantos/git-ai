@@ -296,6 +296,18 @@ func Revlist(
 	go func() {
 		defer close(resultChan)
 
+		// The revisions go to git-rev-list(1) one per line on its stdin: whatever a caller validated,
+		// a revision with a line break is more than one revision, and one with a NUL is read only up
+		// to it. The guard is here, at the sink, so that it holds for every caller.
+		for _, revision := range revisions {
+			if strings.ContainsAny(revision, "\n\r\x00") {
+				sendRevisionResult(ctx, resultChan, RevisionResult{
+					err: fmt.Errorf("revision %q: a revision can't contain a line break or NUL", revision),
+				})
+				return
+			}
+		}
+
 		if cfg.trailers && cfg.objects {
 			sendRevisionResult(ctx, resultChan, RevisionResult{
 				err: fmt.Errorf("WithTrailers is incompatible with WithObjects"),
