@@ -64,9 +64,9 @@ func TestUserCommitFilesReleasesProcessesAndFiles(t *testing.T) {
 			expectedErr: "A file with this name doesn't exist",
 		},
 		{
-			desc:        "a tree the writer refuses",
+			desc:        "a file below a file",
 			requests:    []*gitalypb.UserCommitFilesRequest{createFileHeaderRequest("README/file"), actionContentRequest("content\n")},
-			expectedErr: "writing tree writing tree: exit status 128",
+			expectedErr: "A file with this name already exists",
 		},
 		{
 			desc:        "a start branch that does not exist",

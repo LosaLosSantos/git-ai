@@ -24,11 +24,11 @@ var lazyTreeSeed = flag.Uint64("lazy-tree-seed", 0, "seed of TestApplyActionLazy
 // TestApplyActionLazyTreeMatchesRecursiveTree applies random sequences of UserCommitFiles actions
 // to the tree read whole (ReadTree with WithRecursive, then Write: the path before WP96) and to the
 // tree of ReadTreeLazily (then the tree writer: the path after it). Every action must give the same
-// error on both, and every sequence the same tree ID. The actions reach every outcome: each action
-// type succeeds, and each error the whole tree detected (an existing file or directory, a move
-// onto an existing file, a missing file to update, move or delete, a file in the way of a
-// directory) occurs, also below the top level. A failure names the seed, which
-// -lazy-tree-seed replays.
+// error on both, and every sequence the same tree ID: no action leaves a tree that a writer
+// refuses. The actions reach every outcome: each action type succeeds, and each error the whole
+// tree detected (an existing file or directory, a move onto an existing file, a missing file to
+// update, move or delete) occurs below the top level, as does a file in the way of the path a
+// file, a directory or a move creates. A failure names the seed, which -lazy-tree-seed replays.
 func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 	t.Parallel()
 
@@ -84,8 +84,9 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 		}
 	}
 
-	// underFile is whether a directory of path is a file or a submodule in root: Add would then
-	// add path below that entry, which no tree can hold.
+	// underFile is whether a directory of path is a file or a submodule in root, so that nothing
+	// can be created at path. Get clears the ID of the tree it finds an entry in, as an action
+	// does, so it is asked of both trees alike.
 	underFile := func(root *localrepo.TreeEntry, path string) bool {
 		for dir := filepath.Dir(path); dir != "."; dir = filepath.Dir(dir) {
 			if entry, err := root.Get(dir); err == nil && entry.Type != localrepo.Tree {
@@ -102,9 +103,6 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 		root := &localrepo.TreeEntry{Mode: "040000", Type: localrepo.Tree}
 		for range 4 + rng.IntN(12) {
 			path := randomPath()
-			if underFile(root, path) {
-				continue
-			}
 			entry := localrepo.TreeEntry{Path: filepath.Base(path), Type: localrepo.Blob, OID: randomBlob()}
 			switch rng.IntN(5) {
 			case 0:
@@ -117,7 +115,9 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 				entry.Mode = "100644"
 			}
 			if err := root.Add(path, entry); err != nil {
-				require.ErrorIs(t, err, localrepo.ErrEntryExists)
+				if !errors.Is(err, localrepo.ErrFileInPath) {
+					require.ErrorIs(t, err, localrepo.ErrEntryExists)
+				}
 				continue
 			}
 			basePaths = append(basePaths, path)
@@ -144,24 +144,45 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 			action := randomAction()
 			trace = append(trace, fmt.Sprintf("%T%+v", action, action))
 
+			// The path an action creates, when a file may be in its way.
+			var created string
+			switch action := action.(type) {
+			case createFile:
+				created = action.Path
+			case createDirectory:
+				created = action.Path
+			case moveFile:
+				created = action.NewPath
+			}
+			belowFile := created != "" && underFile(recursive, created)
+			require.Equal(t, belowFile, created != "" && underFile(lazy, created))
+			// Whether a chmod addresses a directory or a submodule.
+			var chmodNonFile bool
+			if action, ok := action.(changeFileMode); ok {
+				recursiveEntry, recursiveErr := recursive.Get(action.Path)
+				lazyEntry, lazyErr := lazy.Get(action.Path)
+				require.Equal(t, recursiveErr, lazyErr)
+				chmodNonFile = recursiveErr == nil && recursiveEntry.Type != localrepo.Blob
+				require.Equal(t, chmodNonFile, lazyErr == nil && lazyEntry.Type != localrepo.Blob)
+			}
+
 			recursiveErr := applyAction(ctx, action, recursive, repo)
 			lazyErr := applyAction(ctx, action, lazy, repo)
 			require.Equal(t, recursiveErr, lazyErr, "seed %d, sequence %d, base %s, actions %v", seed, sequence, baseOID, trace)
 
-			outcomes[outcome(action, recursiveErr)]++
+			switch {
+			case belowFile && recursiveErr != nil:
+				outcomes[fmt.Sprintf("%T below a file: %s", action, recursiveErr)]++
+			case chmodNonFile:
+				outcomes[fmt.Sprintf("%T of a directory: %s", action, recursiveErr)]++
+			default:
+				outcomes[outcome(action, recursiveErr)]++
+			}
 		}
 
-		// A file created below a file leaves a tree that no writer accepts: both must refuse it
-		// the same way, and write the same tree otherwise.
-		recursiveErr := recursive.Write(ctx, repo)
-		lazyErr := writeTreeEntries(ctx, repo, lazy)
-		require.Equal(t, fmt.Sprint(recursiveErr), fmt.Sprint(lazyErr), "seed %d, sequence %d, base %s, actions %v", seed, sequence, baseOID, trace)
-		require.Equal(t, recursiveErr == nil, lazyErr == nil, "seed %d, sequence %d", seed, sequence)
-		if recursiveErr != nil {
-			outcomes["write: "+recursiveErr.Error()]++
-			continue
-		}
-		outcomes["write ok"]++
+		// No action leaves a tree that a writer refuses: both write the same tree.
+		require.NoError(t, recursive.Write(ctx, repo), "seed %d, sequence %d, base %s, actions %v", seed, sequence, baseOID, trace)
+		require.NoError(t, writeTreeEntries(ctx, repo, lazy), "seed %d, sequence %d, base %s, actions %v", seed, sequence, baseOID, trace)
 		require.Equal(t, recursive.OID, lazy.OID, "seed %d, sequence %d, base %s, actions %v", seed, sequence, baseOID, trace)
 	}
 
@@ -180,8 +201,10 @@ func TestApplyActionLazyTreeMatchesRecursiveTree(t *testing.T) {
 		"operations.updateFile at depth: A file with this name doesn't exist",
 		"operations.deleteFile at depth: A file with this name doesn't exist",
 		"operations.changeFileMode at depth: A file with this name doesn't exist",
-		"write ok",
-		"write: writing tree: exit status 128",
+		"operations.changeFileMode of a directory: A file with this name doesn't exist",
+		"operations.createFile below a file: A file with this name already exists",
+		"operations.createDirectory below a file: A file with this name already exists",
+		"operations.moveFile below a file: A file with this name already exists",
 	} {
 		require.Positive(t, outcomes[expected], "seed %d: outcome %q never occurred; outcomes: %v", seed, expected, outcomes)
 	}

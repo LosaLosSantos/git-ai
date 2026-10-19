@@ -256,6 +256,16 @@ func applyAction(
 		if err := root.Modify(
 			action.Path,
 			func(entry *localrepo.TreeEntry) error {
+				// Only files have an executable mode. A tree or a submodule given a file's mode
+				// would make a tree that git refuses, or one whose entry is no longer a
+				// submodule.
+				if entry.Type != localrepo.Blob {
+					return indexError{
+						path:      action.Path,
+						errorType: errFileNotFound,
+					}
+				}
+
 				if action.ExecutableMode {
 					if entry.Mode != "100755" {
 						entry.Mode = "100755"
@@ -421,7 +431,8 @@ func translateError(err error, path string) error {
 			path:      path,
 			errorType: errDirectoryTraversal,
 		}
-	case errors.Is(err, localrepo.ErrEntryExists):
+	case errors.Is(err, localrepo.ErrEntryExists) ||
+		errors.Is(err, localrepo.ErrFileInPath):
 		return indexError{
 			path:      path,
 			errorType: errFileExists,

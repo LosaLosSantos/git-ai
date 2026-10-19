@@ -183,6 +183,8 @@ var (
 	ErrEntryNotFound = errors.New("entry not found")
 	// ErrEntryExists indicates an entry already exists.
 	ErrEntryExists = errors.New("entry already exists")
+	// ErrFileInPath indicates that a directory of the path is a file or a submodule.
+	ErrFileInPath = errors.New("file in the way of the path")
 	// ErrPathTraversal indicates a path contains a traversal.
 	ErrPathTraversal = errors.New("path contains traversal")
 	// ErrAbsolutePath indicates the path is an absolute path
@@ -308,6 +310,11 @@ Loop:
 				currentTree.Entries[i] = &newEntry
 
 				return nil
+			}
+
+			// A file or a submodule is in the way: nothing can be added below it.
+			if entry.Type != Tree {
+				return ErrFileInPath
 			}
 
 			// We found the next directory to walk into.
