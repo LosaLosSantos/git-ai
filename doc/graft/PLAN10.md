@@ -878,11 +878,12 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |                               tip T read as the lane reads it; no branch / already landed /
    |                               the merge of T and the change is clean -> skipped (lane answers)
    |                               agent may not update the branch (policy) -> PermissionDenied
-   |                               conflicting files -> one VERDICT per file (15.2), bounded slots
-   |                               decideLand (15.4):
+   |                               the conflicting files not yet resolved -> one VERDICT per file
+   |                               (15.2), each kept by its key (path, base, ours, theirs, modes),
+   |                               resolve slots; decideLand (15.4):
    |                                 not landable -> proposals kept (14) and PACKAGE now: the lane
    |                                                 is not entered
-   |                                 landable ----> the pre-resolution goes to the lane, for T
+   |                                 landable ----> the verdicts go to the lane
    v
  LANE (one per branch)
    |-- a resolution -----> landWithResolution: tip moved -> refuse, fresh PACKAGE
@@ -893,12 +894,15 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  3-way merge (rebase or merge) of the tip and the change
    |-- clean -------------------------------------------------------------> LAND
    |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
-   |-- conflicts, a landable pre-resolution for this tip
+   |-- conflicts, every conflicting file has a landable verdict with its key, and the lane's
+   |   classification of the file agrees with the verdict's
    |       -> operator verify.command; passes -> merge commit signed by the rules -> LAND
    |                                   fails  -> PACKAGE (every file REJECTED, reason)
-   |-- conflicts, none for this tip (the tip moved since T, or the pre-resolution was skipped)
-           -> TIP MOVED, out of the lane: PRE-RESOLVE again against the new tip, once; if the
-              branch moved again -> merge_conflict, "the branch kept moving during resolution"
+   |-- conflicts, a file without such a verdict (new, or its sides changed)
+           -> NEEDS RESOLUTION, out of the lane: PRE-RESOLVE only those files against the new tip,
+              keeping the other verdicts, and enter the lane again; at most resolve_rounds rounds
+              (default 3) within the resolver's timeout, then merge_conflict, "files kept
+              changing: a, b"
  The resolver is never called inside the lane.
 
  PACKAGE to the agent (merge_conflict detail): sides by OID, hunks, per-file outcome + reason,
@@ -1078,32 +1082,63 @@ GitButler's AI resolve is described here from the PM's account of it; its code w
 
 Today a land with resolve_conflicts calls the resolver inside the branch's lane, so the branch is
 held for the resolver's whole call: seconds, minutes for a file with 20 regions at ~13 s each, and
-~97 ms more to keep the proposals. The change mirrors the precheck of an agent's resolution:
+~97 ms more to keep the proposals. A first version of this delta bound the resolution to the tip
+read before the lane; on a busy branch (the 50-agent race) the tip moves every few hundred
+milliseconds while a resolution takes seconds, so that version would fail exactly under load.
+The resolution is bound to the files instead (the PM's correction):
 
+* **What a file's verdict depends on.** The resolver answers a file from its sides: its key is
+  (path, base OID, ours OID, theirs OID, the three modes). Two inputs come from elsewhere, and the
+  design states them:
+  * The classification (15.2) also reads the tip: the linguist-generated attribute from the tip's
+    .gitattributes, and the paths a side comes from in the tip's tree (renames). The lane therefore
+    runs the classification again on every file it reuses: local git work, bounded like the
+    package's, never the resolver. A file whose classification at the lane's tip differs from its
+    verdict's counts as changed.
+  * The request also carries the tip's commit message. R1's prompt sends only THEIRS' message,
+    which is fixed for the land; an operator's command strategy could read the tip's message, and
+    its verdict would then be reused across tips. That is stated in RESOLVE.md: a resolver's
+    answer for a file must depend on the file, not on the tip's message.
 * **Pre-resolve before the lane.** UserLand reads the tip T as the lane does and, in a quarantine
   it discards, merges T and the change. Skipped (the lane answers as today) when the branch does
-  not exist, the change already landed, or the merge is clean. Otherwise the pre-resolution runs
-  the whole per-file flow of 15.2 against T: the policy first, the classification, the resolver
-  call, the validation, decideLand. The resolver's requests take the same slots as its checks
-  (check_concurrency now bounds every request to the resolver of the process) and run within the
-  resolver's timeout, the wait included.
-* **Not landable: no lane at all.** The land fails anyway, so the proposals are kept (and pruned)
-  and the package is returned for T without entering the lane. If the branch moved meanwhile, the
-  agent's re-land against T is refused with a fresh package, as for any resolution.
-* **Landable: applied in the lane, only for T.** The lane gets the pre-resolution with the tip it
-  was made for; when the lane's tip is T and the merge conflicts, the lane writes the resolver's
-  answer into the merge commit (and runs verify.command); the resolver is not called again.
-* **The tip moved.** When the lane's tip is not T, or the merge conflicts without a
-  pre-resolution, the lane returns "tip moved" without resolving. UserLand then pre-resolves once
-  more against the new tip, out of the lane; if the branch moved again, the land fails with the
-  merge conflict and the reason "the branch kept moving during resolution". The one retry bounds
-  the resolver calls a land can cause to two. In a batch, a pre-resolved member that comes after
-  another finds the tip moved and is pre-resolved again: resolutions do not chain inside a batch.
+  not exist, the change already landed, or the merge is clean. Otherwise it runs the per-file flow
+  of 15.2 for the conflicting files that have no verdict yet: the policy first, the
+  classification, one resolver request for them, the validation; each verdict is kept by its key;
+  then decideLand over all of them.
+* **Not landable: no lane at all.** The land fails anyway, so the proposals are kept (and pruned,
+  14) and the package is returned without entering the lane. Built per file, the package of an
+  older tip stays true per file; the agent's re-land is bound to the tip of its resolution, as
+  today (binding agents' resolutions to the files too is a possible later extension, not now).
+* **Landable: applied in the lane, file by file.** The lane merges its own tip and the change. When
+  every conflicting file has a landable verdict with its key, and the lane's classification of the
+  file agrees, the lane writes the verdicts into the merge commit (and runs verify.command); the
+  resolver is not called. In a batch, a member's verdicts hold whenever their keys match, so
+  members chain.
+* **Needs resolution.** When a conflicting file has no verdict with its key (it is new, or a side
+  changed), the lane returns the attempt with those files, without resolving. UserLand
+  pre-resolves only them against the new tip, out of the lane, keeps every other verdict, and
+  enters the lane again. The rounds are bounded by the resolver's timeout for the whole land and
+  by resolve_rounds (default 3); past them the land fails with the merge conflict and the reason
+  "files kept changing: a, b". A tip that moves on unrelated files costs no resolver call at all.
+* **Rules alike.** The operator rules' verdicts (trivial, union, rerere, command) are kept and
+  reused by the same key, so the policy is the same for every strategy.
+* **Slots: two pools.** check_concurrency bounds the checks of agents' resolutions and
+  resolve_concurrency (new, default 2) the resolutions. A check is short and gates an agent's
+  re-land; a resolution with a model takes seconds to minutes. One shared pool would let a few
+  long resolutions starve the checks, and fairness inside one pool needs a scheduler for no gain
+  over two plain semaphores; the memory bound of the process is the sum of the two pools' requests.
+  Each request waits for its slot within the resolver's timeout and fails closed when it expires.
 * **Still in the lane, stated:** verify.command, the operator's tests on the merged tree, runs in
   the lane for the rules' resolutions and for agents' resolutions alike. It is the next candidate
   to move out, as its own step.
-* **Tests.** The resolver is never called with the lane held (a resolver that blocks while another
-  land of the branch proceeds); a not-landable answer never enters the lane; a moved tip
-  re-resolves once and then fails with the reason; a batch member is re-resolved; the slots bound
-  resolutions and checks together.
-
+* **Tests.**
+  * The resolver is never called with the lane held: a resolver that blocks while another land of
+    the branch proceeds.
+  * A not-landable answer never enters the lane.
+  * A tip that moves on an unrelated file reuses every verdict, with no second resolver call.
+  * A tip that changes one conflicting file re-resolves only that file.
+  * Files that keep changing fail after resolve_rounds, with the reason naming them.
+  * A batch member reuses its verdicts.
+  * A high-churn test: many concurrent lands on the branch, the resolve lands among them land
+    eventually, with no starvation.
+  * The two pools: a held resolve slot does not delay a check.
