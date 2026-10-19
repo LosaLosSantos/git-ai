@@ -730,9 +730,30 @@ whole series under $5 real, and a run over $1.00 real stops the series until the
 
 ## 14. The agent always resolves; the server's AI only proposes (Federico, PM-approved design)
 
-This supersedes "AI lands with trace only". The server never lands a resolution of the llm strategy
-by itself: it is a proposal, which the agent reviews, edits or replaces, and lands with its own
-resolution (UserLandRequest.resolution, Graft-Resolved-By: agent/<actor>). The deterministic
+**Final ruling (Federico, 2026-10-19, relayed by the PM; it supersedes the amendment at the end of
+this section and every statement below that the server never lands a model's resolution).** An AI
+resolution lands only through the operator's verification (15.9).
+
+* Server AI configured and verify.command configured: the server resolves. If every deterministic
+  check passes and verify.command passes on the merged tree, it LANDS, signed Graft-Resolved-By:
+  <the resolver> and Graft-Checked-By: verify:<command>. Otherwise it goes to the agent as a
+  PROPOSAL, with the verify output when verify failed.
+* Server AI configured, no verify.command: proposal only, and the agent decides. An unverified AI
+  resolution never lands.
+* No AI: the agent resolves.
+* Rules (trivial, union, rerere, command) are unchanged: they land after verify.command when one is
+  configured, in the lane, as today.
+* The composition report (15.3) stays a report, not a gate.
+* One rule, in decideLand: a file that proposes may land only if verify.command ran and passed on
+  the exact tree that lands, compared by tree object ID. No other code path lands a model's
+  resolution.
+* The trailer names what ran: Graft-Checked-By: verify:<command>. The syntax and operator checks
+  run inside the resolver and are not separate trailers; the composition report is not built, so
+  the trailer does not claim it.
+
+This supersedes "AI lands with trace only". Before the ruling above, the server never landed a
+resolution of the llm strategy by itself: it was a proposal, which the agent reviews, edits or
+replaces, and lands with its own resolution (UserLandRequest.resolution, Graft-Resolved-By: agent/<actor>). The deterministic
 strategies that the operator configures (trivial, union, rerere, command) are rules, not AI: a
 resolution made by rules alone still lands. The llm auto-land path is removed, not kept behind a
 flag.
@@ -835,7 +856,8 @@ flag.
     resolve_conflicts, takes seconds. Moving both out of the lane, like the precheck of an agent's
     resolution, is a step of its own.
 
-* **Amendment: Federico's product decision (2026-10-19, relayed by the PM).** "When the server AI
+* **Amendment: Federico's product decision (2026-10-19, relayed by the PM). Superseded by the final
+  ruling at the top of this section: the gate is verify.command, not the composition check.** "When the server AI
   is configured, the server always tries to resolve, and it LANDS its resolution by itself ONLY if
   the proposal passes every deterministic check: syntax, anchors, no markers, and the composition
   check from §15 (keeps both changes, no duplicated both-added lines). There is still no
@@ -880,10 +902,12 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |                               agent may not update the branch (policy) -> PermissionDenied
    |                               the conflicting files not yet resolved -> one VERDICT per file
    |                               (15.2), each kept by its key (path, base, ours, theirs, modes),
-   |                               resolve slots; decideLand (15.4):
+   |                               resolve slots; a model's answer: verify.command runs on the exact
+   |                               tree that would land, verify slots (15.9); decideLand (15.4):
    |                                 not landable -> proposals kept (14) and PACKAGE now: the lane
-   |                                                 is not entered
-   |                                 landable ----> the verdicts go to the lane
+   |                                                 is not entered; a model's files are PROPOSED,
+   |                                                 with the verify output when verify failed
+   |                                 landable ----> the verdicts, and the verified tree, go to the lane
    v
  LANE (one per branch)
    |-- a resolution -----> landWithResolution: tip moved -> refuse, fresh PACKAGE
@@ -894,16 +918,28 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  3-way merge (rebase or merge) of the tip and the change
    |-- clean -------------------------------------------------------------> LAND
    |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
-   |-- conflicts, every conflicting file has a landable verdict with its key, and the lane's
+   |-- conflicts, every conflicting file has a verdict with its key, and the lane's
    |   classification of the file agrees with the verdict's
-   |       -> operator verify.command; passes -> merge commit signed by the rules -> LAND
-   |                                   fails  -> PACKAGE (every file REJECTED, reason)
+   |       rules only -> operator verify.command (in the lane, for now); passes -> merge commit
+   |                     signed by the rules -> LAND;  fails -> PACKAGE (every file REJECTED, reason)
+   |       a model's file -> decideLand (15.4) on the tree the lane would write: it LANDS only if
+   |                     that tree is the tree verify.command passed on (tree object IDs). The lane
+   |                     runs no verification of a model's resolution. Merge commit signed
+   |                     Graft-Resolved-By: <resolver> + Graft-Checked-By: verify:<command>.
+   |                     Another tree (the tip moved) -> NEEDS VERIFICATION, below
    |-- conflicts, a file without such a verdict (new, or its sides changed)
-           -> NEEDS RESOLUTION, out of the lane: PRE-RESOLVE only those files against the new tip,
-              keeping the other verdicts, and enter the lane again; at most resolve_rounds rounds
-              (default 3) within the resolver's timeout, then merge_conflict, "files kept
-              changing: a, b"
- The resolver is never called inside the lane.
+   |       -> NEEDS RESOLUTION, out of the lane: PRE-RESOLVE only those files against the new tip,
+   |          keeping the other verdicts, and enter the lane again
+   |-- a model's answer whose tree is not the verified one (the tip moved)
+           -> NEEDS VERIFICATION, out of the lane: rebuild the tree from the same verdicts (the
+              resolver is called only for files that changed), VERIFY it, enter the lane again
+ The rounds are bounded by the deadline of the land (the resolver's timeout, plus verify.timeout when
+ a verify.command is configured) and by resolve_rounds (default 32, a safety cap, no contract). At
+ the deadline: files that kept changing -> merge_conflict, "files kept changing: a, b"; a model's
+ resolution that was not verified in time -> PACKAGE, the model's files PROPOSED, "could not verify
+ before the branch moved again" (a verified AI land is opportunistic: losing the race is harmless,
+ the agent gets the proposal).
+ The resolver is never called inside the lane, and neither is the verification of a model's resolution.
 
  PACKAGE to the agent (merge_conflict detail): sides by OID, hunks, per-file outcome + reason,
    per-file proposal (+ its report, planned), the proposals kept under refs/graft/proposals/ (14),
@@ -941,11 +977,16 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  assemble the file; file checks: markers, tree-sitter syntax, operator checks
    |-- a check fails ----------------------------------------> AGENT (REJECTED, reason)
    v
- composition report (15.3) (planned)
+ composition report (15.3) (planned; a report, not a gate)
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
-   [AI landing when every deterministic check passes: designed by Federico's amendment (14),
-    NOT ENABLED: the measurement in 15.6 shows no deterministic check that reaches the bar]
+   v
+ verify.command configured? --no--> stays a PROPOSAL: the agent decides ("no verify.command")
+   | yes: the exact tree that would land is verified, out of the lane (15.9)
+   |-- fails ------------------------------------------------> stays a PROPOSAL (+ the verify output)
+   |-- not verified before the branch moved again -----------> stays a PROPOSAL (+ the reason)
+   v
+ passes --> LANDS, if it is still the tree to land (decideLand, 15.4), signed Graft-Checked-By: verify:...
 ```
 
 ### 15.3 Composition report (planned; a report, not a gate)
@@ -973,10 +1014,13 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 ### 15.4 The one decision point
 
 ```
- decideLand, before the lane (the pre-resolution calls it; landAnswerProposes is its guard)
-   every file resolved by an operator rule ...... LAND (then verify.command)
-   anything else, including any model answer .... PACKAGE (the model's files are proposals)
- No other code path lands a model's resolution. No check disables itself: a configuration that
+ decideLand(answer, files, tree, verified): the pre-resolution calls it with the tree it verified,
+ the lane with the tree it would write
+   every file resolved by an operator rule ...... LAND (then verify.command, in the lane)
+   a file a model resolved ...................... LAND only if verify.command ran and passed on THIS
+                                                  tree: tree object ID equality, not the tip
+   anything else ................................ PACKAGE (the model's files are proposals)
+ One rule about a model's resolution. No other code path lands it. No check disables itself: a configuration that
  cannot be used stops the server at startup, and a failure at run time refuses the land. No
  confidence that the model declares about itself decides anything.
 ```
@@ -991,8 +1035,11 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | LANE, re-land | `landAttempt`, `landingAttempt.decide`, `landWithResolution` | operations/land.go, land_attempt.go, land_reland.go |
 | 3-way merge, listing | `landingAttempt.decide`, `landListConflicts` | operations/land_attempt.go, land_resolve.go |
 | out of the lane: rounds, deadline | `landResolving`, `landPreResolve` | operations/land_preresolve.go |
-| per-file verdicts, decide | `landResolveAt`, `decideLand`, `landAnswerProposes`, `landKeyOf` | operations/land_resolve.go, land_proposals.go, land_preresolve.go |
+| per-file verdicts, decide | `landResolveAt`, `landSetOutcomes`, `decideLand`, `landAnswerProposes`, `landKeyOf` | operations/land_resolve.go, land_proposals.go, land_preresolve.go |
+| the tree that would land | `landResolvedTree` | operations/land_resolve.go |
+| verify a model's resolution, out of the lane | `landVerifyOutOfLane`, `landVerify`, `Client.AcquireVerifySlot` | operations/land_verify.go; graft/resolver/check.go |
 | verdicts applied in the lane | `landApplyVerdicts`, `landNeedsResolution` | operations/land_resolve.go, land_preresolve.go |
+| unverified in time: proposals | `landUnverified`, `landNotVerifiedReason` | operations/land_preresolve.go |
 | resolver call, bounded slots | `Client.AcquireResolveSlot`, `ResolveSlot.Resolve` | graft/resolver/check.go |
 | policy before resolving | `hook.CheckAgentPolicy`, `landPolicyDeniedError` | operations/land_resolve.go, land_proposals.go |
 | classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
@@ -1041,10 +1088,10 @@ the same base lines supersedes it. Measured with zero model calls:
   measures overlap with the sides.
 
 **Decisions.**
-1. The AI stays proposal-only.
-2. Federico's amendment (AI landing when every deterministic check passes) stays recorded and is
-   not enabled: no deterministic check reaches the bar. Pending the Sol-100 result, which Federico
-   uses to decide.
+1. The AI stays proposal-only unless verify.command passes on the tree (the final ruling, 14 and 15.9).
+2. Federico's amendment (AI landing when every deterministic check passes) is superseded by the
+   final ruling: the gate is the operator's verify.command, because no deterministic check reaches
+   the bar.
 3. The composition report goes with every proposal, honest about what it can say: "keeps every
    uncontested change of both sides" or "drops THEIRS' change at base 40-44", "duplicates a line
    both sides added", "changes lines outside the conflicts", "N contested regions resolved freely".
@@ -1149,8 +1196,9 @@ The resolution is bound to the files instead (the PM's correction):
   over two plain semaphores; the memory bound of the process is the sum of the two pools' requests.
   Each request waits for its slot within the resolver's timeout and fails closed when it expires.
 * **Still in the lane, stated:** verify.command, the operator's tests on the merged tree, runs in
-  the lane for the rules' resolutions and for agents' resolutions alike. It is the next candidate
-  to move out, as its own step.
+  the lane for the rules' resolutions and for agents' resolutions alike. For a model's resolution
+  it already runs out of the lane (15.9). Moving the other two onto the same mechanism is the next
+  step, measured on its own, so that in the end there is one verification mechanism.
 * **Measured (TestLandResolveBench, GRAFT_LAND_BENCH=1).** Six lands that the server resolves,
   all on the same file, and six plain lands that conflict with nothing, at once through the lanes
   of a standalone server, with a resolver that takes 500 ms; the same bench on the tree before
@@ -1182,3 +1230,48 @@ The resolution is bound to the files instead (the PM's correction):
   * A proposal kept while a batch holds the lane has the published tip as parent (review of
     6090d5b, item 4): proposals are written before the lane only.
   * The two pools: a held resolve slot does not delay a check.
+
+### 15.9 Design delta: a model's resolution lands through the verification (PM ruling)
+
+The final ruling of 14: an AI resolution lands only through the operator's verification. The
+verification runs the operator's tests, which take minutes, so it cannot run in the lane (15.8),
+and the tree it verifies depends on the tip.
+
+* **Verification out of the lane, on the exact tree.** For an answer that holds a model's
+  resolution, and when nothing else keeps the land from landing (every file resolved or proposed),
+  the pre-resolution builds the tree that would land (`landResolvedTree`: the merged tree of the
+  tip and the change, the answer's files written in) and runs verify.command on it, in the
+  quarantine, with a slot of the verify pool (`verify_concurrency`, default 2, a pool of its own:
+  `graft_resolver_verify_slot_wait_seconds`). The tree object ID that passed is kept.
+* **In the lane: tree equality.** The lane merges its own tip, applies the verdicts, builds the
+  tree it would write, and asks decideLand about it: a model's resolution lands only if that tree is
+  a tree that passed. Tree object IDs are compared, not tips: a tip that moved to the same tree
+  keeps the verification; a tip that moved to another tree does not. The lane runs no verification
+  of a model's resolution, and writes the merge commit with Graft-Checked-By: verify:<command>.
+* **Tip moved: out again, no resolver call.** When the tree is not a verified one, the lane does not
+  land. The land goes back out, rebuilds the tree from the same verdicts (the resolver is called only
+  for files whose sides changed, as in 15.8), verifies the new tree, and enters the lane again. Each
+  round costs one verification; the progress argument is the one of 15.8 (a round is lost only when
+  another land landed on the branch), and the rounds are bounded by the deadline of the land.
+* **Deadline: a proposal, not a failure.** The deadline of the land is the resolver's timeout plus
+  verify.timeout when a verify.command is configured. A verified AI land is opportunistic: when the
+  deadline ends before a tree could be verified and landed, the land does not fail for the agent. The
+  model's files become PROPOSED with the reason "could not verify before the branch moved again" (or
+  "before the deadline of <t>" when the verification itself was cut), the proposals are kept (14), and
+  the package goes to the agent. This final pass verifies nothing and calls no resolver. A caller that
+  gives up is not a deadline: it gets its cancellation.
+* **A verification that fails** (non-zero exit, or its own timeout) is a verdict, not a deadline: the
+  files stay PROPOSED and carry "verification failed: exit status N: <the first 4 KiB of the
+  output>" (the package cuts a reason to 512 bytes). Nothing is verified for a land that cannot land
+  anyway (a file refused, a file left to the agent).
+* **Rules are unchanged.** A resolution made by rules alone lands after verify.command, which runs in
+  the lane, as before; so does an agent's resolution. Moving them onto the same out-of-lane mechanism
+  is the next step, measured on its own, so that in the end there is one verification mechanism.
+* **Tests.** A model's resolution that passes lands, signed, with the command run once (so not in
+  the lane); one that fails gives a proposal and the output; without a verify.command it is a
+  proposal; a tip that moved gets its new tree verified and lands, with no resolver call; a tip that
+  moved to the same tree keeps the verification; churn past the deadline gives a proposal, and so does
+  the cap on the rounds; the lane is free while a verification runs (a plain land passes through it);
+  the lane never verifies a model's resolution; the verify pool bounds the verifications at once;
+  rules keep their verification in the lane; and the table test of decideLand, whose one rule is
+  compared by tree object ID.

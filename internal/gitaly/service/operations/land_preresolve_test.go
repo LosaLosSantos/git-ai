@@ -190,6 +190,10 @@ if [ "$N" = 1 ]; then
   i=0
   while [ ! -f "$V/release" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done
 fi
+if [ "$N" != 1 ] && [ -f "$V/fail" ]; then
+  echo "tests failed"
+  exit 3
+fi
 exit 0`, vdir))
 	graft := batchingGraft()
 	graft.Land.Resolver = withVerify(enabledResolver(argv), verify, "")
@@ -258,9 +262,12 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 		t.Parallel()
 
 		h := newHeldLane(t)
+		// A model's answer for b, whose verification fails: b cannot land (15.9). The verification
+		// runs out of the lane too, while the lane is held.
 		proposal := answerOf("b")
 		proposal.Resolver = "graft-resolve/llm"
 		writeAnswerN(t, h.dir, 2, proposal)
+		require.NoError(t, os.WriteFile(filepath.Join(h.vdir, "fail"), nil, 0o600))
 
 		// The land of b returns while the lane is still held: it never queued behind a.
 		req := h.fx.request("Land b")
@@ -269,7 +276,8 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 		requireMergeConflict(t, err)
 		require.Equal(t, [][]byte{[]byte("b")}, landErrorDetail(t, err).GetMergeConflict().GetConflictingFiles())
 		requireRunning(t, h.first, "the land of a")
-		require.Equal(t, 1, h.verifications(t))
+		require.Equal(t, 2, h.verifications(t), "a's, held in the lane, and b's, out of it")
+		require.Contains(t, packageFile(t, landConflictDetail(err), "b").GetReason(), "verification failed: exit status 3: tests failed")
 
 		// The proposal was kept although the lane was busy with a batch: it was written before the
 		// lane, on the published tip, never on a tip that exists only in a batch's quarantine
@@ -532,12 +540,11 @@ func TestLandApplyVerdicts_neverCallsTheResolver(t *testing.T) {
 	s := fx.server(t, rcfg)
 	in := fx.request("Land agent work")
 
-	verdicts := landVerdicts{}
-	_, _, err := s.landResolveAt(fx.ctx, in, fx.repo, fx.tip, fx.commit, fx.committer(), verdicts)
+	pre := newLandPreResolution()
+	_, _, err := s.landResolveAt(fx.ctx, in, fx.repo, fx.tip, fx.commit, fx.committer(), pre)
 	require.NoError(t, err)
 	require.Equal(t, 1, resolverCalls(t, dir))
-	require.Len(t, verdicts, 2)
-	pre := &landPreResolution{verdicts: verdicts}
+	require.Len(t, pre.verdicts, 2)
 
 	// At the tip they were made at, the verdicts are written.
 	res, err := s.landApplyVerdicts(fx.ctx, in, fx.repo, fx.tip, fx.commit, fx.committer(), pre)

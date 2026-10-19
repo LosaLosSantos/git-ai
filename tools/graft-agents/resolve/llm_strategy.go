@@ -181,7 +181,8 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 func (s *llmStrategy) syntaxChecked() {}
 
 // proposer marks a strategy whose results are proposals: those of a model, which the server
-// proposes to the agent and never lands (PLAN10 14).
+// proposes to the agent, and lands only when verify.command passed on the tree that lands
+// (PLAN10 14, 15.9).
 type proposer interface{ proposes() }
 
 // proposes marks the llm answers as proposals (resolveFile).

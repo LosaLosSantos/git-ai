@@ -30,7 +30,8 @@ import (
 //	DIR/sides/ours/<path>
 //	DIR/sides/theirs/<path>
 //	DIR/proposals/<path>      the resolver's proposal for the path, when it made one (a model's
-//	                          resolution, which the server never lands, or the rules' of a land
+//	                          resolution, which did not land because no verification passed on
+//	                          it, or the rules' of a land
 //	                          that failed for another file); copy it over DIR/files/<path> to
 //	                          land it as yours
 //	DIR/conflict.json         the conflict package

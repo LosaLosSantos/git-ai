@@ -30,7 +30,7 @@ func TestResolveSlot_aPanickingResolverCallGivesItsSlotBack(t *testing.T) {
 	s.landResolveHook = func() { panic("a resolution failed") }
 
 	require.PanicsWithValue(t, "a resolution failed", func() {
-		_, _, _ = s.landResolveAt(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer(), landVerdicts{})
+		_, _, _ = s.landResolveAt(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer(), newLandPreResolution())
 	})
 	require.Equal(t, 0, resolverCalls(t, dir), "the hook ran before the call")
 

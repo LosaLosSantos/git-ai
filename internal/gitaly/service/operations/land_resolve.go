@@ -77,24 +77,27 @@ type landFileConflict struct {
 }
 
 // landResolveAt resolves, against tip, the conflicting files of the land that have no verdict in
-// verdicts yet (PLAN10 15.8). It runs out of the lane: the policy first (an agent that may not
+// pre yet (PLAN10 15.8). It runs out of the lane: the policy first (an agent that may not
 // update the branch gets nothing resolved), the listing, the classification of every file, one
-// resolver request for the files to resolve, taken with a resolve slot, and the validation; then
-// decideLand over every file, the verdicts reused included. A request carries only what a file's
-// verdict may depend on: the sides, the path and modes, the change's message, the configuration;
-// not the tip, its merge base or its message, so that a verdict can be reused at another tip
-// (15.8). When the land is landable, the new verdicts are added to verdicts, and the listing and
-// the answer to write are returned. Otherwise the answer is kept as proposals (14) and the land
-// fails with a *landUnresolvedError, whose package says what happened to each file; a request the
-// server does not attempt at all also gets a package, with the reason. Any other error means the
-// conflicts could not be listed, and the caller reports the merge conflict alone.
+// resolver request for the files to resolve, taken with a resolve slot, and the validation; then,
+// for an answer that holds a model's resolution, the verification of the exact tree that would
+// land (15.9), with a verify slot; then decideLand over every file, the verdicts reused included.
+// A request carries only what a file's verdict may depend on: the sides, the path and modes, the
+// change's message, the configuration; not the tip, its merge base or its message, so that a
+// verdict can be reused at another tip (15.8). When the land is landable, the new verdicts are
+// added to pre, the verified tree is recorded there, and the listing and the answer to write are
+// returned. Otherwise the answer is kept as proposals (14) and the land fails with a
+// *landUnresolvedError, whose package says what happened to each file, and why a model's
+// resolution did not land; a request the server does not attempt at all also gets a package, with
+// the reason. A verification that the context ended is a *landVerifyUnfinishedError. Any other
+// error means the conflicts could not be listed, and the caller reports the merge conflict alone.
 func (s *Server) landResolveAt(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
 	repo *localrepo.Repo,
 	tip, commitID git.ObjectID,
 	committer git.Signature,
-	verdicts landVerdicts,
+	pre *landPreResolution,
 ) (landListing, *resolver.Response, error) {
 	// An agent that may not update the branch gets nothing resolved, and no proposal is kept for
 	// it: the policy decides on the actor and the reference alone, so it is checked first.
@@ -136,20 +139,31 @@ func (s *Server) landResolveAt(
 	}
 
 	// A file the classification sends and that has a verdict with its key is not resolved again.
+	// mine are the files with an answer, reused or fresh, whose outcome the answer decides.
 	reused := map[string]resolver.ResponseFile{}
 	var reusedNames []string
 	var sent []resolver.File
+	var mine []*landFileState
 	for _, f := range files {
 		if !f.sent() {
 			continue
 		}
-		if v, ok := verdicts[landKeyOf(f.conflict)]; ok {
+		mine = append(mine, f)
+		if v, ok := pre.verdicts[landKeyOf(f.conflict)]; ok {
 			reused[f.conflict.path] = v.file
 			reusedNames = append(reusedNames, v.resolver)
 			f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
 			continue
 		}
 		sent = append(sent, landRequestFile(f))
+	}
+	// Past its deadline a land only reports what it has: the resolver is not called.
+	if pre.unverifiable != "" && len(sent) > 0 {
+		paths := make([]string, 0, len(sent))
+		for _, f := range sent {
+			paths = append(paths, f.Path)
+		}
+		return l, nil, &landNeedsResolution{tip: tip, commit: commitID, paths: paths}
 	}
 
 	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
@@ -184,32 +198,55 @@ func (s *Server) landResolveAt(
 			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
 		default:
 			answer = resp
-			proposes := landAnswerProposes(resp)
-			// A resolver that names the llm strategy but marks no file is taken to have proposed
-			// every file: the mark may be missing, never the other way round.
-			flagged := landAnswerFlagsProposals(resp)
-			written := make(map[string]resolver.ResponseFile, len(resp.Files))
-			for _, rf := range resp.Files {
-				written[rf.Path] = rf
-			}
-			for _, f := range files {
-				if !f.sent() {
-					continue
-				}
-				rf := written[f.conflict.path]
-				f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
-				switch err := landModeOfSides(f.conflict, rf); {
-				case err != nil:
-					f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
-				case rf.Proposal || (proposes && !flagged):
-					f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
+		}
+	}
+
+	combined := landCombinedAnswer(answer, reused, reusedNames, len(sent) > 0)
+	if combined != nil {
+		landSetOutcomes(combined, mine)
+	}
+	// The verdicts of an answer that nothing refuses are kept by their keys before it is verified or
+	// decided: the lane and the next round reuse them, whatever becomes of this verification.
+	if answer != nil && landAllAnswered(files) {
+		for _, f := range files {
+			for _, rf := range answer.Files {
+				if rf.Path == f.conflict.path {
+					pre.verdicts[landKeyOf(f.conflict)] = landVerdict{file: rf, resolver: answer.Resolver}
 				}
 			}
 		}
 	}
 
-	combined := landCombinedAnswer(answer, reused, reusedNames, len(sent) > 0)
-	landed := decideLand(combined, files)
+	// A model's resolution lands only through the operator's verification (15.9): verify.command
+	// runs here, out of the lane, on the exact tree that would land, once nothing else stops the
+	// land. Whatever keeps a model's file from landing is said in the reason of its file.
+	var tree, verified git.ObjectID
+	if combined != nil && landAnswerProposes(combined) {
+		switch {
+		case pre.unverifiable != "":
+			landAnnotateProposed(files, pre.unverifiable)
+		case !s.resolveCfg.Verify.Enabled:
+			landAnnotateProposed(files, landNoVerifyReason)
+		case landAllAnswered(files):
+			var err error
+			if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, combined); err != nil {
+				return l, nil, err
+			}
+			var verifyErr *landVerifyError
+			switch err := s.landVerifyOutOfLane(ctx, repo, tree); {
+			case err == nil:
+				verified = tree
+				pre.markVerified(tree)
+				s.logger.WithFields(log.Fields{"branch": string(in.GetBranch()), "tip": tip.String(), "commit": commitID.String(), "tree": tree.String()}).
+					InfoContext(ctx, "graft: a model's resolution passed the verification out of the lane")
+			case errors.As(err, &verifyErr):
+				landAnnotateProposed(files, verifyErr.Error())
+			default:
+				return l, nil, err
+			}
+		}
+	}
+	landed := decideLand(combined, files, tree, verified)
 	// An answer that does not land, because a model made part of it or another file is left, is
 	// kept for the agent: the files that rules resolved can be landed as they are. The proposals
 	// are an aid and the package is the contract: when they cannot be kept, the package still goes
@@ -229,16 +266,56 @@ func (s *Server) landResolveAt(
 		return l, nil, l.unresolved("", landUnresolvedCause(files), resolveErr)
 	}
 
-	if answer != nil {
-		for _, f := range files {
-			for _, rf := range answer.Files {
-				if rf.Path == f.conflict.path {
-					verdicts[landKeyOf(f.conflict)] = landVerdict{file: rf, resolver: answer.Resolver}
-				}
-			}
+	return l, combined, nil
+}
+
+// landSetOutcomes sets the outcome of each of files from the answer that covers them: RESOLVED, or
+// REJECTED when the resolution writes a mode no side has, or PROPOSED when a model made the file.
+// A resolver that names the llm strategy but marks no file is taken to have proposed every file:
+// the mark may be missing, never the other way round. The lane sets them the same way from the
+// verdicts it applies, so that both ask decideLand the same question.
+func landSetOutcomes(answer *resolver.Response, files []*landFileState) {
+	proposes := landAnswerProposes(answer)
+	flagged := landAnswerFlagsProposals(answer)
+	written := make(map[string]resolver.ResponseFile, len(answer.Files))
+	for _, rf := range answer.Files {
+		written[rf.Path] = rf
+	}
+	for _, f := range files {
+		rf := written[f.conflict.path]
+		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_RESOLVED, ""
+		switch err := landModeOfSides(f.conflict, rf); {
+		case err != nil:
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
+		case rf.Proposal || (proposes && !flagged):
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
 		}
 	}
-	return l, combined, nil
+}
+
+// landAllAnswered reports whether every file is resolved or proposed: nothing else keeps the land
+// from landing, so that a model's resolution is worth verifying.
+func landAllAnswered(files []*landFileState) bool {
+	for _, f := range files {
+		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED && f.outcome != gitalypb.LandConflictFile_OUTCOME_PROPOSED {
+			return false
+		}
+	}
+	return true
+}
+
+// landAnnotateProposed adds why a model's files did not land to the reason of each.
+func landAnnotateProposed(files []*landFileState, why string) {
+	for _, f := range files {
+		if f.outcome != gitalypb.LandConflictFile_OUTCOME_PROPOSED {
+			continue
+		}
+		if f.reason == "" {
+			f.reason = why
+		} else {
+			f.reason += "; " + why
+		}
+	}
 }
 
 // landResolveSlotted sends the resolve request with a resolve slot. The slot is given back when the
@@ -363,7 +440,36 @@ func (s *Server) landApplyVerdicts(
 		names = append(names, v.resolver)
 	}
 	answer := landCombinedAnswer(nil, reused, names, false)
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "")
+	landSetOutcomes(answer, l.files)
+
+	// The one rule about a model's resolution, asked of the tree this tip would land: it lands only
+	// if verify.command passed on this very tree (tree OIDs, not tips). When the tip moved, the tree
+	// is another one, and the land goes back out of the lane to be verified again. The lane never
+	// runs the verification of a model's resolution.
+	var tree, verified git.ObjectID
+	if landAnswerProposes(answer) {
+		if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, answer); err != nil {
+			return landResolution{}, err
+		}
+		if pre.isVerified(tree) {
+			verified = tree
+		}
+	}
+	if !decideLand(answer, l.files, tree, verified) {
+		need := &landNeedsResolution{tip: tip, commit: commitID, unverified: tree}
+		if tree == "" {
+			// Nothing to verify, yet not landable: a file the answer rejects. Resolving again says why.
+			for _, f := range l.files {
+				need.paths = append(need.paths, f.conflict.path)
+			}
+		}
+		return landResolution{}, need
+	}
+	checkedBy := ""
+	if verified != "" {
+		checkedBy = s.landVerifyTrailer()
+	}
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, checkedBy, tree, verified != "")
 	return res, l.verifyRejected(err)
 }
 
@@ -555,8 +661,12 @@ func landUnresolvedCause(files []*landFileState) string {
 }
 
 // landWriteResolution writes a resolution (the resolver's answer, or the agent's) into the merged
-// tree and commits it with parents [tip, commitID]; checkedBy names the resolver that checked an
-// agent's resolution, if one did. The commit message carries the trailers.
+// tree and commits it with parents [tip, commitID]; checkedBy names what checked it, if anything
+// did. The commit message carries the trailers. built is the resolved tree when the caller already
+// built it (landResolvedTree). verified says that verify.command passed on that very tree, out of
+// the lane (15.9), so that it is not run again; otherwise the operator's verification runs here,
+// in the lane, on the merged tree, before it lands: that is a resolution made by rules or by an
+// agent, which keeps its verification in the lane for now.
 func (s *Server) landWriteResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -566,11 +676,9 @@ func (s *Server) landWriteResolution(
 	actor string,
 	resp *resolver.Response,
 	checkedBy string,
+	built git.ObjectID,
+	verified bool,
 ) (landResolution, error) {
-	tree, err := repo.ReadTree(ctx, git.Revision(mergedTree.String()), localrepo.WithRecursive())
-	if err != nil {
-		return landResolution{}, fmt.Errorf("reading merged tree: %w", err)
-	}
 	paths := make([]string, 0, len(resp.Files))
 	for _, f := range resp.Files {
 		paths = append(paths, f.Path)
@@ -581,35 +689,23 @@ func (s *Server) landWriteResolution(
 	if err != nil {
 		return landResolution{}, err
 	}
-	for _, f := range resp.Files {
-		if f.Action == resolver.ActionDelete {
-			if err := tree.Delete(f.Path); err != nil && !errors.Is(err, localrepo.ErrEntryNotFound) {
-				return landResolution{}, fmt.Errorf("deleting %q: %w", f.Path, err)
-			}
-			continue
-		}
-
-		blob, err := repo.WriteBlob(ctx, bytes.NewReader(f.Content), localrepo.WriteBlobConfig{Path: f.Path})
-		if err != nil {
-			return landResolution{}, fmt.Errorf("writing resolved %q: %w", f.Path, err)
-		}
-		entry := localrepo.TreeEntry{OID: blob, Mode: f.Mode, Path: path.Base(f.Path), Type: localrepo.Blob}
-		if err := tree.Add(f.Path, entry, localrepo.WithOverwriteFile()); err != nil {
-			return landResolution{}, fmt.Errorf("adding resolved %q: %w", f.Path, err)
+	treeID := built
+	if treeID == "" {
+		var err error
+		if treeID, err = s.landResolvedTree(ctx, repo, mergedTree, resp); err != nil {
+			return landResolution{}, err
 		}
 	}
-	if err := tree.Write(ctx, repo); err != nil {
-		return landResolution{}, fmt.Errorf("writing merged tree: %w", err)
-	}
-	// The optional verification runs on the merged tree, the resolution included, before it lands.
-	if s.resolveCfg.Verify.Enabled {
-		if err := s.landVerify(ctx, repo, tree.OID); err != nil {
+	// The optional verification runs on the merged tree, the resolution included, before it lands,
+	// unless it already passed on this tree out of the lane.
+	if s.resolveCfg.Verify.Enabled && !verified {
+		if err := s.landVerify(ctx, repo, treeID); err != nil {
 			return landResolution{}, err
 		}
 	}
 
 	newTip, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{
-		TreeID:         tree.OID,
+		TreeID:         treeID,
 		Message:        message,
 		Parents:        []git.ObjectID{tip, commitID},
 		AuthorName:     committer.Name,
@@ -645,6 +741,36 @@ func (s *Server) landWriteResolution(
 	}).InfoContext(ctx, "graft: conflicts of land resolved")
 
 	return landResolution{commit: newTip, resolvedPaths: resolvedPaths, resolver: resp.Resolver}, nil
+}
+
+// landResolvedTree writes a resolution into the merged tree and returns the tree: the exact tree
+// that a land of this resolution would commit. Its object ID is what the verification is tied to.
+func (s *Server) landResolvedTree(ctx context.Context, repo *localrepo.Repo, mergedTree git.ObjectID, resp *resolver.Response) (git.ObjectID, error) {
+	tree, err := repo.ReadTree(ctx, git.Revision(mergedTree.String()), localrepo.WithRecursive())
+	if err != nil {
+		return "", fmt.Errorf("reading merged tree: %w", err)
+	}
+	for _, f := range resp.Files {
+		if f.Action == resolver.ActionDelete {
+			if err := tree.Delete(f.Path); err != nil && !errors.Is(err, localrepo.ErrEntryNotFound) {
+				return "", fmt.Errorf("deleting %q: %w", f.Path, err)
+			}
+			continue
+		}
+
+		blob, err := repo.WriteBlob(ctx, bytes.NewReader(f.Content), localrepo.WriteBlobConfig{Path: f.Path})
+		if err != nil {
+			return "", fmt.Errorf("writing resolved %q: %w", f.Path, err)
+		}
+		entry := localrepo.TreeEntry{OID: blob, Mode: f.Mode, Path: path.Base(f.Path), Type: localrepo.Blob}
+		if err := tree.Add(f.Path, entry, localrepo.WithOverwriteFile()); err != nil {
+			return "", fmt.Errorf("adding resolved %q: %w", f.Path, err)
+		}
+	}
+	if err := tree.Write(ctx, repo); err != nil {
+		return "", fmt.Errorf("writing merged tree: %w", err)
+	}
+	return tree.OID, nil
 }
 
 // landClassify decides, for every file, whether it may be sent to the resolver, and reads the

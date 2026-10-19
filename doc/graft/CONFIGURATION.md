@@ -193,11 +193,12 @@ cause.
 | `command` | array of strings | empty | Program and arguments. It reads one request on stdin and writes the answer on stdout. |
 | `url` | string | empty | `http://` or `https://` endpoint that receives the request as a JSON POST. Exactly one of `command` and `url` must be set when `enabled` is true. |
 | `token_file` | string | empty | For `url`: file with the bearer token, read at startup. |
-| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration), and on the whole land that the server resolves for `resolve_conflicts`: its rounds (the resolutions, the waits for a resolve slot, and the passes through the branch's lane) end at this deadline. A round that the lane hands back after it fails the land with the merge conflict, "files kept changing", naming the files. |
+| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration), and on the whole land that the server resolves for `resolve_conflicts`: its rounds (the resolutions, the verifications of a model's resolution, the waits for slots, and the passes through the branch's lane) end at this deadline, which is `timeout` plus `verify.timeout` when `verify.enabled`. A round that the lane hands back after it fails the land with the merge conflict, "files kept changing", naming the files. |
 | `max_files` | int | `20` | Conflicted files per land. A land with more is not sent to the resolver. |
 | `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. At most 12566528 (about 12 MiB): one file, its three sides and its resolution, must fit one check request. |
 | `proposal_ttl` | string | `"168h"` | How long the proposals of a failed land are kept under `refs/graft/proposals/` (Go duration, by the server's clock); at most 20 are kept per branch. Lands with a resolution and the housekeeping pass prune them. |
 | `check_concurrency` | int | `2` | Checks of agents' resolutions that run at once in the Gitaly process, across all its listeners (one resolver client is shared by them); each holds a request of up to 64 MiB. A check waits for a free slot within its deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_check_slot_wait_seconds`. |
+| `verify_concurrency` | int | `2` | Verifications of a model's resolution that run at once in the Gitaly process, out of the lane, in a pool of their own, as `verify.command` takes minutes. A verification waits for a free slot within the land's deadline. The wait is in `graft_resolver_verify_slot_wait_seconds`. |
 | `resolve_concurrency` | int | `2` | Resolutions that run at once in the Gitaly process, in a pool apart from the checks', so that long resolutions never delay a check. A resolution waits for a free slot within the land's deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_resolve_slot_wait_seconds`. |
 | `resolve_rounds` | int | `32` | Safety cap on the rounds of a land whose conflicting files keep changing while it is resolved out of the lane. The rounds are bounded by `timeout`; the cap is set well above realistic contention and is no contract. |
 | `paths_allow` | array of strings | empty (every path) | Globs of paths that may be sent to the resolver, with the syntax of policy refs. |
@@ -208,9 +209,9 @@ cause.
 | `minified.globs` | array of strings | empty | Base-name globs of minified files, besides the built-in `*.min.js`, `*.min.mjs`, `*.min.css` and `*.bundle.js`. Such files are never sent. |
 | `minified.average_line_bytes` | int | `300` | A side larger than 2 KiB whose average line is longer is minified. |
 | `minified.longest_line_bytes` | int | `5000` | A side larger than 2 KiB with a longer line is minified. |
-| `verify.enabled` | bool | `false` | Run `verify.command` on the merged tree of every resolution (a resolver's or an agent's) before it lands; it applies even when `enabled` is false. |
+| `verify.enabled` | bool | `false` | Run `verify.command` on the merged tree of every resolution (a resolver's or an agent's) before it lands; it applies even when `enabled` is false. It is also what lets a model's resolution land: only a tree it passed on lands, and without it a model's resolution is only ever a proposal. |
 | `verify.command` | array of strings | empty | Program and arguments, run in a temporary checkout of the merged tree with `PATH`, `HOME` and `TMPDIR` only. A non-zero exit rejects the resolution. |
-| `verify.timeout` | string | `"5m"` | Bound on one run (Go duration); a run that does not finish rejects the resolution. |
+| `verify.timeout` | string | `"5m"` | Bound on one run (Go duration); a run that does not finish rejects the resolution. When `verify.enabled`, it is added to `timeout` for the deadline of a resolved land. |
 
 A file that is never sent goes to the agent with its reason in the conflict
 package: large (a side over `max_file_bytes`), binary (a NUL byte), lockfile,

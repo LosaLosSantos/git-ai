@@ -278,8 +278,9 @@ const (
 	// OUTCOME_NOT_ATTEMPTED: the request was not resolved at all (see
 	// LandConflict.reason).
 	LandConflictFile_OUTCOME_NOT_ATTEMPTED LandConflictFile_Outcome = 5
-	// OUTCOME_PROPOSED: a model resolved the file; the server never lands a
-	// model's resolution, it proposes it (see proposal).
+	// OUTCOME_PROPOSED: a model resolved the file; the server lands a
+	// model's resolution only after verify.command passed on the merged tree,
+	// otherwise it proposes it (see proposal).
 	LandConflictFile_OUTCOME_PROPOSED LandConflictFile_Outcome = 6
 )
 

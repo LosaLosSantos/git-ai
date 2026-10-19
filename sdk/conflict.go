@@ -28,8 +28,9 @@ func LandConflict(err error) (*gitalypb.LandConflict, bool) {
 type ConflictSides struct {
 	Base, Ours, Theirs []byte
 	Unreadable         map[string]string
-	// Proposal is the resolver's resolution of the file, when it made one: a model's, which the
-	// server never lands (OUTCOME_PROPOSED), or the rules' in a land that failed for another file.
+	// Proposal is the resolver's resolution of the file, when it made one: a model's, which did not
+	// land because no verification passed on it (OUTCOME_PROPOSED), or the rules' in a land that
+	// failed for another file.
 	// Land it, edited or not, as your own (ResolutionFromProposals).
 	Proposal *Proposal
 }

@@ -91,10 +91,11 @@ func (s *Server) landVerify(ctx context.Context, repo *localrepo.Repo, tree git.
 	}
 	runErr := cmd.Wait()
 	switch {
+	case ctx.Err() != nil:
+		// The caller's deadline or cancellation, not a verdict of the command.
+		return ctx.Err()
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return &landVerifyError{reason: fmt.Sprintf("the command did not finish within %s", timeout)}
-	case ctx.Err() != nil:
-		return ctx.Err()
 	case runErr != nil:
 		reason := strings.TrimSpace(output.String())
 		if code, ok := command.ExitStatus(runErr); ok {
@@ -103,6 +104,55 @@ func (s *Server) landVerify(ctx context.Context, repo *localrepo.Repo, tree git.
 		return &landVerifyError{reason: reason}
 	}
 	return nil
+}
+
+// landVerifyUnfinishedError is a verification that could not be completed, because its context ended
+// (the deadline of the land, or the caller) while it waited for a slot or ran: not a verdict.
+type landVerifyUnfinishedError struct {
+	err error
+}
+
+func (e *landVerifyUnfinishedError) Error() string {
+	return "verification not finished: " + e.err.Error()
+}
+
+func (e *landVerifyUnfinishedError) Unwrap() error { return e.err }
+
+// landVerifyOutOfLane runs the verification of a model's resolution out of the lane (PLAN10 15.9),
+// with a slot of the verify pool. It returns a *landVerifyError when the command fails or times
+// out, a *landVerifyUnfinishedError when ctx ended first, and another error when the verification
+// could not be run.
+func (s *Server) landVerifyOutOfLane(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID) error {
+	slot, err := s.conflictResolver.AcquireVerifySlot(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return &landVerifyUnfinishedError{err: err}
+		}
+		return err
+	}
+	defer slot.Release()
+
+	err = s.landVerify(ctx, repo, tree)
+	var verifyErr *landVerifyError
+	switch {
+	case err == nil, errors.As(err, &verifyErr):
+		return err
+	case ctx.Err() != nil:
+		return &landVerifyUnfinishedError{err: err}
+	}
+	return err
+}
+
+// landVerifyTrailer is what Graft-Checked-By says of a verification that passed: verify:<command>,
+// the base name of the command, or verify when that is not a valid trailer value.
+func (s *Server) landVerifyTrailer() string {
+	name := "verify"
+	if cmd := s.resolveCfg.Verify.Command; len(cmd) > 0 {
+		if v := "verify:" + filepath.Base(cmd[0]); landTrailerValueValid(v) {
+			name = v
+		}
+	}
+	return name
 }
 
 // landExtractTar writes the files of the archive of a tree under dir. It refuses an entry that

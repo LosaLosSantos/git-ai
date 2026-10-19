@@ -1349,8 +1349,9 @@ message LandConflictFile {
     // OUTCOME_NOT_ATTEMPTED: the request was not resolved at all (see
     // LandConflict.reason).
     OUTCOME_NOT_ATTEMPTED = 5;
-    // OUTCOME_PROPOSED: a model resolved the file; the server never lands a
-    // model's resolution, it proposes it (see proposal).
+    // OUTCOME_PROPOSED: a model resolved the file; the server lands a
+    // model's resolution only after verify.command passed on the merged tree,
+    // otherwise it proposes it (see proposal).
     OUTCOME_PROPOSED = 6;
   }
   // path is the path of the conflict in the merged tree.

@@ -151,8 +151,9 @@ type ResolvedFile struct {
 	Action  string `json:"action"`
 	Mode    string `json:"mode,omitempty"`
 	Content []byte `json:"content"`
-	// Proposal marks a resolution made by a model (the llm strategy): the server never lands it,
-	// it proposes it to the agent (PLAN10 14).
+	// Proposal marks a resolution made by a model (the llm strategy): the server lands it only if
+	// verify.command passed on the tree that lands, and otherwise proposes it to the agent
+	// (PLAN10 14, 15.9).
 	Proposal bool `json:"proposal,omitempty"`
 }
 

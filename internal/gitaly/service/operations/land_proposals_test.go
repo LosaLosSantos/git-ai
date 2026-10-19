@@ -54,7 +54,7 @@ func proposalRefTarget(t *testing.T, fx resolveFixture) string {
 func TestUserLand_proposals(t *testing.T) {
 	t.Parallel()
 
-	t.Run("a model's answer is proposed, never landed", func(t *testing.T) {
+	t.Run("a model's answer without a verify.command is proposed, not landed", func(t *testing.T) {
 		t.Parallel()
 
 		dir, argv := resolverScript(t, "")
@@ -79,7 +79,7 @@ func TestUserLand_proposals(t *testing.T) {
 		for _, p := range []string{"a", "b"} {
 			f := packageFile(t, pkg, p)
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), p)
-			require.Contains(t, f.GetReason(), "never lands a model's resolution", p)
+			require.Contains(t, f.GetReason(), "no verify.command is configured", p)
 			prop := f.GetProposal()
 			require.NotNil(t, prop, p)
 			require.Equal(t, resolver.ActionWrite, prop.GetAction())
@@ -303,17 +303,41 @@ func TestDecideLand(t *testing.T) {
 		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}}
 	}
 	rules := &resolver.Response{Resolver: "graft-resolve/trivial,union", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
-	require.True(t, decideLand(rules, resolved()), "rules resolved every file")
-	require.False(t, decideLand(nil, resolved()), "no answer")
+	require.True(t, decideLand(rules, resolved(), "", ""), "rules resolved every file")
+	require.True(t, decideLand(rules, resolved(), "t1", "t2"), "rules land whatever tree was verified: their verification stays in the lane")
+	require.False(t, decideLand(nil, resolved(), "t1", "t1"), "no answer")
 
 	left := resolved()
 	left[1].outcome = gitalypb.LandConflictFile_OUTCOME_NOT_SENT
-	require.False(t, decideLand(rules, left), "a file left to the agent")
+	require.False(t, decideLand(rules, left, "", ""), "a file left to the agent")
+	rejected := resolved()
+	rejected[0].outcome = gitalypb.LandConflictFile_OUTCOME_REJECTED
+	require.False(t, decideLand(rules, rejected, "", ""), "a file the answer is refused for")
+	proposedByRules := resolved()
+	proposedByRules[0].outcome = gitalypb.LandConflictFile_OUTCOME_PROPOSED
+	require.False(t, decideLand(rules, proposedByRules, "", ""), "a PROPOSED file in an answer that does not propose")
 
+	// THE rule (PLAN10 15.9): a file that proposes may land only if verify.command passed on the exact
+	// tree that lands, compared by object ID.
 	flagged := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b", Proposal: true}}}
-	require.False(t, decideLand(flagged, resolved()), "a file that proposes, even with every outcome RESOLVED")
 	named := &resolver.Response{Resolver: "graft-resolve/trivial,llm", Files: []resolver.ResponseFile{{Path: "a"}, {Path: "b"}}}
-	require.False(t, decideLand(named, resolved()), "a resolver that names the llm strategy")
+	proposing := func() []*landFileState {
+		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_PROPOSED}}
+	}
+	for desc, answer := range map[string]*resolver.Response{"a flagged file": flagged, "the llm strategy by name": named} {
+		require.True(t, decideLand(answer, proposing(), "tree-1", "tree-1"), "%s: verified on this very tree", desc)
+		require.False(t, decideLand(answer, proposing(), "tree-1", ""), "%s: nothing verified", desc)
+		require.False(t, decideLand(answer, proposing(), "tree-1", "tree-2"), "%s: verified on another tree (the tip moved)", desc)
+		require.False(t, decideLand(answer, proposing(), "", ""), "%s: no tree at all: empty is not equal", desc)
+		require.False(t, decideLand(answer, resolved(), "tree-1", ""), "%s: even with every outcome RESOLVED", desc)
+
+		leftOver := proposing()
+		leftOver[0].outcome = gitalypb.LandConflictFile_OUTCOME_FAILED
+		require.False(t, decideLand(answer, leftOver, "tree-1", "tree-1"), "%s: verified, but a file is left to the agent", desc)
+		refused := proposing()
+		refused[1].outcome = gitalypb.LandConflictFile_OUTCOME_REJECTED
+		require.False(t, decideLand(answer, refused, "tree-1", "tree-1"), "%s: verified, but a file is refused", desc)
+	}
 }
 
 // TestResolveLandConflicts_policyFirst: an agent the policy does not let update the branch gets

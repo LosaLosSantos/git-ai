@@ -102,6 +102,9 @@ type Client struct {
 	// the short checks (PLAN10 15.8).
 	checkSlots   chan struct{}
 	resolveSlots chan struct{}
+	// verifySlots bounds the verifications of a model's resolution that run at once (VerifySlot),
+	// a third pool, as the operator's command takes minutes (PLAN10 15.9).
+	verifySlots chan struct{}
 	// sendRules decide the files that are never sent (SendRules).
 	sendRules *SendRules
 }
@@ -135,8 +138,8 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		return nil, err
 	}
 
-	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 || cfg.ResolveConcurrency < 0 || cfg.ResolveRounds < 0 {
-		return nil, errors.New("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency and resolve_rounds must not be negative")
+	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 || cfg.ResolveConcurrency < 0 || cfg.VerifyConcurrency < 0 || cfg.ResolveRounds < 0 {
+		return nil, errors.New("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency, verify_concurrency and resolve_rounds must not be negative")
 	}
 	// The check of an agent's resolution sends a file's three sides and its resolution in one
 	// request, which must fit its bound.
@@ -159,6 +162,7 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		sendRules:    rules,
 		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
 		resolveSlots: make(chan struct{}, cfg.ResolveConcurrencyOrDefault()),
+		verifySlots:  make(chan struct{}, cfg.VerifyConcurrencyOrDefault()),
 	}
 
 	if cfg.URL != "" {

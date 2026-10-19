@@ -128,6 +128,47 @@ func (s *ResolveSlot) Resolve(ctx context.Context, req Request) (*Response, erro
 	return s.c.resolve(ctx, req)
 }
 
+// verifySlotWait is the time the verifications waited for a verify slot.
+var verifySlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "graft_resolver_verify_slot_wait_seconds",
+	Help:    "Time a verification of a model's resolution waited for one of the resolver's verify slots.",
+	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
+})
+
+// VerifySlot is the right to run one verification at a time: the client runs at most
+// verify_concurrency of them at once (AcquireVerifySlot), in a pool apart from the checks' and the
+// resolutions'. Release it when the verification is done.
+type VerifySlot struct {
+	c        *Client
+	released bool
+}
+
+// AcquireVerifySlot waits for a verify slot. The wait counts against the deadline of ctx: when ctx
+// ends first, it fails, and the land cannot be verified in time.
+func (c *Client) AcquireVerifySlot(ctx context.Context) (*VerifySlot, error) {
+	if c == nil {
+		return nil, ErrDisabled
+	}
+	start := time.Now()
+	select {
+	case c.verifySlots <- struct{}{}:
+		verifySlotWait.Observe(time.Since(start).Seconds())
+		return &VerifySlot{c: c}, nil
+	case <-ctx.Done():
+		verifySlotWait.Observe(time.Since(start).Seconds())
+		return nil, fmt.Errorf("waiting for a verify slot of the resolver: %w", ctx.Err())
+	}
+}
+
+// Release gives the slot back; a second call does nothing.
+func (s *VerifySlot) Release() {
+	if s == nil || s.released {
+		return
+	}
+	s.released = true
+	<-s.c.verifySlots
+}
+
 // Check sends one check request with the slot (Client.check).
 func (s *CheckSlot) Check(ctx context.Context, req Request) (*CheckResponse, error) {
 	if s == nil || s.released {

@@ -450,7 +450,8 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
 			continue
 		}
-		// A model resolution is a proposal: the server never lands it (PLAN10 14). It is not
+		// A model resolution is a proposal: the server lands it only after verify.command passed on
+		// the tree that lands (PLAN10 14, 15.9). It is not
 		// recorded either: a strategy that learns accepted answers (Recorder) would otherwise
 		// replay a model's resolution later as a rule's.
 		_, proposal := b.Strategy.(proposer)

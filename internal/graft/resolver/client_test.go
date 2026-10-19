@@ -768,6 +768,55 @@ func TestAcquireResolveSlot_boundsTheResolutionsAtOnce(t *testing.T) {
 	require.ErrorIs(t, err, ErrDisabled)
 }
 
+// TestAcquireVerifySlot_boundsTheVerificationsAtOnce: at most verify_concurrency slots are held at
+// once; a wait counts against the caller's deadline; a released slot frees its place once; the pool
+// is apart from the checks' and the resolutions'.
+func TestAcquireVerifySlot_boundsTheVerificationsAtOnce(t *testing.T) {
+	cfg := commandConfig([]string{"/bin/true"})
+	cfg.VerifyConcurrency = 1
+	cfg.CheckConcurrency = 1
+	cfg.ResolveConcurrency = 1
+	client := newClient(t, cfg)
+	ctx := testhelper.Context(t)
+
+	first, err := client.AcquireVerifySlot(ctx)
+	require.NoError(t, err)
+
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	_, err = client.AcquireVerifySlot(waitCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "waiting for a verify slot of the resolver")
+
+	// A held verify slot delays neither a check nor a resolution.
+	quick, cancelQuick := context.WithTimeout(ctx, time.Second)
+	defer cancelQuick()
+	checkSlot, err := client.AcquireCheckSlot(quick)
+	require.NoError(t, err)
+	resolveSlot, err := client.AcquireResolveSlot(quick)
+	require.NoError(t, err)
+	checkSlot.Release()
+	resolveSlot.Release()
+
+	first.Release()
+	first.Release()
+	second, err := client.AcquireVerifySlot(ctx)
+	require.NoError(t, err)
+	waitCtx2, cancel2 := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel2()
+	_, err = client.AcquireVerifySlot(waitCtx2)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "a second release must not free a second place")
+	second.Release()
+
+	var none *VerifySlot
+	none.Release()
+	var disabled *Client
+	_, err = disabled.AcquireVerifySlot(ctx)
+	require.ErrorIs(t, err, ErrDisabled)
+
+	require.Equal(t, config.DefaultGraftResolverVerifyConcurrency, cap(newClient(t, commandConfig([]string{"/bin/true"})).verifySlots))
+}
+
 // TestResolveSlots_apartFromTheCheckSlots: the resolutions and the checks have pools of their own
 // (PLAN10 15.8): every resolve slot held does not delay a check, and every check slot held does not
 // delay a resolution.
@@ -806,6 +855,7 @@ func TestAcquireResolveSlot_defaultConcurrency(t *testing.T) {
 func TestNew_refusesNegativePools(t *testing.T) {
 	for name, set := range map[string]func(*config.GraftResolver){
 		"resolve_concurrency": func(c *config.GraftResolver) { c.ResolveConcurrency = -1 },
+		"verify_concurrency":  func(c *config.GraftResolver) { c.VerifyConcurrency = -1 },
 		"resolve_rounds":      func(c *config.GraftResolver) { c.ResolveRounds = -1 },
 	} {
 		cfg := commandConfig([]string{"/bin/true"})

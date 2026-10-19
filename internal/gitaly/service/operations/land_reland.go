@@ -306,7 +306,7 @@ func (s *Server) landWithResolution(
 	for _, f := range l.files {
 		resp.Files = append(resp.Files, review.resolved[f.conflict.path])
 	}
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, review.actor, resp, checkedBy)
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, review.actor, resp, checkedBy, "", false)
 	res.syntaxUnchecked = syntaxUnchecked
 	return res, l.verifyRejected(err)
 }

@@ -24,8 +24,9 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// A resolution that a model made is never landed by the server: it is a proposal, which the agent
-// reviews, edits or replaces, and lands as its own (PLAN10 14). The server keeps the proposals of a
+// A resolution that a model made lands only through the operator's verification (PLAN10 14, 15.9):
+// when verify.command ran and passed on the exact tree that lands. Otherwise it is a proposal, which
+// the agent reviews, edits or replaces, and lands as its own. The server keeps the proposals of a
 // failed land under a hidden reference, which the agent reads by object ID (GetObjects).
 
 // landProposalPruneErrors counts the prunings of proposal references that failed after a land.
@@ -41,8 +42,13 @@ var landProposalWriteErrors = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Resolver answers of a failed land that could not be kept as proposals.",
 })
 
-// landProposedReason is the reason of a file that a model resolved.
-const landProposedReason = "a model resolved the file: the server never lands a model's resolution, it proposes it (see proposal); land it, edited or not, as your own resolution"
+// landProposedReason is the reason of a file that a model resolved and that did not land: a model's
+// resolution lands only after verify.command passed on the merged tree, and the reason that it did
+// not follows it (landNoVerifyReason, the output of the verification, or why it could not run).
+const landProposedReason = "a model resolved the file: it is proposed (see proposal), and lands by itself only after verify.command passed on the merged tree; land it, edited or not, as your own resolution"
+
+// landNoVerifyReason follows landProposedReason when no verify.command is configured.
+const landNoVerifyReason = "no verify.command is configured, so nothing verifies a model's resolution"
 
 // landAnswerFlagsProposals reports whether a file of the answer is marked as a proposal.
 func landAnswerFlagsProposals(answer *resolver.Response) bool {
@@ -198,18 +204,29 @@ func landTrailerValueOrQuoted(v string) string {
 }
 
 // decideLand is the one decision point of a land that asked the server to resolve its conflicts
-// (PLAN10 15.4): it lands only when the resolver answered, the answer holds no model's resolution,
-// and every conflicting file is resolved. A file that proposes is never landed. This is where a
-// landing gate for model resolutions would live; today there is none.
-func decideLand(answer *resolver.Response, files []*landFileState) bool {
+// (PLAN10 15.4): it lands only when the resolver answered and every conflicting file is resolved,
+// by a rule (RESOLVED) or by a model (PROPOSED). The one rule about a model: a file that proposes
+// may land only if verify.command ran and passed on the exact tree that lands. tree is the tree
+// the land would write and verified the tree the verification passed on, compared by object ID,
+// not by the tip they were made at; a verified tree is never the empty ID. No other code path
+// lands a model's resolution.
+func decideLand(answer *resolver.Response, files []*landFileState, tree, verified git.ObjectID) bool {
 	if answer == nil {
 		return false
 	}
-	if landAnswerProposes(answer) {
+	proposes := landAnswerProposes(answer)
+	if proposes && (verified == "" || verified != tree) {
 		return false
 	}
 	for _, f := range files {
-		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+		switch f.outcome {
+		case gitalypb.LandConflictFile_OUTCOME_RESOLVED:
+		case gitalypb.LandConflictFile_OUTCOME_PROPOSED:
+			// Only an answer that proposes has a PROPOSED file, and it passed the rule above.
+			if !proposes {
+				return false
+			}
+		default:
 			return false
 		}
 	}

@@ -46,6 +46,9 @@ actors = ["builder", "planner"]
   never delay the short checks. `resolve_rounds` (default 32) is a safety cap
   on the rounds of a land whose files keep changing (see "Out of the lane"
   below); the rounds are bounded by `timeout`, and the cap is no contract.
+- `verify_concurrency` (default 2): the verifications of a model's resolution
+  that run at once in the Gitaly process, in a pool of their own (see "Optional
+  verification of a resolution").
 - A configuration the server could not use is a startup error (see
   [CONFIGURATION](CONFIGURATION.md)). A configured resolver is never treated
   as no resolver: if it cannot be built later, every land that needs it fails
@@ -162,13 +165,18 @@ and the error carries the conflict package as a second detail (see
 [The conflict package and the re-land](#the-conflict-package-and-the-re-land)).
 Nothing lands partially: the branch is never left in a partial state.
 
-### Proposals: a model's resolution never lands
+### Proposals, and when a model's resolution lands
 
-The server never lands what a model resolved: the agent always resolves
-(PLAN10 14). graft-resolve marks every file its `llm` strategy resolved as a
-proposal (`"proposal": true`), and the server treats an answer as proposing
-when a file is marked, or when the resolver names the `llm` strategy without
-marking any. Such a land fails with the package: the model's files are
+A model's resolution lands only through the operator's verification
+(PLAN10 14 and 15.9): when `verify.command` is configured and passes, out of
+the lane, on the exact tree that would land (see "Optional verification of a
+resolution"). Without a `verify.command` the server never lands what a model
+resolved: the agent decides. graft-resolve marks every file its `llm` strategy
+resolved as a proposal (`"proposal": true`), and the server treats an answer as
+proposing when a file is marked, or when the resolver names the `llm` strategy
+without marking any. A land of such an answer that does not land (no
+`verify.command`, a verification that failed, or none finished in time) fails
+with the package: the model's files are
 `PROPOSED`, the files the rules resolved keep `RESOLVED`, and every file the
 answer resolved carries its `proposal` (action, blob OID, mode, resolver, and
 the explanation cut to 512 bytes). An answer that does not land for another
@@ -381,7 +389,33 @@ temporary directory and runs `command` there, with a minimal environment
 (`PATH`, and `HOME` and `TMPDIR` in a directory of their own). A non-zero exit or a
 timeout rejects the resolution: the land fails, every file of the package is
 `REJECTED`, and the reason is `verification failed:` with the exit status and
-the first 4 KiB of the output.
+the first 4 KiB of the output. That is the verification of a resolution made by
+rules and of an agent's, which runs in the branch's lane, on the merged tree of
+the lane's tip.
+
+**For a model's resolution the verification is the gate that lets it land**
+(PLAN10 15.9), and it runs out of the lane:
+
+- The server builds the tree that would land (the merged tree of the tip and
+  the change, the model's files written in) and runs `command` on it with a slot
+  of the verify pool (`verify_concurrency`, default 2;
+  `graft_resolver_verify_slot_wait_seconds`). The lane never runs it.
+- In the lane, the model's resolution lands only if the tree it would write is
+  a tree that passed (compared by tree object ID, not by tip). It is signed
+  `Graft-Resolved-By: <resolver>` and `Graft-Checked-By: verify:<command>`.
+  The trailer names what ran: the syntax and operator checks run inside the
+  resolver and are not named, and the composition report is not a check.
+- If the branch moved to another tree, the land goes back out: it rebuilds the
+  tree from the same answers (the resolver is called again only for files whose
+  sides changed), verifies the new tree, and tries the lane again.
+- If the verification fails, the model's files stay `PROPOSED`, with the reason
+  `verification failed:` and the output. If the deadline ends before a tree could
+  be verified and landed, the land does not fail for the agent: the files stay
+  `PROPOSED` with the reason `could not verify before the branch moved again`
+  (or `before the deadline of <t>`), and the package carries the proposals. The
+  deadline is `timeout` plus `verify.timeout`.
+- Nothing is verified for a land that cannot land anyway (a file refused, a
+  file left to the agent).
 
 **A verify command such as a build or a test suite executes code from the
 merged tree: code that agents and the AI wrote, run as the gitaly user on the
@@ -494,7 +528,7 @@ sides read and 64 Mi cells of diff work for its hunks, and 4 MiB encoded
 | `REJECTED` | the result failed a rule or a check, e.g. a syntax error at line:column |
 | `FAILED` | the resolver failed on it: a model error, `AI budget exhausted`, no strategy applied |
 | `RESOLVED` | resolved by rules, but the land failed because another file was not; see `proposal` |
-| `PROPOSED` | a model resolved it: proposed, never landed; see `proposal` |
+| `PROPOSED` | a model resolved it and it did not land (nothing verified it, the verification failed, or none finished in time): proposed; see `proposal` and the reason |
 | `NOT_ATTEMPTED` | the request was not attempted; see `reason` |
 
 The agent reads the sides by OID with `GetBlobs`, resolves every file, and
@@ -952,6 +986,7 @@ in blank lines only, and the accepted results that got no syntax verdict.
 | check answer | 64 KiB + 8 KiB per file | server |
 | checks of agents' resolutions at once | 2 | `check_concurrency` |
 | resolutions at once | 2 | `resolve_concurrency` |
+| verifications of a model's resolution at once | 2 | `verify_concurrency` |
 | rounds of a land whose files keep changing | 32 (a safety cap; `timeout` bounds the land) | `resolve_rounds` |
 | verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |
