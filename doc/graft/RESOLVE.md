@@ -367,7 +367,9 @@ the whole request is bounded by the 4 MiB gRPC message limit.
 
 `graft-resolve` tries an ordered list of strategies per file. The first
 strategy whose result passes the configured checks wins. If none succeeds the
-file is unresolved and the program exits 1 with the reason on stderr.
+file is unresolved: the request is refused as a whole, with the outcome of
+every file in the error response (in command mode the program exits 1, writes
+the error response on stdout and the reason on stderr).
 
 | Strategy  | Behavior |
 |-----------|----------|
@@ -445,9 +447,31 @@ Run modes of `graft-resolve`:
   token.
 - Both modes take `--max-request-bytes N` (default 128 MiB,
   `protocol.DefaultMaxRequestBytes`). A larger request is refused.
+- Both modes answer the `check` operation of the protocol as well as
+  `resolve` (see [Protocol v1](#protocol-v1)).
 - Without `--config`, only the `trivial` strategy runs.
+- `graft-resolve bench ...` measures a configuration on real merges (see
+  [Measuring a resolver](#measuring-a-resolver)).
 
 ## AI resolvers
+
+The AI setup is the `llm` strategy alone. The deterministic strategies above
+(`trivial`, `union`, `rerere`, `command`) are opt-in additions in front of it,
+not part of the default AI chain:
+
+```toml
+[[strategy]]
+type = "llm"
+
+[strategy.llm]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-6-luna"
+effort = "low"
+max_tokens = 8000
+timeout = "180s"
+```
 
 The `llm` strategy is registered by `tools/graft-agents` and uses an
 `llm.Provider` configured in `resolve.toml`. Providers are anthropic, any
@@ -590,6 +614,50 @@ The spend is reported in three places:
 - In both modes, the answer's `explanation` gives the spend of each strategy
   that answered.
 
+## Measuring a resolver
+
+`graft-resolve bench` measures a `resolve.toml` on conflicts that humans
+resolved in real repositories. It needs the grammars (a cgo build).
+
+- `bench mine --corpus FILE --clones DIR --manifest OUT`: clones the
+  repositories of the corpus (bare, complete clones), replays every two-parent
+  merge with `git merge-tree --write-tree` on its parents, and keeps each
+  conflicting file of a benchmark language whose human resolution differs from
+  both sides. It leaves out a merge without a single merge base, and a human
+  resolution that is not a valid reference: one committed with conflict
+  markers, or one that does not parse although both sides do. Each
+  repository is saved as soon as it is mined, so a stopped run resumes with
+  the next one. The committed corpus
+  (`tools/graft-agents/resolve/bench/corpus.json`) lists well-known
+  repositories under permissive licenses at a pinned commit; the manifest
+  holds object IDs, never third-party code.
+- `bench filter`: applies the reference rule to a manifest mined before it.
+- `bench syntax`: runs the syntax check on every human resolution and reports,
+  per language, the files checked, those that fail, and those the grammar
+  gives no verdict on, with the reason of each.
+- `bench run --config resolve.toml --manifest M --clones DIR --sample N
+  --seed S --max-usd USD --answers-dir A --json-out R`: replays a sample of the
+  manifest through the configured chain, as the server would build the
+  request (the never-send rules included), and judges each accepted result
+  against the human file. The sample is stratified by family, with Rust and
+  Java apart, so a language with few cases is taken whole. A chain with a
+  model needs `--max-usd`: every call books its worst case first, and a call
+  that would pass the cap is not made. The model's price is read at run time
+  from OpenRouter's endpoints API (`--pricing openrouter`, the highest price
+  of the model's endpoints), or given as flags (`--pricing fixed`). The
+  answers are kept in `--answers-dir`.
+- `bench rejudge --report-in R --manifest M --clones DIR --answers-dir A`:
+  judges the stored answers again with the current judge, with no model call.
+
+The outcomes of a case are: correct (equal to the human file after
+normalizing line endings and trailing whitespace; exact when byte-identical),
+wrong (accepted by the checks, but different), rejected by checks, not sent,
+model error, not run (cap) and abstained (no strategy applied, such as the
+`llm` strategy on a modify/delete conflict). The error rate is wrong /
+(correct + wrong): the share of the results that would land and differ from
+the human resolution. The report counts apart the wrong results that differ
+in blank lines only, and the accepted results that got no syntax verdict.
+
 ## Bounds and failure modes
 
 | Limit | Default | Where |
@@ -597,19 +665,26 @@ The spend is reported in three places:
 | files per land | 20 | `max_files` |
 | bytes per file | 1 MiB | `max_file_bytes` |
 | resolver time | 120 s | `timeout` |
-| resolver answer (stdout or HTTP body) | 2 × `max_file_bytes` × files in the request + 64 KiB | server |
-| stderr or HTTP 422 body kept as the reason | 4 KiB | server |
+| resolver answer (stdout or HTTP body), and a refusal's error response | 2 × `max_file_bytes` × files in the request + 64 KiB | server |
+| reason of a refusal (stderr, or `error` of the error response) | 4 KiB | server |
+| check answer | 64 KiB + 8 KiB per file | server |
+| verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |
+| land request with an agent's resolution | 4 MiB, the gRPC message limit | server; the SDK refuses larger ones |
+| package: files, reasons, messages | `max_files`; 512 bytes; 4 KiB each | server |
 | land attempts | 20 | `max_attempts` of the land |
 
 A resolver that hangs is killed at the timeout. Its stderr is kept in the
 logged error, which is truncated. An answer larger than its bound kills the
 resolver and is a failure.
 
-Before calling the resolver, the server also checks its own limits: at most
-`max_files` conflicted files, no side larger than `max_file_bytes`, every path
-allowed by `paths_allow`/`paths_deny` and the actor allowed by `actors`. A
-request that breaks one of them is not sent.
+Before calling the resolver, the server also checks its own limits. A request
+with more than `max_files` conflicted files, or from an actor that `actors`
+does not allow, is not attempted at all. A file that breaks a per-file rule
+(a side larger than `max_file_bytes`, a path denied by `paths_allow` /
+`paths_deny`, the other rules of [What is never sent](#what-is-never-sent))
+is not sent, and the other files are. Either way the land fails with the
+conflict package unless every file is resolved.
 
 `graft-resolve` must be able to read the requests the server sends. The
 default `--max-request-bytes` covers the default server limits (20 files of
@@ -649,7 +724,8 @@ or `max_file_bytes`.
 - Redirects are never followed, so the bearer token never travels to another
   URL. A `3xx` answer is a failure.
 - Only `422` is a refusal (unresolvable). Every other non-`200` status is a
-  failure. Both end in the normal `merge_conflict` error.
+  failure. Both end in the normal `merge_conflict` error, with the conflict
+  package.
 
 ### graft-resolve subprocesses
 
