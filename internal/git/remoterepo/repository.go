@@ -90,6 +90,37 @@ func (rr *Repo) ResolveRevision(ctx context.Context, revision git.Revision) (git
 	return oid, nil
 }
 
+// ResolveBranch will dial to the remote repository and resolve the branch named branch (without
+// refs/heads/) by its exact reference name to the commit it points to. Unlike ResolveRevision,
+// whose revision git resolves with its DWIM rules, a missing branch never resolves through
+// refs/tags/refs/heads/<branch> or another reference: it returns git.ErrReferenceNotFound.
+func (rr *Repo) ResolveBranch(ctx context.Context, branch string) (git.ObjectID, error) {
+	resp, err := gitalypb.NewRefServiceClient(rr.conn).FindBranch(ctx, &gitalypb.FindBranchRequest{
+		Repository: rr.Repository,
+		Name:       []byte(branch),
+	})
+	if err != nil {
+		return "", fmt.Errorf("find branch: %w", err)
+	}
+
+	oidHex := resp.GetBranch().GetTargetCommit().GetId()
+	if oidHex == "" {
+		return "", git.ErrReferenceNotFound
+	}
+
+	objectHash, err := rr.ObjectHash(ctx)
+	if err != nil {
+		return "", fmt.Errorf("detecting object hash: %w", err)
+	}
+
+	oid, err := objectHash.FromHex(oidHex)
+	if err != nil {
+		return "", fmt.Errorf("parsing object ID: %w", err)
+	}
+
+	return oid, nil
+}
+
 // HasBranches will dial to the remote repository and check whether the repository has any branches.
 func (rr *Repo) HasBranches(ctx context.Context) (bool, error) {
 	resp, err := gitalypb.NewRepositoryServiceClient(rr.conn).HasLocalBranches(

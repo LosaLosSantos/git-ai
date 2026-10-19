@@ -730,8 +730,9 @@ Each one, traced to its call site (all through `localrepo.Repo.Exec`):
    exactly by one `for-each-ref`, whose values the reader peels to commits. So
    exactly one `for-each-ref` runs per request: the exact read, or, when no branch
    resolved, `HasBranches` (B, L). `RepoCreated` is false when the target or the
-   start branch exists exactly. A start branch in another repository is still resolved
-   there by `FindCommit`, unchanged.
+   start branch exists exactly. A branch resolved in another repository (the request's
+   start repository) is resolved there by its exact name too, with `FindBranch`
+   (`remoterepo.ResolveBranch`) instead of `FindCommit` on `refs/heads/<x>^{commit}`.
 4. **Unchanged:** E, one `hash-object --path` per blob: the attributes of the path decide
    the bytes of the blob, and a batched writer cannot apply per-path attributes without a
    `check-attr` process, which costs as much as it saves for one or two files. K, one
@@ -769,8 +770,10 @@ resolution of item 3.)
   it required every sequence to write, the same class in `chmod`: a chmod of a directory
   gave a tree entry a file's mode (a tree git refuses), and a chmod of a submodule turned
   the gitlink into a file. `chmod` now applies to files only and answers "A file with this
-  name doesn't exist" otherwise, as `update` does. A chmod of a symlink still turns it
-  into a regular file, as before; that is unchanged.
+  name doesn't exist" otherwise, as `update` does.
+* **Known, pre-existing, kept on purpose:** an executable chmod of a symlink (mode
+  `120000`) turns it into a regular executable file (`100755`) with the link's target as
+  its content. It was so before WP96 and is unchanged; the PM chose to keep it (2026-10-19).
 * **The object reader goes back to the catfile cache** at the end of the request, on every
   path (a deferred release), as today's `ReadTree` reader does. Its cache key holds the
   quarantine directory, so no other request reuses it, and the cache's TTL ends it.
@@ -789,7 +792,9 @@ resolution of item 3.)
   absent, in a repository with branches and in one without, a target branch `x` gets an
   orphan commit on a new branch, and a start branch `x` is not found, or, without
   branches, gives the orphan commit of the issue-3294 workaround. The decoy's commit is
-  never the parent.
+  never the parent. `TestUserCommitFilesResolvesStartRepositoryBranchesExactly` does the
+  same with the decoys in the start repository, and `TestRepository_ResolveBranch` for
+  `remoterepo`.
 * `TestApplyActionLazyTreeMatchesRecursiveTree` applies seeded random sequences of the six
   actions to the whole tree with today's writer and to the lazy tree with the tree writer.
   It asserts the same error for every action, the same tree ID for every sequence (no

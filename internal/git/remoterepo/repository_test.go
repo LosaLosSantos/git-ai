@@ -66,6 +66,44 @@ func TestRepository(t *testing.T) {
 	)
 }
 
+// TestRepository_ResolveBranch checks that a branch resolves by its exact name only: with
+// refs/heads/x missing, the references git's DWIM rules would try for it do not answer.
+func TestRepository_ResolveBranch(t *testing.T) {
+	t.Parallel()
+
+	cfg := setupGitalyServer(t)
+
+	ctx := testhelper.Context(t)
+	ctx, err := storage.InjectGitalyServers(ctx, "default", cfg.SocketPath, cfg.Auth.Token)
+	require.NoError(t, err)
+	ctx = metadata.OutgoingToIncoming(ctx)
+
+	pool := client.NewPool()
+	defer testhelper.MustClose(t, pool)
+
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	branchCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+	decoyCommit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("decoy"))
+	for _, decoy := range []git.ReferenceName{"refs/refs/heads/x", "refs/tags/refs/heads/x", "refs/remotes/refs/heads/x"} {
+		gittest.WriteRef(t, cfg, repoPath, decoy, decoyCommit)
+	}
+
+	repo, err := remoterepo.New(ctx, repoProto, pool)
+	require.NoError(t, err)
+
+	oid, err := repo.ResolveBranch(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, branchCommit, oid)
+
+	_, err = repo.ResolveBranch(ctx, "x")
+	require.Equal(t, git.ErrReferenceNotFound, err)
+
+	// The DWIM resolution, for contrast, answers with the decoy.
+	oid, err = repo.ResolveRevision(ctx, "refs/heads/x^{commit}")
+	require.NoError(t, err)
+	require.Equal(t, decoyCommit, oid)
+}
+
 func TestRepository_ObjectHash(t *testing.T) {
 	t.Parallel()
 

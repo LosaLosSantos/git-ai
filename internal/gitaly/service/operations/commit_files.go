@@ -899,7 +899,9 @@ func (s *Server) resolveParentCommit(
 		return targetBranchCommit, false, nil
 	}
 
-	commit, err := repo.ResolveRevision(ctx, git.Revision(refish))
+	// By its exact name, as in the local repository: a missing branch does not resolve through
+	// a tag or another reference of the start repository.
+	commit, err := repo.ResolveBranch(ctx, strings.TrimPrefix(branch.String(), "refs/heads/"))
 	if err != nil {
 		return "", false, fmt.Errorf("resolving refish %q in %T: %w", refish, repo, err)
 	}
