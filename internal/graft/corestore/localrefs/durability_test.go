@@ -86,10 +86,23 @@ func setupDurability(t *testing.T) durabilityFixture {
 	}
 }
 
-func (f durabilityFixture) durability(t *testing.T, bootID string, idle time.Duration) *Durability {
+// unowned returns a durability of the fixture's storage that does not own it.
+func (f durabilityFixture) unowned(t *testing.T, bootID string, idle time.Duration) *Durability {
 	t.Helper()
 	d, err := NewDurability(f.locator, idle, WithBootID(bootID), WithSync(f.synced.sync))
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, d.Close()) })
+	return d
+}
+
+// durability returns a durability that owns the fixture's storage, as the
+// process that runs the durable steps. Close it before another one owns.
+func (f durabilityFixture) durability(t *testing.T, bootID string, idle time.Duration) *Durability {
+	t.Helper()
+	d := f.unowned(t, bootID, idle)
+	owned, err := d.TryOwn(f.ctx, []string{f.repo.Storage})
+	require.NoError(t, err)
+	require.True(t, owned)
 	return d
 }
 
@@ -112,6 +125,7 @@ func TestMarkDirtyWritesOneDurableMarker(t *testing.T) {
 	t.Parallel()
 	f := setupDurability(t)
 	d := f.durability(t, "boot-a", 0)
+	before := len(f.synced.recorded())
 
 	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
 	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
@@ -123,11 +137,62 @@ func TestMarkDirtyWritesOneDurableMarker(t *testing.T) {
 	require.Equal(t, []string{f.path}, d.Dirty())
 
 	// The marker file and its directory were made durable before MarkDirty
-	// returned.
-	recorded := f.synced.recorded()
+	// returned, once.
+	recorded := f.synced.recorded()[before:]
 	require.Len(t, recorded, 2)
 	require.Equal(t, filepath.Dir(f.markerPath(t, d)), recorded[1])
 	require.Equal(t, filepath.Join(f.cfg.Storages[0].Path, MarkerDirName), filepath.Dir(f.markerPath(t, d)))
+}
+
+func TestOwnershipCreatesTheMarkerDirectoryDurably(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	f.durability(t, "boot-a", 0)
+
+	dir := filepath.Join(f.cfg.Storages[0].Path, MarkerDirName)
+	require.DirExists(t, dir)
+	require.Contains(t, f.synced.recorded(), filepath.Dir(dir), "the new directory's entry is durable")
+}
+
+// TestOneOwnerPerStorage is the overlap of a graceful upgrade: two processes
+// on one storage. Only the owner defers, settles and recovers; the other one
+// writes with fsync until the owner is gone.
+func TestOneOwnerPerStorage(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	storages := []string{f.repo.Storage}
+
+	old := f.durability(t, "boot-a", 0)
+	require.True(t, old.Deferring())
+	require.NoError(t, old.MarkDirty(f.ctx, f.repo, f.path))
+	old.Begin(f.path, key(1))
+
+	next := f.unowned(t, "boot-a", 0)
+	owned, err := next.TryOwn(f.ctx, storages)
+	require.NoError(t, err)
+	require.False(t, owned, "the old process owns the storage")
+	require.False(t, next.Deferring())
+	require.Equal(t, 0.0, testutil.ToFloat64(next.owning))
+
+	// The next process neither recovers nor settles: the old process's
+	// transaction is live, and only the old process counts it.
+	found, err := next.Recover(f.ctx, storages)
+	require.NoError(t, err)
+	require.Empty(t, found)
+	require.NoError(t, next.Settle(f.path, true))
+	require.FileExists(t, f.markerPath(t, old))
+
+	// The old process exits; the next one owns and recovers the marker.
+	require.NoError(t, old.Close())
+	owned, err = next.TryOwn(f.ctx, storages)
+	require.NoError(t, err)
+	require.True(t, owned)
+	require.True(t, next.Deferring())
+	found, err = next.Recover(f.ctx, storages)
+	require.NoError(t, err)
+	require.Equal(t, []Recovered{{Repo: f.repo, Path: f.path}}, found)
+	require.NoError(t, next.Settle(f.path, false))
+	require.NoFileExists(t, f.markerPath(t, next))
 }
 
 func TestSettleMakesTheStackDurableAndRemovesTheMarker(t *testing.T) {
@@ -136,7 +201,7 @@ func TestSettleMakesTheStackDurableAndRemovesTheMarker(t *testing.T) {
 	d := f.durability(t, "boot-a", 0)
 
 	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
-	require.NoError(t, d.Settle(f.path))
+	require.NoError(t, d.Settle(f.path, false))
 
 	require.NoFileExists(t, f.markerPath(t, d))
 	require.Empty(t, d.Dirty())
@@ -149,8 +214,11 @@ func TestSettleMakesTheStackDurableAndRemovesTheMarker(t *testing.T) {
 	}
 	require.Contains(t, recorded, filepath.Join(f.path, "reftable", "tables.list"))
 	require.Contains(t, recorded, filepath.Join(f.path, "reftable"))
-	// The lock taken for the removal is released.
+	// The lock taken for the removal is released, and its temporary file gone.
 	require.NoFileExists(t, filepath.Join(f.path, "reftable", "tables.list.lock"))
+	leftovers, err := filepath.Glob(filepath.Join(f.path, stepTempPrefix+"*"))
+	require.NoError(t, err)
+	require.Empty(t, leftovers)
 }
 
 func TestSettleKeepsTheMarkerWhileWritesMayGoOn(t *testing.T) {
@@ -162,31 +230,53 @@ func TestSettleKeepsTheMarkerWhileWritesMayGoOn(t *testing.T) {
 		d := f.durability(t, "boot-a", time.Hour)
 
 		require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
-		require.NoError(t, d.Settle(f.path))
+		require.NoError(t, d.Settle(f.path, false))
 		require.FileExists(t, f.markerPath(t, d))
 		// The stack was made durable all the same.
 		require.Contains(t, f.synced.recorded(), filepath.Join(f.path, "reftable", f.tables(t)[0]))
+
+		// The last step of a stopping process does not wait for idleness.
+		require.NoError(t, d.Settle(f.path, true))
+		require.NoFileExists(t, f.markerPath(t, d))
 	})
 
-	t.Run("a transaction between Prepared and Committed", func(t *testing.T) {
+	t.Run("a live transaction", func(t *testing.T) {
 		t.Parallel()
 		f := setupDurability(t)
 		d := f.durability(t, "boot-a", 0)
 
 		require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
 		d.Begin(f.path, key(1))
-		require.NoError(t, d.Settle(f.path))
-		require.FileExists(t, f.markerPath(t, d))
+		require.NoError(t, d.Settle(f.path, true))
+		require.FileExists(t, f.markerPath(t, d), "not even the last step removes it")
 
 		// An end of another key does not count; the end of the transaction does.
 		d.End(f.path, key(2))
-		require.NoError(t, d.Settle(f.path))
+		require.NoError(t, d.Settle(f.path, false))
 		require.FileExists(t, f.markerPath(t, d))
 
 		d.End(f.path, key(1))
-		require.NoError(t, d.Settle(f.path))
+		require.NoError(t, d.Settle(f.path, false))
 		require.NoFileExists(t, f.markerPath(t, d))
 		require.Equal(t, 0.0, testutil.ToFloat64(d.inflight))
+	})
+
+	t.Run("two live transactions with the same key", func(t *testing.T) {
+		t.Parallel()
+		f := setupDurability(t)
+		d := f.durability(t, "boot-a", 0)
+
+		// Whichever of the two ends first (an abort before Prepared, say), the
+		// other one is still counted.
+		require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+		d.Begin(f.path, key(1))
+		d.Begin(f.path, key(1))
+		d.End(f.path, key(1))
+		require.NoError(t, d.Settle(f.path, false))
+		require.FileExists(t, f.markerPath(t, d))
+		d.End(f.path, key(1))
+		require.NoError(t, d.Settle(f.path, false))
+		require.NoFileExists(t, f.markerPath(t, d))
 	})
 
 	t.Run("git holds the reference lock", func(t *testing.T) {
@@ -198,10 +288,40 @@ func TestSettleKeepsTheMarkerWhileWritesMayGoOn(t *testing.T) {
 		lock := filepath.Join(f.path, "reftable", "tables.list.lock")
 		require.NoError(t, os.WriteFile(lock, nil, 0o666))
 
-		require.NoError(t, d.Settle(f.path))
+		require.NoError(t, d.Settle(f.path, false))
 		require.FileExists(t, f.markerPath(t, d))
 		require.FileExists(t, lock, "the durable step removed a lock it did not take")
 	})
+}
+
+// TestStackLockReleaseRemovesOnlyItsOwnLock verifies that the durable step
+// never removes a reference lock that is not the one it created: one that
+// someone else removed and git took again stays.
+func TestStackLockReleaseRemovesOnlyItsOwnLock(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	lockPath := filepath.Join(f.path, "reftable", "tables.list.lock")
+
+	lock, ok, err := lockStack(f.path)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = lockStack(f.path)
+	require.NoError(t, err)
+	require.False(t, ok, "the lock is exclusive")
+
+	// Housekeeping removed the lock as stale, and another durable step took it
+	// (the freed inode may well be reused for it).
+	require.NoError(t, os.Remove(lockPath))
+	require.NoError(t, os.WriteFile(lockPath, []byte(stackLockTag+"0123456789abcdef\n"), 0o666))
+	require.NoError(t, lock.release())
+	require.FileExists(t, lockPath, "a lock of another holder, even with the same tag, is not removed")
+
+	require.NoError(t, os.Remove(lockPath))
+	lock, ok, err = lockStack(f.path)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, lock.release())
+	require.NoFileExists(t, lockPath)
 }
 
 func TestSettleReportsAFailedWriteAsUntrusted(t *testing.T) {
@@ -213,7 +333,7 @@ func TestSettleReportsAFailedWriteAsUntrusted(t *testing.T) {
 	writeback := errors.New("input/output error")
 	f.synced.fail(writeback)
 
-	err := d.Settle(f.path)
+	err := d.Settle(f.path, false)
 	require.ErrorIs(t, err, ErrUntrusted)
 	require.ErrorIs(t, err, writeback)
 	var untrusted *UntrustedError
@@ -225,10 +345,50 @@ func TestSettleReportsAFailedWriteAsUntrusted(t *testing.T) {
 	require.FileExists(t, f.markerPath(t, d))
 	require.Equal(t, []string{f.path}, d.Dirty())
 
+	f.synced.fail(nil)
 	require.NoError(t, d.Forget(f.ctx, f.repo, f.path))
 	require.NoFileExists(t, f.markerPath(t, d))
 	require.Empty(t, d.Dirty())
 	require.Equal(t, 0.0, testutil.ToFloat64(d.dirty))
+}
+
+// TestSettleTransientErrorIsNotUntrusted verifies that a failure to read the
+// stack (not a failed fsync) is retried: the repository is not distrusted.
+func TestSettleTransientErrorIsNotUntrusted(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	d := f.durability(t, "boot-a", 0)
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+
+	list := filepath.Join(f.path, "reftable", "tables.list")
+	require.NoError(t, os.Rename(list, list+".away"))
+	err := d.Settle(f.path, false)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrUntrusted)
+	require.FileExists(t, f.markerPath(t, d))
+
+	require.NoError(t, os.Rename(list+".away", list))
+	require.NoError(t, d.Settle(f.path, false))
+	require.NoFileExists(t, f.markerPath(t, d))
+}
+
+// TestSettleForgetsTablesTheStackNoLongerLists verifies that the set of tables
+// made durable does not grow with tables compacted away.
+func TestSettleForgetsTablesTheStackNoLongerLists(t *testing.T) {
+	t.Parallel()
+	f := setupDurability(t)
+	d := f.durability(t, "boot-a", time.Hour)
+	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+
+	d.mu.Lock()
+	d.repos[f.path].synced["0x000000000001-0x000000000001-compacted.ref"] = struct{}{}
+	d.mu.Unlock()
+
+	require.NoError(t, d.Settle(f.path, false))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	require.Len(t, d.repos[f.path].synced, len(f.tables(t)))
+	require.NotContains(t, d.repos[f.path].synced, "0x000000000001-0x000000000001-compacted.ref")
 }
 
 func TestSettleDropsTheMarkerOfARepositoryThatIsGone(t *testing.T) {
@@ -240,7 +400,7 @@ func TestSettleDropsTheMarkerOfARepositoryThatIsGone(t *testing.T) {
 	require.NoError(t, os.Rename(f.path, f.path+".moved"))
 	t.Cleanup(func() { require.NoError(t, os.Rename(f.path+".moved", f.path)) })
 
-	require.NoError(t, d.Settle(f.path))
+	require.NoError(t, d.Settle(f.path, false))
 	require.NoFileExists(t, f.markerPath(t, d))
 	require.Empty(t, d.Dirty())
 }
@@ -248,9 +408,11 @@ func TestSettleDropsTheMarkerOfARepositoryThatIsGone(t *testing.T) {
 func TestRecoverTellsAKernelRestartFromAProcessRestart(t *testing.T) {
 	t.Parallel()
 	f := setupDurability(t)
+	storages := []string{f.repo.Storage}
+
 	before := f.durability(t, "boot-a", time.Hour)
 	require.NoError(t, before.MarkDirty(f.ctx, f.repo, f.path))
-	storages := []string{f.repo.Storage}
+	require.NoError(t, before.Close())
 
 	// The same boot: the process restarted, the kernel kept every write.
 	sameBoot := f.durability(t, "boot-a", 0)
@@ -258,11 +420,12 @@ func TestRecoverTellsAKernelRestartFromAProcessRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []Recovered{{Repo: f.repo, Path: f.path, Reboot: false}}, found)
 	require.Equal(t, []string{f.path}, sameBoot.Dirty())
-	require.NoError(t, sameBoot.Settle(f.path))
+	require.NoError(t, sameBoot.Settle(f.path, false))
 	require.NoFileExists(t, f.markerPath(t, sameBoot))
 
 	// Another boot: the writes may not have reached the disk.
-	require.NoError(t, f.durability(t, "boot-a", time.Hour).MarkDirty(f.ctx, f.repo, f.path))
+	require.NoError(t, sameBoot.MarkDirty(f.ctx, f.repo, f.path))
+	require.NoError(t, sameBoot.Close())
 	otherBoot := f.durability(t, "boot-b", 0)
 	found, err = otherBoot.Recover(f.ctx, storages)
 	require.NoError(t, err)
@@ -270,36 +433,35 @@ func TestRecoverTellsAKernelRestartFromAProcessRestart(t *testing.T) {
 	require.Empty(t, otherBoot.Dirty())
 }
 
-// TestRecoverRemovesTheLockOfADurableStepThatDied verifies that a reference
-// lock left by a durable step of a process that died is removed at startup,
-// and that a lock of git is not.
-func TestRecoverRemovesTheLockOfADurableStepThatDied(t *testing.T) {
+// TestRecoverRemovesWhatADurableStepThatDiedLeft verifies that the reference
+// lock and the temporary files of a durable step of a process that died are
+// removed when the next process owns the storage, and that a lock of git is
+// not.
+func TestRecoverRemovesWhatADurableStepThatDiedLeft(t *testing.T) {
 	t.Parallel()
 	f := setupDurability(t)
+	storages := []string{f.repo.Storage}
 	lock := filepath.Join(f.path, "reftable", "tables.list.lock")
 
-	require.NoError(t, f.durability(t, "boot-a", 0).MarkDirty(f.ctx, f.repo, f.path))
-	unlock, ok, err := lockStack(f.path)
+	dead := f.durability(t, "boot-a", 0)
+	require.NoError(t, dead.MarkDirty(f.ctx, f.repo, f.path))
+	_, ok, err := lockStack(f.path)
 	require.NoError(t, err)
 	require.True(t, ok)
-	_, ok, err = lockStack(f.path)
-	require.NoError(t, err)
-	require.False(t, ok, "the lock is exclusive")
-	entries, err := os.ReadDir(f.path)
-	require.NoError(t, err)
-	for _, entry := range entries {
-		require.False(t, strings.HasPrefix(entry.Name(), ".graft-durable-step-"), "temporary file %s left", entry.Name())
-	}
+	leftover := filepath.Join(f.path, stepTempPrefix+"123")
+	require.NoError(t, os.WriteFile(leftover, []byte(stackLockTag+"0123456789abcdef\n"), 0o600))
+	require.NoError(t, dead.Close())
 
-	// The process dies holding the lock; the next one of the same boot removes it.
-	_, err = f.durability(t, "boot-a", 0).Recover(f.ctx, []string{f.repo.Storage})
+	next := f.durability(t, "boot-a", 0)
+	_, err = next.Recover(f.ctx, storages)
 	require.NoError(t, err)
 	require.NoFileExists(t, lock)
-	require.Error(t, unlock(), "the lock was already removed")
+	require.NoFileExists(t, leftover)
+	require.NoError(t, next.Close())
 
 	// A lock of git is kept.
 	require.NoError(t, os.WriteFile(lock, []byte("0x000000000001-0x000000000003-abcdef01.ref\n"), 0o666))
-	_, err = f.durability(t, "boot-a", 0).Recover(f.ctx, []string{f.repo.Storage})
+	_, err = f.durability(t, "boot-a", 0).Recover(f.ctx, storages)
 	require.NoError(t, err)
 	require.FileExists(t, lock)
 }
@@ -307,20 +469,25 @@ func TestRecoverRemovesTheLockOfADurableStepThatDied(t *testing.T) {
 func TestRecoverRefusesACorruptMarker(t *testing.T) {
 	t.Parallel()
 	f := setupDurability(t)
+	storages := []string{f.repo.Storage}
 	d := f.durability(t, "boot-a", 0)
 	require.NoError(t, d.MarkDirty(f.ctx, f.repo, f.path))
+	require.NoError(t, d.Close())
 
 	marker := f.markerPath(t, d)
-	incomplete := filepath.Join(filepath.Dir(marker), ".marker-123.tmp")
+	incomplete := filepath.Join(filepath.Dir(marker), markerTempPrefix+"123.tmp")
 	require.NoError(t, os.WriteFile(incomplete, []byte("{"), 0o600))
 
-	found, err := f.durability(t, "boot-b", 0).Recover(f.ctx, []string{f.repo.Storage})
+	next := f.durability(t, "boot-b", 0)
+	found, err := next.Recover(f.ctx, storages)
 	require.NoError(t, err)
 	require.Len(t, found, 1)
 	require.NoFileExists(t, incomplete, "an incomplete marker write is removed")
+	require.FileExists(t, filepath.Join(filepath.Dir(marker), ownerLockName), "the owner lock is not a marker")
+	require.NoError(t, next.Close())
 
 	require.NoError(t, os.WriteFile(marker, []byte(`{"storage":"`), 0o600))
-	_, err = f.durability(t, "boot-b", 0).Recover(f.ctx, []string{f.repo.Storage})
+	_, err = f.durability(t, "boot-b", 0).Recover(f.ctx, storages)
 	require.ErrorContains(t, err, "corrupt dirty marker")
 }
 
@@ -330,13 +497,18 @@ func TestNilDurabilityIsOff(t *testing.T) {
 
 	var d *Durability
 	require.False(t, d.Enabled())
+	require.False(t, d.Deferring())
+	owned, err := d.TryOwn(ctx, []string{"default"})
+	require.NoError(t, err)
+	require.False(t, owned)
 	require.NoError(t, d.MarkDirty(ctx, RepoRef{}, "path"))
-	require.NoError(t, d.Settle("path"))
+	require.NoError(t, d.Settle("path", true))
 	d.Begin("path", key(1))
 	d.End("path", key(1))
 	found, err := d.Recover(ctx, []string{"default"})
 	require.NoError(t, err)
 	require.Empty(t, found)
+	require.NoError(t, d.Close())
 }
 
 // TestTornReftableStackReadsAsAnEmptyRepository is the experiment behind the

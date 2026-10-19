@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/blobstore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
@@ -200,16 +200,33 @@ func Open(tb testing.TB, opts Options) *corestore.Core {
 }
 
 // EnableLocalRefs gives the core the admission and the deferred durability of
-// the local reference writes, as gitaly serve does in authoritative mode
-// (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). The boot identity is a
-// fixed test value unless opts set another one.
-func EnableLocalRefs(tb testing.TB, core *corestore.Core, locator storage.Locator, opts ...localrefs.DurabilityOption) {
+// the local reference writes, owning the storages of cfg, as gitaly serve does
+// in authoritative mode (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). The
+// boot identity is a fixed test value unless opts set another one. A deferred
+// durability the core had is closed first, as when its process exits.
+func EnableLocalRefs(tb testing.TB, core *corestore.Core, cfg config.Cfg, opts ...localrefs.DurabilityOption) {
 	tb.Helper()
 
+	if core.RefDurability != nil {
+		require.NoError(tb, core.RefDurability.Close())
+	}
 	core.RefAdmission = localrefs.NewAdmission(10*time.Second, 10*time.Second)
-	durability, err := localrefs.NewDurability(locator, 0, append([]localrefs.DurabilityOption{localrefs.WithBootID(TestBootID)}, opts...)...)
+	durability, err := localrefs.NewDurability(config.NewLocator(cfg), 0, append([]localrefs.DurabilityOption{localrefs.WithBootID(TestBootID)}, opts...)...)
 	require.NoError(tb, err)
+	owned, err := durability.TryOwn(context.Background(), StorageNames(cfg))
+	require.NoError(tb, err)
+	require.True(tb, owned, "another durability of the test owns the storages")
+	tb.Cleanup(func() { _ = durability.Close() })
 	core.RefDurability = durability
+}
+
+// StorageNames returns the names of the storages of cfg.
+func StorageNames(cfg config.Cfg) []string {
+	names := make([]string, 0, len(cfg.Storages))
+	for _, s := range cfg.Storages {
+		names = append(names, s.Name)
+	}
+	return names
 }
 
 // TestBootID is the boot identity EnableLocalRefs gives the deferred

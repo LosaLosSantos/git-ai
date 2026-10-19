@@ -134,7 +134,7 @@ func newFixture(t *testing.T, opts fixtureOptions) *fixture {
 	logger := testhelper.NewLogger(t)
 	locator := config.NewLocator(cfg)
 	if opts.localRefs {
-		coretest.EnableLocalRefs(t, core, locator)
+		coretest.EnableLocalRefs(t, core, cfg)
 	}
 	cache := catfile.NewCache(cfg)
 	t.Cleanup(cache.Stop)

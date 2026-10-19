@@ -8,8 +8,8 @@ func (s *Syncer) SetTestHook(hook func(point string)) {
 	s.testHook = hook
 }
 
-// DurableStep runs one durable step of the repository at path, as
-// RunDurableSteps does every interval.
-func (s *Syncer) DurableStep(ctx context.Context, path string) {
-	s.durableStep(ctx, path)
+// DurableStep runs one durable step of the repository at path, as the
+// durable-step loop does every interval (final: as the stop does).
+func (s *Syncer) DurableStep(ctx context.Context, path string, final bool) {
+	s.durableStep(ctx, path, final)
 }

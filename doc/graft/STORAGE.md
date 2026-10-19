@@ -456,7 +456,18 @@ or re-import the repository from scratch (see
     dropped.
   - *A write the kernel reports as failed* (a writeback error, same boot): the
     durable step's fsync fails, the repository is moved aside at once and logged,
-    and the next request hydrates it.
+    and the next request hydrates it. Other errors of the step (a file that
+    cannot be opened for a moment) are retried every second and counted.
+  - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
+    repository durable and removes its marker, so a clean reboot hydrates
+    nothing.
+  - *Graceful upgrade* (`GITALY_UPGRADES_ENABLED`): the new process serves while
+    the old one drains. One process per storage owns the deferred durability, by
+    an exclusive lock on `<storage>/+gitaly/graft-ref-durability/owner.lock`.
+    Until the old process exits, the new one writes references with fsync, as
+    in the other modes; then it takes over (`graft_storage_ref_durability_owner`).
+    During the overlap two processes also open an SQLite database, and their
+    writes meet in SQLite's own lock wait, see Limits; Postgres is not affected.
   - Offline tools that read a repository from disk (`gitaly git -C <repo>`,
     `gitaly-debug simulate-http-clone`) must not be pointed at a repository of
     a node after an unclean shutdown before `gitaly serve` has started once:
@@ -501,7 +512,9 @@ without a single divergence.
 | `graft_storage_ref_admission_expired_total` | Turns ended by the 10 s bound instead of their release (a git process that died between its phases). |
 | `graft_storage_ref_dirty_repositories` | Repositories with reference writes not yet made durable. |
 | `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written and removed by the durable step. |
-| `graft_storage_ref_writes_inflight` | Hook transactions between their Prepared and Committed phases; one that never commits keeps its repository dirty. |
+| `graft_storage_ref_writes_inflight` | Hook transactions between their start and their end (Committed or Aborted); one whose end is never reported keeps its repository dirty. |
+| `graft_storage_ref_durability_owner` | 1 when this process owns the deferred durability of its storages, 0 while another process (the old one of a graceful upgrade) does. |
+| `graft_storage_ref_durable_step_errors_total` | Durable steps that failed with a transient error (not a failed fsync); retried every second. |
 | `graft_storage_ref_untrusted_total{reason}` | Repositories moved aside to be hydrated again: `reboot` (dirty at a kernel restart), `sync_failed` (the durable step's fsync failed). |
 
 ## Benchmark
@@ -614,9 +627,12 @@ show:
   after a power loss it is always hydrated again, even though its references
   were made durable less than a second earlier: the marker does not record which
   writes are already durable.
-- **SQLite serves one node.** SQLite has a single write lock. The writes of
-  one gitaly process take it in the order they arrive, but several processes on
-  one SQLite file (several nodes on one host) meet in SQLite's own lock wait,
+- **SQLite serves one node.** Only `gitaly serve` opens the database: the
+  `graft` CLI and the other tools go through the server. SQLite has a single
+  write lock. The writes of one gitaly process take it in the order they
+  arrive, but several processes on one SQLite file (several nodes on one host,
+  or the old and the new process during a graceful upgrade) meet in SQLite's
+  own lock wait,
   which keeps no queue: under steady contention an unlucky write can wait past
   the 10 s busy timeout and fail. A deployment with more than one node uses
   Postgres; SQLite is for one node, or for tests.

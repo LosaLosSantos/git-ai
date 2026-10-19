@@ -44,6 +44,10 @@ func (v *recordingVoter) Preparing(context.Context, gitcmd.HooksPayload, []byte)
 	v.record("preparing")
 }
 
+func (v *recordingVoter) Denied(context.Context, gitcmd.HooksPayload, []byte) {
+	v.record("denied")
+}
+
 func (v *recordingVoter) Prepared(context.Context, gitcmd.HooksPayload, []byte, changelog.Meta) error {
 	v.record("prepared")
 	return nil
@@ -82,9 +86,11 @@ func TestReferenceTransactionHook_storageVoterPhases(t *testing.T) {
 			want: []string{"preparing", "prepared", "committed"},
 		},
 		{
+			// The voter learns of its start (Denied), so that it counts the
+			// transaction until its abort, but prepares nothing.
 			desc:   "a denied transaction is neither prepared nor committed",
 			policy: []config.GraftPolicyRule{{Refs: []string{"refs/heads/main"}, Allow: false}},
-			want:   nil,
+			want:   []string{"denied"},
 			denied: true,
 		},
 	} {

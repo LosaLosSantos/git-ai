@@ -1379,8 +1379,10 @@ func refTransaction(ctx context.Context, repo *localrepo.Repo, w refWriter, comm
 		return fmt.Errorf("reference backend: %w", err)
 	}
 
+	// Only while this process owns the deferred durability; the syncer's
+	// repository lock is held, and the ownership never goes back.
 	var durability []gitcmd.CmdOpt
-	if w.core.RefDurability.Enabled() {
+	if w.core.RefDurability.Deferring() {
 		if err := w.core.RefDurability.MarkDirty(ctx, w.repo, w.path); err != nil {
 			return err
 		}

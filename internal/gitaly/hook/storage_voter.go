@@ -15,6 +15,11 @@ type StorageVoter interface {
 	// its pack) before git takes the reference locks. It never fails the
 	// transaction: when it did not complete, Prepared does that work itself.
 	Preparing(ctx context.Context, payload gitcmd.HooksPayload, changes []byte)
+	// Denied is called instead of Preparing for a transaction that the
+	// standalone access policy denies: it prepares nothing, and the transaction
+	// is aborted in its Prepared phase. Every transaction gets exactly one of
+	// Preparing and Denied before its Aborted or Committed phase.
+	Denied(ctx context.Context, payload gitcmd.HooksPayload, changes []byte)
 	// Prepared commits the transaction to the storage core while git holds
 	// the reference locks. An error aborts the transaction.
 	Prepared(ctx context.Context, payload gitcmd.HooksPayload, changes []byte, meta changelog.Meta) error
@@ -65,6 +70,7 @@ func (m *GitLabHookManager) storagePreparing(ctx context.Context, payload gitcmd
 	}
 
 	if message, err := m.graftPolicyDecision(env, changes); err != nil || message != "" {
+		m.storageVoter.Denied(ctx, payload, changes)
 		return
 	}
 

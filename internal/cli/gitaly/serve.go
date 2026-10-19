@@ -638,12 +638,13 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			for _, s := range cfg.Storages {
 				storageNames = append(storageNames, s.Name)
 			}
-			if err := syncer.RecoverLocalReferences(ctx, storageNames); err != nil {
+			stopLocalReferences, err := syncer.StartLocalReferences(ctx, storageNames)
+			if err != nil {
 				return err
 			}
-			durableCtx, stopDurableSteps := context.WithCancel(ctx)
-			defer stopDurableSteps()
-			go syncer.RunDurableSteps(durableCtx, localrefs.DurableStepInterval)
+			// Deferred here, so it runs after the servers stopped: a last durable step
+			// settles every repository whose writes ended.
+			defer stopLocalReferences()
 
 			storageGate = gate.New(storageCore, syncer, logger, locator, localrepoFactory, protoregistry.GitalyProtoPreregistered)
 		}

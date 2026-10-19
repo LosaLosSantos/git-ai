@@ -24,6 +24,8 @@ type durabilityVoter struct {
 
 func (durabilityVoter) Preparing(context.Context, gitcmd.HooksPayload, []byte) {}
 
+func (durabilityVoter) Denied(context.Context, gitcmd.HooksPayload, []byte) {}
+
 func (durabilityVoter) Prepared(context.Context, gitcmd.HooksPayload, []byte, changelog.Meta) error {
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -30,7 +31,9 @@ func (e *env) markers(t *testing.T) []string {
 	require.NoError(t, err)
 	var names []string
 	for _, entry := range entries {
-		names = append(names, entry.Name())
+		if strings.HasSuffix(entry.Name(), ".json") {
+			names = append(names, entry.Name())
+		}
 	}
 	return names
 }
@@ -77,7 +80,7 @@ func caughtUpDirty(t *testing.T, opts ...localrefs.DurabilityOption) (*env, core
 	t.Helper()
 
 	e := newEnv(t, envOptions{})
-	coretest.EnableLocalRefs(t, e.core, e.locator, opts...)
+	coretest.EnableLocalRefs(t, e.core, e.cfg, opts...)
 	src := e.newSource(t)
 	c1 := e.writeCommit(t, src)
 	repo := e.register(t, e.key(localRelPath), src, c1)
@@ -102,7 +105,7 @@ func TestSyncerCatchUpMarksTheRepositoryDirty(t *testing.T) {
 	e.verifySynced(t, repo)
 	require.Equal(t, []string{e.localPath()}, e.core.RefDurability.Dirty())
 
-	e.sy.DurableStep(e.ctx, e.localPath())
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
 	require.Empty(t, e.markers(t))
 	require.Empty(t, e.core.RefDurability.Dirty())
 	e.verifySynced(t, repo)
@@ -125,7 +128,7 @@ func TestSyncerMovesAsideARepositoryDirtyAtAKernelRestart(t *testing.T) {
 	require.Empty(t, strings.TrimSpace(string(torn)))
 
 	// The node restarts after a kernel restart.
-	coretest.EnableLocalRefs(t, e.core, e.locator, localrefs.WithBootID("boot-b"))
+	coretest.EnableLocalRefs(t, e.core, e.cfg, localrefs.WithBootID("boot-b"))
 	e.sy = syncer.New(e.core, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
 	require.NoError(t, e.sy.RecoverLocalReferences(e.ctx, []string{e.storageName}))
 
@@ -145,7 +148,7 @@ func TestSyncerKeepsARepositoryDirtyAtAProcessRestart(t *testing.T) {
 
 	e, repo, _ := caughtUpDirty(t, localrefs.WithBootID("boot-a"))
 
-	coretest.EnableLocalRefs(t, e.core, e.locator, localrefs.WithBootID("boot-a"))
+	coretest.EnableLocalRefs(t, e.core, e.cfg, localrefs.WithBootID("boot-a"))
 	e.sy = syncer.New(e.core, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
 	require.NoError(t, e.sy.RecoverLocalReferences(e.ctx, []string{e.storageName}))
 
@@ -153,7 +156,7 @@ func TestSyncerKeepsARepositoryDirtyAtAProcessRestart(t *testing.T) {
 	require.Equal(t, []string{e.localPath()}, e.core.RefDurability.Dirty())
 	e.verifySynced(t, repo)
 
-	e.sy.DurableStep(e.ctx, e.localPath())
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
 	require.Empty(t, e.markers(t))
 }
 
@@ -164,14 +167,14 @@ func TestSyncerRecoveryKeepsWhatIsNotACache(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, envOptions{})
-	coretest.EnableLocalRefs(t, e.core, e.locator, localrefs.WithBootID("boot-a"))
+	coretest.EnableLocalRefs(t, e.core, e.cfg, localrefs.WithBootID("boot-a"))
 	pb, path := gittest.CreateRepository(t, e.ctx, e.cfg, gittest.CreateRepositoryConfig{
 		SkipCreationViaService: true,
 		ReferenceBackend:       git.ReferenceBackendReftables,
 	})
 	require.NoError(t, e.core.RefDurability.MarkDirty(e.ctx, localrefs.RepoRef{Storage: pb.GetStorageName(), RelativePath: pb.GetRelativePath()}, path))
 
-	coretest.EnableLocalRefs(t, e.core, e.locator, localrefs.WithBootID("boot-b"))
+	coretest.EnableLocalRefs(t, e.core, e.cfg, localrefs.WithBootID("boot-b"))
 	e.sy = syncer.New(e.core, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
 	require.NoError(t, e.sy.RecoverLocalReferences(e.ctx, []string{e.storageName}))
 
@@ -196,7 +199,7 @@ func TestSyncerDurableStepMovesAsideOnAFailedWrite(t *testing.T) {
 	}))
 
 	failing.Store(true)
-	e.sy.DurableStep(e.ctx, e.localPath())
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
 	failing.Store(false)
 
 	require.NoDirExists(t, e.localPath())
@@ -206,4 +209,84 @@ func TestSyncerDurableStepMovesAsideOnAFailedWrite(t *testing.T) {
 	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
 	require.Equal(t, float64(2), syncCount(t, e.sy, "hydrated"), "the first hydration and the one after the move")
 	e.verifySynced(t, repo)
+}
+
+// TestSyncerDurableStepRetriesATransientError verifies that a durable step that
+// fails without a failed fsync (the stack cannot be read for a moment) keeps
+// the repository and its marker and is retried.
+func TestSyncerDurableStepRetriesATransientError(t *testing.T) {
+	t.Parallel()
+
+	e, repo, _ := caughtUpDirty(t)
+	list := filepath.Join(e.localPath(), "reftable", "tables.list")
+	require.NoError(t, os.Rename(list, list+".away"))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.NoError(t, os.Rename(list+".away", list))
+
+	require.DirExists(t, e.localPath())
+	require.Len(t, e.markers(t), 1)
+	require.Equal(t, float64(0), e.untrusted(t, localrefs.ReasonSyncFailed))
+
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.Empty(t, e.markers(t))
+	e.verifySynced(t, repo)
+}
+
+// TestSyncerSecondProcessWaitsForTheOwner is the overlap of a graceful
+// upgrade: while the old process owns the deferred durability, the new one
+// writes with fsync and touches no marker; once the old one is gone, the new
+// one owns, recovers and settles.
+func TestSyncerSecondProcessWaitsForTheOwner(t *testing.T) {
+	t.Parallel()
+
+	e, _, _ := caughtUpDirty(t)
+	storages := []string{e.storageName}
+
+	next := *e.core
+	durability, err := localrefs.NewDurability(e.locator, 0, localrefs.WithBootID(coretest.TestBootID))
+	require.NoError(t, err)
+	next.RefDurability = durability
+	t.Cleanup(func() { _ = durability.Close() })
+	nextSyncer := syncer.New(&next, e.logger, e.locator, e.repoFactory, e.gitCmdFactory)
+
+	stop, err := nextSyncer.StartLocalReferences(e.ctx, storages)
+	require.NoError(t, err)
+	defer stop()
+	require.False(t, durability.Deferring(), "the old process owns the storage")
+	require.Len(t, e.markers(t), 1)
+
+	// The old process exits.
+	require.NoError(t, e.core.RefDurability.Close())
+
+	// The next process tries every durable step interval.
+	require.Eventually(t, func() bool { return durability.Deferring() && len(e.markers(t)) == 0 },
+		30*time.Second, 10*time.Millisecond, "the next process owns and settles the marker")
+}
+
+// TestSyncerStopSettlesEveryRepository verifies that a clean stop removes the
+// marker of a repository whose writes ended, without waiting for it to be idle.
+func TestSyncerStopSettlesEveryRepository(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, envOptions{})
+	e.core.RefAdmission = localrefs.NewAdmission(10*time.Second, 10*time.Second)
+	durability, err := localrefs.NewDurability(e.locator, time.Hour, localrefs.WithBootID(coretest.TestBootID))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = durability.Close() })
+	e.core.RefDurability = durability
+
+	stop, err := e.sy.StartLocalReferences(e.ctx, []string{e.storageName})
+	require.NoError(t, err)
+	require.True(t, durability.Deferring())
+
+	src := e.newSource(t)
+	c1 := e.writeCommit(t, src)
+	repo := e.register(t, e.key(localRelPath), src, c1)
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.advanceMain(t, repo.ID, src, c1)
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	require.Len(t, e.markers(t), 1, "the repository is not idle for an hour")
+
+	stop()
+	require.Empty(t, e.markers(t))
 }

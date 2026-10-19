@@ -176,6 +176,8 @@ func (v *Voter) Preparing(ctx context.Context, payload gitcmd.HooksPayload, chan
 		return
 	}
 
+	// The transaction is live from now on (it ends in Committed or Aborted).
+	v.begin(ctx, payload, changes)
 	// Deferred first, so that it runs last: the admission is waited for after
 	// the pack work, when git is about to take the reference lock.
 	defer v.admit(ctx, payload, changes)
@@ -797,11 +799,38 @@ func (v *Voter) localRefs() bool {
 }
 
 // DeferredReferenceDurability reports whether the reference writes of the
-// transactions this voter commits may run without fsync: authoritative mode
-// with the deferred durability of the node on (doc/graft/PLAN7.md, LOCAL
-// REFERENCE WRITES RULE). The hook manager asks it for UpdateWithHooks.
+// transactions this voter commits may run without fsync: authoritative mode,
+// and this process owns the deferred durability of the node (doc/graft/PLAN7.md,
+// LOCAL REFERENCE WRITES RULE). The hook manager asks it for UpdateWithHooks.
+// It goes from false to true at most once in a process.
 func (v *Voter) DeferredReferenceDurability() bool {
-	return v != nil && v.core.Authoritative() && v.core.RefDurability.Enabled()
+	return v != nil && v.core.Authoritative() && v.core.RefDurability.Deferring()
+}
+
+// Denied records the start of a transaction that the standalone policy denies:
+// it is live until its Aborted phase, like any other (see begin).
+func (v *Voter) Denied(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if v == nil || !v.core.Enabled() || payload.Repo == nil {
+		return
+	}
+	v.begin(ctx, payload, changes)
+}
+
+// begin counts the transaction as live for the deferred durability: from
+// before git takes the reference lock until Committed or Aborted, it may write
+// a table or compact the stack, so the durable step keeps the repository's
+// marker meanwhile.
+func (v *Voter) begin(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
+	if !v.core.Authoritative() || !v.core.RefDurability.Enabled() {
+		return
+	}
+
+	repoPath, err := v.repoPath(ctx, payload)
+	if err != nil {
+		v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path of a starting transaction")
+		return
+	}
+	v.core.RefDurability.Begin(repoPath, localrefs.Key(pendingKey(payload.Repo, changes)))
 }
 
 // admit waits for the admission of the transaction to the reference lock of
@@ -822,11 +851,11 @@ func (v *Voter) admit(ctx context.Context, payload gitcmd.HooksPayload, changes 
 }
 
 // deferDurability lets git write the references of a transaction that the
-// database committed without fsync (authoritative mode with deferred
-// durability): the repository gets its durable dirty marker first, and the
-// transaction counts as in flight until its Committed phase, because git may
-// still write its table and compact the stack until then. It runs in the
-// Prepared phase, under git's reference lock and before git writes anything.
+// database committed without fsync (authoritative mode, and this process owns
+// the deferred durability): the repository gets its durable dirty marker
+// first. The transaction is live since its start (begin), so the durable step
+// keeps the marker until it ends. It runs in the Prepared phase, under git's
+// reference lock and before git writes anything.
 func (v *Voter) deferDurability(ctx context.Context, payload gitcmd.HooksPayload, changes []byte, shadow bool) error {
 	if shadow || !v.DeferredReferenceDurability() {
 		return nil
@@ -837,11 +866,7 @@ func (v *Voter) deferDurability(ctx context.Context, payload gitcmd.HooksPayload
 		return err
 	}
 	repoKey := corestore.KeyOf(payload.Repo)
-	if err := v.core.RefDurability.MarkDirty(ctx, localrefs.RepoRef{Storage: repoKey.Storage, RelativePath: repoKey.RelativePath}, repoPath); err != nil {
-		return err
-	}
-	v.core.RefDurability.Begin(repoPath, localrefs.Key(pendingKey(payload.Repo, changes)))
-	return nil
+	return v.core.RefDurability.MarkDirty(ctx, localrefs.RepoRef{Storage: repoKey.Storage, RelativePath: repoKey.RelativePath}, repoPath)
 }
 
 // Aborted tells the voter that git aborted the transaction.
@@ -863,14 +888,13 @@ func (v *Voter) Aborted(ctx context.Context, payload gitcmd.HooksPayload, change
 
 	key := pendingKey(payload.Repo, changes)
 
-	// A transaction aborted after its Prepared phase stays in flight for the
-	// deferred durability (see localrefs.Durability.End): its repository stays
-	// dirty.
+	// git wrote nothing more of the transaction once it reports the abort.
 	if v.localRefs() {
 		if repoPath, err := v.repoPath(ctx, payload); err != nil {
 			v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path after an abort, the admission ends at its bound")
 		} else {
 			v.core.RefAdmission.Release(repoPath, localrefs.Key(key))
+			v.core.RefDurability.End(repoPath, localrefs.Key(key))
 		}
 	}
 

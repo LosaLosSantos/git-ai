@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,7 +47,9 @@ func (f *fixture) markers(t *testing.T) []string {
 	require.NoError(t, err)
 	var names []string
 	for _, entry := range entries {
-		names = append(names, entry.Name())
+		if strings.HasSuffix(entry.Name(), ".json") {
+			names = append(names, entry.Name())
+		}
 	}
 	return names
 }
@@ -74,7 +77,7 @@ func TestLocalReferenceWritesOfACommittedTransaction(t *testing.T) {
 
 	// git may still write and compact until Committed: the durable step keeps
 	// the marker.
-	require.NoError(t, f.core.RefDurability.Settle(f.repoPath))
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
 	require.Len(t, f.markers(t), 1)
 
 	gittest.WriteRef(t, f.cfg, f.repoPath, git.ReferenceName(ref), f.a)
@@ -82,14 +85,13 @@ func TestLocalReferenceWritesOfACommittedTransaction(t *testing.T) {
 	require.False(t, f.admissionHeld(t), "Committed releases the admission")
 	require.Len(t, f.applier.calls, 1, "the local commit is still noted")
 
-	require.NoError(t, f.core.RefDurability.Settle(f.repoPath))
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
 	require.Empty(t, f.markers(t))
 }
 
 // TestLocalReferenceWritesOfAnAbortedTransaction verifies that an abort after
-// Prepared releases the admission but leaves the repository dirty: the
-// transaction cannot be told from another with the same input, so it is never
-// counted as ended.
+// Prepared releases the admission and ends the transaction: the repository is
+// settled once nothing else is live.
 func TestLocalReferenceWritesOfAnAbortedTransaction(t *testing.T) {
 	t.Parallel()
 
@@ -101,8 +103,32 @@ func TestLocalReferenceWritesOfAnAbortedTransaction(t *testing.T) {
 	f.voter.Aborted(f.ctx, f.payload, input)
 	require.False(t, f.admissionHeld(t))
 
-	require.NoError(t, f.core.RefDurability.Settle(f.repoPath))
-	require.Len(t, f.markers(t), 1)
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
+	require.Empty(t, f.markers(t))
+}
+
+// TestLocalReferenceWritesOfTransactionsWithTheSameInput verifies that two
+// live transactions with the same input are both counted: the one denied by
+// the policy and aborted does not end the other one, which may still write.
+func TestLocalReferenceWritesOfTransactionsWithTheSameInput(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative, localRefs: true})
+	input := line(f.zero, f.a.String(), "refs/heads/main")
+
+	f.voter.Preparing(f.ctx, f.payload, input)
+	require.NoError(t, f.prepared(input))
+
+	// The same input from an agent the policy denies.
+	f.voter.Denied(f.ctx, f.payload, input)
+	f.voter.Aborted(f.ctx, f.payload, input)
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, true))
+	require.Len(t, f.markers(t), 1, "the first transaction may still write")
+
+	gittest.WriteRef(t, f.cfg, f.repoPath, git.ReferenceName("refs/heads/main"), f.a)
+	f.voter.Committed(f.ctx, f.payload, input)
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
+	require.Empty(t, f.markers(t))
 }
 
 // TestLocalReferenceWritesOfARejectedTransaction verifies that a transaction
@@ -131,9 +157,11 @@ func TestLocalReferenceWritesWhenTheMarkerCannotBeWritten(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative, localRefs: true})
+	// The marker directory exists (the ownership created it); no file can be
+	// created in it.
 	markerDir := filepath.Join(f.cfg.Storages[0].Path, localrefs.MarkerDirName)
-	require.NoError(t, os.MkdirAll(filepath.Dir(markerDir), 0o755))
-	require.NoError(t, os.WriteFile(markerDir, nil, 0o644))
+	require.NoError(t, os.Chmod(markerDir, 0o500))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(markerDir, 0o700)) })
 
 	input := line(f.zero, f.a.String(), "refs/heads/main")
 	err := f.prepared(input)

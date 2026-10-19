@@ -93,6 +93,22 @@ func newRealNode(t *testing.T) *realNode {
 	}
 }
 
+// sibling returns a second server of the same storage, database and bucket on
+// its own socket, as the new process of a graceful upgrade is.
+func (n *realNode) sibling(t *testing.T) *realNode {
+	t.Helper()
+
+	s := *n
+	s.cfg.SocketPath = testhelper.GetTemporaryGitalySocketFileName(t)
+	s.clientCfg = s.cfg
+	s.clientCfg.SocketPath = "unix://" + s.cfg.SocketPath
+	s.cfgPath = testcfg.WriteTemporaryGitalyConfigFile(t, s.cfg)
+	s.logPath = filepath.Join(t.TempDir(), "gitaly.log")
+	s.setupCtx = testhelper.MergeOutgoingMetadata(s.ctx, testcfg.GitalyServersMetadataFromCfg(t, s.clientCfg))
+	s.cmd, s.exited = nil, nil
+	return &s
+}
+
 // start starts the server process with the extra environment env and waits
 // until it serves.
 func (n *realNode) start(t *testing.T, env ...string) {
@@ -205,7 +221,9 @@ func (n *realNode) markers(t *testing.T) []string {
 	require.NoError(t, err)
 	var names []string
 	for _, entry := range entries {
-		names = append(names, filepath.Join(n.storagePath(), localrefs.MarkerDirName, entry.Name()))
+		if strings.HasSuffix(entry.Name(), ".json") {
+			names = append(names, filepath.Join(n.storagePath(), localrefs.MarkerDirName, entry.Name()))
+		}
 	}
 	return names
 }
@@ -361,6 +379,47 @@ func TestStorageLocalReferencesAfterAKernelRestart(t *testing.T) {
 	require.Empty(t, n.markers(t))
 	n.requireServed(t, rel, written)
 	require.Contains(t, n.log(t), "moved aside a local repository whose references may have lost writes")
+}
+
+// TestStorageLocalReferencesDuringAGracefulUpgrade runs a second server on
+// the same storage while the first one lives, as a graceful upgrade does: the
+// first one owns the deferred durability, the second writes with fsync and
+// leaves the markers alone. When the first one dies, the second owns, settles
+// and defers. Every write is served throughout.
+func TestStorageLocalReferencesDuringAGracefulUpgrade(t *testing.T) {
+	t.Parallel()
+
+	old := newRealNode(t)
+	old.start(t)
+	rel := old.createRepository(t)
+	base, err := commitFile(old.ctx, old.agent(t, rel), workerName(0), "main", "", "README.md", "base\n")
+	require.NoError(t, err)
+	written := writeBranches(t, old.agent(t, rel), old.ctx, base, "old", 3)
+	written["main"] = base
+	require.Len(t, old.markers(t), 1)
+
+	next := old.sibling(t)
+	next.start(t)
+	require.Contains(t, next.log(t), "another gitaly process owns the deferred durability")
+	for branch, commit := range writeBranches(t, next.agent(t, rel), next.ctx, base, "during", 3) {
+		written[branch] = commit
+	}
+	next.requireServed(t, rel, written)
+
+	// The old process owns the marker and settles it once the repository is
+	// idle; the new process's writes were made with fsync and need none.
+	require.Eventually(t, func() bool { return len(old.markers(t)) == 0 }, 30*time.Second, 50*time.Millisecond)
+
+	old.kill(t)
+	require.Eventually(t, func() bool {
+		return strings.Contains(next.log(t), "this process owns the deferred durability of the storages now")
+	}, 30*time.Second, 50*time.Millisecond)
+
+	for branch, commit := range writeBranches(t, next.agent(t, rel), next.ctx, base, "after", 2) {
+		written[branch] = commit
+	}
+	require.Len(t, next.markers(t), 1, "the new owner writes without fsync")
+	next.requireServed(t, rel, written)
 }
 
 // TestStorageLocalReferencesStackDepthIsBounded writes many references

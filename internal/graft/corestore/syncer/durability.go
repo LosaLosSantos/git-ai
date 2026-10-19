@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
@@ -14,14 +15,111 @@ import (
 	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
+// finalStepTimeout bounds the durable steps that run when the process stops.
+const finalStepTimeout = 30 * time.Second
+
+// StartLocalReferences starts the deferred durability of the node's local
+// references (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE). gitaly serve
+// calls it before its listeners open.
+//
+// When the process takes the ownership of the storages' deferred durability,
+// it recovers them before returning (RecoverLocalReferences): a repository
+// that had writes not yet durable when the kernel restarted is moved aside, so
+// nothing reads its possibly torn stack. When another process owns them (a
+// graceful upgrade overlaps the old and the new process), that process
+// recovered them when it started, in this boot; this one writes references
+// with fsync and tries again every DurableStepInterval, recovering when it
+// takes the ownership.
+//
+// The returned stop ends the durable steps and runs a last one for every dirty
+// repository, without waiting for it to be idle, so that a clean stop leaves
+// no marker of a repository whose writes ended.
+func (s *Syncer) StartLocalReferences(ctx context.Context, storages []string) (stop func(), err error) {
+	d := s.core.RefDurability
+	if !d.Enabled() {
+		return func() {}, nil
+	}
+
+	owned, err := d.TryOwn(ctx, storages)
+	if err != nil {
+		return nil, fmt.Errorf("storage core: own the deferred durability: %w", err)
+	}
+	recovered := false
+	if owned {
+		if err := s.RecoverLocalReferences(ctx, storages); err != nil {
+			return nil, err
+		}
+		recovered = true
+	} else {
+		s.logger.Warn("storage core: another gitaly process owns the deferred durability of the storages; references are written with fsync until it exits")
+	}
+
+	loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.runDurableSteps(loopCtx, storages, recovered)
+	}()
+
+	return func() {
+		cancel()
+		wg.Wait()
+		if !d.Deferring() {
+			return
+		}
+		finalCtx, cancelFinal := context.WithTimeout(context.WithoutCancel(ctx), finalStepTimeout)
+		defer cancelFinal()
+		for _, path := range d.Dirty() {
+			s.durableStep(finalCtx, path, true)
+		}
+	}, nil
+}
+
+// runDurableSteps runs, every DurableStepInterval until ctx ends, the durable
+// step of every dirty repository, or, while another process owns the deferred
+// durability, an attempt to take it (and the recovery once taken).
+func (s *Syncer) runDurableSteps(ctx context.Context, storages []string, recovered bool) {
+	d := s.core.RefDurability
+	ticker := time.NewTicker(localrefs.DurableStepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if !recovered {
+			owned, err := d.TryOwn(ctx, storages)
+			if err != nil {
+				s.logger.WithError(err).Error("storage core: own the deferred durability")
+				continue
+			}
+			if !owned {
+				continue
+			}
+			if err := s.RecoverLocalReferences(ctx, storages); err != nil {
+				s.logger.WithError(err).Error("storage core: recover the local references after taking the deferred durability; retried")
+				continue
+			}
+			recovered = true
+			s.logger.Info("storage core: this process owns the deferred durability of the storages now")
+		}
+
+		for _, path := range d.Dirty() {
+			s.durableStep(ctx, path, false)
+		}
+	}
+}
+
 // RecoverLocalReferences moves aside every local repository that had reference
 // writes that were not durable yet when the kernel restarted (doc/graft/PLAN7.md,
 // LOCAL REFERENCE WRITES RULE): its reftable stack may be torn, and git reads a
 // torn stack as an empty repository without an error. The next request
-// hydrates it from the database and the bucket. gitaly serve calls it before
-// its listeners open, so nothing reads such a repository before. A repository
-// dirty from a process restart of the same boot is kept: the kernel kept every
-// write, and the durable step settles it.
+// hydrates it from the database and the bucket. The process owns the deferred
+// durability. A repository dirty from a process restart of the same boot is
+// kept: the kernel kept every write, and the durable step settles it.
 //
 // Only a cache of the storage core is moved: the database must hold the
 // repository with changesets, and the local repository must have its
@@ -39,7 +137,7 @@ func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) 
 			continue
 		}
 
-		cache, err := s.storageCoreCache(ctx, rec)
+		cache, err := s.storageCoreCache(ctx, rec.Repo, rec.Path)
 		if err != nil {
 			return fmt.Errorf("storage core: recover the local references of %s:%s: %w", rec.Repo.Storage, rec.Repo.RelativePath, err)
 		}
@@ -59,11 +157,11 @@ func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) 
 	return nil
 }
 
-// storageCoreCache reports whether the local repository of rec is a cache of
+// storageCoreCache reports whether the local repository at path is a cache of
 // the storage core that a hydration can rebuild: the database holds it with
 // changesets, and it has a watermark.
-func (s *Syncer) storageCoreCache(ctx context.Context, rec localrefs.Recovered) (bool, error) {
-	r, err := s.core.Meta.GetRepository(ctx, corestore.RepoKey{Storage: rec.Repo.Storage, RelativePath: rec.Repo.RelativePath})
+func (s *Syncer) storageCoreCache(ctx context.Context, repo localrefs.RepoRef, path string) (bool, error) {
+	r, err := s.core.Meta.GetRepository(ctx, corestore.RepoKey{Storage: repo.Storage, RelativePath: repo.RelativePath})
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
 		return false, nil
 	}
@@ -74,12 +172,12 @@ func (s *Syncer) storageCoreCache(ctx context.Context, rec localrefs.Recovered) 
 		return false, nil
 	}
 
-	if _, err := os.Lstat(rec.Path); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
-	_, ok, err := gitops.ReadWatermark(rec.Path)
+	_, ok, err := gitops.ReadWatermark(path)
 	if err != nil {
 		// A watermark that cannot be read is no proof that the storage core wrote
 		// the repository: it is kept, as untracked() keeps it.
@@ -88,48 +186,46 @@ func (s *Syncer) storageCoreCache(ctx context.Context, rec localrefs.Recovered) 
 	return ok, nil
 }
 
-// RunDurableSteps runs the durable step of every dirty repository each interval
-// until ctx ends (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
-func (s *Syncer) RunDurableSteps(ctx context.Context, interval time.Duration) {
-	if !s.core.RefDurability.Enabled() {
-		return
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		for _, path := range s.core.RefDurability.Dirty() {
-			s.durableStep(ctx, path)
-		}
-	}
-}
-
 // durableStep makes the references of the repository at path durable under the
-// repository lock, and moves the repository aside at once when the kernel
-// reports that a write failed.
-func (s *Syncer) durableStep(ctx context.Context, path string) {
+// repository lock (final: without waiting for the repository to be idle). When
+// the kernel reports that a write failed, the repository is moved aside at
+// once, if it is a cache of the storage core; any other failure is retried at
+// the next step.
+func (s *Syncer) durableStep(ctx context.Context, path string, final bool) {
 	release, err := s.lock(ctx, path)
 	if err != nil {
 		return
 	}
 	defer release()
 
-	err = s.core.RefDurability.Settle(path)
-	var untrusted *localrefs.UntrustedError
-	if errors.As(err, &untrusted) {
-		if err := s.distrustLocked(ctx, untrusted.Repo, path, localrefs.ReasonSyncFailed, untrusted); err != nil {
-			s.logger.WithError(err).WithField("repository_path", path).
-				Error("storage core: could not move aside a repository whose references may have lost writes")
-		}
+	d := s.core.RefDurability
+	err = d.Settle(path, final)
+	if err == nil {
 		return
 	}
-	if err != nil {
-		s.logger.WithError(err).WithField("repository_path", path).Error("storage core: durable step of the local references")
+
+	logger := s.logger.WithError(err).WithField("repository_path", path)
+	var untrusted *localrefs.UntrustedError
+	if !errors.As(err, &untrusted) {
+		d.CountStepError()
+		logger.Warn("storage core: durable step of the local references failed, retried at the next step")
+		return
+	}
+
+	cache, cacheErr := s.storageCoreCache(ctx, untrusted.Repo, path)
+	if cacheErr != nil {
+		d.CountStepError()
+		logger.WithField("cache_check_error", cacheErr.Error()).
+			Error("storage core: the references of a repository may have lost writes; whether it can be hydrated again is not known yet, retried at the next step")
+		return
+	}
+	if !cache {
+		logger.Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place")
+		return
+	}
+	if err := s.distrustLocked(ctx, untrusted.Repo, path, localrefs.ReasonSyncFailed, untrusted); err != nil {
+		logger.WithField("move_error", err.Error()).
+			Error("storage core: could not move aside a repository whose references may have lost writes")
 	}
 }
 
@@ -146,8 +242,8 @@ func (s *Syncer) distrust(ctx context.Context, repo localrefs.RepoRef, path, rea
 // distrustLocked moves the local repository at path into the temporary
 // directory of its storage and removes it there in the background, then drops
 // its dirty marker: the next request hydrates it. The move is made durable
-// before the marker goes, so a crash in between moves it again. The caller
-// holds the repository lock.
+// (both directories, and the new directory's entry) before the marker goes, so
+// a crash in between moves it again. The caller holds the repository lock.
 func (s *Syncer) distrustLocked(ctx context.Context, repo localrefs.RepoRef, path, reason string, cause error) error {
 	d := s.core.RefDurability
 
@@ -169,8 +265,10 @@ func (s *Syncer) distrustLocked(ctx context.Context, repo localrefs.RepoRef, pat
 		_ = os.Remove(stale)
 		return structerr.NewInternal("storage core: move aside an untrusted repository: %w", err)
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return structerr.NewInternal("storage core: make the move of an untrusted repository durable: %w", err)
+	for _, dir := range []string{filepath.Dir(path), stale, tmpDir} {
+		if err := syncDir(dir); err != nil {
+			return structerr.NewInternal("storage core: make the move of an untrusted repository durable: %w", err)
+		}
 	}
 
 	s.forgetPending(path)

@@ -541,8 +541,31 @@ repository-wide lock.
 2. *Deferred durability* (`corestore/localrefs.Durability`). The hook's
    `UpdateWithHooks` transactions and the syncer's catch-up write references with
    `core.fsync` without `reference`. Only the voter can turn this on
-   (`DeferredReferenceDurability`: authoritative mode and the kernel's boot
-   identity readable). Objects stay durable as before.
+   (`DeferredReferenceDurability`: authoritative mode, the kernel's boot identity
+   readable, and this process owns the storage's deferred durability). Objects
+   stay durable as before.
+   * *One owner per storage.* The deferred durability of a storage belongs to the
+     process that holds an exclusive lock (flock) on
+     `<storage>/+gitaly/graft-ref-durability/owner.lock` for its whole life.
+     * Only the owner writes references without fsync, runs the durable steps,
+       recovers, and removes a durable step's leftovers. A second process on the
+       storage (a graceful upgrade overlaps the old and the new process) writes
+       references with fsync and touches no marker or lock. It tries every second
+       to take the ownership, and recovers when it does.
+     * Ownership only goes from false to true within a process. So a write
+       decided as deferred always runs in the owner.
+     * Why this is safe:
+       * The unfsynced writes, the live transactions and the syncer lock that
+         the durable step reasons about all belong to one process.
+       * A non-owner's writes are durable by themselves. Its compactions fsync
+         the new table and list before they delete the tables they replace.
+       * A new owner takes over only after the old process exited (the flock is
+         released at exit), so no durable step of the old process is still
+         running.
+       * While an old process lives, no foreign-boot marker can exist: that
+         process recovered at its own start in this boot.
+     * Measured with real binaries: a second `gitaly serve` during the first's
+       life, then the first killed.
    * *Dirty marker.* Before the first such write after a durable step, the
      repository gets a marker, written durably, with the kernel's boot identity
      (`<storage>/+gitaly/graft-ref-durability/<sha256(path)>.json`, not the state
@@ -552,28 +575,49 @@ repository-wide lock.
        the marker cannot be written, Prepared fails and git aborts; catch-up
        repairs the database's write, like any local failure.
      * The syncer writes it under its repository lock.
-     * A hook transaction counts as in flight from Prepared to Committed.
-       Reasons from git's source: the new table is written in
-       `transaction_finish` after "prepared", and auto-compaction runs inside
-       `reftable_addition_commit`, before "committed". An abort after Prepared
-       is not counted as an end (two transactions with the same input cannot be
-       told apart), so the repository stays dirty.
+     * A hook transaction is live from its start to its end, and the durable
+       step never clears the marker while any is live.
+       * Start: the voter's Preparing, or `Denied` for a transaction the policy
+         denies.
+       * End: Committed or Aborted.
+       * Every transaction starts once and ends once, so the count per input is
+         the number of live transactions, whichever of two with the same input
+         ends first.
+       * Reasons from git's source: the new table is written in
+         `transaction_finish` after "prepared", and auto-compaction runs inside
+         `reftable_addition_commit`, before "committed".
+       * A transaction whose end is never reported keeps its repository dirty
+         (conservative).
    * *Durable step* (`Settle`, every second for every dirty repository, under the
      syncer's repository lock).
      * It fsyncs the tables not yet fsynced, `tables.list` and the directory.
-     * When the repository has been idle for a second and nothing is in flight,
-       it takes git's lock without waiting (the lock is created with a tag, by
-       linking a temporary file). It then fsyncs what was written since, marks
-       the state clean, and releases the lock. Last, it removes the marker,
-       under a per-repository file lock that `MarkDirty` waits for.
+     * When the repository has been idle for a second, or the process stops,
+       and nothing is live, the step clears the marker:
+       * It takes git's lock without waiting. The lock is created by linking a
+         temporary file that holds a tag and a random nonce.
+       * It fsyncs what was written since, marks the state clean, and releases
+         the lock. The release removes the lock only if it is still the same
+         file with the same nonce: an inode is reused as soon as it is freed, so
+         a lock that someone else replaced is never removed.
+       * Last, it removes the marker, under a per-repository file lock that
+         `MarkDirty` waits for.
      * A busy lock leaves the marker for the next step.
-   * *Write failure.* A failed fsync in the durable step means the kernel may
-     have dropped writes. The repository is moved aside at once, under the
-     repository lock: the move is made durable, then the marker removed. The
-     failure is logged and counted (`sync_failed`), and the next request
-     hydrates the repository.
+     * The set of fsynced tables keeps only the tables the stack still lists.
+     * A graceful stop runs a last step for every dirty repository after the
+       servers stopped, so a clean reboot does not rehydrate them.
+   * *Write failure.* Only a failed fsync means the kernel may have dropped
+     writes. The repository is then moved aside at once, under the repository
+     lock: the move (both directories and the new entry) is made durable, then
+     the marker removed. This happens only when the repository is a cache of the
+     storage core, the same check as the recovery. The failure is logged and
+     counted (`sync_failed`), and the next request hydrates the repository. Any
+     other error (opening a file, reading the list) is transient: counted
+     (`graft_storage_ref_durable_step_errors_total`) and retried at the next
+     step.
    * *Recovery* (`Syncer.RecoverLocalReferences`). `gitaly serve` runs it before
-     any listener opens and before any background worker.
+     any listener opens and before any background worker, when it owns the
+     storage (`Syncer.StartLocalReferences`); otherwise it runs when the process
+     takes the ownership.
      * A marker of another boot means the kernel restarted with writes that may
        not have reached the disk. git reads a torn stack as an empty repository
        with exit code 0 (experiment 1, kept as
@@ -585,8 +629,8 @@ repository-wide lock.
        dropped, keeping a repository whose local copy may be the only one.
      * A marker of the same boot is a process restart: the page cache kept
        every write, so the repository stays dirty to be settled.
-     * A lock with the durable step's tag, left by a process that died, is
-       removed.
+     * A lock with the durable step's tag and the step's temporary files, left
+       by a process that died, are removed.
      * A corrupt marker fails the startup: its repository is unknown.
    * Not Linux (no boot identity): references stay durable per transaction.
 3. *Read paths.* After the recovery, no read path in authoritative mode can see
@@ -605,32 +649,62 @@ repository-wide lock.
 * `localrefs` (`admission.go`, `durability.go`); `Core.RefAdmission`/`RefDurability`.
 * `voter` (`admit`, `deferDurability`, Committed/Aborted).
 * `syncer` (`refWriter`, `durability.go`).
-* `serve.go`: `openLocalReferenceWrites`, the recovery before the listeners, the
-  durable-step loop.
+* `serve.go`: `openLocalReferenceWrites`; `StartLocalReferences` before the
+  listeners (ownership, recovery, durable-step loop), and its stop, deferred so
+  that it runs after the servers stopped.
 * PM grant: `updateref.WithDeferredReferenceDurability`; the `gitcmd` constants
   `FsyncComponents`, `FsyncComponentsWithoutReferences` and
   `ReftableLockTimeoutMilliseconds`; `hook/storage_voter.go`
-  (`DeferredReferenceDurability`); the optional interface asserted in
+  (`DeferredReferenceDurability`, `Denied`); the optional interface asserted in
   `UpdateWithHooks`.
+* Follow-up after the independent review of 310facd:
+  * MAJOR: process-local state with overlapping processes. Fixed by one owner
+    per storage.
+  * The unlock is ownership-checked (nonce and file).
+  * An abort ends its transaction (the live count).
+  * The fsynced-table set is pruned.
+  * A final step runs on a graceful stop.
+  * Only a failed fsync distrusts a repository, and only after the cache check.
+  * The directory fsyncs (the marker directory's parent; the stale and temporary
+    directories of a move) are added.
+  * The step's temporary files are cleaned at recovery.
 
 **Tests.**
-* `localrefs`: FIFO order, a cancelled waiter, the wait bound, the hold bound,
-  unique keys; the marker, the durable step (idle, in flight, git's lock held,
-  failed fsync, repository gone), recovery (process restart, kernel restart,
-  stale lock, corrupt marker), the torn-stack experiment.
-* `voter`: committed, aborted and rejected transactions; a marker that cannot be
+* `localrefs`:
+  * admission: FIFO order, a cancelled waiter, the wait bound, the hold bound,
+    unique keys;
+  * ownership: one owner per storage; a non-owner neither defers, settles nor
+    recovers; ownership taken after the owner closes; the marker directory
+    created durably;
+  * durable step: the marker; idle, live transactions (including two with the
+    same key), git's lock held, the final step; the checked release (a
+    replaced lock with a reused inode is kept); failed fsync versus a transient
+    error; pruning; repository gone;
+  * recovery: process restart, kernel restart, stale lock and temporary files,
+    corrupt marker;
+  * the torn-stack experiment.
+* `voter`: committed, aborted (now settled) and rejected transactions; a denied
+  and an allowed transaction with the same input; a marker that cannot be
   written; durability per mode (off, shadow and authoritative without boot
   identity keep the fsync).
 * `updateref`: the effective `core.fsync` of `update-ref`.
 * `hook/updateref`: only a voter that defers turns it off.
 * `syncer`: catch-up marks; reboot recovery hydrates (a read before it lists
   nothing); process-restart recovery keeps; non-caches are kept; a failed fsync
-  moves aside and hydrates.
-* e2e with the real `gitaly` binary: SIGKILL after writes (same boot, kept,
-  settled); SIGKILL in the durable step (the lock is removed at restart, writes
-  go on); a simulated power loss (torn table, other boot: moved aside, every
-  write served); stack depth under 4×30 concurrent writes (git's geometric
-  compaction, at most 2⌈log₂ n⌉+2 tables; measured 4 for 122 updates).
+  moves aside and hydrates; a transient error is retried; a second process waits
+  for the owner, then owns and settles; the stop settles a repository that is
+  not idle.
+* e2e with the real `gitaly` binary:
+  * SIGKILL after writes: same boot, kept, settled;
+  * SIGKILL in the durable step: the lock is removed at restart and writes go
+    on;
+  * a simulated power loss (torn table, other boot): moved aside, every write
+    served;
+  * a graceful-upgrade overlap: a second `gitaly serve` on the same storage
+    writes with fsync while the first owns; after a SIGKILL of the first, the
+    second owns and defers;
+  * stack depth under 4×30 concurrent writes: git's geometric compaction, at
+    most 2⌈log₂ n⌉+2 tables; measured 4 for 122 updates.
 
 **Measured** (2026-10-19, same method as the problem's numbers, alternating
 before = b665f56 and after = WP76b, two runs each, load 3–7; mean ms, 50 / 100
