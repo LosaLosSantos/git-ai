@@ -463,12 +463,16 @@ or re-import the repository from scratch (see
     loss: one hydration per repository that had a write in the second before the
     loss, or that was still being written. On a busy node that can be every
     active repository. A repository is only moved when the database holds it
-    with changesets and the local copy has a watermark; other markers are
-    dropped.
+    with changesets; other markers are dropped.
   - *A write the kernel reports as failed* (a writeback error, same boot): the
     durable step's fsync fails, the repository is moved aside at once and logged,
-    and the next request hydrates it. Other errors of the step (a file that
+    and the next request hydrates it. The kernel reports such a failure once, so
+    from then on the repository's marker is never removed: if the move aside
+    fails, it is retried every second. Other errors of the step (a file that
     cannot be opened for a moment) are retried every second and counted.
+  - *Process restart*: the markers found are kept for 20 s (twice git's
+    reference lock timeout) before they can be removed, in case a git process of
+    the previous process is still finishing.
   - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
     repository durable and removes its marker, so a clean reboot hydrates
     nothing.
@@ -523,7 +527,7 @@ without a single divergence.
 | `graft_storage_ref_admission_expired_total` | Turns ended by the 10 s bound instead of their release (a git process that died between its phases). |
 | `graft_storage_ref_dirty_repositories` | Repositories with reference writes not yet made durable. |
 | `graft_storage_ref_dirty_marked_total`, `graft_storage_ref_dirty_cleared_total` | Dirty markers written and removed by the durable step. |
-| `graft_storage_ref_writes_inflight` | Hook transactions between their start and their end (Committed or Aborted); one whose end is never reported keeps its repository dirty. |
+| `graft_storage_ref_writes_inflight` | git processes of this node that write references without fsync and have not exited; their repositories keep their markers. |
 | `graft_storage_ref_durability_owner` | 1 when this process owns the deferred durability of its storages, 0 while another process (the old one of a graceful upgrade) does. |
 | `graft_storage_ref_durable_step_errors_total` | Durable steps that failed with a transient error (not a failed fsync); retried every second. |
 | `graft_storage_ref_untrusted_total{reason}` | Repositories moved aside to be hydrated again: `reboot` (dirty at a kernel restart), `sync_failed` (the durable step's fsync failed). |

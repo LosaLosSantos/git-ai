@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
-	"github.com/feder-cr/git-ai/internal/graft/corestore/gitops"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/structerr"
 )
@@ -49,6 +48,7 @@ func (s *Syncer) StartLocalReferences(ctx context.Context, storages []string) (s
 		if err := s.RecoverLocalReferences(ctx, storages); err != nil {
 			return nil, err
 		}
+		d.Activate()
 		recovered = true
 	} else {
 		s.logger.Warn("storage core: another gitaly process owns the deferred durability of the storages; references are written with fsync until it exits")
@@ -103,6 +103,7 @@ func (s *Syncer) runDurableSteps(ctx context.Context, storages []string, recover
 				s.logger.WithError(err).Error("storage core: recover the local references after taking the deferred durability; retried")
 				continue
 			}
+			d.Activate()
 			recovered = true
 			s.logger.Info("storage core: this process owns the deferred durability of the storages now")
 		}
@@ -159,7 +160,10 @@ func (s *Syncer) RecoverLocalReferences(ctx context.Context, storages []string) 
 
 // storageCoreCache reports whether the local repository at path is a cache of
 // the storage core that a hydration can rebuild: the database holds it with
-// changesets, and it has a watermark.
+// changesets (an import that is not complete has none, and its local copy may
+// be the only one). A sync replaces such a local repository too when it is
+// stale, whatever its watermark. An error (the database, or the repository's
+// directory, cannot be read) is returned: the caller tries again.
 func (s *Syncer) storageCoreCache(ctx context.Context, repo localrefs.RepoRef, path string) (bool, error) {
 	r, err := s.core.Meta.GetRepository(ctx, corestore.RepoKey{Storage: repo.Storage, RelativePath: repo.RelativePath})
 	if errors.Is(err, corestore.ErrRepositoryNotFound) {
@@ -177,13 +181,7 @@ func (s *Syncer) storageCoreCache(ctx context.Context, repo localrefs.RepoRef, p
 	} else if err != nil {
 		return false, err
 	}
-	_, ok, err := gitops.ReadWatermark(path)
-	if err != nil {
-		// A watermark that cannot be read is no proof that the storage core wrote
-		// the repository: it is kept, as untracked() keeps it.
-		return false, nil
-	}
-	return ok, nil
+	return true, nil
 }
 
 // durableStep makes the references of the repository at path durable under the
@@ -212,6 +210,15 @@ func (s *Syncer) durableStep(ctx context.Context, path string, final bool) {
 		return
 	}
 
+	// A repository that is gone (moved aside as a stale cache meanwhile) has
+	// nothing left to serve: its marker is dropped.
+	if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+		if err := s.distrustLocked(ctx, untrusted.Repo, path, localrefs.ReasonSyncFailed, untrusted); err != nil {
+			logger.WithField("forget_error", err.Error()).Error("storage core: could not drop the marker of a repository that is gone; retried at the next step")
+		}
+		return
+	}
+
 	cache, cacheErr := s.storageCoreCache(ctx, untrusted.Repo, path)
 	if cacheErr != nil {
 		d.CountStepError()
@@ -220,12 +227,16 @@ func (s *Syncer) durableStep(ctx context.Context, path string, final bool) {
 		return
 	}
 	if !cache {
+		// Its marker stays (the untrusted state is sticky): after a reboot the
+		// recovery decides again.
 		logger.Error("storage core: the references of a repository that is not a cache of the storage core may have lost writes; it is kept in place")
 		return
 	}
 	if err := s.distrustLocked(ctx, untrusted.Repo, path, localrefs.ReasonSyncFailed, untrusted); err != nil {
+		// The untrusted state is sticky: the next step moves it aside again, and
+		// the marker is never cleared meanwhile.
 		logger.WithField("move_error", err.Error()).
-			Error("storage core: could not move aside a repository whose references may have lost writes")
+			Error("storage core: could not move aside a repository whose references may have lost writes; retried at the next step")
 	}
 }
 

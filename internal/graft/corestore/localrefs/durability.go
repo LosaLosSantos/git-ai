@@ -21,6 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
@@ -54,7 +55,17 @@ const (
 	// DurableStepIdle is how long a dirty repository must be without a reference
 	// write before the durable step removes its marker.
 	DurableStepIdle = time.Second
+	// RecoveryGrace is how long a repository found dirty when the process takes
+	// the ownership keeps its marker at least: longer than git waits for the
+	// reference lock (reftable.lockTimeout), so that a git process of the
+	// previous owner that is not reaped yet has finished.
+	RecoveryGrace = 2 * gitcmd.ReftableLockTimeoutMilliseconds * time.Millisecond
 )
+
+// WithRecoveryGrace replaces RecoveryGrace. Tests shorten it.
+func WithRecoveryGrace(grace time.Duration) DurabilityOption {
+	return func(d *Durability) { d.recoveryGrace = grace }
+}
 
 // CrashEnv names the test-only environment variable that makes the process
 // exit (exit code 75) in the durable step, while it holds git's reference lock
@@ -138,11 +149,17 @@ type Durability struct {
 	// crashAt is the crash point selected with CrashEnv.
 	crashAt string
 
-	// owner is set once the process owns the deferred durability of its
-	// storages; it never goes back. ownerFiles hold the owner locks.
+	// ownerFiles hold the owner locks, taken by TryOwn. owner is set by
+	// Activate once the process has recovered the storages: from then on its
+	// writes are deferred. Neither goes back.
 	owner      atomic.Bool
 	ownerMu    sync.Mutex
 	ownerFiles []*os.File
+	locked     bool
+	// recoveryGrace is how long a repository recovered dirty keeps its marker
+	// at least: a git process of the previous owner that outlived it (killed
+	// with it, but not reaped yet) may still be committing for that long.
+	recoveryGrace time.Duration
 
 	mu sync.Mutex
 	// repos holds the state of every repository written since the process
@@ -169,13 +186,17 @@ type refState struct {
 	repo   RepoRef
 	marker string
 	dirty  bool
-	// live counts, by key, the hook transactions of the process from their
-	// start (Preparing, or a policy denial) to their end (Committed or
-	// Aborted): any of them may still write a table or compact the stack
-	// without fsync.
-	live      map[Key]int
+	// nLive counts the git processes of this process that write the
+	// repository's references without fsync and have not exited: any of them
+	// may still write a table or compact the stack.
 	nLive     int
 	lastWrite time.Time
+	// settleAfter keeps the marker of a repository recovered dirty until then.
+	settleAfter time.Time
+	// untrusted is the first failed fsync of the repository. The kernel reports
+	// a failed writeback once, so a later fsync can succeed although writes
+	// were lost: the repository never becomes clean again, only moved aside.
+	untrusted error
 	// synced holds the tables made durable during the current dirty period that
 	// the stack still lists. Tables are immutable, so one fsync each is enough.
 	synced map[string]struct{}
@@ -248,11 +269,12 @@ func NewDurability(locator storage.Locator, idle time.Duration, opts ...Durabili
 
 func newDurability(locator storage.Locator, idle time.Duration) *Durability {
 	return &Durability{
-		locator: locator,
-		idle:    idle,
-		sync:    (*os.File).Sync,
-		crashAt: os.Getenv(CrashEnv),
-		repos:   map[string]*refState{},
+		locator:       locator,
+		idle:          idle,
+		sync:          (*os.File).Sync,
+		crashAt:       os.Getenv(CrashEnv),
+		recoveryGrace: RecoveryGrace,
+		repos:         map[string]*refState{},
 		marked: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "graft_storage_ref_dirty_marked_total",
 			Help: "Number of dirty markers written: a repository got local reference writes that are not durable yet.",
@@ -293,19 +315,22 @@ func (d *Durability) Enabled() bool { return d != nil }
 // once.
 func (d *Durability) Deferring() bool { return d != nil && d.owner.Load() }
 
-// TryOwn takes the ownership of the deferred durability of the storages
-// without waiting. It returns false when another process holds it for one of
-// them; the locks taken are kept, and a later call takes the rest.
+// TryOwn takes the owner locks of the storages without waiting. It returns
+// false when another process holds one of them; the locks taken are kept, and
+// a later call takes the rest. Owning the locks lets the process recover the
+// storages (Recover); its writes are deferred only after Activate, so that no
+// writer of this process writes a marker that the recovery could take for one
+// left behind.
 func (d *Durability) TryOwn(ctx context.Context, storages []string) (bool, error) {
 	if d == nil {
 		return false, nil
 	}
-	if d.owner.Load() {
-		return true, nil
-	}
 
 	d.ownerMu.Lock()
 	defer d.ownerMu.Unlock()
+	if d.locked {
+		return true, nil
+	}
 
 	for _, storageName := range storages[len(d.ownerFiles):] {
 		dir, err := d.markerDir(ctx, storageName)
@@ -329,9 +354,31 @@ func (d *Durability) TryOwn(ctx context.Context, storages []string) (bool, error
 		d.ownerFiles = append(d.ownerFiles, f)
 	}
 
+	d.locked = true
+	return true, nil
+}
+
+// Activate makes the writes of the process deferred; it holds the owner locks
+// (TryOwn) and has recovered the storages.
+func (d *Durability) Activate() {
+	if d == nil {
+		return
+	}
+
+	d.ownerMu.Lock()
+	defer d.ownerMu.Unlock()
+	if !d.locked {
+		panic("localrefs: Activate without the owner locks")
+	}
 	d.owner.Store(true)
 	d.owning.Set(1)
-	return true, nil
+}
+
+// ownsLocks reports whether the process holds the owner locks.
+func (d *Durability) ownsLocks() bool {
+	d.ownerMu.Lock()
+	defer d.ownerMu.Unlock()
+	return d.locked
 }
 
 // Close releases the ownership. The process must not write references
@@ -348,6 +395,7 @@ func (d *Durability) Close() error {
 		errs = append(errs, f.Close())
 	}
 	d.ownerFiles = nil
+	d.locked = false
 	return errors.Join(errs...)
 }
 
@@ -374,7 +422,7 @@ func (d *Durability) markerDir(ctx context.Context, storageName string) (string,
 func (d *Durability) stateLocked(path string) *refState {
 	st := d.repos[path]
 	if st == nil {
-		st = &refState{live: map[Key]int{}, synced: map[string]struct{}{}}
+		st = &refState{synced: map[string]struct{}{}}
 		d.repos[path] = st
 	}
 	return st
@@ -422,53 +470,45 @@ func (d *Durability) MarkDirty(ctx context.Context, repo RepoRef, path string) e
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	st.dirty = true
 	st.repo = repo
 	st.marker = markerPath
 	d.marked.Inc()
-	d.dirty.Inc()
+	if !st.dirty {
+		st.dirty = true
+		d.dirty.Inc()
+	}
 	return nil
 }
 
-// Begin records that the hook transaction key started on the repository at
-// path: from its Preparing phase (or its policy denial, which aborts it), before
-// git takes the reference lock, to its end (End), it may write a table and
-// compact the stack. Every transaction begins exactly once and ends exactly
-// once (Committed or Aborted), so the count of a key is the number of its live
-// transactions, whichever of two transactions with the same key ends first.
-func (d *Durability) Begin(path string, key Key) {
+// Begin records that a git process that writes the references of the
+// repository at path without fsync is about to start; the caller calls end
+// once the process has exited. Until then the process may write a table or
+// compact the stack, whatever hooks git runs or skips (a failed prepare, a
+// failed commit, a kill), so the durable step keeps the marker. end may be
+// called more than once.
+func (d *Durability) Begin(path string) (end func()) {
 	if d == nil {
-		return
+		return func() {}
 	}
 
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	st := d.stateLocked(path)
-	st.live[key]++
 	st.nLive++
 	d.inflight.Inc()
-}
+	d.mu.Unlock()
 
-// End records that a hook transaction with key ended (Committed or Aborted).
-// An end without a begin (the process started after the transaction began)
-// changes nothing.
-func (d *Durability) End(path string, key Key) {
-	if d == nil {
-		return
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			// Forget may have dropped the state; the count belongs to it.
+			if d.repos[path] == st {
+				st.nLive--
+				d.inflight.Dec()
+			}
+		})
 	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	st := d.repos[path]
-	if st == nil || st.live[key] == 0 {
-		return
-	}
-	st.live[key]--
-	if st.live[key] == 0 {
-		delete(st.live, key)
-	}
-	st.nLive--
-	d.inflight.Dec()
 }
 
 // Dirty returns the paths of the dirty repositories.
@@ -535,7 +575,14 @@ func (d *Durability) Settle(path string, final bool) error {
 		return nil
 	}
 	repo := st.repo
-	idle := st.nLive == 0 && (final || time.Since(st.lastWrite) >= d.idle)
+	if st.untrusted != nil {
+		// Sticky: the move aside is retried, the marker never cleared.
+		untrusted := st.untrusted
+		d.mu.Unlock()
+		return &UntrustedError{Repo: repo, Path: path, Err: untrusted}
+	}
+	now := time.Now()
+	idle := st.nLive == 0 && now.After(st.settleAfter) && (final || now.Sub(st.lastWrite) >= d.idle)
 	d.mu.Unlock()
 
 	if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
@@ -546,7 +593,7 @@ func (d *Durability) Settle(path string, final bool) error {
 	}
 
 	if err := d.syncStack(path, st); err != nil {
-		return d.stepError(repo, path, err)
+		return d.stepError(st, repo, path, err)
 	}
 	if !idle {
 		return nil
@@ -563,7 +610,7 @@ func (d *Durability) Settle(path string, final bool) error {
 	cleared, err := d.settleLocked(path, st)
 	if err != nil {
 		_ = lock.release()
-		return d.stepError(repo, path, err)
+		return d.stepError(st, repo, path, err)
 	}
 	if !cleared {
 		return lock.release()
@@ -580,13 +627,20 @@ func (d *Durability) Settle(path string, final bool) error {
 }
 
 // stepError is the error of a durable step: an *UntrustedError for a failed
-// fsync, the error itself otherwise.
-func (d *Durability) stepError(repo RepoRef, path string, err error) error {
+// fsync, which makes the repository untrusted for good, the error itself
+// otherwise.
+func (d *Durability) stepError(st *refState, repo RepoRef, path string, err error) error {
 	var writeback writebackError
-	if errors.As(err, &writeback) {
-		return &UntrustedError{Repo: repo, Path: path, Err: err}
+	if !errors.As(err, &writeback) {
+		return err
 	}
-	return err
+
+	d.mu.Lock()
+	if st.untrusted == nil {
+		st.untrusted = err
+	}
+	d.mu.Unlock()
+	return &UntrustedError{Repo: repo, Path: path, Err: err}
 }
 
 // settleLocked makes the tables written since the first pass durable and, when
@@ -596,7 +650,7 @@ func (d *Durability) stepError(repo RepoRef, path string, err error) error {
 // before they take it until their end.
 func (d *Durability) settleLocked(path string, st *refState) (bool, error) {
 	d.mu.Lock()
-	busy := st.nLive > 0
+	busy := st.nLive > 0 || st.untrusted != nil
 	d.mu.Unlock()
 	if busy {
 		return false, nil
@@ -856,7 +910,7 @@ type Recovered struct {
 // boot before serving. A marker that cannot be read is an error: its
 // repository is unknown, and serving could read a torn stack.
 func (d *Durability) Recover(ctx context.Context, storages []string) ([]Recovered, error) {
-	if !d.Deferring() {
+	if d == nil || !d.ownsLocks() {
 		return nil, nil
 	}
 
@@ -917,10 +971,11 @@ func (d *Durability) Recover(ctx context.Context, storages []string) ([]Recovere
 				st := d.stateLocked(path)
 				if !st.dirty {
 					st.dirty = true
-					st.repo = m.RepoRef
-					st.marker = markerPath
 					d.dirty.Inc()
 				}
+				st.repo = m.RepoRef
+				st.marker = markerPath
+				st.settleAfter = time.Now().Add(d.recoveryGrace)
 				d.mu.Unlock()
 			}
 			found = append(found, Recovered{Repo: m.RepoRef, Path: path, Reboot: reboot})

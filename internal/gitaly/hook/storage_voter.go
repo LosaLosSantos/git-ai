@@ -5,6 +5,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // StorageVoter is the write path of the Graft storage core
@@ -15,11 +16,6 @@ type StorageVoter interface {
 	// its pack) before git takes the reference locks. It never fails the
 	// transaction: when it did not complete, Prepared does that work itself.
 	Preparing(ctx context.Context, payload gitcmd.HooksPayload, changes []byte)
-	// Denied is called instead of Preparing for a transaction that the
-	// standalone access policy denies: it prepares nothing, and the transaction
-	// is aborted in its Prepared phase. Every transaction gets exactly one of
-	// Preparing and Denied before its Aborted or Committed phase.
-	Denied(ctx context.Context, payload gitcmd.HooksPayload, changes []byte)
 	// Prepared commits the transaction to the storage core while git holds
 	// the reference locks. An error aborts the transaction.
 	Prepared(ctx context.Context, payload gitcmd.HooksPayload, changes []byte, meta changelog.Meta) error
@@ -30,19 +26,24 @@ type StorageVoter interface {
 	// Authoritative reports whether the storage core's database replaces the
 	// file changelog.
 	Authoritative() bool
-	// DeferredReferenceDurability reports whether reference transactions that
-	// the voter commits may write their references without fsync: the database
+	// DeferReferenceWrites decides whether the git process the caller is about
+	// to start for repo writes its references without fsync: the database
 	// commit is their durable point, and the storage core makes the local
 	// references durable later (doc/graft/PLAN7.md, LOCAL REFERENCE WRITES RULE).
-	DeferredReferenceDurability() bool
+	// When ok, the caller calls end once that process has exited.
+	DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool)
 }
 
-// DeferredReferenceDurability reports whether the reference transactions that
-// the manager drives itself (UpdateWithHooks) may write their references
-// without fsync. It is false without a storage voter, so only the storage
-// core's authoritative mode ever turns the fsync of references off.
-func (m *GitLabHookManager) DeferredReferenceDurability() bool {
-	return m.storageVoter != nil && m.storageVoter.DeferredReferenceDurability()
+// DeferReferenceWrites decides whether the git process that the manager's
+// caller (UpdateWithHooks) is about to start writes its references without
+// fsync; when ok, end is called once that process has exited. It is false
+// without a storage voter, so only the storage core's authoritative mode ever
+// turns the fsync of references off.
+func (m *GitLabHookManager) DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool) {
+	if m.storageVoter == nil {
+		return nil, false
+	}
+	return m.storageVoter.DeferReferenceWrites(ctx, repo)
 }
 
 // WithStorageVoter makes the manager commit every reference transaction to
@@ -70,7 +71,6 @@ func (m *GitLabHookManager) storagePreparing(ctx context.Context, payload gitcmd
 	}
 
 	if message, err := m.graftPolicyDecision(env, changes); err != nil || message != "" {
-		m.storageVoter.Denied(ctx, payload, changes)
 		return
 	}
 

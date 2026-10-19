@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -71,6 +74,7 @@ func newRealNode(t *testing.T, configure ...func(*config.GraftStorage)) *realNod
 		c(&cfg.Graft.Storage)
 	}
 	cfg.SocketPath = testhelper.GetTemporaryGitalySocketFileName(t)
+	cfg.PrometheusListenAddr = freeAddr(t)
 	testcfg.BuildGitalySSH(t, cfg)
 	testcfg.BuildGitalyHooks(t, cfg)
 
@@ -103,6 +107,7 @@ func (n *realNode) sibling(t *testing.T) *realNode {
 
 	s := *n
 	s.cfg.SocketPath = testhelper.GetTemporaryGitalySocketFileName(t)
+	s.cfg.PrometheusListenAddr = freeAddr(t)
 	s.clientCfg = s.cfg
 	s.clientCfg.SocketPath = "unix://" + s.cfg.SocketPath
 	s.cfgPath = testcfg.WriteTemporaryGitalyConfigFile(t, s.cfg)
@@ -180,6 +185,34 @@ func (n *realNode) log(t *testing.T) string {
 }
 
 func (n *realNode) storagePath() string { return n.cfg.Storages[0].Path }
+
+// freeAddr returns a local TCP address that was free a moment ago.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, addr := testhelper.GetLocalhostListener(t)
+	require.NoError(t, l.Close())
+	return addr
+}
+
+// counter returns the value of the counter name of the server's metrics.
+func (n *realNode) counter(t *testing.T, name string) float64 {
+	t.Helper()
+
+	resp, err := http.Get("http://" + n.cfg.PrometheusListenAddr + "/metrics")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	for _, line := range strings.Split(string(body), "\n") {
+		if value, ok := strings.CutPrefix(line, name+" "); ok {
+			v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			require.NoError(t, err)
+			return v
+		}
+	}
+	t.Fatalf("metric %s not found", name)
+	return 0
+}
 
 // createRepository creates an empty repository through the server and returns
 // its relative path. In authoritative mode the gate registers it.
@@ -300,7 +333,7 @@ func TestStorageLocalReferencesAfterAProcessKill(t *testing.T) {
 
 	// The durable step runs every second and removes the marker of an idle
 	// repository.
-	require.Eventually(t, func() bool { return len(n.markers(t)) == 0 }, 30*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool { return len(n.markers(t)) == 0 }, 90*time.Second, 50*time.Millisecond)
 	n.requireServed(t, rel, written)
 }
 
@@ -408,6 +441,8 @@ func TestStorageLocalReferencesDuringAGracefulUpgrade(t *testing.T) {
 		written[branch] = commit
 	}
 	next.requireServed(t, rel, written)
+	require.Equal(t, float64(0), next.counter(t, "graft_storage_ref_durability_owner"))
+	require.Equal(t, float64(0), next.counter(t, "graft_storage_ref_dirty_marked_total"), "the new process writes with fsync")
 
 	// The old process owns the marker and settles it once the repository is
 	// idle; the new process's writes were made with fsync and need none.
@@ -421,7 +456,8 @@ func TestStorageLocalReferencesDuringAGracefulUpgrade(t *testing.T) {
 	for branch, commit := range writeBranches(t, next.agent(t, rel), next.ctx, base, "after", 2) {
 		written[branch] = commit
 	}
-	require.Len(t, next.markers(t), 1, "the new owner writes without fsync")
+	require.Equal(t, float64(1), next.counter(t, "graft_storage_ref_durability_owner"))
+	require.GreaterOrEqual(t, next.counter(t, "graft_storage_ref_dirty_marked_total"), float64(1), "the new owner writes without fsync")
 	next.requireServed(t, rel, written)
 }
 

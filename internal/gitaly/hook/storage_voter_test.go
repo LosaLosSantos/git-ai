@@ -17,6 +17,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -44,10 +45,6 @@ func (v *recordingVoter) Preparing(context.Context, gitcmd.HooksPayload, []byte)
 	v.record("preparing")
 }
 
-func (v *recordingVoter) Denied(context.Context, gitcmd.HooksPayload, []byte) {
-	v.record("denied")
-}
-
 func (v *recordingVoter) Prepared(context.Context, gitcmd.HooksPayload, []byte, changelog.Meta) error {
 	v.record("prepared")
 	return nil
@@ -63,7 +60,9 @@ func (v *recordingVoter) Aborted(context.Context, gitcmd.HooksPayload, []byte) {
 
 func (v *recordingVoter) Authoritative() bool { return true }
 
-func (v *recordingVoter) DeferredReferenceDurability() bool { return false }
+func (v *recordingVoter) DeferReferenceWrites(context.Context, *gitalypb.Repository) (func(), bool) {
+	return nil, false
+}
 
 // TestReferenceTransactionHook_storageVoterPhases checks that the hook manager
 // hands every phase of a reference transaction to the storage core, the
@@ -86,11 +85,9 @@ func TestReferenceTransactionHook_storageVoterPhases(t *testing.T) {
 			want: []string{"preparing", "prepared", "committed"},
 		},
 		{
-			// The voter learns of its start (Denied), so that it counts the
-			// transaction until its abort, but prepares nothing.
 			desc:   "a denied transaction is neither prepared nor committed",
 			policy: []config.GraftPolicyRule{{Refs: []string{"refs/heads/main"}, Allow: false}},
-			want:   []string{"denied"},
+			want:   nil,
 			denied: true,
 		},
 	} {

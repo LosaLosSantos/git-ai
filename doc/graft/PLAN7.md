@@ -575,19 +575,21 @@ repository-wide lock.
        the marker cannot be written, Prepared fails and git aborts; catch-up
        repairs the database's write, like any local failure.
      * The syncer writes it under its repository lock.
-     * A hook transaction is live from its start to its end, and the durable
-       step never clears the marker while any is live.
-       * Start: the voter's Preparing, or `Denied` for a transaction the policy
-         denies.
-       * End: Committed or Aborted.
-       * Every transaction starts once and ends once, so the count per input is
-         the number of live transactions, whichever of two with the same input
-         ends first.
+     * The durable step never clears the marker while a git process of the owner
+       that writes references without fsync is alive.
+       * Only `UpdateWithHooks`' update-ref writes that way. It is counted from
+         just before it starts (`DeferReferenceWrites`, which also decides the
+         deferral) until after it exited (`updater.Close` waits for it).
+       * The syncer's update-ref runs under the syncer lock, which the durable
+         step holds too.
+       * The count follows the process, not the hooks. git skips the Aborted and
+         Committed hooks in several cases: a failed prepare (a stale old value,
+         a busy lock, a name conflict), a failed finish, initial transactions, a
+         kill. Its Committed hook names a symbolic reference's target instead of
+         the reference. Neither can leak a count or end the wrong one.
        * Reasons from git's source: the new table is written in
          `transaction_finish` after "prepared", and auto-compaction runs inside
          `reftable_addition_commit`, before "committed".
-       * A transaction whose end is never reported keeps its repository dirty
-         (conservative).
    * *Durable step* (`Settle`, every second for every dirty repository, under the
      syncer's repository lock).
      * It fsyncs the tables not yet fsynced, `tables.list` and the directory.
@@ -606,10 +608,16 @@ repository-wide lock.
      * A graceful stop runs a last step for every dirty repository after the
        servers stopped, so a clean reboot does not rehydrate them.
    * *Write failure.* Only a failed fsync means the kernel may have dropped
-     writes. The repository is then moved aside at once, under the repository
-     lock: the move (both directories and the new entry) is made durable, then
-     the marker removed. This happens only when the repository is a cache of the
-     storage core, the same check as the recovery. The failure is logged and
+     writes, and the kernel reports a failed writeback once: a later fsync of the
+     same file succeeds.
+     * So the first failed fsync makes the repository *untrusted* for good.
+     * An untrusted repository's marker is never cleared; only the move aside is
+       retried, until it succeeds. Then the hydrated repository starts clean.
+     * The repository is moved aside at once, under the repository lock: the
+       move (both directories and the new entry) is made durable, then the
+       marker removed.
+     * This happens only when the repository is a cache of the storage core:
+       the database holds it with changesets, as for the recovery. The failure is logged and
      counted (`sync_failed`), and the next request hydrates the repository. Any
      other error (opening a file, reading the list) is transient: counted
      (`graft_storage_ref_durable_step_errors_total`) and retried at the next
@@ -625,10 +633,22 @@ repository-wide lock.
        moved aside before anything reads it (`reboot`), and the next request
        hydrates it.
      * The move only happens when the database holds the repository with
-       changesets and the local copy has a watermark; any other marker is
-       dropped, keeping a repository whose local copy may be the only one.
+       changesets. A sync would replace such a local copy too when it is stale,
+       whatever its watermark. Any other marker is dropped, keeping a repository
+       whose local copy may be the only one (an import that is not complete).
      * A marker of the same boot is a process restart: the page cache kept
        every write, so the repository stays dirty to be settled.
+       * It is settled no earlier than the recovery grace (twice
+         `reftable.lockTimeout`): a git process of the previous owner that
+         outlived it (killed with it, not reaped yet) may still be committing
+         for that long.
+       * The git children get no parent-death signal: the command package is
+         shared and not in m3's grant. The grace bounds their life instead,
+         since a killed parent closes their stdin and git then aborts.
+     * The ownership is taken in two steps. The locks come first; the recovery
+       runs; only then are the process's writes deferred (`Activate`). So no
+       writer of the new owner writes a marker that the recovery could take for
+       a leftover.
      * A lock with the durable step's tag and the step's temporary files, left
        by a process that died, are removed.
      * A corrupt marker fails the startup: its repository is unknown.
@@ -655,7 +675,7 @@ repository-wide lock.
 * PM grant: `updateref.WithDeferredReferenceDurability`; the `gitcmd` constants
   `FsyncComponents`, `FsyncComponentsWithoutReferences` and
   `ReftableLockTimeoutMilliseconds`; `hook/storage_voter.go`
-  (`DeferredReferenceDurability`, `Denied`); the optional interface asserted in
+  (`DeferReferenceWrites`); the optional interface asserted in
   `UpdateWithHooks`.
 * Follow-up after the independent review of 310facd:
   * MAJOR: process-local state with overlapping processes. Fixed by one owner
@@ -668,6 +688,24 @@ repository-wide lock.
   * The directory fsyncs (the marker directory's parent; the stale and temporary
     directories of a move) are added.
   * The step's temporary files are cleaned at recovery.
+* Second review (of 8953e8e):
+  * M1: the live count is tied to the deferred git process itself; it no
+    longer depends on hooks git may skip. `StorageVoter.Denied` is gone.
+  * M2: untrusted is sticky.
+  * The recovery runs before the writes are deferred (`TryOwn`, `Recover`,
+    `Activate`).
+  * The recovery grace for recovered markers.
+  * The dirty gauge counts a repository once.
+  * Tests:
+    * the reused inode is simulated deterministically;
+    * a non-owner neither recovers nor removes the live owner's lock;
+    * the e2e upgrade test reads the owner and marker counters instead of the
+      racing marker file;
+    * a non-owner's write marks nothing, at unit, syncer and e2e level;
+    * git skipping its hooks, with the race, the failed prepare and the
+      symbolic split;
+    * a failed fsync then a successful one; and the same with a failed move
+      aside.
 
 **Tests.**
 * `localrefs`:

@@ -176,8 +176,6 @@ func (v *Voter) Preparing(ctx context.Context, payload gitcmd.HooksPayload, chan
 		return
 	}
 
-	// The transaction is live from now on (it ends in Committed or Aborted).
-	v.begin(ctx, payload, changes)
 	// Deferred first, so that it runs last: the admission is waited for after
 	// the pack work, when git is about to take the reference lock.
 	defer v.admit(ctx, payload, changes)
@@ -774,7 +772,6 @@ func (v *Voter) Committed(ctx context.Context, payload gitcmd.HooksPayload, chan
 	// git finished the transaction, its auto-compaction included, and released
 	// the reference lock.
 	v.core.RefAdmission.Release(repoPath, localrefs.Key(key))
-	v.core.RefDurability.End(repoPath, localrefs.Key(key))
 
 	if !ok || v.applier == nil {
 		return
@@ -801,36 +798,31 @@ func (v *Voter) localRefs() bool {
 // DeferredReferenceDurability reports whether the reference writes of the
 // transactions this voter commits may run without fsync: authoritative mode,
 // and this process owns the deferred durability of the node (doc/graft/PLAN7.md,
-// LOCAL REFERENCE WRITES RULE). The hook manager asks it for UpdateWithHooks.
-// It goes from false to true at most once in a process.
+// LOCAL REFERENCE WRITES RULE). It goes from false to true at most once in a
+// process.
 func (v *Voter) DeferredReferenceDurability() bool {
 	return v != nil && v.core.Authoritative() && v.core.RefDurability.Deferring()
 }
 
-// Denied records the start of a transaction that the standalone policy denies:
-// it is live until its Aborted phase, like any other (see begin).
-func (v *Voter) Denied(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
-	if v == nil || !v.core.Enabled() || payload.Repo == nil {
-		return
-	}
-	v.begin(ctx, payload, changes)
-}
-
-// begin counts the transaction as live for the deferred durability: from
-// before git takes the reference lock until Committed or Aborted, it may write
-// a table or compact the stack, so the durable step keeps the repository's
-// marker meanwhile.
-func (v *Voter) begin(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
-	if !v.core.Authoritative() || !v.core.RefDurability.Enabled() {
-		return
+// DeferReferenceWrites decides whether the git process that the caller is about
+// to start for repo (UpdateWithHooks' update-ref) writes its references without
+// fsync. When ok, the process counts as live for the repository's deferred
+// durability, and the caller calls end once it has exited: until then it may
+// write a table or compact the stack, whichever hooks git runs or skips.
+func (v *Voter) DeferReferenceWrites(ctx context.Context, repo *gitalypb.Repository) (end func(), ok bool) {
+	if !v.DeferredReferenceDurability() {
+		return nil, false
 	}
 
-	repoPath, err := v.repoPath(ctx, payload)
+	repoPath, err := v.locator.GetRepoPath(ctx, &gitalypb.Repository{
+		StorageName:  repo.GetStorageName(),
+		RelativePath: repo.GetRelativePath(),
+	}, storage.WithRepositoryVerificationSkipped())
 	if err != nil {
-		v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path of a starting transaction")
-		return
+		v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path of a reference write; it is made durable by git")
+		return nil, false
 	}
-	v.core.RefDurability.Begin(repoPath, localrefs.Key(pendingKey(payload.Repo, changes)))
+	return v.core.RefDurability.Begin(repoPath), true
 }
 
 // admit waits for the admission of the transaction to the reference lock of
@@ -853,9 +845,11 @@ func (v *Voter) admit(ctx context.Context, payload gitcmd.HooksPayload, changes 
 // deferDurability lets git write the references of a transaction that the
 // database committed without fsync (authoritative mode, and this process owns
 // the deferred durability): the repository gets its durable dirty marker
-// first. The transaction is live since its start (begin), so the durable step
-// keeps the marker until it ends. It runs in the Prepared phase, under git's
-// reference lock and before git writes anything.
+// first. A git process that writes without fsync counts as live from before it
+// started until it exited (DeferReferenceWrites), so the durable step keeps the
+// marker meanwhile. It runs in the Prepared phase, under git's reference lock
+// and before git writes anything. A transaction whose git process writes with
+// fsync (a push) gets a marker too, which only delays its removal.
 func (v *Voter) deferDurability(ctx context.Context, payload gitcmd.HooksPayload, changes []byte, shadow bool) error {
 	if shadow || !v.DeferredReferenceDurability() {
 		return nil
@@ -888,13 +882,11 @@ func (v *Voter) Aborted(ctx context.Context, payload gitcmd.HooksPayload, change
 
 	key := pendingKey(payload.Repo, changes)
 
-	// git wrote nothing more of the transaction once it reports the abort.
 	if v.localRefs() {
 		if repoPath, err := v.repoPath(ctx, payload); err != nil {
 			v.logger.WithError(err).WarnContext(ctx, "storage core: resolving the repository path after an abort, the admission ends at its bound")
 		} else {
 			v.core.RefAdmission.Release(repoPath, localrefs.Key(key))
-			v.core.RefDurability.End(repoPath, localrefs.Key(key))
 		}
 	}
 

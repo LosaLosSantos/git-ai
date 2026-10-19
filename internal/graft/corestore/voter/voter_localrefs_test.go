@@ -14,6 +14,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/voter"
@@ -54,10 +55,20 @@ func (f *fixture) markers(t *testing.T) []string {
 	return names
 }
 
+// deferred starts a deferred git process for the fixture's repository, as
+// UpdateWithHooks does before its update-ref.
+func (f *fixture) deferred(t *testing.T) (end func()) {
+	t.Helper()
+	end, ok := f.voter.DeferReferenceWrites(f.ctx, f.repo)
+	require.True(t, ok)
+	return end
+}
+
 // TestLocalReferenceWritesOfACommittedTransaction follows one authoritative
 // transaction through the LOCAL REFERENCE WRITES RULE (doc/graft/PLAN7.md):
-// admitted at the end of Preparing, marked dirty and in flight after the
-// database commit in Prepared, released and ended in Committed.
+// its git process is live from before it starts until it exits, it is
+// admitted at the end of Preparing and released in Committed, and its
+// repository is marked dirty after the database commit in Prepared.
 func TestLocalReferenceWritesOfACommittedTransaction(t *testing.T) {
 	t.Parallel()
 
@@ -68,6 +79,7 @@ func TestLocalReferenceWritesOfACommittedTransaction(t *testing.T) {
 	require.True(t, f.voter.DeferredReferenceDurability())
 	require.False(t, f.admissionHeld(t))
 
+	end := f.deferred(t)
 	f.voter.Preparing(f.ctx, f.payload, input)
 	require.True(t, f.admissionHeld(t), "the transaction is admitted at the end of Preparing")
 	require.Empty(t, f.markers(t), "nothing is dirty before the database commit")
@@ -75,58 +87,72 @@ func TestLocalReferenceWritesOfACommittedTransaction(t *testing.T) {
 	require.NoError(t, f.prepared(input))
 	require.Len(t, f.markers(t), 1)
 
-	// git may still write and compact until Committed: the durable step keeps
-	// the marker.
-	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
-	require.Len(t, f.markers(t), 1)
-
 	gittest.WriteRef(t, f.cfg, f.repoPath, git.ReferenceName(ref), f.a)
 	f.voter.Committed(f.ctx, f.payload, input)
 	require.False(t, f.admissionHeld(t), "Committed releases the admission")
 	require.Len(t, f.applier.calls, 1, "the local commit is still noted")
 
+	// The git process may still compact until it exits.
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, true))
+	require.Len(t, f.markers(t), 1)
+
+	end()
 	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
 	require.Empty(t, f.markers(t))
 }
 
 // TestLocalReferenceWritesOfAnAbortedTransaction verifies that an abort after
-// Prepared releases the admission and ends the transaction: the repository is
-// settled once nothing else is live.
+// Prepared releases the admission, and that the repository is settled once its
+// git process exited.
 func TestLocalReferenceWritesOfAnAbortedTransaction(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative, localRefs: true})
 	input := line(f.zero, f.a.String(), "refs/heads/main")
 
+	end := f.deferred(t)
 	f.voter.Preparing(f.ctx, f.payload, input)
 	require.NoError(t, f.prepared(input))
 	f.voter.Aborted(f.ctx, f.payload, input)
 	require.False(t, f.admissionHeld(t))
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
+	require.Len(t, f.markers(t), 1, "the git process has not exited yet")
 
+	end()
 	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
 	require.Empty(t, f.markers(t))
 }
 
-// TestLocalReferenceWritesOfTransactionsWithTheSameInput verifies that two
-// live transactions with the same input are both counted: the one denied by
-// the policy and aborted does not end the other one, which may still write.
-func TestLocalReferenceWritesOfTransactionsWithTheSameInput(t *testing.T) {
+// TestLocalReferenceWritesWhenGitSkipsItsHooks covers the transactions whose
+// later phases git never reports: a prepare that fails (a stale old value of a
+// writer that lost a race, a lock that stayed busy, a name conflict), a commit
+// whose finish fails, and the Committed phase of a symbolic reference that
+// names its target instead of the reference of Preparing. The live count
+// follows the git processes, so none of them leaks: the repository settles once
+// both processes exited.
+func TestLocalReferenceWritesWhenGitSkipsItsHooks(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative, localRefs: true})
-	input := line(f.zero, f.a.String(), "refs/heads/main")
+	winner := line(f.zero, f.a.String(), "refs/heads/main")
+	loser := line(f.zero, f.b.String(), "refs/heads/main")
 
-	f.voter.Preparing(f.ctx, f.payload, input)
-	require.NoError(t, f.prepared(input))
+	endWinner := f.deferred(t)
+	endLoser := f.deferred(t)
+	f.voter.Preparing(f.ctx, f.payload, winner)
+	f.voter.Preparing(f.ctx, f.payload, loser)
 
-	// The same input from an agent the policy denies.
-	f.voter.Denied(f.ctx, f.payload, input)
-	f.voter.Aborted(f.ctx, f.payload, input)
-	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, true))
-	require.Len(t, f.markers(t), 1, "the first transaction may still write")
+	require.NoError(t, f.prepared(winner))
+	gittest.WriteRef(t, f.cfg, f.repoPath, "refs/heads/main", f.a)
+	// The Committed phase names another reference than Preparing (a symbolic
+	// reference split into its target).
+	f.voter.Committed(f.ctx, f.payload, line(f.zero, f.a.String(), "HEAD"))
+	endWinner()
 
-	gittest.WriteRef(t, f.cfg, f.repoPath, git.ReferenceName("refs/heads/main"), f.a)
-	f.voter.Committed(f.ctx, f.payload, input)
+	// The loser's prepare failed in git: no Prepared, no Aborted, no Committed.
+	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
+	require.Len(t, f.markers(t), 1, "the loser's git process is still live")
+	endLoser()
 	require.NoError(t, f.core.RefDurability.Settle(f.repoPath, false))
 	require.Empty(t, f.markers(t))
 }
@@ -141,9 +167,11 @@ func TestLocalReferenceWritesOfARejectedTransaction(t *testing.T) {
 	f.seed(t, ref, corestore.Target(f.b.String()))
 	input := line(f.a.String(), f.c.String(), ref)
 
+	end := f.deferred(t)
 	f.voter.Preparing(f.ctx, f.payload, input)
 	requireMismatch(t, f.prepared(input), ref, f.a.String(), f.b.String())
 	f.voter.Aborted(f.ctx, f.payload, input)
+	end()
 
 	require.False(t, f.admissionHeld(t))
 	require.Empty(t, f.markers(t))
@@ -171,11 +199,13 @@ func TestLocalReferenceWritesWhenTheMarkerCannotBeWritten(t *testing.T) {
 }
 
 // TestDeferredReferenceDurabilityByMode verifies that references are written
-// without fsync in authoritative mode with deferred durability only: off and
-// shadow modes, and authoritative mode without the boot identity, keep git's
-// fsync of references.
+// without fsync in authoritative mode by the process that owns the deferred
+// durability only: off and shadow modes, authoritative mode without the boot
+// identity, and a process that does not own the storage (the new process of a
+// graceful upgrade) keep git's fsync of references.
 func TestDeferredReferenceDurabilityByMode(t *testing.T) {
 	t.Parallel()
+	ctx := testhelper.Context(t)
 
 	var nilVoter *voter.Voter
 	require.False(t, nilVoter.DeferredReferenceDurability())
@@ -185,12 +215,28 @@ func TestDeferredReferenceDurabilityByMode(t *testing.T) {
 
 	shadow := newFixture(t, fixtureOptions{mode: corestore.ModeShadow, localRefs: true})
 	require.False(t, shadow.voter.DeferredReferenceDurability())
+	_, ok := shadow.voter.DeferReferenceWrites(ctx, shadow.repo)
+	require.False(t, ok)
 
 	authoritative := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative})
 	require.False(t, authoritative.voter.DeferredReferenceDurability())
+	_, ok = authoritative.voter.DeferReferenceWrites(ctx, authoritative.repo)
+	require.False(t, ok)
 
 	deferred := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative, localRefs: true})
 	require.True(t, deferred.voter.DeferredReferenceDurability())
+
+	// Another process owns the storage: this one's durability holds no lock.
+	notOwner := newFixture(t, fixtureOptions{mode: corestore.ModeAuthoritative})
+	durability, err := localrefs.NewDurability(config.NewLocator(notOwner.cfg), 0, localrefs.WithBootID("boot"))
+	require.NoError(t, err)
+	notOwner.core.RefDurability = durability
+	require.False(t, notOwner.voter.DeferredReferenceDurability())
+	_, ok = notOwner.voter.DeferReferenceWrites(ctx, notOwner.repo)
+	require.False(t, ok)
+	// Its Prepared phase marks nothing: its writes are made with fsync.
+	require.NoError(t, notOwner.prepared(line(notOwner.zero, notOwner.a.String(), "refs/heads/main")))
+	require.Empty(t, notOwner.markers(t))
 }
 
 // TestLocalReferenceWritesNotInShadowMode verifies that shadow mode, where git

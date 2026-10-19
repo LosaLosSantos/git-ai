@@ -211,6 +211,96 @@ func TestSyncerDurableStepMovesAsideOnAFailedWrite(t *testing.T) {
 	e.verifySynced(t, repo)
 }
 
+// TestSyncerUntrustedRepositoryIsNeverSettled is a failed fsync whose move
+// aside fails too (the temporary directory cannot be written for a moment).
+// The kernel reports the failed writeback once, so the next step's fsyncs
+// succeed: the repository must still be moved aside, never settled.
+func TestSyncerUntrustedRepositoryIsNeverSettled(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+	e, repo, _ := caughtUpDirty(t, localrefs.WithSync(func(f *os.File) error {
+		if failing.Load() {
+			return errors.New("input/output error")
+		}
+		return f.Sync()
+	}))
+	tmpDir, err := e.locator.TempDir(e.storageName)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpDir, 0o700))
+
+	failing.Store(true)
+	require.NoError(t, os.Chmod(tmpDir, 0o500))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	failing.Store(false)
+	require.NoError(t, os.Chmod(tmpDir, 0o700))
+
+	require.DirExists(t, e.localPath(), "the move aside failed")
+	require.Len(t, e.markers(t), 1, "the marker stays")
+
+	e.sy.DurableStep(e.ctx, e.localPath(), true)
+	require.NoDirExists(t, e.localPath(), "moved aside, although its fsyncs succeed now")
+	require.Empty(t, e.markers(t))
+	require.Equal(t, float64(1), e.untrusted(t, localrefs.ReasonSyncFailed))
+
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.verifySynced(t, repo)
+}
+
+// TestSyncerUntrustedRepositoryThatIsGoneLosesItsMarker verifies that an
+// untrusted repository that was moved away meanwhile (a stale cache) does not
+// keep its marker forever.
+func TestSyncerUntrustedRepositoryThatIsGoneLosesItsMarker(t *testing.T) {
+	t.Parallel()
+
+	var failing atomic.Bool
+	e, _, _ := caughtUpDirty(t, localrefs.WithSync(func(f *os.File) error {
+		if failing.Load() {
+			return errors.New("input/output error")
+		}
+		return f.Sync()
+	}))
+
+	tmpDir, err := e.locator.TempDir(e.storageName)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(tmpDir, 0o700))
+	failing.Store(true)
+	require.NoError(t, os.Chmod(tmpDir, 0o500))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.NoError(t, os.Chmod(tmpDir, 0o700))
+	failing.Store(false)
+	require.Len(t, e.markers(t), 1)
+
+	require.NoError(t, os.Rename(e.localPath(), filepath.Join(tmpDir, "moved.git")))
+	e.sy.DurableStep(e.ctx, e.localPath(), false)
+	require.Empty(t, e.markers(t))
+	require.Empty(t, e.core.RefDurability.Dirty())
+}
+
+// TestSyncerCatchUpOfANonOwnerWritesWithFsync verifies that a process that
+// does not own the deferred durability catches up with fsync: it writes no
+// marker.
+func TestSyncerCatchUpOfANonOwnerWritesWithFsync(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, envOptions{})
+	durability, err := localrefs.NewDurability(e.locator, 0, localrefs.WithBootID(coretest.TestBootID))
+	require.NoError(t, err)
+	e.core.RefDurability = durability
+	require.False(t, durability.Deferring())
+
+	src := e.newSource(t)
+	c1 := e.writeCommit(t, src)
+	repo := e.register(t, e.key(localRelPath), src, c1)
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	e.advanceMain(t, repo.ID, src, c1)
+	require.NoError(t, e.sy.EnsureFresh(e.ctx, e.pbRepo(localRelPath)))
+	require.Equal(t, float64(1), syncCount(t, e.sy, "caught_up"))
+
+	require.Empty(t, e.markers(t))
+	require.Empty(t, durability.Dirty())
+}
+
 // TestSyncerDurableStepRetriesATransientError verifies that a durable step that
 // fails without a failed fsync (the stack cannot be read for a moment) keeps
 // the repository and its marker and is retried.
@@ -243,7 +333,7 @@ func TestSyncerSecondProcessWaitsForTheOwner(t *testing.T) {
 	storages := []string{e.storageName}
 
 	next := *e.core
-	durability, err := localrefs.NewDurability(e.locator, 0, localrefs.WithBootID(coretest.TestBootID))
+	durability, err := localrefs.NewDurability(e.locator, 0, localrefs.WithBootID(coretest.TestBootID), localrefs.WithRecoveryGrace(0))
 	require.NoError(t, err)
 	next.RefDurability = durability
 	t.Cleanup(func() { _ = durability.Close() })
@@ -270,7 +360,7 @@ func TestSyncerStopSettlesEveryRepository(t *testing.T) {
 
 	e := newEnv(t, envOptions{})
 	e.core.RefAdmission = localrefs.NewAdmission(10*time.Second, 10*time.Second)
-	durability, err := localrefs.NewDurability(e.locator, time.Hour, localrefs.WithBootID(coretest.TestBootID))
+	durability, err := localrefs.NewDurability(e.locator, time.Hour, localrefs.WithBootID(coretest.TestBootID), localrefs.WithRecoveryGrace(0))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = durability.Close() })
 	e.core.RefDurability = durability
