@@ -1325,6 +1325,33 @@ the changesets after the newest checkpoint `>= checkpoint_pack_bytes`, then
 `serve.go` (the storage core block only), started with the server and stopped on
 shutdown.
 
+**As implemented (WP77).**
+* Signature: `New(core, cp, collector, fresh, logger, cfg, storages []string)`.
+  The node's storage names replace the locator, which has no list of storages,
+  and `RunOnce` is exported for the tests.
+* The lease holder is `node_id/PID`, so the old and the new process of a
+  graceful upgrade never both hold a lease.
+* A lost lease (a renewal that fails or finds another holder) cancels the run
+  of that repository.
+* The pack-byte threshold reads the changesets after the newest checkpoint a
+  page at a time, only until the threshold is reached, and only when the count
+  threshold did not decide already.
+* A failure of one repository or one step does not stop the others; the
+  failures are counted by step.
+* `maintenance = "auto"` outside authoritative mode is a startup error, also
+  when the mode is off.
+* Metrics: `graft_storage_maintenance_{runs,checkpoints,packs_deleted,bytes_reclaimed,skipped,failures}_total`.
+* Tests: checkpoint by count and by bytes; both thresholds off; skip without a
+  local copy; skip when another holder has the lease, and the run's own release;
+  an orphan pack deleted gc_grace after a run observed it; Start/stop.
+* Not tested: a lease lost in the middle of a run (it needs a build slower than
+  the renewal).
+* **Database openers (audit).** Only `gitaly serve` opens the storage database
+  (`corestoreopen.Open`, one `sqlstore.Store` per process). The `graft` CLI and
+  every other binary reach it through gRPC. Two Stores on one SQLite file exist
+  only when two `gitaly serve` processes run on it: several nodes on one host,
+  or the overlap of a graceful upgrade. STORAGE.md (Limits) states it.
+
 ### Configuration (`config_graft_storage.go`, my section)
 
 ```toml

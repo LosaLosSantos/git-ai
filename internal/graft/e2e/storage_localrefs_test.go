@@ -53,7 +53,7 @@ type realNode struct {
 	exited chan struct{}
 }
 
-func newRealNode(t *testing.T) *realNode {
+func newRealNode(t *testing.T, configure ...func(*config.GraftStorage)) *realNode {
 	t.Helper()
 
 	graft, tokens := workerGraft(1)
@@ -66,6 +66,9 @@ func newRealNode(t *testing.T) *realNode {
 		Database: coretest.DatabaseURL(t, sqlstore.SQLite),
 		Bucket:   coretest.BucketURL(t, false),
 		NodeID:   "node-a",
+	}
+	for _, c := range configure {
+		c(&cfg.Graft.Storage)
 	}
 	cfg.SocketPath = testhelper.GetTemporaryGitalySocketFileName(t)
 	testcfg.BuildGitalySSH(t, cfg)
@@ -420,6 +423,34 @@ func TestStorageLocalReferencesDuringAGracefulUpgrade(t *testing.T) {
 	}
 	require.Len(t, next.markers(t), 1, "the new owner writes without fsync")
 	next.requireServed(t, rel, written)
+}
+
+// TestStorageBackgroundMaintenanceCheckpoints runs the real server with the
+// background maintenance on (doc/graft/PLAN7.md, "Background maintenance"): a
+// repository that gets enough changesets is checkpointed without a request,
+// and keeps serving every write.
+func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	changesets := uint64(2)
+	n := newRealNode(t, func(s *config.GraftStorage) {
+		s.Maintenance = config.GraftStorageMaintenanceAuto
+		s.MaintenanceInterval = "1s"
+		s.CheckpointChangesets = &changesets
+	})
+	n.start(t)
+	require.Contains(t, n.log(t), "background maintenance enabled")
+
+	rel := n.createRepository(t)
+	onA := n.agent(t, rel)
+	base, err := commitFile(n.ctx, onA, workerName(0), "main", "", "README.md", "base\n")
+	require.NoError(t, err)
+	written := writeBranches(t, onA, n.ctx, base, "maintained", 3)
+	written["main"] = base
+
+	require.Eventually(t, func() bool { return strings.Contains(n.log(t), "storage core: checkpoint created") },
+		60*time.Second, 100*time.Millisecond, "the maintenance checkpoints the repository")
+	n.requireServed(t, rel, written)
 }
 
 // TestStorageLocalReferencesStackDepthIsBounded writes many references

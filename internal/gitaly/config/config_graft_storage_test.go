@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +40,14 @@ func TestGraftStorageValidate(t *testing.T) {
 		{desc: "bad gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCMargin: "0"}, err: "gc_margin"},
 		{desc: "gc_grace not above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "6m", GCMargin: "5m", SyncTimeout: "1m"}, err: "gc_grace 6m0s must be greater than sync_timeout 1m0s + gc_margin 5m0s"},
 		{desc: "gc_grace just above sync_timeout + gc_margin", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, GCGrace: "361s", GCMargin: "5m", SyncTimeout: "1m"}},
+		{desc: "maintenance auto in authoritative mode", storage: GraftStorage{Mode: "authoritative", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "auto", MaintenanceInterval: "15m", LeaseTTL: "2m", CheckpointChangesets: ptr[uint64](0), CheckpointPackBytes: ptr[int64](0)}, standalone: true},
+		{desc: "maintenance off", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "off"}},
+		{desc: "maintenance auto in shadow mode", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "auto"}, err: `maintenance = "auto" requires mode = "authoritative"`},
+		{desc: "maintenance auto with the storage core off", storage: GraftStorage{Maintenance: "auto"}, err: `requires mode = "authoritative"`},
+		{desc: "unknown maintenance", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, Maintenance: "nightly"}, err: "unknown maintenance"},
+		{desc: "bad maintenance interval", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, MaintenanceInterval: "0s"}, err: "maintenance_interval"},
+		{desc: "bad lease ttl", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, LeaseTTL: "never"}, err: "lease_ttl"},
+		{desc: "negative checkpoint pack bytes", storage: GraftStorage{Mode: "shadow", Database: valid.Database, Bucket: valid.Bucket, CheckpointPackBytes: ptr[int64](-1)}, err: "checkpoint_pack_bytes"},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
@@ -76,12 +85,52 @@ func TestGraftStorageDefaults(t *testing.T) {
 	require.Equal(t, DefaultGraftStorageGCMargin, margin)
 	require.NoError(t, s.validateGC(), "the defaults are consistent")
 
+	require.False(t, s.MaintenanceAuto(), "the background maintenance is off by default")
+	interval, err := s.MaintenanceIntervalOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, DefaultGraftStorageMaintenanceInterval, interval)
+	ttl, err := s.LeaseTTLOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, DefaultGraftStorageLeaseTTL, ttl)
+	require.Equal(t, DefaultGraftStorageCheckpointChangesets, s.CheckpointChangesetsOrDefault())
+	require.Equal(t, DefaultGraftStorageCheckpointPackBytes, s.CheckpointPackBytesOrDefault())
+
 	s = GraftStorage{Mode: "shadow", SyncTimeout: "250ms"}
 	require.True(t, s.Enabled())
 	sync, err = s.SyncTimeoutOrDefault()
 	require.NoError(t, err)
 	require.Equal(t, 250*time.Millisecond, sync)
 }
+
+// TestGraftStorageMaintenanceFromTOML checks that a threshold set to 0 in the
+// file means never, not the default.
+func TestGraftStorageMaintenanceFromTOML(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(strings.NewReader(`
+[graft.storage]
+mode = "authoritative"
+maintenance = "auto"
+maintenance_interval = "30m"
+checkpoint_changesets = 0
+checkpoint_pack_bytes = 1048576
+lease_ttl = "3m"
+`))
+	require.NoError(t, err)
+
+	s := cfg.Graft.Storage
+	require.True(t, s.MaintenanceAuto())
+	require.Equal(t, uint64(0), s.CheckpointChangesetsOrDefault())
+	require.Equal(t, int64(1<<20), s.CheckpointPackBytesOrDefault())
+	interval, err := s.MaintenanceIntervalOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, 30*time.Minute, interval)
+	ttl, err := s.LeaseTTLOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, 3*time.Minute, ttl)
+}
+
+func ptr[T any](v T) *T { return &v }
 
 func TestGraftValidateChecksStorage(t *testing.T) {
 	t.Parallel()

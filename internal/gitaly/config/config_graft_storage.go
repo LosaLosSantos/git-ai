@@ -40,6 +40,102 @@ type GraftStorage struct {
 	// Empty means DefaultGraftStorageGCMargin. See doc/graft/STORAGE.md for the
 	// clock assumption it covers.
 	GCMargin string `json:"gc_margin" toml:"gc_margin,omitempty"`
+	// Maintenance is "off" (the default, also when empty) or "auto": the
+	// background checkpoints and garbage collection of the storage core, in
+	// authoritative mode only (doc/graft/PLAN7.md, "Background maintenance").
+	// The graft storage commands work in either case.
+	Maintenance string `json:"maintenance" toml:"maintenance,omitempty"`
+	// MaintenanceInterval is how often the background maintenance runs (Go
+	// duration). Empty means DefaultGraftStorageMaintenanceInterval.
+	MaintenanceInterval string `json:"maintenance_interval" toml:"maintenance_interval,omitempty"`
+	// CheckpointChangesets makes the maintenance checkpoint a repository once
+	// this many changesets follow its newest checkpoint; 0 never checkpoints by
+	// count. Unset means DefaultGraftStorageCheckpointChangesets.
+	CheckpointChangesets *uint64 `json:"checkpoint_changesets" toml:"checkpoint_changesets,omitempty"`
+	// CheckpointPackBytes makes the maintenance checkpoint a repository once the
+	// packs of the changesets after its newest checkpoint hold this many bytes;
+	// 0 never checkpoints by size. Unset means
+	// DefaultGraftStorageCheckpointPackBytes.
+	CheckpointPackBytes *int64 `json:"checkpoint_pack_bytes" toml:"checkpoint_pack_bytes,omitempty"`
+	// LeaseTTL is how long a node holds the maintenance lease of a repository
+	// before it must renew it (Go duration). Empty means
+	// DefaultGraftStorageLeaseTTL.
+	LeaseTTL string `json:"lease_ttl" toml:"lease_ttl,omitempty"`
+}
+
+// Values of GraftStorage.Maintenance.
+const (
+	GraftStorageMaintenanceOff  = "off"
+	GraftStorageMaintenanceAuto = "auto"
+)
+
+const (
+	// DefaultGraftStorageMaintenanceInterval is the default
+	// GraftStorage.MaintenanceInterval.
+	DefaultGraftStorageMaintenanceInterval = time.Hour
+	// DefaultGraftStorageCheckpointChangesets is the default
+	// GraftStorage.CheckpointChangesets.
+	DefaultGraftStorageCheckpointChangesets uint64 = 1000
+	// DefaultGraftStorageCheckpointPackBytes is the default
+	// GraftStorage.CheckpointPackBytes (256 MiB).
+	DefaultGraftStorageCheckpointPackBytes int64 = 256 << 20
+	// DefaultGraftStorageLeaseTTL is the default GraftStorage.LeaseTTL.
+	DefaultGraftStorageLeaseTTL = 10 * time.Minute
+)
+
+// MaintenanceAuto reports whether the background maintenance runs.
+func (s GraftStorage) MaintenanceAuto() bool { return s.Maintenance == GraftStorageMaintenanceAuto }
+
+// MaintenanceIntervalOrDefault parses MaintenanceInterval, applying the default.
+func (s GraftStorage) MaintenanceIntervalOrDefault() (time.Duration, error) {
+	return positiveDurationOrDefault("maintenance_interval", s.MaintenanceInterval, DefaultGraftStorageMaintenanceInterval)
+}
+
+// LeaseTTLOrDefault parses LeaseTTL, applying the default.
+func (s GraftStorage) LeaseTTLOrDefault() (time.Duration, error) {
+	return positiveDurationOrDefault("lease_ttl", s.LeaseTTL, DefaultGraftStorageLeaseTTL)
+}
+
+// CheckpointChangesetsOrDefault returns CheckpointChangesets, applying the
+// default.
+func (s GraftStorage) CheckpointChangesetsOrDefault() uint64 {
+	if s.CheckpointChangesets == nil {
+		return DefaultGraftStorageCheckpointChangesets
+	}
+	return *s.CheckpointChangesets
+}
+
+// CheckpointPackBytesOrDefault returns CheckpointPackBytes, applying the
+// default.
+func (s GraftStorage) CheckpointPackBytesOrDefault() int64 {
+	if s.CheckpointPackBytes == nil {
+		return DefaultGraftStorageCheckpointPackBytes
+	}
+	return *s.CheckpointPackBytes
+}
+
+// validateMaintenance checks the background maintenance settings.
+func (s GraftStorage) validateMaintenance() error {
+	switch s.Maintenance {
+	case "", GraftStorageMaintenanceOff:
+	case GraftStorageMaintenanceAuto:
+		if s.Mode != "authoritative" {
+			return fmt.Errorf("graft storage: maintenance = %q requires mode = \"authoritative\" (checkpoints exist in authoritative mode only)", s.Maintenance)
+		}
+	default:
+		return fmt.Errorf("graft storage: unknown maintenance %q (want off or auto)", s.Maintenance)
+	}
+
+	if _, err := s.MaintenanceIntervalOrDefault(); err != nil {
+		return err
+	}
+	if _, err := s.LeaseTTLOrDefault(); err != nil {
+		return err
+	}
+	if s.CheckpointPackBytes != nil && *s.CheckpointPackBytes < 0 {
+		return fmt.Errorf("graft storage: checkpoint_pack_bytes %d must not be negative", *s.CheckpointPackBytes)
+	}
+	return nil
 }
 
 const (
@@ -116,7 +212,9 @@ func positiveDurationOrDefault(name, value string, def time.Duration) (time.Dura
 func (s GraftStorage) validate(standalone bool) error {
 	switch s.Mode {
 	case "", "off":
-		return nil
+		// The other settings are not read when the storage core is off, but a
+		// maintenance that cannot run is an error, not silence.
+		return s.validateMaintenance()
 	case "shadow", "authoritative":
 	default:
 		return fmt.Errorf("graft storage: unknown mode %q (want off, shadow or authoritative)", s.Mode)
@@ -151,6 +249,9 @@ func (s GraftStorage) validate(standalone bool) error {
 		return err
 	}
 	if _, err := s.ShadowTimeoutOrDefault(); err != nil {
+		return err
+	}
+	if err := s.validateMaintenance(); err != nil {
 		return err
 	}
 

@@ -199,6 +199,13 @@ bucket = "file:///var/opt/graft/objects"        # gocloud URL: file://, s3://, g
 node_id = "node-a"                              # default: the host name
 sync_timeout = "10s"                            # catch-up budget per request
 shadow_timeout = "5s"                           # shadow work budget per transaction
+gc_grace = "1h"                                 # age before a dead pack is deleted
+gc_margin = "5m"                                # writers' deadline is gc_grace - gc_margin
+maintenance = "auto"                            # off (default) | auto: background checkpoints and GC
+maintenance_interval = "1h"
+checkpoint_changesets = 1000                    # 0 = never by count
+checkpoint_pack_bytes = 268435456               # 0 = never by size
+lease_ttl = "10m"
 ```
 
 Every key is described in [CONFIGURATION.md](CONFIGURATION.md#graftstorage).
@@ -215,7 +222,11 @@ created and migrated at startup.
 Startup fails when the mode is unknown, authoritative mode is set without
 `standalone = true`, the database URL is missing or neither `sqlite:///` nor
 `postgres://` (`postgresql://`), the bucket is missing or not a URL, `node_id`
-contains spaces or slashes, or a timeout is not a positive Go duration.
+contains spaces or slashes, a duration is not a positive Go duration,
+`gc_grace` is not greater than `sync_timeout + gc_margin`, or `maintenance =
+"auto"` is set outside authoritative mode. The background maintenance is off by
+default; its metrics are `graft_storage_maintenance_*` (runs, checkpoints, packs
+and bytes deleted, skipped repositories, failed steps).
 
 ## Operations
 
@@ -601,10 +612,11 @@ show:
   and the bucket, not that nodes keep no local state. Every request runs git
   on a local copy, a node's first request for a repository downloads all of its
   packs, and there is no virtual filesystem.
-- **No garbage collection of packs yet.** Packs are never deleted: neither the
-  orphans of writes that died before the database commit nor the packs of
-  removed repositories. There is no checkpoint compaction either: hydration
-  replays every changeset from 1. Both are planned after the first release.
+- **Checkpoints and pack garbage collection run in the background only when
+  `maintenance = "auto"`** (authoritative mode; off by default). Without it,
+  packs are never deleted and hydration replays every changeset after the
+  newest checkpoint, from 1 when there is none. The on-demand `graft storage`
+  commands for both are not available yet.
 - **Praefect is not supported in authoritative mode.** Configuration validation
   requires `[graft] standalone = true` for authoritative mode. Shadow mode
   works with or without Praefect.

@@ -212,6 +212,13 @@ are in [STORAGE.md](STORAGE.md).
 | `node_id` | string | the host name | Name of this node in the database (changesets record it, and `graft storage state` shows it). Must not contain spaces or slashes. Give every node its own. |
 | `sync_timeout` | string (Go duration) | `"10s"` | Budget of the catch-up before a request in authoritative mode. A catch-up that cannot finish in time (for example because the database is unreachable or a local writer holds a reference lock) fails the request with `Unavailable`. Must be positive. |
 | `shadow_timeout` | string (Go duration) | `"5s"` | Budget of the shadow-mode work of one reference transaction, for its Preparing phase (pack build and upload, before git locks the references) and its Prepared phase together. When it runs out, the work is abandoned, logged and counted, and the git write proceeds. Must be positive. |
+| `gc_grace` | string (Go duration) | `"1h"` | How long garbage collection waits before it deletes a pack it observed unreferenced, and how old a checkpoint must be before the packs it covers are deleted. Must be greater than `sync_timeout + gc_margin`. |
+| `gc_margin` | string (Go duration) | `"5m"` | Safety margin of the writers' deadline: a write uploads its pack and commits its changeset within `gc_grace - gc_margin`, else it fails. It also covers the difference between a node's clock and the database's. Must be positive. |
+| `maintenance` | string | `"off"` | `"auto"` runs the background checkpoints and garbage collection: every `maintenance_interval`, the packs of removed repositories are deleted, and every repository this node has a current copy of is checkpointed when the thresholds below say so and its dead packs are collected, under a per-repository lease so that two nodes do not do the same work. Authoritative mode only. `graft storage` commands do the same on demand in either case. |
+| `maintenance_interval` | string (Go duration) | `"1h"` | Time between two background maintenance runs. Must be positive. |
+| `checkpoint_changesets` | integer | `1000` | Checkpoint a repository once this many changesets follow its newest checkpoint. `0` never checkpoints by count. |
+| `checkpoint_pack_bytes` | integer | `268435456` (256 MiB) | Checkpoint a repository once the packs of the changesets after its newest checkpoint hold this many bytes. `0` never checkpoints by size. |
+| `lease_ttl` | string (Go duration) | `"10m"` | How long a node holds a repository's maintenance lease; renewed every third of it while the work runs. Must be positive. |
 
 ```toml
 [graft.storage]
@@ -219,12 +226,16 @@ mode = "authoritative"
 database = "sqlite:///var/opt/graft/meta.db"
 bucket = "file:///var/opt/graft/objects"
 node_id = "node-a"
+maintenance = "auto"
 ```
 
 Startup fails when the mode is unknown, authoritative mode is set without
 `standalone = true`, the database URL is missing or has another scheme, the
-bucket is missing or not a URL, `node_id` contains spaces or slashes, or a
-timeout is not a positive Go duration.
+bucket is missing or not a URL, `node_id` contains spaces or slashes, a
+duration is not a positive Go duration, `gc_grace` is not greater than
+`sync_timeout + gc_margin`, `maintenance` is neither `off` nor `auto`,
+`maintenance = "auto"` is set outside authoritative mode, or
+`checkpoint_pack_bytes` is negative.
 
 ## `graft-cache` flags
 

@@ -36,8 +36,11 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
 	"github.com/feder-cr/git-ai/internal/gitlab"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/checkpoint"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/gate"
+	"github.com/feder-cr/git-ai/internal/graft/corestore/gc"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
+	storagemaintenance "github.com/feder-cr/git-ai/internal/graft/corestore/maintenance"
 	corestoreopen "github.com/feder-cr/git-ai/internal/graft/corestore/open"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/reviewroots"
 	corestoresyncer "github.com/feder-cr/git-ai/internal/graft/corestore/syncer"
@@ -646,6 +649,14 @@ func run(appCtx *cli.Command, cfg config.Cfg, logger log.Logger) error {
 			// settles every repository whose writes ended.
 			defer stopLocalReferences()
 
+			if cfg.Graft.Storage.MaintenanceAuto() {
+				stopMaintenance, err := startStorageMaintenance(ctx, cfg, storageCore, syncer, locator, localrepoFactory, logger, storageNames)
+				if err != nil {
+					return err
+				}
+				defer stopMaintenance()
+			}
+
 			storageGate = gate.New(storageCore, syncer, logger, locator, localrepoFactory, protoregistry.GitalyProtoPreregistered)
 		}
 
@@ -961,6 +972,36 @@ func openLocalReferenceWrites(core *corestore.Core, locator storage.Locator, log
 	core.RefDurability = durability
 	prometheus.MustRegister(durability)
 	return nil
+}
+
+// startStorageMaintenance starts the background checkpoints and garbage
+// collection of the storage core ([graft.storage] maintenance = "auto",
+// authoritative mode only; doc/graft/PLAN7.md, "Background maintenance").
+func startStorageMaintenance(ctx context.Context, cfg config.Cfg, core *corestore.Core, fresh corestore.Freshener, locator storage.Locator, repoFactory localrepo.Factory, logger log.Logger, storageNames []string) (func(), error) {
+	interval, err := cfg.Graft.Storage.MaintenanceIntervalOrDefault()
+	if err != nil {
+		return nil, err
+	}
+	leaseTTL, err := cfg.Graft.Storage.LeaseTTLOrDefault()
+	if err != nil {
+		return nil, err
+	}
+
+	runner := storagemaintenance.New(core,
+		checkpoint.New(core, logger, locator, repoFactory, fresh),
+		gc.New(core, logger),
+		fresh, logger,
+		storagemaintenance.Config{
+			Interval:             interval,
+			CheckpointChangesets: cfg.Graft.Storage.CheckpointChangesetsOrDefault(),
+			CheckpointPackBytes:  cfg.Graft.Storage.CheckpointPackBytesOrDefault(),
+			LeaseTTL:             leaseTTL,
+		},
+		storageNames,
+	)
+	prometheus.MustRegister(runner)
+	logger.WithField("interval", interval.String()).Info("graft storage core: background maintenance enabled")
+	return runner.Start(ctx), nil
 }
 
 // newPackObjectsAdaptiveLimit builds the adaptive limit backing a pack objects limiter. The limit
