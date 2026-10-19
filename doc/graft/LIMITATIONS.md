@@ -238,6 +238,11 @@ Git hooks use private.
   are, so a reader never sees an entry that a crash could take back. The entries
   of the transactions that commit together are written with one fsync, in the
   order in which the transactions locked their references.
+- When an append fails and cutting off the bytes it wrote fails too (two I/O
+  errors in a row), only the process that wrote them remembers that they are not
+  entries, and it forgets this when it drops its cache of the log. Another Gitaly
+  process, during a graceful restart, can then read those bytes as entries or cut
+  entries after them. A later version persists that marker next to the log.
 - The log is stored per Gitaly node and is not replicated. Behind Praefect,
   every replica records the updates it applies itself, so sequence numbers and
   metadata differ between replicas. Praefect therefore always routes
@@ -298,7 +303,7 @@ commitment.
 ## Phase 4b limitations
 
 1. The phase 4a acceptance is met by two runs on one machine and one workload
-   (seed 1, conflict rate 0.2; see [BENCH](BENCH.md#measured-phase-4b-results)).
+   (seed 1, conflict rate 0.2; see [BENCH](BENCH.md#batched-landing-phase-4b)).
    The runs vary a lot, the benchmark saturates the machine, and the stretch goal
    passed by only 3.7% in one of the two runs.
 2. Batches still run one at a time per lane, and each batch spends most of its time

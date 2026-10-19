@@ -117,20 +117,35 @@ func TestReadersSeeEntriesOnlyOnceDurable(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(data), "refs/heads/b")
 
+	// The reader comes without this process's state, as a reader of another process does: it
+	// does not wait for the state's mutex but for the log's lock file, which the append holds.
+	statesMu.Lock()
+	delete(states, Path(repoPath))
+	statesMu.Unlock()
+
 	type result struct {
 		refs []string
 		last uint64
+		err  error
 	}
 	read := make(chan result, 1)
 	go func() {
 		var r result
-		r.refs = references(t, repoPath, 0)
-		r.last, _ = LastSequence(repoPath)
+		var entries []Entry
+		if entries, r.err = List(repoPath, 0, 10); r.err == nil {
+			for _, entry := range entries {
+				r.refs = append(r.refs, entry.Reference)
+			}
+			r.last, r.err = LastSequence(repoPath)
+		}
 		read <- r
 	}()
 
+	readEarly := false
 	select {
 	case r := <-read:
+		readEarly = true
+		require.NoError(t, r.err)
 		require.Equal(t, []string{"refs/heads/a"}, r.refs, "a reader returned an entry before its fsync")
 		require.EqualValues(t, 1, r.last)
 	case <-time.After(200 * time.Millisecond):
@@ -140,8 +155,10 @@ func TestReadersSeeEntriesOnlyOnceDurable(t *testing.T) {
 	close(release)
 	require.NoError(t, <-appended)
 
-	r := <-read
-	if len(r.refs) == 2 {
+	if !readEarly {
+		// The reader waited for the lock file: it read once the entry was durable.
+		r := <-read
+		require.NoError(t, r.err)
 		require.Equal(t, []string{"refs/heads/a", "refs/heads/b"}, r.refs)
 		require.EqualValues(t, 2, r.last)
 	}
