@@ -2,7 +2,10 @@ package maintenance_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -39,6 +42,7 @@ type env struct {
 	cfg    config.Cfg
 	core   *corestore.Core
 	sy     *syncer.Syncer
+	cp     *checkpoint.Checkpointer
 	runner *maintenance.Runner
 	repo   corestore.Repository
 	src    *localrepo.Repo
@@ -60,11 +64,11 @@ func newEnv(t *testing.T, opts coretest.Options, cfg maintenance.Config) *env {
 
 	core := coretest.Open(t, opts)
 	sy := syncer.New(core, logger, locator, repoFactory, gitCmdFactory)
-	runner := maintenance.New(core, checkpoint.New(core, logger, locator, repoFactory, sy), gc.New(core, logger), sy, logger, cfg,
-		[]string{gcfg.Storages[0].Name})
+	cp := checkpoint.New(core, logger, locator, repoFactory, sy)
+	runner := maintenance.New(core, cp, gc.New(core, logger), sy, logger, cfg, []string{gcfg.Storages[0].Name})
 
 	srcPB, srcDir := gittest.CreateRepository(t, ctx, gcfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
-	e := &env{t: t, cfg: gcfg, core: core, sy: sy, runner: runner, src: localrepo.NewTestRepo(t, gcfg, srcPB), srcDir: srcDir}
+	e := &env{t: t, cfg: gcfg, core: core, sy: sy, cp: cp, runner: runner, src: localrepo.NewTestRepo(t, gcfg, srcPB), srcDir: srcDir}
 
 	repo, _, err := core.Meta.RegisterRepository(ctx, e.key(), gittest.DefaultObjectHash.Format, corestore.InitialState{})
 	require.NoError(t, err)
@@ -274,6 +278,65 @@ func TestRunOnceCollectsAnOrphanPack(t *testing.T) {
 	}, 30*time.Second, 100*time.Millisecond)
 	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_packs_deleted_total", ""))
 	require.Equal(t, float64(len(content)), e.metric("graft_storage_maintenance_bytes_reclaimed_total", ""))
+}
+
+// TestRunOnceStopsWhenTheLeaseIsLost blocks a checkpoint build after its
+// upload while another holder takes the lease (it expired, as for a run that
+// stalled): the run is cancelled, the checkpoint is never recorded (its pack is
+// an orphan, as for any failed build), and the run deletes nothing.
+func TestRunOnceStopsWhenTheLeaseIsLost(t *testing.T) {
+	t.Parallel()
+	ctx := testhelper.Context(t)
+	cfg := config3(1, 0)
+	cfg.LeaseTTL = 300 * time.Millisecond
+	e := newEnv(t, coretest.Options{}, cfg)
+	e.fresh()
+	holder := fmt.Sprintf("%s/%d", e.core.NodeID, os.Getpid())
+
+	uploaded := make(chan struct{})
+	resume := make(chan struct{})
+	checkpoint.SetFaultHook(e.cp, func(point string) error {
+		if point == checkpoint.PointAfterUpload {
+			close(uploaded)
+			<-resume
+		}
+		return nil
+	})
+	before := e.bucketKeys()
+
+	done := make(chan error, 1)
+	go func() { done <- e.runner.RunOnce(ctx) }()
+	<-uploaded
+
+	// The lease is taken by another node: the run's next renewal finds it gone.
+	require.NoError(t, e.core.Meta.ReleaseMaintenanceLease(ctx, e.repo.ID, holder))
+	acquired, err := e.core.Meta.AcquireMaintenanceLease(ctx, e.repo.ID, "node-b/1", time.Hour)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	require.Eventually(t, func() bool { return e.metric("graft_storage_maintenance_failures_total", "lease") == 1 },
+		30*time.Second, 10*time.Millisecond, "the renewal notices the lost lease")
+	close(resume)
+
+	require.ErrorIs(t, <-done, context.Canceled)
+	_, ok := e.newestCheckpoint()
+	require.False(t, ok, "a run that lost its lease records no checkpoint")
+
+	after := e.bucketKeys()
+	for key := range before {
+		require.Contains(t, after, key, "a run that lost its lease deleted %s", key)
+	}
+	require.Len(t, after, len(before)+1, "the uploaded checkpoint pack is an orphan")
+	require.Equal(t, float64(1), e.metric("graft_storage_maintenance_runs_total", "error"))
+}
+
+func (e *env) bucketKeys() map[string]bool {
+	e.t.Helper()
+	keys := map[string]bool{}
+	require.NoError(e.t, e.core.Blobs.List(testhelper.Context(e.t), "", func(info corestore.BlobInfo) error {
+		keys[info.Key] = true
+		return nil
+	}))
+	return keys
 }
 
 func TestStartRunsEveryIntervalUntilStopped(t *testing.T) {

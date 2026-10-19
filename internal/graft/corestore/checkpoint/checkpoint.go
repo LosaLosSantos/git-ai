@@ -236,6 +236,12 @@ func (c *Checkpointer) tempDir(storageName string) (string, error) {
 	return dir, nil
 }
 
+// SetFaultHook sets the hook called at the fault points of c's builds; an
+// error it returns ends the build there, as a crash would. Only tests set it
+// (also the maintenance tests, which block a build with it), before c builds;
+// it is nil in production.
+func SetFaultHook(c *Checkpointer, hook func(point string) error) { c.faultHook = hook }
+
 func (c *Checkpointer) fault(point string) error {
 	if c.faultHook == nil {
 		return nil
