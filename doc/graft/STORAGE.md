@@ -755,7 +755,14 @@ show:
 - **A sync round is bounded by `sync_timeout`.** A hydration or catch-up that
   needs more than one round answers `Unavailable` until it reaches the head;
   each round keeps what it did. A single pack that cannot be downloaded and
-  indexed within one round never completes.
+  indexed within one round never completes. Measured (2026-10-19, Postgres,
+  file bucket, small changesets of the land benchmark): about 4 ms per
+  changeset, so at the default `sync_timeout` of 10 s (7.5 s of fetch per
+  round) one round covers about 1800–2000 changesets after the newest
+  checkpoint. A copy that is further behind needs several requests. With the
+  default checkpoints (every 1000 changesets) a repository stays within one
+  round. Before the concurrent fetch, the same repository took about 40 ms per
+  changeset and never finished at 10 s.
 - **Praefect is not supported in authoritative mode.** Configuration validation
   requires `[graft] standalone = true` for authoritative mode. Shadow mode
   works with or without Praefect.
