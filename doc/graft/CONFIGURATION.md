@@ -169,7 +169,7 @@ See [LAND-BATCHING.md](LAND-BATCHING.md).
 |---|---|---|---|
 | `disabled` | bool | `false` | Turn batching off. Every request then runs its own compare-and-swap loop, as in phase 2. |
 | `window` | string (Go duration) | `"10ms"` | How long a lane waits after its first queued request before it runs the batch. `"0s"` means no wait: a batch is whatever queued while the previous batch ran. Must not be negative. |
-| `max_size` | int | `50` | Largest number of requests in one batch. Zero means the default; negative values are rejected. |
+| `max_size` | int | `50` | Largest number of requests in one batch, at most `100`: the update of a batch records the identity of every member ([PLAN11](PLAN11.md)) in the environment of its git processes. Zero means the default; negative values and values above `100` are rejected. |
 | `target_latency` | string (Go duration) | `"500ms"` | Batch duration the lane aims for. A lane halves its effective maximum batch size after a batch slower than this, and grows it back (up to `max_size`) after batches faster than half of it. `"0s"` disables the adaptation, and the lane always uses `max_size`. Must be a valid, non-negative Go duration. See [LAND-BATCHING.md](LAND-BATCHING.md#adaptive-sizing). |
 
 ### `[graft.land.resolver]`

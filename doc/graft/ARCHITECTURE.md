@@ -94,12 +94,15 @@ client                      graft-cache (optional)        gitaly (standalone)
   |------------------------------->|----------------------------->| 1. read the tip T of main
   |                                |                              | 2. T is an ancestor of C: fast-forward
   |                                |                              |    C is reachable from T: already_landed
+  |                                |                              |    C landed before as C', C' reachable
+  |                                |                              |      from T: already_landed (PLAN11)
   |                                |                              |    otherwise rebase C onto T
   |                                |                              | 3. update hooks and the standalone policy
   |                                |                              | 4. compare-and-swap main from T to C'
   |                                |                              |    lost the race: retry from 1 (jittered)
   |                                |                              | 5. changeset: operation=land, actor,
-  |                                |                              |    rewritten=true when history changed
+  |                                |                              |    rewritten=true when history changed,
+  |                                |                              |    lands=[C -> C']
   |   UserLandResponse             |                              |
   |<-------------------------------|<-----------------------------|
   |                                |                              |

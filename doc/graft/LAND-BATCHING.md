@@ -69,6 +69,10 @@ One batch attempt:
      reports `already_landed` and changes nothing.
    - If the running tip is an ancestor of the commit, the commit becomes the new
      running tip (fast-forward).
+   - If an earlier land of the commit on the branch put a commit on it that is
+     still reachable from the running tip, the request reports
+     `already_landed` with that commit and changes nothing (the land identity
+     of [PLAN11](PLAN11.md)).
    - Otherwise the commit is rebased onto the running tip, or merged for
      `STRATEGY_MERGE`. `STRATEGY_FF_ONLY` fails that request with a
      `not_ancestor` error.
@@ -374,8 +378,9 @@ graph_ancestry = false    # true: ancestry from the stored graph index
 
 The keys are documented in [CONFIGURATION.md](CONFIGURATION.md#graftlandbatch)
 and [CONFIGURATION.md](CONFIGURATION.md#graftland). `window` and
-`target_latency` must be non-negative Go durations. `max_size` must not be
-negative; zero means the default.
+`target_latency` must be non-negative Go durations. `max_size` must be between
+0 and 100; zero means the default. The update of a batch carries the identity
+of every member in the environment of its git processes, which bounds it.
 
 ## Metrics
 
@@ -483,16 +488,17 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
   an exponential backoff from 100 ms to 2 s with full jitter, stopped by the
   context, reported in `LandResult.UnavailableRetries`. A client that does not
   use the SDK must do the same: retry `Unavailable`, and only `Unavailable`, with
-  a bounded backoff, and only for the lands below.
-  - Merge and fast-forward lands are retried by default. The response of a call
-    can be lost after the change landed; the change itself is then on the
-    branch, and the retry reports it as already landed.
-  - Rebase lands, with or without conflict resolution, are not retried by
-    default (`RebaseLands` turns it on). The branch holds a rebased copy of the
-    change, and the server cannot yet tell that this change landed: a retry
-    replays it, and a change that a later commit reverted in between (for
-    example graft-verify reverting the culprit) would land again. The land
-    identity index of [PLAN11](PLAN11.md) removes this limit.
+  a bounded backoff. Every strategy is retried by default
+  (`UnavailableRetry.SkipRebaseLands` turns it off for rebase lands). The
+  response of a call can be lost after the change landed, and the retry then
+  lands nothing and reports `already_landed`: with a merge or a fast-forward,
+  the change itself is on the branch; with a rebase, with or without conflict
+  resolution, the branch holds a rebased copy, and the server answers from its
+  record of the first land (the land identity of [PLAN11](PLAN11.md)), with
+  `landed_commit_id` the copy and `landed_sequence` its changelog sequence.
+  This holds also when a later commit reverted the change in between (for
+  example graft-verify reverting the culprit): the change is not landed again,
+  and `reverted_by_commit_id` names the revert.
 - A land that arrives alone waits up to `window` before its batch runs. Set
   `window = "0s"` to remove the wait, or `disabled = true` to remove batching.
 - Requests that do not qualify (see *When a land is batched*) run unbatched and

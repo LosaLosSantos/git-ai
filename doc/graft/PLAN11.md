@@ -17,8 +17,8 @@ twice and must report what happened.
   in between (graft-verify reverting the culprit), the replay is not empty: the retry
   lands the change again.
 
-Until this plan is in, the SDK does not retry rebase lands by default
-(`UnavailableRetry.RebaseLands`, commit f13ad58).
+Until this plan was in, the SDK did not retry rebase lands by default
+(commit f13ad58).
 
 Federico's decision (2026-10-19): the server keeps an index of what landed, by the
 identity of the request, with no trailer in the commits.
@@ -44,12 +44,15 @@ lands and for the unbatched lands of a lane (`UpdateSolo`), not for the classic
 `landWithRetries` path, and `Members` are capped at 32 KiB in the hook payload, which
 can drop members of a large batch.
 
-* A new field of the changelog metadata, `Lands []LandRecord{Original, Landed}`,
-  separate from `Members`, carries the identity pairs. It is never cut: a pair is
-  under 200 bytes, a batch has at most `max_size` (50) members, so the field is at most
-  about 10 KiB. A request whose pairs would not fit the payload budget fails before
-  its update rather than landing without its identity (it cannot happen with the
-  configured limits; the check makes the bound an invariant).
+* A new field of the changelog metadata, `Lands []Land{Original, Landed}` with the
+  branch they landed on (`LandReference`), separate from `Members`, carries the
+  identity pairs; only the entry of that branch's update carries them. It is never
+  cut. `changelog.WithLands` validates them (a branch, full object IDs, at most 100
+  pairs, at most 40 KiB encoded) and a land whose identities do not pass fails
+  before its update rather than landing without its identity. A SHA-256 pair
+  encodes in 156 bytes and `max_size` is now at most 100, so 100 pairs and a
+  4096-byte branch name, escaped by JSON at worst into 6 bytes per byte, fit: the
+  check makes the bound an invariant.
 * Every land path sets it: the batch update, `UpdateSolo` and `landWithRetries`
   (through `updateLandedReference`, which knows `commit_id` and the new tip).
 * The MVCC path records after its commit (`AfterCommit`), with the same metadata.
@@ -74,9 +77,13 @@ graft_land_identities(
 A land of an identity that has a row and whose landed commit is still on the branch
 does not land (section 5), so it writes no row. One whose landed commit is no longer on
 the branch (the branch was reset past it) lands as a new change and replaces the row
-with its newer sequence (`ON CONFLICT ... DO UPDATE` when the new sequence is greater).
+with its newer sequence (`ON CONFLICT ... DO UPDATE`: every writer appends after the
+last entry, so the last write is the latest land). The rows are written by every
+insert of changelog entries: a changeset, the initial history of a registered
+repository and the history that shadow mode imports, so a repository moved to the
+authoritative mode keeps the identities of its file changelog.
 
-Migration `2026102xxxxxxx_graft_land_identities`, in both dialects, with the rule of
+Migration `20261020000000_graft_land_identities`, in both dialects, with the rule of
 milestone 3: a node whose database has a migration it does not know refuses to start
 (`unknown migrations`), so an older binary never writes changesets without the rows.
 A repository removed by `RemoveRepository` loses its rows by `ON DELETE CASCADE`.
@@ -88,28 +95,44 @@ The record is part of the log entry itself: the entry of the branch update gets 
 write and fsync. A secondary index file next to the log,
 `graft/changelog.lands`, makes the lookup cheap:
 
-* JSON lines `{"seq":N,"branch":"...","original":"...","landed":"..."}`, appended
-  after the log append, with its own fsync, and a header line recording the log
-  sequence it is complete up to.
-* It is derived data. A crash between the log append and the index append leaves the
-  index behind the log; the first lookup after it reads the log after the index's
-  sequence (`Scan` from that cursor) and appends what is missing. A torn last line is
-  cut off, as in the log. A missing or corrupt index is rebuilt from the log.
-* The lookup loads the index once per process and keeps it in memory, updated by the
-  appends of the process and caught up from the log when the log's durable end is past
-  the index (another process appended).
+* The file is a sequence of blocks of JSON lines: the records
+  `{"seq":N,"ref":"<base64>","original":"...","landed":"..."}` of the lands of some
+  log entries, then a mark `{"mark":N,"ref":"<base64>","new_oid":"...","crc":C}`
+  naming the last log entry the block covers and the CRC-32 of its records. The index
+  is complete up to its last mark.
+* It is derived data, written by the lookups, not by the appends: a lookup reads the
+  durable log entries after the last mark (`Scan` from it), adds their lands to the
+  index and appends them as one block. An append therefore never waits for the index,
+  and a crash between the log append and the index leaves nothing to repair: the
+  next lookup reads those entries.
+* Reading the file stops at the first line that is not a record or a mark, at a mark
+  whose CRC does not match its records, and at a mark that does not follow the one
+  before; the file is cut there and caught up from the log. A torn tail, a lost or
+  corrupt file are handled so. The mark proves that the index describes this log:
+  the lookup reads the log entry at the mark first, and an index whose mark names
+  another entry, or one past the end of the log (the repository was created again at
+  the same path), is rebuilt from the whole log. The file is written without fsync,
+  since whatever a crash leaves of it is either a good prefix or cut off.
+* The lookup keeps the index in memory, for the 64 most recently used repositories of
+  the process, and reads the file again when another process changed it. A lookup
+  whose index is already at the log's last durable sequence reads nothing.
 
 ## 5. The land path
 
-Before a rebase replays a diverged change (`LandDiverged` with the rebase strategy),
-the land looks up `(branch, commit_id)`:
+Before a land computes a diverged change (`LandDiverged`, whatever the strategy: a
+rebase replays it, a merge or a resolution merges it, `STRATEGY_FF_ONLY` fails), the
+land looks up `(branch, commit_id)`. A merge commit, of a merge or of a resolution,
+has `commit_id` as a parent, so its retry already finds `commit_id` reachable; the
+lookup answers the rebased lands, and makes the answer the same for every strategy:
 
 * A hit whose landed commit is reachable from the current tip (one
   `merge-base --is-ancestor`): the change is on the branch. The answer is
   `AlreadyLanded`, `landed_commit_id` the recorded commit, nothing replayed, no
   resolver run, whatever happened on the branch since (a revert included). The answer
-  explains itself: its message says "landed as <oid> at changelog <seq>", and adds "it
-  was reverted later by <oid>" when a revert of it is on the branch (section 5.1).
+  explains itself: `UserLandResponse` gains `landed_sequence`, `reverted_by_commit_id`
+  and `already_landed_detail`, which says "landed as <oid> at changelog <seq>", and
+  adds "; it was reverted later by <oid>" when a revert of it is on the branch
+  (section 5.1). `branch_update.commit_id` stays the tip.
 * A hit whose landed commit is not reachable (the branch was reset past it): the change
   is no longer on the branch; the land proceeds as a new one.
 * No hit: the land proceeds.
@@ -133,12 +156,15 @@ landed again from the same commit. The land answers `AlreadyLanded`, because the
 did land and is still in the branch's history. Landing it again needs a new commit (a
 revert of the revert, or the change recommitted), which is a new identity. A merge or a
 fast-forward land behaves so already today (the reverted `commit_id` is still reachable,
-so it answers `AlreadyLanded`); this plan gives a rebase land the same rule. Today a
-rebase re-land lands the change again; the documentation of `UserLand` and of
-graft-verify's revert says so with this plan.
+so it answers `AlreadyLanded`); this plan gives a rebase land the same rule. Before
+it, a rebase re-land landed the change again; the documentation of `UserLand`
+(LIMITATIONS, LAND-BATCHING) and of graft-verify's revert (VERIFY) says so.
 
-With this in, the SDK retries rebase lands by default again (`RebaseLands` stays, to
-turn it off).
+With this in, the SDK retries rebase lands by default again;
+`UnavailableRetry.SkipRebaseLands` turns it off (it replaces `RebaseLands`, which was
+never released: a field whose zero value is the default cannot turn a default off).
+`LandResult` reports `LandedSequence`, `RevertedByCommitID` and
+`AlreadyLandedDetail`.
 
 ## 6. Option: `Unavailable` that is always safe to retry (m2)
 
@@ -153,7 +179,8 @@ after this plan.
 ## 7. Tests
 
 * Lost response, then retry: `AlreadyLanded` with the rebased copy, for rebase,
-  rebase with resolution, merge and fast-forward.
+  rebase with resolution, merge and fast-forward. (Built: a resolution lands a merge
+  commit, so its retry answers by reachability, as a merge does.)
 * Lost response, a revert of the change on the branch, retry: `AlreadyLanded`, the
   revert stays, nothing replayed (the case of 1).
 * A batch: every member recorded, a retried member answers `AlreadyLanded`.
@@ -164,8 +191,8 @@ after this plan.
   catches up and answers `AlreadyLanded`. In the database the row and the changeset are
   one transaction (a test that fails the row insert fails the changeset).
 * The payload bound: a batch of `max_size` members with the longest branch name fits.
-* The SDK: `RebaseLands` on by default again; an end-to-end retry after a forced lost
-  response.
+* The SDK: rebase lands retried by default again; an end-to-end retry after a forced
+  lost response.
 
 ## 8. Ownership needed
 

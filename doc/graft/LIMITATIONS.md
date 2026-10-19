@@ -182,6 +182,20 @@ Git hooks use private.
   concurrent writer is only detected when the snapshot is published. The land
   then fails after one attempt with `reference_update`, and the client has to
   land again. The changeset log only lists the lands that were published.
+- A change that landed is not landed again from the same `commit_id` on the
+  same branch while the commit it landed as is on the branch, also when a
+  later commit reverted it: the land answers `already_landed` and names the
+  revert when its message says "This reverts commit <id>" (the land identity
+  of [PLAN11](PLAN11.md)). Landing it again needs a new commit: a revert of
+  the revert, or the change committed again. A branch reset past the land
+  lands the change again.
+- The land identity is recorded in the changeset log. With
+  `[graft.changelog] disabled = true` nothing is recorded, and a retried
+  rebase land replays the change: a change reverted in between lands again.
+- In the file changelog, the land identity index (`graft/changelog.lands`)
+  holds every land of the repository and is kept in memory for the 64 most
+  recently used repositories of a process; a repository beyond them reads its
+  index file again on its next land that diverges.
 - Hooks run on every attempt, so a slow custom hook adds latency under
   contention.
 - `graft land --strategy merge` and `ff_only` are available in the CLI. The
