@@ -274,10 +274,28 @@ temporary directory and runs `command` there, with a minimal environment
 (`PATH`, and `HOME` and `TMPDIR` in a directory of their own). A non-zero exit or a
 timeout rejects the resolution: the land fails, every file of the package is
 `REJECTED`, and the reason is `verification failed:` with the exit status and
-the first 4 KiB of the output. The command runs on the server, with the
-server's rights, on code that agents wrote: treat it as a custom hook. It
-also costs time on every resolution, which is why it is off by default; the
-trailers and `graft-verify` remain the safety net.
+the first 4 KiB of the output.
+
+**A verify command such as a build or a test suite executes code from the
+merged tree: code that agents and the AI wrote, run as the gitaly user on the
+server.** The server only limits the environment of the command (`PATH`,
+`HOME`, `TMPDIR`); that is not a sandbox. The command can read what the gitaly
+user can read, reach the network, and leave processes behind if it forks
+away from its process group. Run it inside an isolation boundary that you
+control: a container, or a separate unprivileged user without network
+access. For example, a wrapper that runs the build in a throwaway container
+with the checkout mounted read-only and no network:
+
+```sh
+#!/bin/sh
+# /usr/local/bin/graft-check-build: run from the checkout by the server.
+exec docker run --rm --network=none --read-only --tmpfs /tmp \
+  --user 65534:65534 --memory 2g --pids-limit 512 \
+  -v "$PWD":/src:ro -w /src golang:1.26 go build ./...
+```
+
+It also costs time on every resolution, which is why it is off by default;
+the trailers and `graft-verify` remain the safety net.
 
 ## Finding and reverting AI resolutions
 
