@@ -1773,6 +1773,30 @@ every entry point returns `FailedPrecondition`.
 | WP78 | proto, handlers, SDK, CLI | WP74, WP75 |
 | WP79 | e2e, STORAGE.md and CONFIGURATION.md, benchmark | all |
 
+**As implemented (WP79, e2e and docs; the benchmark waits for its window).**
+* `storage_gc_test.go`, in-process servers sharing the database and the
+  bucket, on SQLite and Postgres:
+  * a repository written on two nodes is checkpointed on node A;
+  * node B collects every covered changeset pack once the checkpoint is
+    gc_grace old;
+  * a node that joins after the collection hydrates from the checkpoint and
+    serves every write;
+  * writes go on and every node serves them;
+  * an orphan pack and a removed repository are collected.
+* `storage_localrefs_test.go`, the real `gitaly` binary:
+  * the daily housekeeping, scheduled a minute ahead, backfills the
+    keep-around references of a review written without them (the
+    authoritative `Housekeep` path end to end);
+  * the background maintenance checkpoints;
+  * the deferred durability scenarios.
+* STORAGE.md:
+  * checkpoints and garbage collection for operators;
+  * the clock assumption of `gc_margin`, precisely: a rate drift over
+    `gc_grace`, with a forward jump of the database clock counting;
+  * the configuration;
+  * the milestone's e2e.
+* CONFIGURATION.md: every key.
+
 **Opus writes** everything that deletes data, is concurrent, is a compare-and-swap
 or is crash recovery: WP71–WP77 entirely, the handlers of WP78, and the race, crash
 and e2e tests. **Haiku drafts** from an exact spec, monitored and checked by Opus:

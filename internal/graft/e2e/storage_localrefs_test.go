@@ -25,11 +25,14 @@ import (
 	"github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/coretest"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/localrefs"
 	"github.com/feder-cr/git-ai/internal/graft/corestore/sqlstore"
+	"github.com/feder-cr/git-ai/internal/helper/duration"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/feder-cr/git-ai/sdk"
 )
 
@@ -185,6 +188,13 @@ func (n *realNode) log(t *testing.T) string {
 }
 
 func (n *realNode) storagePath() string { return n.cfg.Storages[0].Path }
+
+// git runs git in the node's local copy of the repository, reading the disk
+// directly.
+func (n *realNode) git(t *testing.T, relPath string, args ...string) string {
+	t.Helper()
+	return strings.TrimSpace(string(gittest.Exec(t, n.cfg, append([]string{"-C", n.repoPath(relPath)}, args...)...)))
+}
 
 // freeAddr returns a local TCP address that was free a moment ago.
 func freeAddr(t *testing.T) string {
@@ -487,6 +497,66 @@ func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
 	require.Eventually(t, func() bool { return strings.Contains(n.log(t), "storage core: checkpoint created") },
 		60*time.Second, 100*time.Millisecond, "the maintenance checkpoints the repository")
 	n.requireServed(t, rel, written)
+}
+
+// TestStorageHousekeepingBackfillsReviewRoots runs the daily housekeeping of
+// the real server in authoritative mode (doc/graft/PLAN7.md, REVIEW ROOTS RULE,
+// the backstop of the daily worker): a review written without the keep-around
+// references of its commits (a review from before the rule) gets them, in the
+// database and on the node, through the ordinary write path.
+func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
+	t.Parallel()
+
+	// The daily worker starts at a minute of the clock: the next one that the
+	// server is sure to see as future.
+	start := time.Now().Add(time.Minute)
+	if start.Second() > 40 {
+		start = start.Add(time.Minute)
+	}
+	n := newRealNode(t)
+	n.cfg.DailyMaintenance = config.DailyJob{
+		Hour:     uint(start.Hour()),
+		Minute:   uint(start.Minute()),
+		Duration: duration.Duration(5 * time.Minute),
+		Storages: []string{n.cfg.Storages[0].Name},
+	}
+	n.cfgPath = testcfg.WriteTemporaryGitalyConfigFile(t, n.cfg)
+	n.start(t)
+
+	rel := n.createRepository(t)
+	onA := n.agent(t, rel)
+	base, err := commitFile(n.ctx, onA, workerName(0), "main", "", "README.md", "base\n")
+	require.NoError(t, err)
+	head, err := commitFile(n.ctx, onA, workerName(0), "topic", base, "topic.txt", "topic\n")
+	require.NoError(t, err)
+	state, err := n.operator(t, rel).StorageState(n.ctx)
+	require.NoError(t, err)
+
+	// A review from before the rule: recorded without its roots.
+	meta, err := sqlstore.Open(n.ctx, n.cfg.Graft.Storage.Database)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = meta.Close() })
+	_, err = meta.InsertReview(n.ctx, state.RepositoryID, func(id string) (*gitalypb.Review, error) {
+		return &gitalypb.Review{Id: id, TargetBranch: []byte("main"), HeadCommitId: head, BaseCommitId: base, Title: []byte("before the rule")}, nil
+	}, false)
+	require.NoError(t, err)
+
+	roots := []string{corestore.KeepAroundRef(head), corestore.KeepAroundRef(base)}
+	require.Eventually(t, func() bool {
+		refs, _, err := meta.Refs(n.ctx, state.RepositoryID)
+		require.NoError(t, err)
+		for _, root := range roots {
+			if refs[root].Absent() {
+				return false
+			}
+		}
+		return true
+	}, 4*time.Minute, time.Second, "the daily housekeeping backfills the roots")
+	require.GreaterOrEqual(t, n.counter(t, "graft_review_roots_backfilled_total"), float64(len(roots)))
+	for _, root := range roots {
+		require.NotEmpty(t, n.git(t, rel, "rev-parse", "--verify", root), "the node has %s", root)
+	}
+	n.requireServed(t, rel, map[string]string{"main": base, "topic": head})
 }
 
 // TestStorageLocalReferencesStackDepthIsBounded writes many references

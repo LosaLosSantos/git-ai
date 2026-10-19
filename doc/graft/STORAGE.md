@@ -322,6 +322,28 @@ authoritative mode.
 
 ### Checkpoints and garbage collection
 
+How it stays safe:
+- Every write uploads its pack under a new key of its own, and commits the
+  database row that references it within `gc_grace - gc_margin` of a database
+  read that found the repository. A write that misses that deadline fails, and
+  its pack is an orphan.
+- Garbage collection deletes a pack only when:
+  - no row references it, and the collector itself observed that at least
+    `gc_grace` earlier;
+  - or it is covered by a checkpoint created at least `gc_grace` ago.
+- Every "how old" decision uses the database clock: Postgres's `now()`; with
+  SQLite, the host clock, since SQLite serves one host. The clocks of the
+  nodes never decide.
+- A writer measures its deadline on its own monotonic clock, so the steps of
+  a node's wall clock do not matter. The assumption is that, over `gc_grace`,
+  the writer's clock runs at most `gc_margin` slower than the database's, a
+  forward jump of the database clock included. With the defaults, 5 minutes
+  over an hour. Do not step the database host's clock forward by more than
+  `gc_margin`.
+- `gc_grace` must also be greater than `sync_timeout + gc_margin`, so that a
+  sync that started from an older checkpoint never meets a pack deleted under
+  it.
+
 ```sh
 graft storage checkpoint -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--json]
 graft storage gc         -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--dry-run] [--json]
@@ -531,6 +553,18 @@ or re-import the repository from scratch (see
 - **A corrupt dirty marker** stops `gitaly serve` at startup with the marker's
   path: the repository it named cannot be identified. Check the storage, then
   remove the marker; the repository's next request hydrates it if it is stale.
+
+Milestone 3 is proved by `internal/graft/e2e/storage_gc_test.go` and
+`storage_localrefs_test.go`, on SQLite and Postgres:
+- a repository written on two nodes is checkpointed on one; the other collects
+  the covered packs once the checkpoint is `gc_grace` old;
+- a node that joins afterwards hydrates from the checkpoint and serves every
+  write, and writes go on after the collection;
+- orphan packs and removed repositories are collected;
+- with the real `gitaly` binary: the deferred reference durability across
+  process kills, a simulated power loss and a graceful upgrade; the background
+  maintenance; and the daily housekeeping that backfills the keep-around
+  references of a review from before the REVIEW ROOTS RULE.
 
 These behaviours are proved by the end-to-end tests
 `internal/graft/e2e/storage_*_test.go`, with several real servers sharing one
