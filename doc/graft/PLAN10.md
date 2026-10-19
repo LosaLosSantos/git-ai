@@ -1451,22 +1451,42 @@ whitespace; a model that CHOOSES cannot. The same llm strategy gets a first step
 constraints and the pre-registered gate BEFORE any paid arm; it changes no product code, and nothing here
 goes into the product without Federico's decision after the measurement.
 
-* **One strategy, a first step.** For each region of the file (git's, 15.10) the model picks one token from a
-  fixed vocabulary: `OURS`, `THEIRS`, `OURS+THEIRS`, `THEIRS+OURS`, `NEEDS-MERGE`, in plain text inside the
-  nonce tags, with the same context as the writer's request (sides, base, both changes, both messages). If
-  every region is a pick, the server assembles the file deterministically from the sides and the clean
-  segments of the merge: the answer holds no line that no side has and no whitespace of the model's. If any
-  region says NEEDS-MERGE, the file goes to today's writer path (15.10) and becomes a proposal as now. The
-  origin stays "model" (15.9), and the single landing rule of `decideLand` is unchanged: a resolution lands
-  only through the verification on the exact tree. Nothing else lands.
-* **The gate is fixed before it is measured.** "Every region picked identically by all N cross-family models,
-  plus the verification." N and the model set are tuned on the corpus OUTSIDE the 300 (a family-stratified
-  subsample of it: the corpus is 48% one repository, see below, and a plain sample would be tuned on that
-  repository) and confirmed once on the 300, held out. The target of at most 5% wrong among what lands is
-  reported as met only if the Wilson 95% upper bound of the wrong rate is at most 5%, under BOTH judges:
-  the strict one (the human's file after normalization) and judge A (the reference-based LLM judge adapted
-  from ConflictAgent's rubric, MIT, measured offline; it tolerates whitespace, order and equivalent phrasing). Under neither is the point
-  estimate enough.
+* **Each part does what it is good at.** Git computes the facts (the regions, the sides, the base). A
+  decision model, **Jev** (`typesafe/jev-1.14` through OpenRouter, TypeSafe's calibrated decision model; it
+  cannot write code), DECIDES per region among `OURS`, `THEIRS`, `OURS+THEIRS`, `THEIRS+OURS`,
+  `NEEDS-MERGE`, and returns a probability for every option. A language model WRITES only where Jev says
+  NEEDS-MERGE (2-3 screened writers produce candidates; Jev then chooses among the distinct candidates of the
+  region plus "none: send to the agent"). Deterministic checks and the verification decide landing. The
+  single landing rule of `decideLand` is unchanged: a resolution lands only through the verification on the
+  exact tree, the origin stays "model" (15.9), and nothing else lands.
+* **One strategy, a first step.** If every region is a pick, the server assembles the file deterministically
+  from the sides and the clean segments of the merge: the answer holds no line that no side has and no
+  whitespace of a model's. If any region needs a merge, the file goes to today's writer path (15.10) and
+  becomes a proposal as now.
+* **How Jev is called** (probed 2026-10-19, two calls, $0.000022 each): `POST https://openrouter.ai/api/v1/systemone`
+  with the OpenRouter key, body `{model, state, questions:{id:{type:"choice", instructions, criteria:{option:
+  description}}}}`; the answer per question is `{choice, probabilities:{option:p}, confidence}` and `usage.cost`
+  is in the response. One request per file: the state (path, per region base/ours/theirs lines with context,
+  both commit messages) is ingested once and each region is one question. At most 255 options, 32 MiB; default
+  context 64k per request and 32k per question (a header raises both to 262k, slower and less accurate, and is
+  not used until a file needs it). The model is priced per input token only ($0.042 per million). Jev leans
+  toward the FIRST option (TypeSafe's own jaggedness note, confirmed by the probe: the same question with the
+  options reversed moved OURS+THEIRS from 0.69 to 0.54 and NEEDS-MERGE from 0.15 to 0.26), so every decision
+  is asked in two orders and the probabilities are averaged; a decision whose argmax differs between the two
+  orders is NEEDS-MERGE.
+* **The gate is fixed before it is measured.** "Jev's averaged probability for the picked option is at least
+  tau in every region of the file, no region is NEEDS-MERGE, plus the verification." (A cross-family
+  agreement gate, "every region picked identically by all N models", is measured beside it.) tau, and N and
+  the model set for the agreement gate, are tuned on half of a family-stratified sample of the corpus OUTSIDE
+  the 300 (the corpus is 48% one repository, see below, and a plain sample would be tuned on that repository;
+  spring-boot is capped in the sample) and then FROZEN; the other half and the 300 are the held-out
+  confirmation, reported separately and pooled. The target of at most 5% wrong among what lands is reported as met
+  only if the Wilson 95% upper bound of the wrong rate is at most 5%, under BOTH judges: the strict one (the
+  human's file after normalization) and judge A (the reference-based LLM judge adapted from ConflictAgent's
+  rubric, MIT, measured offline; it tolerates whitespace, order and equivalent phrasing). Under neither is
+  the point estimate enough. That bound needs about 75 landed files with none wrong, 150 with one, 300 with
+  three; the ceiling below says what a sample can reach. Everything is judged against the constant policy
+  "always THEIRS" and reported with and without spring-boot.
 * **Concatenations are measured, not assumed.** `OURS+THEIRS` and `THEIRS+OURS` stay in the vocabulary only if
   the data shows they are safe: their precision is reported separately from the single-side picks, and if it
   is clearly worse they are dropped from the vocabulary (those regions become NEEDS-MERGE), not special-cased.
