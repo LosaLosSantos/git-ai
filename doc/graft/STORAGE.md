@@ -320,6 +320,38 @@ registration gets a new repository ID and a full pack, and takes the changelog
 and the reviews from the files again, so do this before switching to
 authoritative mode.
 
+### Checkpoints and garbage collection
+
+```sh
+graft storage checkpoint -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--json]
+graft storage gc         -address unix:/var/opt/graft/gitaly.sock -repo @hashed/ab/cd/x.git [--dry-run] [--json]
+graft storage gc --removed -address unix:/var/opt/graft/gitaly.sock [-storage default] [--dry-run] [--json]
+```
+
+- `checkpoint` (authoritative mode) consolidates the repository at its current
+  database head: one pack of every object reachable from its references, and
+  the reference snapshot. A fresh node then hydrates from the checkpoint
+  instead of replaying every changeset, and garbage collection can delete the
+  packs the checkpoint covers. A checkpoint that exists at the head is
+  reported, not built again.
+- `gc` deletes the packs of one repository that no reader needs any more:
+  - the changeset packs covered by a checkpoint at least `gc_grace` old, and
+    the checkpoints that one supersedes;
+  - the objects no database row references, once garbage collection observed
+    them unreferenced at least `gc_grace` earlier (the packs of writes that
+    died before their database commit). The first run only observes them.
+
+  It runs in shadow mode too (orphans only: there are no checkpoints). It holds
+  the repository's maintenance lease while it runs, and fails with
+  `FailedPrecondition` when another maintenance of the repository (the
+  background one, another node) holds it.
+- `gc --removed` deletes every object of the repositories of the storage that
+  were removed at least `gc_grace` ago.
+- `--dry-run` reports what would be deleted and changes nothing.
+
+These commands are for operators: they need the shared token, and an agent
+token is refused.
+
 ### Switching from shadow to authoritative
 
 1. Run every node in shadow mode and import every repository
@@ -622,9 +654,10 @@ show:
   packs, and there is no virtual filesystem.
 - **Checkpoints and pack garbage collection run in the background only when
   `maintenance = "auto"`** (authoritative mode; off by default). Without it,
-  packs are never deleted and hydration replays every changeset after the
-  newest checkpoint, from 1 when there is none. The on-demand `graft storage`
-  commands for both are not available yet.
+  they run when an operator runs `graft storage checkpoint` and `graft storage
+  gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection));
+  otherwise packs are never deleted and hydration replays every changeset after
+  the newest checkpoint, from 1 when there is none.
 - **Praefect is not supported in authoritative mode.** Configuration validation
   requires `[graft] standalone = true` for authoritative mode. Shadow mode
   works with or without Praefect.

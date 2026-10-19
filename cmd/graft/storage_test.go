@@ -99,6 +99,53 @@ func TestCLIStorageAgainstServer(t *testing.T) {
 	require.Equal(t, []sdk.StorageDivergence{{Reference: "refs/heads/rogue", LocalTarget: main.String()}}, verify.Divergences)
 }
 
+// TestCLIStorageMaintenanceAgainstServer drives graft storage checkpoint and gc
+// against a real server whose storage core runs in authoritative mode. It runs
+// serially because the CLI tests share the package-level backend factory.
+func TestCLIStorageMaintenanceAgainstServer(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	cfg.Graft.Standalone = true
+	core := coretest.Open(t, coretest.Options{Mode: corestore.ModeAuthoritative})
+	addr := testserver.RunGitalyServer(t, cfg, setup.RegisterAll, testserver.WithGraftStorage(core))
+
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+	server := []string{"-address", addr, "-storage", repo.GetStorageName()}
+	target := append(append([]string{}, server...), "-repo", repo.GetRelativePath())
+	cli := func(args ...string) (int, string, string) {
+		return runCLI(t, append(append([]string{"storage"}, args...), target...)...)
+	}
+
+	code, _, stderr := cli("import")
+	require.Equal(t, exitOK, code, stderr)
+
+	code, stdout, stderr := cli("checkpoint")
+	require.Equal(t, exitOK, code, stderr)
+	require.Regexp(t, `^checkpoint created at changeset 1: 2 references, pack [1-9][0-9]* bytes\n$`, stdout)
+
+	code, stdout, stderr = cli("checkpoint", "--json")
+	require.Equal(t, exitOK, code, stderr)
+	var checkpoint sdk.StorageCheckpoint
+	require.NoError(t, json.Unmarshal([]byte(stdout), &checkpoint))
+	require.False(t, checkpoint.Created, "a checkpoint at the head exists")
+	require.EqualValues(t, 1, checkpoint.Sequence)
+
+	code, stdout, stderr = cli("gc", "--dry-run", "--json")
+	require.Equal(t, exitOK, code, stderr)
+	var gc sdk.StorageGC
+	require.NoError(t, json.Unmarshal([]byte(stdout), &gc))
+	require.True(t, gc.DryRun)
+
+	code, stdout, stderr = cli("gc")
+	require.Equal(t, exitOK, code, stderr)
+	require.Contains(t, stdout, "deleted 0 objects (0 bytes)")
+
+	code, stdout, stderr = runCLI(t, append([]string{"storage", "gc", "--removed"}, server...)...)
+	require.Equal(t, exitOK, code, stderr)
+	require.Equal(t, "deleted 0 objects (0 bytes) of 0 removed repositories of storage "+repo.GetStorageName()+"\n", stdout)
+}
+
 // TestCLIStorageCoreOff checks that a server without a storage core reports
 // mode off and refuses an import.
 func TestCLIStorageCoreOff(t *testing.T) {
@@ -121,11 +168,15 @@ func TestCLIStorageUsageErrorsDoNotContactServer(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "missing")
 
 	cases := map[string][]string{
-		"no subcommand":      {"storage", "-C", dir},
-		"unknown subcommand": {"storage", "repair", "-C", dir},
-		"import with arg":    {"storage", "import", "-C", dir, "extra"},
-		"state with arg":     {"storage", "state", "-C", dir, "extra"},
-		"verify with arg":    {"storage", "verify", "-C", dir, "extra"},
+		"no subcommand":             {"storage", "-C", dir},
+		"unknown subcommand":        {"storage", "repair", "-C", dir},
+		"import with arg":           {"storage", "import", "-C", dir, "extra"},
+		"state with arg":            {"storage", "state", "-C", dir, "extra"},
+		"verify with arg":           {"storage", "verify", "-C", dir, "extra"},
+		"checkpoint with arg":       {"storage", "checkpoint", "-C", dir, "extra"},
+		"gc with arg":               {"storage", "gc", "-C", dir, "extra"},
+		"gc removed and repo":       {"storage", "gc", "--removed", "-C", dir, "-repo", "a.git"},
+		"gc removed without server": {"storage", "gc", "--removed", "-C", dir},
 	}
 	for name, args := range cases {
 		code, _, stderr := runCLI(t, args...)

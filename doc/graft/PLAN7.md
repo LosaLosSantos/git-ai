@@ -1536,6 +1536,29 @@ graft storage gc --removed [-storage S] [--dry-run] [--json]
 `gc -repo R` touches only that repository (answer 1); `--removed` is the storage-wide
 sweep of removed repositories and takes no `-repo`.
 
+**As implemented (WP78).**
+* `CreateCheckpointResponse` has no `review_commits`: since the REVIEW ROOTS
+  RULE the review commits are references, counted in `references`.
+* `CollectGarbage` takes the lease as `maintenance.RequestLeaseHolder`:
+  `node_id/PID/request-N`, unique per request. So a request excludes the
+  background runs (`node_id/PID`), and the other requests, of its own process
+  too.
+* The SDK methods are in `sdk/storage.go`, already among the operator-only
+  sources of the agent allowlist test, not in a new `sdk/storage_gc.go`.
+* `graft storage gc --removed` dials a client of the server without a
+  repository: the workspace backend requires one.
+* The handlers map the errors of `checkpoint` and `gc`, which carry their
+  codes. Off is `FailedPrecondition`; a checkpoint in shadow mode is
+  `FailedPrecondition`; an untracked repository is `NotFound`; an unknown
+  storage is `InvalidArgument`.
+* Tests:
+  * the handlers on SQLite and Postgres: created and idempotent, refusals, an
+    orphan collected after the grace, dry run, lease held by another holder
+    and released after the request, removed repositories;
+  * the SDK against a fake;
+  * the CLI against a real authoritative server (`checkpoint`, `gc`,
+    `gc --dry-run --json`, `gc --removed`) and its usage errors.
+
 ## Rejected alternatives
 
 * **Local-only hidden keep-alive references for review roots** (option b of the

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -83,6 +84,23 @@ type Runner struct {
 
 var _ prometheus.Collector = (*Runner)(nil)
 
+// LeaseHolder names the background maintenance of this process in the
+// maintenance leases of core: the node ID and the process ID, so that two
+// processes of one node (a graceful upgrade) never both hold a lease.
+func LeaseHolder(core *corestore.Core) string {
+	return fmt.Sprintf("%s/%d", core.NodeID, os.Getpid())
+}
+
+// requests numbers the on-demand maintenance operations of the process.
+var requests atomic.Uint64
+
+// RequestLeaseHolder names one on-demand maintenance operation of this process
+// (a StorageCoreService RPC): a holder of its own, so that it excludes the
+// background runs and the other operations.
+func RequestLeaseHolder(core *corestore.Core) string {
+	return fmt.Sprintf("%s/request-%d", LeaseHolder(core), requests.Add(1))
+}
+
 // New returns the runner of core for the node's storages.
 func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collector, fresh corestore.Freshener, logger log.Logger, cfg Config, storages []string) *Runner {
 	r := &Runner{
@@ -93,7 +111,7 @@ func New(core *corestore.Core, cp *checkpoint.Checkpointer, collector *gc.Collec
 		logger:    logger,
 		cfg:       cfg,
 		storages:  storages,
-		holder:    fmt.Sprintf("%s/%d", core.NodeID, os.Getpid()),
+		holder:    LeaseHolder(core),
 		runs: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "graft_storage_maintenance_runs_total",
 			Help: "Runs of the background maintenance of the storage core, by result (ok, error: at least one step failed).",

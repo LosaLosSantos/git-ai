@@ -19,9 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	StorageCoreService_ImportRepository_FullMethodName = "/gitaly.StorageCoreService/ImportRepository"
-	StorageCoreService_GetStorageState_FullMethodName  = "/gitaly.StorageCoreService/GetStorageState"
-	StorageCoreService_VerifyRepository_FullMethodName = "/gitaly.StorageCoreService/VerifyRepository"
+	StorageCoreService_ImportRepository_FullMethodName           = "/gitaly.StorageCoreService/ImportRepository"
+	StorageCoreService_GetStorageState_FullMethodName            = "/gitaly.StorageCoreService/GetStorageState"
+	StorageCoreService_VerifyRepository_FullMethodName           = "/gitaly.StorageCoreService/VerifyRepository"
+	StorageCoreService_CreateCheckpoint_FullMethodName           = "/gitaly.StorageCoreService/CreateCheckpoint"
+	StorageCoreService_CollectGarbage_FullMethodName             = "/gitaly.StorageCoreService/CollectGarbage"
+	StorageCoreService_CollectRemovedRepositories_FullMethodName = "/gitaly.StorageCoreService/CollectRemovedRepositories"
 )
 
 // StorageCoreServiceClient is the client API for StorageCoreService service.
@@ -50,6 +53,23 @@ type StorageCoreServiceClient interface {
 	// optionally checks the connectivity of the local repository. In
 	// authoritative mode the local repository is caught up first.
 	VerifyRepository(ctx context.Context, in *VerifyRepositoryRequest, opts ...grpc.CallOption) (*VerifyRepositoryResponse, error)
+	// CreateCheckpoint builds a checkpoint of the repository at its current
+	// database head and records it: one pack of every object reachable from the
+	// references at the head, with the reference snapshot, so that hydration
+	// starts from it and garbage collection can delete the packs it covers. It
+	// fails with FailedPrecondition outside authoritative mode.
+	CreateCheckpoint(ctx context.Context, in *CreateCheckpointRequest, opts ...grpc.CallOption) (*CreateCheckpointResponse, error)
+	// CollectGarbage deletes the packs of the repository that no reader needs
+	// any more: the objects no row references once they were observed so at
+	// least gc_grace ago, the changeset packs covered by a checkpoint at least
+	// gc_grace old, and the checkpoints that one supersedes. It touches no other
+	// repository. It fails with FailedPrecondition when the storage core is off,
+	// or while another maintenance of the repository holds its lease.
+	CollectGarbage(ctx context.Context, in *CollectGarbageRequest, opts ...grpc.CallOption) (*CollectGarbageResponse, error)
+	// CollectRemovedRepositories deletes every object of the repositories of a
+	// storage that were removed at least gc_grace ago. It fails with
+	// FailedPrecondition when the storage core is off.
+	CollectRemovedRepositories(ctx context.Context, in *CollectRemovedRepositoriesRequest, opts ...grpc.CallOption) (*CollectRemovedRepositoriesResponse, error)
 }
 
 type storageCoreServiceClient struct {
@@ -90,6 +110,36 @@ func (c *storageCoreServiceClient) VerifyRepository(ctx context.Context, in *Ver
 	return out, nil
 }
 
+func (c *storageCoreServiceClient) CreateCheckpoint(ctx context.Context, in *CreateCheckpointRequest, opts ...grpc.CallOption) (*CreateCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateCheckpointResponse)
+	err := c.cc.Invoke(ctx, StorageCoreService_CreateCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *storageCoreServiceClient) CollectGarbage(ctx context.Context, in *CollectGarbageRequest, opts ...grpc.CallOption) (*CollectGarbageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CollectGarbageResponse)
+	err := c.cc.Invoke(ctx, StorageCoreService_CollectGarbage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *storageCoreServiceClient) CollectRemovedRepositories(ctx context.Context, in *CollectRemovedRepositoriesRequest, opts ...grpc.CallOption) (*CollectRemovedRepositoriesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CollectRemovedRepositoriesResponse)
+	err := c.cc.Invoke(ctx, StorageCoreService_CollectRemovedRepositories_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StorageCoreServiceServer is the server API for StorageCoreService service.
 // All implementations must embed UnimplementedStorageCoreServiceServer
 // for forward compatibility.
@@ -116,6 +166,23 @@ type StorageCoreServiceServer interface {
 	// optionally checks the connectivity of the local repository. In
 	// authoritative mode the local repository is caught up first.
 	VerifyRepository(context.Context, *VerifyRepositoryRequest) (*VerifyRepositoryResponse, error)
+	// CreateCheckpoint builds a checkpoint of the repository at its current
+	// database head and records it: one pack of every object reachable from the
+	// references at the head, with the reference snapshot, so that hydration
+	// starts from it and garbage collection can delete the packs it covers. It
+	// fails with FailedPrecondition outside authoritative mode.
+	CreateCheckpoint(context.Context, *CreateCheckpointRequest) (*CreateCheckpointResponse, error)
+	// CollectGarbage deletes the packs of the repository that no reader needs
+	// any more: the objects no row references once they were observed so at
+	// least gc_grace ago, the changeset packs covered by a checkpoint at least
+	// gc_grace old, and the checkpoints that one supersedes. It touches no other
+	// repository. It fails with FailedPrecondition when the storage core is off,
+	// or while another maintenance of the repository holds its lease.
+	CollectGarbage(context.Context, *CollectGarbageRequest) (*CollectGarbageResponse, error)
+	// CollectRemovedRepositories deletes every object of the repositories of a
+	// storage that were removed at least gc_grace ago. It fails with
+	// FailedPrecondition when the storage core is off.
+	CollectRemovedRepositories(context.Context, *CollectRemovedRepositoriesRequest) (*CollectRemovedRepositoriesResponse, error)
 	mustEmbedUnimplementedStorageCoreServiceServer()
 }
 
@@ -134,6 +201,15 @@ func (UnimplementedStorageCoreServiceServer) GetStorageState(context.Context, *G
 }
 func (UnimplementedStorageCoreServiceServer) VerifyRepository(context.Context, *VerifyRepositoryRequest) (*VerifyRepositoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VerifyRepository not implemented")
+}
+func (UnimplementedStorageCoreServiceServer) CreateCheckpoint(context.Context, *CreateCheckpointRequest) (*CreateCheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateCheckpoint not implemented")
+}
+func (UnimplementedStorageCoreServiceServer) CollectGarbage(context.Context, *CollectGarbageRequest) (*CollectGarbageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectGarbage not implemented")
+}
+func (UnimplementedStorageCoreServiceServer) CollectRemovedRepositories(context.Context, *CollectRemovedRepositoriesRequest) (*CollectRemovedRepositoriesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectRemovedRepositories not implemented")
 }
 func (UnimplementedStorageCoreServiceServer) mustEmbedUnimplementedStorageCoreServiceServer() {}
 func (UnimplementedStorageCoreServiceServer) testEmbeddedByValue()                            {}
@@ -210,6 +286,60 @@ func _StorageCoreService_VerifyRepository_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StorageCoreService_CreateCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageCoreServiceServer).CreateCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageCoreService_CreateCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageCoreServiceServer).CreateCheckpoint(ctx, req.(*CreateCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StorageCoreService_CollectGarbage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CollectGarbageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageCoreServiceServer).CollectGarbage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageCoreService_CollectGarbage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageCoreServiceServer).CollectGarbage(ctx, req.(*CollectGarbageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StorageCoreService_CollectRemovedRepositories_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CollectRemovedRepositoriesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StorageCoreServiceServer).CollectRemovedRepositories(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StorageCoreService_CollectRemovedRepositories_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StorageCoreServiceServer).CollectRemovedRepositories(ctx, req.(*CollectRemovedRepositoriesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StorageCoreService_ServiceDesc is the grpc.ServiceDesc for StorageCoreService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -228,6 +358,18 @@ var StorageCoreService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VerifyRepository",
 			Handler:    _StorageCoreService_VerifyRepository_Handler,
+		},
+		{
+			MethodName: "CreateCheckpoint",
+			Handler:    _StorageCoreService_CreateCheckpoint_Handler,
+		},
+		{
+			MethodName: "CollectGarbage",
+			Handler:    _StorageCoreService_CollectGarbage_Handler,
+		},
+		{
+			MethodName: "CollectRemovedRepositories",
+			Handler:    _StorageCoreService_CollectRemovedRepositories_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

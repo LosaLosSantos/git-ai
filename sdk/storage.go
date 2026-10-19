@@ -147,6 +147,125 @@ func (r *Repo) StorageVerify(ctx context.Context, connectivity bool) (*StorageVe
 	return out, nil
 }
 
+// StorageCheckpoint is the outcome of checkpointing a repository.
+type StorageCheckpoint struct {
+	// Sequence is the changeset sequence the checkpoint is at; 0 when the
+	// repository has no object to consolidate (every reference is symbolic).
+	Sequence uint64 `json:"sequence"`
+	// Created is false when a checkpoint at the head existed already.
+	Created bool `json:"created"`
+	// PackBytes is the size of the checkpoint's pack.
+	PackBytes int64 `json:"pack_bytes"`
+	// References is the number of references in the checkpoint's snapshot.
+	References uint32 `json:"references"`
+}
+
+// StorageGC is what garbage collection of one repository deleted, or would
+// delete in a dry run.
+type StorageGC struct {
+	// Boundary is the sequence of the newest checkpoint at least gc_grace old,
+	// 0 when there is none.
+	Boundary uint64 `json:"boundary"`
+	// CoveredDeleted are the changeset packs covered by the boundary.
+	CoveredDeleted uint32 `json:"covered_deleted"`
+	// CheckpointsDropped are the checkpoints superseded by the boundary.
+	CheckpointsDropped uint32 `json:"checkpoints_dropped"`
+	// OrphansDeleted are the unreferenced objects observed at least gc_grace ago.
+	OrphansDeleted uint32 `json:"orphans_deleted"`
+	// OrphansObserved are the unreferenced objects seen for the first time.
+	OrphansObserved uint32 `json:"orphans_observed"`
+	// OrphansInGrace are the unreferenced objects observed less than gc_grace ago.
+	OrphansInGrace uint32 `json:"orphans_in_grace"`
+	// PacksDeleted counts every object deleted.
+	PacksDeleted uint32 `json:"packs_deleted"`
+	// BytesReclaimed is the size of those objects.
+	BytesReclaimed int64 `json:"bytes_reclaimed"`
+	// DryRun tells that nothing was deleted or recorded.
+	DryRun bool `json:"dry_run"`
+}
+
+// StorageGCRemoved is what garbage collection of a storage's removed
+// repositories deleted, or would delete in a dry run.
+type StorageGCRemoved struct {
+	// Repositories is the number of removed repositories whose objects were
+	// deleted.
+	Repositories uint32 `json:"repositories"`
+	// PacksDeleted counts every object deleted.
+	PacksDeleted uint32 `json:"packs_deleted"`
+	// BytesReclaimed is the size of those objects.
+	BytesReclaimed int64 `json:"bytes_reclaimed"`
+	// DryRun tells that nothing was deleted or recorded.
+	DryRun bool `json:"dry_run"`
+}
+
+// StorageCheckpoint checkpoints the repository at its current database head:
+// one pack of every object reachable from its references, with the reference
+// snapshot, so that hydration starts from it and garbage collection can delete
+// the packs it covers. It fails with FailedPrecondition outside authoritative
+// mode.
+func (r *Repo) StorageCheckpoint(ctx context.Context) (*StorageCheckpoint, error) {
+	resp, err := r.storageCore().CreateCheckpoint(ctx, &gitalypb.CreateCheckpointRequest{
+		Repository: r.repository(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &StorageCheckpoint{
+		Sequence:   resp.GetCheckpointSequence(),
+		Created:    resp.GetCreated(),
+		PackBytes:  resp.GetPackBytes(),
+		References: resp.GetReferences(),
+	}, nil
+}
+
+// StorageGC deletes the packs of the repository that no reader needs any more
+// (with dryRun, only reports them). It touches no other repository. It fails
+// with FailedPrecondition when the storage core is off or another maintenance
+// of the repository is in progress.
+func (r *Repo) StorageGC(ctx context.Context, dryRun bool) (*StorageGC, error) {
+	resp, err := r.storageCore().CollectGarbage(ctx, &gitalypb.CollectGarbageRequest{
+		Repository: r.repository(),
+		DryRun:     dryRun,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &StorageGC{
+		Boundary:           resp.GetBoundary(),
+		CoveredDeleted:     resp.GetCoveredDeleted(),
+		CheckpointsDropped: resp.GetCheckpointsDropped(),
+		OrphansDeleted:     resp.GetOrphansDeleted(),
+		OrphansObserved:    resp.GetOrphansObserved(),
+		OrphansInGrace:     resp.GetOrphansInGrace(),
+		PacksDeleted:       resp.GetPacksDeleted(),
+		BytesReclaimed:     resp.GetBytesReclaimed(),
+		DryRun:             resp.GetDryRun(),
+	}, nil
+}
+
+// StorageGCRemoved deletes every object of the repositories of the storage
+// that were removed at least gc_grace ago (with dryRun, only reports them). An
+// empty storage is the client's storage (WithStorage). It fails with
+// FailedPrecondition when the storage core is off.
+func (c *Client) StorageGCRemoved(ctx context.Context, storage string, dryRun bool) (*StorageGCRemoved, error) {
+	if storage == "" {
+		storage = c.storage
+	}
+	resp, err := gitalypb.NewStorageCoreServiceClient(c.conn).CollectRemovedRepositories(ctx, &gitalypb.CollectRemovedRepositoriesRequest{
+		StorageName: storage,
+		DryRun:      dryRun,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &StorageGCRemoved{
+		Repositories:   resp.GetRepositories(),
+		PacksDeleted:   resp.GetPacksDeleted(),
+		BytesReclaimed: resp.GetBytesReclaimed(),
+		DryRun:         resp.GetDryRun(),
+	}, nil
+}
+
 // storageCore returns the storage core service client on the connection of the client.
 func (r *Repo) storageCore() gitalypb.StorageCoreServiceClient {
 	return gitalypb.NewStorageCoreServiceClient(r.client.conn)
