@@ -816,3 +816,213 @@ flag.
   * An AI-landed merge is signed Graft-Resolved-By: llm/<model> and Graft-Checked-By:
     syntax,composition, and the trace records the proposal and the report.
   * Everything above still applies: a resolution that fails a check is a proposal.
+
+## 15. gitai's resolver design
+
+**Principle.** A conflict is two changes to one base. Only the server holds the base, both
+histories, the landing commit and the agent's request, so the server is the place to check what
+it can check mechanically, and the agent, who decides, gets a proposal with an honest report of
+what was checked, not a bare guess.
+
+The four diagrams below are the source of truth of the flow. A code path that is in no diagram is a
+patch and is removed; a commit that changes the flow changes the diagrams in the same commit, and
+the reviewer checks the code against them with the table that follows. (planned) marks what does
+not exist yet; (not enabled) marks what is designed and measured but switched off.
+
+### 15.1 End to end
+
+```
+ agent: UserLand(branch, commit[, resolve_conflicts | resolution])
+   |
+   |-- resolution given? --yes--> PRECHECK, before the lane, in a discarded quarantine
+   |                               branch moved / change already landed -> skipped (lane answers)
+   |                               review: exact paths, modes, markers, pointer lines, size
+   |                               resolver check (syntax + operator checks), bounded slots
+   |                                 |
+   v                                 v
+ LANE (one per branch) ---------- landWithResolution: tip moved -> refuse, fresh PACKAGE
+   |                                 applies the precheck's verdicts; any failure -> PACKAGE
+   |                                 operator verify.command on the merged tree; fails -> PACKAGE
+   |                                 all good -> LAND as agent/<actor> (+ Graft-Checked-By)
+   v
+ 3-way merge of tip and commit
+   |-- clean -------------------------------------------------------------> LAND
+   |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
+   |-- conflicts, resolve_conflicts
+         |
+         v
+       list the conflicting files (bounded) -> one VERDICT per file (15.2)
+         |
+         v
+       decide: LAND only if every file is resolved by an operator rule (15.4)
+         |-- yes -> operator verify.command; passes -> merge commit signed by the rules -> LAND
+         |                                   fails  -> PACKAGE (every file REJECTED, reason)
+         |-- no  -> PACKAGE to the agent (merge_conflict detail): sides by OID, hunks,
+                    per-file outcome + reason, per-file proposal (+ its report, planned),
+                    the proposals kept under refs/graft/proposals/ (14)
+                      |
+                      v
+                    the agent resolves (takes, edits or replaces the proposals) and
+                    re-lands with resolution (top of this diagram)
+```
+
+### 15.2 Per file
+
+```
+ conflicting file
+   |
+   v
+ classify: path policy, shape, size, binary, lockfile, generated, minified
+   |-- not sendable ----------------------------------------> AGENT (NOT_SENT, reason)
+   v
+ operator rules in their order (trivial, union, rerere, command), each with the syntax check and
+ the operator's checks
+   |-- a rule resolved it ---------------------------------> VERDICT RULE (lands, 15.4)
+   v
+ AI configured? --no-------------------------------------> AGENT (FAILED: no strategy applied)
+   | yes
+   v
+ split into regions (3-way line diff); regions only one side changed are merged locally
+   |-- more than max_regions (20) ------------------------> AGENT (NOT_SENT: regions)
+   v
+ for each region, one call: PATCH = base->theirs (3 context lines), CODE = ours (3 anchors),
+ THEIRS' commit message; per-region checks: last answer block, anchors, newline rule, not a
+ patch, size, markers
+   |-- any region fails -------------------------------------> AGENT (REJECTED, reason; no proposal:
+   |                                                            all or nothing)
+   v
+ assemble the file; file checks: markers, tree-sitter syntax, operator checks
+   |-- a check fails ----------------------------------------> AGENT (REJECTED, reason)
+   v
+ composition report (15.3) (planned)
+   v
+ VERDICT PROPOSAL (PROPOSED, the proposal + its report)
+   [AI landing when every deterministic check passes: designed by Federico's amendment (14),
+    NOT ENABLED: the measurement in 15.5 shows no deterministic check that reaches the bar]
+```
+
+### 15.3 Composition report (planned; a report, not a gate)
+
+```
+ base B, ours O, theirs T, result R (normalized lines)
+   |
+   v
+ diff3 regions of (B, O, T); does R keep every clean segment, in order?
+   |-- no --------------------------------------------------> "changes lines outside the conflicts"
+   v
+ each region's slot in R; each side's hunks of base->side inside the region
+   |
+   v
+ hunk the other side did not touch (uncontested):
+   its added lines in the slot, its deleted lines gone --> "keeps <side>'s change at a-b"
+   otherwise -------------------------------------------> "drops <side>'s change at base a-b"
+ hunk whose base lines the other side also edited (contested):
+   --------------------------------------------------------> "contested region resolved freely"
+                                                              (nothing line-level to verify)
+ a line both sides added, repeated more than either has it -> "duplicates a line both sides added"
+ a line in none of B, O, T --------------------------------> "content in neither side" (warning)
+```
+
+### 15.4 The one decision point
+
+```
+ decide (today: resolveLandConflicts, with landAnswerProposes; one function, planned: decideLand)
+   every file resolved by an operator rule ...... LAND (then verify.command)
+   anything else, including any model answer .... PACKAGE (the model's files are proposals)
+ No other code path lands a model's resolution. No check disables itself: a configuration that
+ cannot be used stops the server at startup, and a failure at run time refuses the land. No
+ confidence that the model declares about itself decides anything.
+```
+
+### 15.5 Box to code (the reviewer's audit table)
+
+| diagram box | function | file |
+|---|---|---|
+| UserLand, PRECHECK | `UserLand`, `landPrecheckInQuarantine`, `landPrecheckResolution` | operations/land.go, land_reland.go |
+| review of a resolution | `landReviewResolution`, `resolver.ValidateFile(WithSides)`, `landModeOfSides` | operations/land_reland.go, land_resolve.go; graft/resolver/validate.go |
+| resolver check, bounded slots | `landCheckResolution`, `landCheckSlotted`, `Client.AcquireCheckSlot` | operations/land_reland.go; graft/resolver/check.go |
+| LANE, re-land | `landAttempt`, `landingAttempt.decide`, `landWithResolution` | operations/land.go, land_attempt.go, land_reland.go |
+| 3-way merge, listing | `landingAttempt.decide`, `landListConflicts` | operations/land_attempt.go, land_resolve.go |
+| per-file verdicts, decide | `resolveLandConflicts`, `landAnswerProposes` (planned: `decideLand`) | operations/land_resolve.go, land_proposals.go |
+| classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
+| operator rules, file checks | `Resolver.resolveFile`, `Resolver.runChecks`, `syntax.CheckMerge` | tools/graft-agents/resolve/resolve.go |
+| AI per file | `llmStrategy.Resolve`, `ResolveLLM`, `llmResolvePatch` | tools/.../resolve/llm_strategy.go, llm_core.go, llm_patch.go |
+| regions, assemble | `llmRegions`, `llmAssemble` | tools/.../resolve/llm_core.go |
+| one call per region, its checks | `llmPatchSystem`, `llmPatchUser`, `llmPatchAnswer`, `llmCheckPatched`, `llmCheckAnswer` | tools/.../resolve/llm_patch.go, llm_core.go |
+| proposal mark, no recording | `proposer`, `Resolver.resolveFile` | tools/.../resolve/llm_strategy.go, resolve.go |
+| verify.command | `landVerify`, `verifyRejected` | operations/land_verify.go, land_resolve.go |
+| merge commit, trailers | `landWriteResolution` | operations/land_resolve.go |
+| PACKAGE | `landWithPackage`, `landListing.conflictPackage` | operations/land_package.go |
+| proposals, hidden reference | `landWriteProposals`, `landUpdateProposalRefs`, `landPruneProposals` | operations/land_proposals.go |
+| refs/graft/ reserved for the server | `graftReservedDenial` | gitaly/hook/referencetransaction.go |
+| composition report | (planned) | (planned: graft/resolver, with a parity-tested copy in tools/) |
+
+### 15.6 The composition check, measured: a report, not a gate
+
+The design first meant the check to turn a proposal into a landable resolution (Federico's
+amendment, 14): every edit of each side must appear in the result unless the other side's edit to
+the same base lines supersedes it. Measured with zero model calls:
+
+* **Definition, from the principle, frozen before measuring** (sha256 9396326b..., checked before
+  every run). A hunk is contested when the other side edited overlapping base lines (or touches it,
+  for an insertion); the result may compose a contested hunk freely, so it is never a drop. An
+  uncontested hunk must be in the result. Duplicates and changes outside the conflicts fail.
+  Disclosure: before freezing it, 8 human resolutions from the 300 had been looked at with an
+  earlier, stricter prototype; the frozen definition is measured on cases outside the 300.
+* **Human resolutions outside the 300** (2644 content cases): 82.6% pass; 324 change lines outside
+  the conflicts, 103 duplicate, 32 drop.
+* **Power.** Something verifiable (an uncontested hunk, or a line both sides added) exists in 20.0%
+  of those cases and 19.2% of their regions (300: 29.9% of cases, 11.6% of regions). A diff3
+  region exists because both sides edited overlapping base lines, so most regions are wholly
+  contested and pass vacuously.
+* **As a gate on R1b's accepted answers:** without it 143 of 244 correct, 58.6% [95% CI 52.3-64.6];
+  with it, 135 of 220 passes correct, 61.4% [54.8-67.6]. 175 of the 220 passes are vacuous (64.6%
+  correct); the verified passes are 48.9% correct [35.0-63.0]. If only passes landed, 73% of the
+  conflicts would land and about 39% of those would be wrong. The gate does not move precision.
+* **Contested regions have no line-level property.** A stricter prototype (every line either side
+  added present unless superseded line by line) separated better on R1 (74.5% precision) but was
+  built while looking at those cases, is still far below a landing bar (~90%), and fails half of the
+  human merges (the right resolution of a contested statement is often a third version that holds
+  neither side's line). Composition inside a contested region is semantic; a line-level check only
+  measures overlap with the sides.
+
+**Decisions.**
+1. The AI stays proposal-only.
+2. Federico's amendment (AI landing when every deterministic check passes) stays recorded and is
+   not enabled: no deterministic check reaches the bar. Pending the Sol-100 result, which Federico
+   uses to decide.
+3. The composition report goes with every proposal, honest about what it can say: "keeps every
+   uncontested change of both sides" or "drops THEIRS' change at base 40-44", "duplicates a line
+   both sides added", "changes lines outside the conflicts", "N contested regions resolved freely".
+   The duplicates flag carries signal (7 of 19 correct where it fires, against 58.6% overall): it is
+   useful in the report and as a repair trigger.
+4. The repair round (when approved) is driven only by deterministic findings with their exact
+   wording: anchors, syntax, and the composition report's drops and duplicates where they apply.
+5. The design work goes to what helps the agent decide: the report, symmetric context (each side's
+   change from the base and its intent), and abstaining (the model may answer that the changes do
+   not compose, which reaches the agent as abstained with the reason).
+
+**Java.** R1b's Java answers are 54 of 54 correct (Wilson 95% CI 93.4-100). That is a property of the
+model on these cases, not of the check, and most of them come from one repository (spring-boot).
+It is a candidate for a per-language, measured policy, which would first need validation on Java
+cases from other repositories.
+
+### 15.7 Other resolvers, compared
+
+From the PM's survey (17 tools and papers; prompts read from source where the licence allowed).
+GitButler's AI resolve is described here from the PM's account of it; its code was not read.
+
+* GitButler sends one structured JSON request per commit with every hunk; we send one call per
+  region. Our own R0 (whole-file JSON) against R1 (per region) on the same 300 cases: 53.8% against
+  41.8% strict error, and R0 -> R1b significantly more correct (McNemar p = 0.018). Per region stays.
+* GitButler writes each resolution into both sides and lets git merge again, which keeps the
+  non-conflicting changes; our llmAssemble rebuilds the file from the base, the clean regions and
+  the resolved ones. The two are equivalent when the regions are those of git's own merge; to be
+  adopted as an assertion test of llmAssemble (planned): writing the result into both sides and
+  merging must give the assembled file.
+* GitButler lands directly with no semantic check; ours proposes, with a report. That, and the
+  measured finding that a line-level check cannot gate, is where gitai differs.
+* Credit: the patch-application structure of R1 is synthmerge's (Andrea Arcangeli; GPL, structure
+  only, our own wording and example). The evidence on scope (ConflictAgent, Shen 2026, MIT; Rover,
+  CC BY) and on intent (GitWand, Copilot, MIT) informed the planned symmetric context. The design,
+  the composition report and its measurement are gitai's.
