@@ -836,6 +836,28 @@ func TestIntegration_Land(t *testing.T) {
 		require.NotContains(t, body, "Graft-Checked-By:")
 	})
 
+	t.Run("a side the repository does not keep", func(t *testing.T) {
+		t.Parallel()
+
+		// The tip renames a.txt to c.txt and changes its last line; the change changes its first
+		// line and adds a c.txt of its own. The tip's side of the add/add conflict on c.txt is the
+		// content merge of the rename, which no tree holds.
+		env := startIntegration(t, nil)
+		base := env.writeCommit(t, "main", map[string]string{"a.txt": "1\n2\n3\n4\n5\n6\n7\n8\n"})
+		env.writeCommit(t, "main", map[string]string{"c.txt": "1\n2\n3\n4\n5\n6\n7\neight\n"}, base)
+		change := env.writeCommit(t, "", map[string]string{"a.txt": "one\n2\n3\n4\n5\n6\n7\n8\n", "c.txt": "theirs\n"}, base)
+
+		_, err := env.repo.Land(env.ctx, sdk.LandOptions{Branch: "main", Commit: change.String(), User: user, ResolveConflicts: true})
+		pkg, ok := sdk.LandConflict(err)
+		require.True(t, ok, "got %v", err)
+		sides, err := env.repo.ConflictSides(env.ctx, pkg)
+		require.NoError(t, err, "an unavailable side fails no other side")
+		c := sides["c.txt"]
+		require.Nil(t, c.Ours)
+		require.Contains(t, c.Unreadable["ours"], "the merge wrote this blob")
+		require.Equal(t, []byte("theirs\n"), c.Theirs)
+	})
+
 	t.Run("create branch", func(t *testing.T) {
 		t.Parallel()
 

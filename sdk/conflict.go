@@ -22,44 +22,68 @@ func LandConflict(err error) (*gitalypb.LandConflict, bool) {
 	return detailOf[*gitalypb.LandConflict](err)
 }
 
-// ConflictSides are the contents of the sides of a conflicting file; an absent side is nil.
+// ConflictSides are the contents of the sides of a conflicting file. An absent side is nil, and so
+// is a side that cannot be read: Unreadable gives the reason of each, by side ("base", "ours",
+// "theirs").
 type ConflictSides struct {
 	Base, Ours, Theirs []byte
+	Unreadable         map[string]string
 }
 
-// ConflictSides reads the sides of every file of a conflict package, by path, with GetObjects.
+// ConflictSides reads the sides of every file of a conflict package, by path, with GetObjects. A
+// side that cannot be read costs only that side: one the package marks unavailable (the merge
+// wrote it for the conflict, and the repository did not keep it), or one the repository does not
+// have, is nil with its reason in Unreadable. An error is a failure to read at all.
 func (r *Repo) ConflictSides(ctx context.Context, c *gitalypb.LandConflict) (map[string]ConflictSides, error) {
 	var oids []string
+	seen := map[string]bool{}
 	for _, f := range c.GetFiles() {
 		for _, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
-			if s != nil {
-				oids = append(oids, s.GetOid())
+			if oid := s.GetOid(); oid != "" && !seen[oid] {
+				seen[oid] = true
+				oids = append(oids, oid)
 			}
 		}
 	}
-	objects, err := r.GetObjects(ctx, oids)
-	if err != nil {
-		return nil, err
-	}
-	data := make(map[string][]byte, len(objects))
-	for _, o := range objects {
-		if o.Missing {
-			return nil, status.Errorf(codes.NotFound, "conflict side %s is missing from the repository", o.OID)
+	data := make(map[string][]byte, len(oids))
+	missing := map[string]bool{}
+	if len(oids) > 0 {
+		objects, err := r.GetObjects(ctx, oids)
+		if err != nil {
+			return nil, err
 		}
-		data[o.OID] = o.Data
-	}
-	read := func(s *gitalypb.LandConflictSide) []byte {
-		if s == nil {
-			return nil
+		for _, o := range objects {
+			if o.Missing {
+				missing[o.OID] = true
+				continue
+			}
+			data[o.OID] = o.Data
 		}
-		if b := data[s.GetOid()]; b != nil {
-			return b
-		}
-		return []byte{}
 	}
 	out := make(map[string]ConflictSides, len(c.GetFiles()))
 	for _, f := range c.GetFiles() {
-		out[string(f.GetPath())] = ConflictSides{Base: read(f.GetBase()), Ours: read(f.GetOurs()), Theirs: read(f.GetTheirs())}
+		var sides [3][]byte
+		unreadable := map[string]string{}
+		for i, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
+			name := []string{"base", "ours", "theirs"}[i]
+			switch {
+			case s == nil:
+			case s.GetOid() == "":
+				unreadable[name] = s.GetUnavailable()
+			case missing[s.GetOid()]:
+				unreadable[name] = "the blob " + s.GetOid() + " is missing from the repository"
+			default:
+				sides[i] = data[s.GetOid()]
+				if sides[i] == nil {
+					sides[i] = []byte{}
+				}
+			}
+		}
+		cs := ConflictSides{Base: sides[0], Ours: sides[1], Theirs: sides[2]}
+		if len(unreadable) > 0 {
+			cs.Unreadable = unreadable
+		}
+		out[string(f.GetPath())] = cs
 	}
 	return out, nil
 }

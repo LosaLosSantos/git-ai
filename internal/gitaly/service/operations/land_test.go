@@ -551,6 +551,10 @@ func TestUserLand_validation(t *testing.T) {
 		{desc: "empty commit ID", modify: func(r *gitalypb.UserLandRequest) { r.CommitId = "" }},
 		{desc: "unknown strategy", modify: func(r *gitalypb.UserLandRequest) { r.Strategy = gitalypb.UserLandRequest_Strategy(42) }},
 		{desc: "negative max attempts", modify: func(r *gitalypb.UserLandRequest) { r.MaxAttempts = -1 }},
+		{desc: "resolution with fast-forward only", modify: func(r *gitalypb.UserLandRequest) {
+			r.Strategy = gitalypb.UserLandRequest_STRATEGY_FF_ONLY
+			r.Resolution = &gitalypb.LandResolution{Tip: base.String(), Commit: child.String()}
+		}},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			request := landRequest(repoProto, git.DefaultBranch, child)

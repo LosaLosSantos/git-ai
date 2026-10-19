@@ -133,10 +133,12 @@ type Labels struct {
 // WithMarkers returns the merged text: the regions that only one side changed (or both the same
 // way) take that change, and every conflicting region is written between git's diff3 conflict
 // markers, "<<<<<<< ours", "||||||| base", "=======" and ">>>>>>> theirs", followed by the labels.
-// A side of a conflict that does not end with a newline gets one before the next marker.
+// A side of a conflict that does not end with a newline gets one before the next marker. The
+// markers and that newline end with CRLF when git's would (crlfNeeded), LF otherwise.
 func (r *Result) WithMarkers(l Labels) []byte {
 	var out bytes.Buffer
 	pos := 0
+	eol := "\n"
 	write := func(lines [][]byte) {
 		for _, line := range lines {
 			out.Write(line)
@@ -145,7 +147,7 @@ func (r *Result) WithMarkers(l Labels) []byte {
 	writeSide := func(lines [][]byte) {
 		write(lines)
 		if out.Len() > 0 && out.Bytes()[out.Len()-1] != '\n' {
-			out.WriteByte('\n')
+			out.WriteString(eol)
 		}
 	}
 	marker := func(m, label string) {
@@ -153,13 +155,17 @@ func (r *Result) WithMarkers(l Labels) []byte {
 		if label != "" {
 			out.WriteString(" " + label)
 		}
-		out.WriteByte('\n')
+		out.WriteString(eol)
 	}
 	for _, reg := range r.regions {
 		write(r.base[pos:reg.base.Start])
 		pos = reg.base.End
 		switch {
 		case reg.conflict:
+			eol = "\n"
+			if r.crlfNeeded(reg) {
+				eol = "\r\n"
+			}
 			marker("<<<<<<<", l.Ours)
 			writeSide(r.ours[reg.ours.Start:reg.ours.End])
 			marker("|||||||", l.Base)
@@ -175,6 +181,52 @@ func (r *Result) WithMarkers(l Labels) []byte {
 	}
 	write(r.base[pos:])
 	return out.Bytes()
+}
+
+// crlfNeeded reports whether the markers of the conflicting region reg end with CRLF, as git's
+// do: the line of ours before the conflict (its first line when the conflict starts the file), the
+// same line of theirs, and the first line of the base must all end with CRLF. A side whose line
+// ending cannot be told (an empty side, or a single line without one) does not decide, but when
+// the base cannot tell, the markers end with LF.
+func (r *Result) crlfNeeded(reg region) bool {
+	before := func(start int) int { return max(start-1, 0) }
+	if lineEndingOf(r.ours, before(reg.ours.Start)) == endingLF {
+		return false
+	}
+	if lineEndingOf(r.theirs, before(reg.theirs.Start)) == endingLF {
+		return false
+	}
+	return lineEndingOf(r.base, 0) == endingCRLF
+}
+
+// lineEnding is the line ending of a line, for crlfNeeded.
+type lineEnding int
+
+const (
+	endingUnknown lineEnding = iota
+	endingLF
+	endingCRLF
+)
+
+// lineEndingOf returns the line ending of line i of lines. The last line of a file may have none:
+// its ending is then the one of the line before it, and unknown when there is none.
+func lineEndingOf(lines [][]byte, i int) lineEnding {
+	ending := func(line []byte) lineEnding {
+		if bytes.HasSuffix(line, []byte("\r\n")) {
+			return endingCRLF
+		}
+		return endingLF
+	}
+	switch {
+	case len(lines) == 0:
+		return endingUnknown
+	case i < len(lines)-1 || bytes.HasSuffix(lines[i], []byte("\n")):
+		return ending(lines[i])
+	case i == 0:
+		return endingUnknown
+	default:
+		return ending(lines[i-1])
+	}
 }
 
 func sameLines(a, b [][]byte) bool {
@@ -201,6 +253,39 @@ func SplitLines(b []byte) [][]byte {
 	return parts
 }
 
+// Cost returns the cells of the two line-diff tables that Merge of base, ours and theirs fills, so
+// that a caller can bound the work of many merges, and whether both fit MaxCells: when one does
+// not, Merge fails at no cost, and cells is 0. Cost splits the lines and compares the common prefix
+// and suffix, which takes time linear in the size of the files.
+func Cost(base, ours, theirs []byte) (cells int, fits bool) {
+	b := SplitLines(base)
+	for _, side := range [][]byte{ours, theirs} {
+		s := SplitLines(side)
+		pre, suf := trim(b, s)
+		n, m := len(b)-pre-suf, len(s)-pre-suf
+		if n == 0 && m == 0 {
+			continue
+		}
+		if (n+1)*(m+1) > MaxCells {
+			return 0, false
+		}
+		cells += (n + 1) * (m + 1)
+	}
+	return cells, true
+}
+
+// trim returns the number of lines that a and b share at their start and, after those, at their
+// end.
+func trim(a, b [][]byte) (pre, suf int) {
+	for pre < len(a) && pre < len(b) && bytes.Equal(a[pre], b[pre]) {
+		pre++
+	}
+	for suf < len(a)-pre && suf < len(b)-pre && bytes.Equal(a[len(a)-1-suf], b[len(b)-1-suf]) {
+		suf++
+	}
+	return pre, suf
+}
+
 // edit replaces the base lines [start, end) with n lines of a side.
 type edit struct {
 	start, end int
@@ -210,14 +295,7 @@ type edit struct {
 // lineDiff returns the line edits that turn a into b, from a longest common subsequence of the
 // lines after the common prefix and suffix. It returns false when the table would exceed MaxCells.
 func lineDiff(a, b [][]byte) ([]edit, bool) {
-	pre := 0
-	for pre < len(a) && pre < len(b) && bytes.Equal(a[pre], b[pre]) {
-		pre++
-	}
-	suf := 0
-	for suf < len(a)-pre && suf < len(b)-pre && bytes.Equal(a[len(a)-1-suf], b[len(b)-1-suf]) {
-		suf++
-	}
+	pre, suf := trim(a, b)
 	am, bm := a[pre:len(a)-suf], b[pre:len(b)-suf]
 	n, m := len(am), len(bm)
 	if n == 0 && m == 0 {

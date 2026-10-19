@@ -22,25 +22,33 @@ import (
 // The conflicts directory of graft land --conflicts-dir DIR holds, for every conflicting path:
 //
 //	DIR/files/<path>          the file as the merge leaves it, with git's diff3 conflict markers
-//	                          around each conflict (or the tip's side when the file is not text,
-//	                          or a side is absent)
-//	DIR/sides/<path>.base     the three sides
-//	DIR/sides/<path>.ours
-//	DIR/sides/<path>.theirs
+//	                          around each conflict (or the side there is when the file is not
+//	                          text, or a side is absent or cannot be read)
+//	DIR/sides/base/<path>     the three sides; a side that is absent or cannot be read has no file
+//	DIR/sides/ours/<path>
+//	DIR/sides/theirs/<path>
 //	DIR/conflict.json         the conflict package
 //
-// The files to edit and the sides live under separate directories, so that no repository path,
-// whatever its name, can collide with a side or with the package. graft land --resolved DIR lands
-// the files of DIR/files as the resolution: a path whose file is present is written, one whose
-// file is absent is deleted.
+// Each directory mirrors the tree of the merge, so that no repository path, whatever its name, can
+// collide with a side, with another path's side, or with the package. graft land --resolved DIR
+// lands the files of DIR/files as the resolution: a path whose file is present is written, one
+// whose file is absent is deleted.
 const (
 	conflictsFilesDir = "files"
 	conflictsSidesDir = "sides"
 	conflictsPackage  = "conflict.json"
 )
 
-// printConflict describes a conflict package: the reason the server gave, and each file with its
-// outcome. The paths and reasons come from the server and are escaped with displayText.
+// conflictSides are the sides of a conflicting file, in the order of the package.
+var conflictSides = []string{"base", "ours", "theirs"}
+
+// conflictsUnreadable is the content of the file to edit when no side of the file can be read: a
+// conflict that the marker rule of the server rejects until the agent writes the resolution.
+const conflictsUnreadable = "<<<<<<< ours (the branch tip): cannot be read, see conflict.json\n=======\n>>>>>>> theirs (the change): cannot be read, see conflict.json\n"
+
+// printConflict describes a conflict package: the reason the server gave, each file with its
+// outcome and what it lacks, and the merge's messages. The paths, reasons and messages come from
+// the server and are escaped with displayText.
 func printConflict(out io.Writer, c *gitalypb.LandConflict) {
 	fmt.Fprintf(out, "the land did not resolve %d conflicting files (tip %s, commit %s)\n", len(c.GetFiles()), shortOID(c.GetTip()), shortOID(c.GetCommit()))
 	if c.GetReason() != "" {
@@ -53,44 +61,67 @@ func printConflict(out io.Writer, c *gitalypb.LandConflict) {
 			line += ": " + displayText(f.GetReason())
 		}
 		fmt.Fprintln(out, line)
-	}
-}
-
-// conflictPath returns the file under sub of the conflicts directory for a conflicting path,
-// refusing a path that would leave it.
-func conflictPath(dir, sub, p string) (string, error) {
-	if p == "" || path.IsAbs(p) || path.Clean(p) != p || p == ".." || strings.HasPrefix(p, "../") {
-		return "", fmt.Errorf("conflicting path %q cannot be written into the conflicts directory", p)
-	}
-	return filepath.Join(dir, sub, filepath.FromSlash(p)), nil
-}
-
-// writeConflicts writes the conflicts directory of a conflict package (see the layout above).
-func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandConflict, dir string) error {
-	var oids []string
-	for _, f := range c.GetFiles() {
-		for _, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
-			if s != nil {
-				oids = append(oids, s.GetOid())
+		for i, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
+			if s.GetUnavailable() != "" {
+				fmt.Fprintf(out, "    %s side unavailable: %s\n", conflictSides[i], displayText(s.GetUnavailable()))
 			}
 		}
+		if f.GetHunksOmitted() != "" {
+			fmt.Fprintf(out, "    hunks: %s\n", displayText(f.GetHunksOmitted()))
+		}
 	}
-	blobs, err := ws.GetObjects(ctx, oids)
-	if err != nil {
-		return fmt.Errorf("reading the sides of the conflict: %w", err)
+	for _, m := range c.GetMessages() {
+		fmt.Fprintf(out, "  merge: %s\n", displayText(m.GetMessage()))
 	}
-	side := func(s *gitalypb.LandConflictSide) ([]byte, error) {
-		if s == nil {
-			return nil, nil
+}
+
+// conflictPath returns the file under sub of the conflicts directory for a conflicting path. It
+// refuses a path that would leave the directory or that this system cannot hold as a file name
+// under it: an absolute or unclean path, a backslash or a colon (a separator or a drive or stream
+// on Windows), a NUL, and any path filepath.IsLocal rejects once in the system's form (such as a
+// reserved name like NUL or COM1 on Windows).
+func conflictPath(dir, sub, p string) (string, error) {
+	local := filepath.FromSlash(p)
+	if p == "" || path.IsAbs(p) || path.Clean(p) != p || strings.ContainsAny(p, "\\:\x00") || !filepath.IsLocal(local) {
+		return "", fmt.Errorf("conflicting path %q cannot be written into the conflicts directory on this system", p)
+	}
+	return filepath.Join(dir, sub, local), nil
+}
+
+// writeConflicts writes the conflicts directory of a conflict package (see the layout above) into
+// dir, which must not hold one yet: the files of an earlier package, which the agent may be
+// editing, are never overwritten. A side that has no object ID in the package (unavailable) or that
+// the server cannot return is left out, and said so; it fails neither its file nor the directory.
+// Two paths that this file system takes for the same file (such as names that differ in case on a
+// case-insensitive one) are an error, since one would overwrite the other.
+func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandConflict, dir string, out io.Writer) error {
+	for _, sub := range []string{conflictsFilesDir, conflictsSidesDir, conflictsPackage} {
+		if _, err := os.Lstat(filepath.Join(dir, sub)); err == nil {
+			return fmt.Errorf("%s already holds a conflicts directory (%s): land it with --resolved, or remove it", dir, sub)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
-		b, ok := blobs[s.GetOid()]
-		if !ok {
-			return nil, fmt.Errorf("side %s is missing from the server", s.GetOid())
+	}
+
+	blobs, missing := fetchSides(ctx, ws, c)
+	written := map[string]string{}
+	create := func(target, p string, data []byte) error {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
 		}
-		if b == nil {
-			b = []byte{}
+		f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("conflicting paths %q and %q are the same file on this file system (names that differ only in case or Unicode normalization): resolve this conflict on a case-sensitive file system", written[target], p)
 		}
-		return b, nil
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		written[target] = p
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		return f.Close()
 	}
 
 	for _, f := range c.GetFiles() {
@@ -99,25 +130,48 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 		if err != nil {
 			return err
 		}
-		sideBase, err := conflictPath(dir, conflictsSidesDir, p)
-		if err != nil {
-			return err
-		}
 		var contents [3][]byte
+		readable := true
 		for i, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
-			if contents[i], err = side(s); err != nil {
-				return fmt.Errorf("%s: %w", p, err)
-			}
-		}
-		for i, ext := range []string{"base", "ours", "theirs"} {
-			if contents[i] == nil {
+			if s == nil {
 				continue
 			}
-			if err := writeFileAll(sideBase+"."+ext, contents[i]); err != nil {
+			b, ok := blobs[s.GetOid()]
+			switch {
+			case s.GetOid() == "":
+				readable = false
+				continue
+			case !ok:
+				readable = false
+				fmt.Fprintf(out, "  %s: the %s side %s cannot be read: %s\n", displayText(p), conflictSides[i], shortOID(s.GetOid()), displayText(missing[s.GetOid()]))
+				continue
+			}
+			if b == nil {
+				b = []byte{}
+			}
+			contents[i] = b
+			sideFile, err := conflictPath(dir, filepath.Join(conflictsSidesDir, conflictSides[i]), p)
+			if err != nil {
+				return err
+			}
+			if err := create(sideFile, p, b); err != nil {
 				return err
 			}
 		}
-		if err := writeFileAll(target, conflictFileContent(contents)); err != nil {
+		content := conflictFileContent(contents)
+		if !readable {
+			// Without every side there is no three-way merge: the file to edit is a side that
+			// can be read, or a conflict the agent must resolve.
+			switch {
+			case contents[1] != nil:
+				content = contents[1]
+			case contents[2] != nil:
+				content = contents[2]
+			default:
+				content = []byte(conflictsUnreadable)
+			}
+		}
+		if err := create(target, p, content); err != nil {
 			return err
 		}
 	}
@@ -126,7 +180,46 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 	if err != nil {
 		return err
 	}
-	return writeFileAll(filepath.Join(dir, conflictsPackage), append(raw, '\n'))
+	return create(filepath.Join(dir, conflictsPackage), conflictsPackage, append(raw, '\n'))
+}
+
+// fetchSides reads the sides of the package that have an object ID, all at once. When the server
+// cannot return them all, it reads them one by one, so that a side it cannot return costs only that
+// side: missing gives the error of each side that could not be read.
+func fetchSides(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandConflict) (map[string][]byte, map[string]string) {
+	var oids []string
+	seen := map[string]bool{}
+	for _, f := range c.GetFiles() {
+		for _, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
+			if oid := s.GetOid(); oid != "" && !seen[oid] {
+				seen[oid] = true
+				oids = append(oids, oid)
+			}
+		}
+	}
+	missing := map[string]string{}
+	blobs, err := ws.GetObjects(ctx, oids)
+	if err == nil {
+		for _, oid := range oids {
+			if _, ok := blobs[oid]; !ok {
+				missing[oid] = "the server did not return it"
+			}
+		}
+		return blobs, missing
+	}
+	blobs = map[string][]byte{}
+	for _, oid := range oids {
+		one, err := ws.GetObjects(ctx, []string{oid})
+		if b, ok := one[oid]; err == nil && ok {
+			blobs[oid] = b
+			continue
+		}
+		if err == nil {
+			err = errors.New("the server did not return it")
+		}
+		missing[oid] = err.Error()
+	}
+	return blobs, missing
 }
 
 // conflictFileContent is the file an agent edits: the merge with markers when both sides are text,
@@ -147,13 +240,6 @@ func conflictFileContent(sides [3][]byte) []byte {
 
 func isBinaryContent(b []byte) bool {
 	return bytes.IndexByte(b, 0) >= 0
-}
-
-func writeFileAll(p string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(p, data, 0o644)
 }
 
 // readResolution reads the resolution of a conflicts directory: the package's tip and commit, and

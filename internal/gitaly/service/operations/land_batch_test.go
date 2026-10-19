@@ -16,6 +16,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
@@ -801,6 +802,75 @@ func testLandBatchResolveConflictsInsideBatch(t *testing.T, ctx context.Context)
 	require.Equal(t, 1, resolverCalls(t, dir))
 
 	require.Equal(t, "merged-a\n", string(gittest.Exec(t, cfg, "-C", repoPath, "show", "refs/heads/"+git.DefaultBranch+":a")))
+}
+
+func TestLandBatch_refusalNeverWrites(t *testing.T) {
+	t.Parallel()
+
+	runLandBatchTest(t, testLandBatchRefusalNeverWrites)
+}
+
+// testLandBatchRefusalNeverWrites: a resolver that refuses but marks every file resolved (a
+// self-contradicting refusal) leads to no write: the request fails with the merge conflict and its
+// package, and the other member of the batch lands.
+func testLandBatchRefusalNeverWrites(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	dir, argv := resolverScript(t, `cat "$DIR/answer.json"; exit 1`)
+	writeRawAnswer(t, dir, resolver.ErrorResponse{
+		Error: "refused",
+		Files: []resolver.FileOutcome{{Path: "a", Outcome: resolver.OutcomeResolved}, {Path: "b", Outcome: resolver.OutcomeResolved}},
+	})
+
+	graft := batchingGraft()
+	graft.Land.Resolver = enabledResolver(argv)
+	ctx, cfg, client := setupLandBatchService(t, ctx, graft)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	entries := func(a, b string) []gittest.TreeEntry {
+		return []gittest.TreeEntry{
+			{Mode: "100644", Path: "a", Content: a},
+			{Mode: "100644", Path: "b", Content: b},
+		}
+	}
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(entries("base", "base")...))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(entries("ours", "ours")...))
+	conflicting := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithTreeEntries(entries("theirs", "theirs")...))
+	independent := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base),
+		gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "base"},
+			gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base"},
+			gittest.TreeEntry{Mode: "100644", Path: "c", Content: "c"},
+		),
+	)
+
+	var (
+		wg              sync.WaitGroup
+		refusedErr      error
+		independentResp *gitalypb.UserLandResponse
+		independentErr  error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		req := landRequest(repoProto, git.DefaultBranch, conflicting)
+		req.ResolveConflicts = true
+		_, refusedErr = client.UserLand(ctx, req)
+	}()
+	go func() {
+		defer wg.Done()
+		independentResp, independentErr = client.UserLand(ctx, landRequest(repoProto, git.DefaultBranch, independent))
+	}()
+	wg.Wait()
+
+	requireMergeConflict(t, refusedErr)
+	pkg := landConflictDetail(refusedErr)
+	require.NotNil(t, pkg)
+	for _, f := range pkg.GetFiles() {
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_FAILED, f.GetOutcome(), "a self-contradicting refusal is not trusted")
+	}
+	require.NoError(t, independentErr, "the other member of the batch is released")
+	require.Equal(t, "c", string(gittest.Exec(t, cfg, "-C", repoPath, "show", independentResp.GetLandedCommitId()+":c")))
 }
 
 func TestLandBatch_externalWriterMovesBranch(t *testing.T) {

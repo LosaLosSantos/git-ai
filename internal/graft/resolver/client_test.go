@@ -406,6 +406,35 @@ func TestResolve_CommandGetsMinimalEnvironment(t *testing.T) {
 	require.Contains(t, string(raw), "PATH=")
 }
 
+// TestCheck_runsForEveryActorAndFileCount: actors and max_files bound requests for an AI
+// resolution only; the check of an agent's resolution runs whatever the actor and the number of
+// files (PLAN10 12), while a resolve request with the same actor and files is refused.
+func TestCheck_runsForEveryActorAndFileCount(t *testing.T) {
+	requireUnix(t)
+
+	req := sampleRequest()
+	req.Resolution = validResponse("merged\n").Files
+	answer, err := json.Marshal(CheckResponse{
+		Version: ProtocolVersion, Operation: OperationCheck, Resolver: "graft-resolve",
+		Files: []CheckFile{{Path: "a.txt", OK: true, Syntax: SyntaxNone}, {Path: "b.txt", OK: true, Syntax: SyntaxNone}},
+	})
+	require.NoError(t, err)
+	cfg := commandConfig(cannedCommand(t, answer))
+	cfg.MaxFiles = 1
+	cfg.Actors = []string{"someone-else"}
+	client := newClient(t, cfg)
+
+	resp, err := client.Check(testhelper.Context(t), req)
+	require.NoError(t, err)
+	require.Len(t, resp.Files, 2)
+
+	_, err = client.Resolve(testhelper.Context(t), req)
+	require.ErrorContains(t, err, "2 conflicted files, limit is 1")
+	cfg.MaxFiles = 0
+	_, err = newClient(t, cfg).Resolve(testhelper.Context(t), req)
+	require.ErrorContains(t, err, `actor "agent-7" may not request conflict resolution`)
+}
+
 func TestResolve_RequestChecksDoNotRunTheResolver(t *testing.T) {
 	requireUnix(t)
 
@@ -569,6 +598,7 @@ func TestValidOutcomes(t *testing.T) {
 		"duplicate":      {{Path: "a", Outcome: OutcomeResolved}, {Path: "a", Outcome: OutcomeFailed}},
 		"unknown path":   {{Path: "a", Outcome: OutcomeResolved}, {Path: "z", Outcome: OutcomeFailed}},
 		"unknown status": {{Path: "a", Outcome: OutcomeResolved}, {Path: "b", Outcome: "maybe"}},
+		"all resolved":   {{Path: "a", Outcome: OutcomeResolved}, {Path: "b", Outcome: OutcomeResolved}},
 	} {
 		require.Nil(t, validOutcomes(req, files), name)
 	}

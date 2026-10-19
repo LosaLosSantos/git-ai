@@ -512,10 +512,10 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
 			var unresolved *landUnresolvedError
 			require.ErrorAs(t, err, &unresolved)
-			a := packageFile(t, unresolved.pkg, "a")
+			a := packageFile(t, builtPackage(t, fx.ctx, unresolved), "a")
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, a.GetOutcome())
 			require.Equal(t, landNotSentDenied, a.GetReason())
-			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, unresolved.pkg, "b").GetOutcome())
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, builtPackage(t, fx.ctx, unresolved), "b").GetOutcome())
 
 			require.Equal(t, 1, resolverCalls(t, dir))
 			req := resolverRequest(t, dir, 1)
@@ -550,8 +550,10 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
 			var unresolved *landUnresolvedError
 			require.ErrorAs(t, err, &unresolved)
-			require.Contains(t, unresolved.pkg.GetReason(), tc.reason)
-			for _, f := range unresolved.pkg.GetFiles() {
+			pkg := builtPackage(t, fx.ctx, unresolved)
+			require.Contains(t, pkg.GetReason(), tc.reason)
+			require.Len(t, pkg.GetFiles(), 2, "the package lists every conflicting file, whatever max_files")
+			for _, f := range pkg.GetFiles() {
 				require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, f.GetOutcome())
 			}
 			require.Equal(t, 0, resolverCalls(t, dir))
@@ -656,13 +658,47 @@ func TestNewServer_warnsWhenResolverActorsMatchNobody(t *testing.T) {
 	}
 }
 
-func TestLandTrailerSafe(t *testing.T) {
+func TestLandTrailerValueValid(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, landTrailerSafe("a/b c.go"))
-	require.False(t, landTrailerSafe("a\nGraft-Resolved-By: evil"))
-	require.False(t, landTrailerSafe("a\rb"))
-	require.False(t, landTrailerSafe("a\x00b"))
+	require.True(t, landTrailerValueValid("a/b c.go"))
+	require.True(t, landTrailerValueValid("résumé.md"))
+	for _, v := range []string{
+		"",
+		"a\nGraft-Resolved-By: evil",
+		"a\rb",
+		"a\x00b",
+		"a\tb",
+		"a b",
+		"a\u0085b",
+		"a\xffb",
+	} {
+		require.False(t, landTrailerValueValid(v), "%q", v)
+	}
+}
+
+func TestLandResolutionTrailers(t *testing.T) {
+	t.Parallel()
+
+	got, err := landResolutionTrailers("agent/a", "graft-resolve", []string{"a", "dir/b c"})
+	require.NoError(t, err)
+	require.Equal(t, "Graft-Resolved-By: agent/a\nGraft-Checked-By: graft-resolve\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n", got)
+
+	for name, tc := range map[string]struct {
+		resolver, checkedBy string
+		paths               []string
+		trailer             string
+	}{
+		"resolver":   {resolver: "agent/x\nGraft-Resolved-Path: evil", paths: []string{"a"}, trailer: landTrailerResolvedBy},
+		"no name":    {resolver: "", paths: []string{"a"}, trailer: landTrailerResolvedBy},
+		"checked by": {resolver: "agent", checkedBy: "c\rd", paths: []string{"a"}, trailer: landTrailerCheckedBy},
+		"path":       {resolver: "agent", paths: []string{"a", lineBreakPath}, trailer: landTrailerResolvedPath},
+	} {
+		_, err := landResolutionTrailers(tc.resolver, tc.checkedBy, tc.paths)
+		var unsafe *landTrailerUnsafeError
+		require.ErrorAs(t, err, &unsafe, name)
+		require.Equal(t, tc.trailer, unsafe.trailer, name)
+	}
 }
 
 func TestLandResolverNameValid(t *testing.T) {
@@ -703,18 +739,22 @@ func TestLandResolveCommitMessage(t *testing.T) {
 
 	t.Run("merge message", func(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main"), MergeMessage: []byte("Custom\n\n")}
-		require.Equal(t,
-			"Custom\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a", "dir/b c"}),
-		)
+		msg, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a", "dir/b c"})
+		require.NoError(t, err)
+		require.Equal(t, "Custom\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n", msg)
 	})
 
 	t.Run("default message", func(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
-		require.Equal(t,
-			"Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a"}),
-		)
+		msg, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a"})
+		require.NoError(t, err)
+		require.Equal(t, "Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n", msg)
+	})
+
+	t.Run("a path that is no trailer line is refused", func(t *testing.T) {
+		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
+		_, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{lineBreakPath})
+		require.Error(t, err)
 	})
 }
 

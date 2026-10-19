@@ -75,6 +75,43 @@ func TestMerge(t *testing.T) {
 			hunks:   []Hunk{{Base: Range{1, 2}, Ours: Range{1, 1}, Theirs: Range{1, 2}}},
 			markers: "1\n<<<<<<< ours\n||||||| base\n2\n=======\nT\n>>>>>>> theirs\n3\n",
 		},
+		// The CRLF cases are the output of git merge-file -p --diff3 on the same files.
+		{
+			name: "CRLF markers in a CRLF file",
+			base: "1\r\n2\r\n3\r\n", ours: "1\r\nO\r\n3\r\n", theirs: "1\r\nT\r\n3\r\n",
+			hunks:   []Hunk{{Base: Range{1, 2}, Ours: Range{1, 2}, Theirs: Range{1, 2}}},
+			markers: "1\r\n<<<<<<< ours\r\nO\r\n||||||| base\r\n2\r\n=======\r\nT\r\n>>>>>>> theirs\r\n3\r\n",
+		},
+		{
+			name: "CRLF: a side without a final newline gets CRLF",
+			base: "1\r\n2", ours: "1\r\nO", theirs: "1\r\nT",
+			hunks:   []Hunk{{Base: Range{1, 2}, Ours: Range{1, 2}, Theirs: Range{1, 2}}},
+			markers: "1\r\n<<<<<<< ours\r\nO\r\n||||||| base\r\n2\r\n=======\r\nT\r\n>>>>>>> theirs\r\n",
+		},
+		{
+			name: "CRLF: a conflict on the first line",
+			base: "1\r\n2\r\n", ours: "O\r\n2\r\n", theirs: "T\r\n2\r\n",
+			hunks:   []Hunk{{Base: Range{0, 1}, Ours: Range{0, 1}, Theirs: Range{0, 1}}},
+			markers: "<<<<<<< ours\r\nO\r\n||||||| base\r\n1\r\n=======\r\nT\r\n>>>>>>> theirs\r\n2\r\n",
+		},
+		{
+			name: "CRLF sides with an LF base get LF markers",
+			base: "1\n2\n3\n", ours: "1\r\nO\r\n3\r\n", theirs: "1\r\nT\r\n3\r\n",
+			hunks:   []Hunk{{Base: Range{0, 3}, Ours: Range{0, 3}, Theirs: Range{0, 3}}},
+			markers: "<<<<<<< ours\n1\r\nO\r\n3\r\n||||||| base\n1\n2\n3\n=======\n1\r\nT\r\n3\r\n>>>>>>> theirs\n",
+		},
+		{
+			name: "CRLF sides without a base get LF markers",
+			base: "", ours: "o\r\n", theirs: "t\r\n",
+			hunks:   []Hunk{{Base: Range{0, 0}, Ours: Range{0, 1}, Theirs: Range{0, 1}}},
+			markers: "<<<<<<< ours\no\r\n||||||| base\n=======\nt\r\n>>>>>>> theirs\n",
+		},
+		{
+			name: "CRLF sides whose base has no line ending get LF markers",
+			base: "1", ours: "O\r\n", theirs: "T\r\n",
+			hunks:   []Hunk{{Base: Range{0, 1}, Ours: Range{0, 1}, Theirs: Range{0, 1}}},
+			markers: "<<<<<<< ours\nO\r\n||||||| base\n1\n=======\nT\r\n>>>>>>> theirs\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -85,6 +122,37 @@ func TestMerge(t *testing.T) {
 			require.Equal(t, tc.markers, string(r.WithMarkers(labels)))
 		})
 	}
+}
+
+func TestCost(t *testing.T) {
+	t.Parallel()
+
+	// Only the changed middle counts: base 1..5 against ours with line 3 changed is a 2x2 table,
+	// and theirs equal to the base costs nothing.
+	cost := func(base, ours, theirs string) (int, bool) { return Cost([]byte(base), []byte(ours), []byte(theirs)) }
+	requireCost := func(cells int, fits bool, gotCells int, gotFits bool) {
+		t.Helper()
+		require.Equal(t, cells, gotCells)
+		require.Equal(t, fits, gotFits)
+	}
+	c, ok := cost("1\n2\n3\n4\n5\n", "1\n2\nO\n4\n5\n", "1\n2\n3\n4\n5\n")
+	requireCost(4, true, c, ok)
+	c, ok = cost("a\n", "a\n", "a\n")
+	requireCost(0, true, c, ok)
+	// An add/add conflict diffs each side against the empty base: (0+1)*(2+1) + (0+1)*(1+1).
+	c, ok = cost("", "o1\no2\n", "t1\n")
+	requireCost(5, true, c, ok)
+
+	// One table over MaxCells: Merge fails, and Cost says so.
+	var a, b strings.Builder
+	for i := 0; i < 3000; i++ {
+		a.WriteString("a\n")
+		b.WriteString("b\n")
+	}
+	c, ok = cost(a.String(), b.String(), a.String())
+	requireCost(0, false, c, ok)
+	_, merged := Merge([]byte(a.String()), []byte(b.String()), []byte(a.String()))
+	require.False(t, merged)
 }
 
 func TestMergeTooLarge(t *testing.T) {

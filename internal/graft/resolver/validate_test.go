@@ -283,3 +283,24 @@ func TestValidate_Errors(t *testing.T) {
 		require.False(t, errors.Is(err, ErrInvalidResponse))
 	})
 }
+
+func TestValidateFile_specialFileSymlinks(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		".gitmodules", "sub/.gitattributes", ".gitignore", ".mailmap",
+		".GITMODULES", ".gitmodules ", ".gitmodules...", ".gitmodules::$DATA",
+		"GITMOD~1", "gi7eba~4", "GI7D29~1", "maba30~2", "gitign~1",
+		// HFS+ ignores zero-width code points.
+		".git\u200cmodules", "\ufeff.gitattributes",
+	} {
+		err := ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20)
+		require.ErrorContains(t, err, "is refused", "%q", name)
+		// As a regular file the name is fine.
+		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeRegular, Content: []byte("x")}, 1<<20), "%q", name)
+	}
+
+	for _, name := range []string{".gitmodules-old", "gitmodules", "GITMOD~A", "gitmod~10", "x.gitignore", "link"} {
+		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20), "%q", name)
+	}
+}

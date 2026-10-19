@@ -25,7 +25,7 @@ func (c *Client) Check(ctx context.Context, req Request) (*CheckResponse, error)
 	req.Operation = OperationCheck
 	req.Limits = Limits{MaxFileBytes: c.maxFileBytes}
 
-	if err := c.checkRequest(req); err != nil {
+	if err := c.checkFiles(req); err != nil {
 		return nil, err
 	}
 	if len(req.Resolution) != len(req.Files) {

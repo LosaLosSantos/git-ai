@@ -211,6 +211,7 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 	if step.resolution != nil {
 		resp.ResolvedPaths = step.resolution.resolvedPaths
 		resp.Resolver = step.resolution.resolver
+		step.resolution.landed()
 	}
 	return resp, nil
 }
@@ -460,6 +461,12 @@ func validateUserLandRequest(ctx context.Context, locator storage.Locator, in *g
 
 	if _, ok := gitalypb.UserLandRequest_Strategy_name[int32(in.GetStrategy())]; !ok {
 		return fmt.Errorf("unknown strategy: %d", in.GetStrategy())
+	}
+
+	// A resolution lands as a merge commit of the tip and the change, which fast-forward only
+	// forbids: the request contradicts itself.
+	if in.GetResolution() != nil && in.GetStrategy() == gitalypb.UserLandRequest_STRATEGY_FF_ONLY {
+		return errors.New("a resolution lands as a merge commit, which STRATEGY_FF_ONLY does not allow")
 	}
 
 	if in.GetMaxAttempts() < 0 {

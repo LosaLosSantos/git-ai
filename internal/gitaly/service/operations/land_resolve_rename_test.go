@@ -186,7 +186,7 @@ func TestUserLand_renameFromDeniedPathIsNotResolved(t *testing.T) {
 			_, err := fx.server(t, rcfg).resolveLandConflicts(fx.ctx, fx.request("Land rename"), fx.repo, fx.tip, fx.commit, fx.committer())
 			var unresolved *landUnresolvedError
 			require.ErrorAs(t, err, &unresolved)
-			k := packageFile(t, unresolved.pkg, "pub/k")
+			k := packageFile(t, builtPackage(t, fx.ctx, unresolved), "pub/k")
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, k.GetOutcome())
 			require.Equal(t, `a side comes from path "secrets/k", which may not be sent to the resolver`, k.GetReason())
 			require.Equal(t, 0, resolverCalls(t, dir))

@@ -122,7 +122,8 @@ error, whose size is limited.
   conflict markers), resolved but not landed because another file was not, or not
   attempted because the whole request was refused (too many files, actor not
   allowed, resolution disabled), with the request-level reason. Reasons are cut to
-  512 bytes; the detail is bounded by `max_files`.
+  512 bytes. The package lists every conflicting file, within its own bounds (see
+  "Review of WP5/WP6" in section 12).
 * The agent reads the sides with `GetBlobs`, which its read access allows.
 * **Re-land**: `UserLandRequest.resolution` (`LandResolution`) carries the tip and
   the commit the resolution was made against and, per file, `write` (mode, content)
@@ -314,7 +315,7 @@ message LandConflict {
   bytes commit_message = 5;
   // messages_truncated is set when a message was cut.
   bool messages_truncated = 6;
-  // files are the conflicting files, at most max_files of them.
+  // files are all the conflicting files (see "Review of WP5/WP6" in section 12).
   repeated LandConflictFile files = 7;
   // reason is set when the server did not try to resolve the request at all, for
   // example because it has too many files or the actor may not resolve; it is cut to
@@ -536,3 +537,34 @@ way.
   resolver resolved in a failed request are wasted work for the agent. The package could
   offer the resolver's resolved content to the agent (for example as blobs written to the
   repository, referenced by OID), so that the agent re-lands with it where it agrees.
+* **Review of WP5/WP6** (independent review of f707b5b and ad68d37, PM: fix all). What
+  changed from the text above:
+  * A refusal is never written. Only an accepted answer is, and a refusal whose outcomes
+    mark every file resolved contradicts itself, so it is malformed (every file failed).
+  * Every `Graft-*` trailer is written by one function, which refuses any value that is
+    not one line of printable UTF-8. Such a path is never sent to a resolver, and the
+    re-land refuses it (`FailedPrecondition`).
+  * A side's blob OID is in the package only when the blob is in the tree of the merge
+    base, the tip or the landed commit. A blob that merge-tree wrote for the conflict (the
+    content merge of a rename) lives in the request's quarantine, which a failed land
+    discards. Such a side gets `unavailable` with the reason; the CLI leaves it out
+    without failing the other sides or files.
+  * `actors` gates only the requests for an AI resolution. An agent's re-land is allowed
+    for every actor that may land, and its `check` runs whatever the actor and covers all
+    its files. `max_files` bounds the AI request only. The package lists every
+    conflicting file, with bounds of its own: 1000 files (a refusal above), 1000 merge
+    messages, 4 MiB encoded, 256 hunks per file, 64 MiB of sides read and 64 Mi cells of
+    diff work for the hunks; `hunks_omitted` says why a file lacks hunks. The package is
+    built only when the land returns it.
+  * A merge that is unclean without a conflicting file (a directory rename split) gets a
+    package that describes it by git's messages (`messages`), which every package carries.
+  * Minors: a re-land with `STRATEGY_FF_ONLY` is `InvalidArgument`; a written mode must
+    be one of the modes of the sides; a symbolic link named like `.gitmodules`,
+    `.gitattributes`, `.gitignore` or `.mailmap` (in the ways HFS+ and NTFS fold names
+    too) is refused; a symbolic link answer has syntax `none`; the
+    `syntax_unchecked` metric counts once, on a successful land; merge3 writes CRLF
+    markers where git does; the CLI layout of the sides is `DIR/sides/<side>/<path>`
+    (`<path>.base` could collide with a directory named `<path>.base`), the CLI refuses
+    paths it cannot write on its system and paths the file system folds together, and
+    never overwrites a conflicts directory; the memory backend refuses a resolution for
+    another commit.

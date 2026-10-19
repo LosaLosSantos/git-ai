@@ -1300,12 +1300,16 @@ message LandConflict {
   bytes commit_message = 5;
   // messages_truncated is set when a message was cut.
   bool messages_truncated = 6;
-  // files are the conflicting files, at most max_files of them.
+  // files are all the conflicting files. A merge with more than 1000 conflicting
+  // files gets no package files: reason says so, and it cannot be resolved through a
+  // land.
   repeated LandConflictFile files = 7;
   // reason is set when the server did not try to resolve the request at all, for
   // example because it has too many files or the actor may not resolve; it is cut to
   // 512 bytes.
   string reason = 8;
+  // messages are the messages of the merge about its conflicts, at most 1000.
+  repeated LandConflictMessage messages = 9;
 }
 
 // LandConflictFile is one conflicting file of a LandConflict.
@@ -1362,14 +1366,38 @@ message LandConflictFile {
   // syntax_unchecked is set when a resolution of the file was accepted without a
   // syntax verdict, because a side does not parse with the grammar of its language.
   bool syntax_unchecked = 9;
+  // hunks_omitted says why hunks is empty or incomplete for a content or add/add
+  // conflict: a side too large to read, a diff over its cost bound, more regions
+  // than a file lists, or a package over its size bound. It is empty when hunks is
+  // complete, and for the kinds of conflict that have no hunks.
+  string hunks_omitted = 10;
 }
 
 // LandConflictSide is one side of a conflicting file; its content is read by oid.
 message LandConflictSide {
-  // oid is the object ID of the blob.
+  // oid is the object ID of the blob. It is set only for a blob in the tree of the
+  // merge base, the tip or the landed commit, which the repository keeps. A side
+  // that the merge wrote for this conflict alone (such as the content merge of a
+  // rename) is not kept after the land fails, so it has no oid and unavailable says
+  // why.
   string oid = 1;
   // mode is the file mode.
   string mode = 2;
+  // unavailable is set instead of oid when the side's blob is not kept in the
+  // repository: its content cannot be read.
+  string unavailable = 3;
+}
+
+// LandConflictMessage is a message of the merge about a conflict, as git
+// merge-tree reports it. A conflict without a conflicting file (a directory rename
+// split, say) is described by its message alone.
+message LandConflictMessage {
+  // paths are the paths the message is about.
+  repeated bytes paths = 1;
+  // type is the kind of the conflict, such as "CONFLICT (rename/delete)".
+  string type = 2;
+  // message is the message, cut to 512 bytes.
+  string message = 3;
 }
 
 // LandConflictHunk is a conflicting region as line ranges of each side. Each range

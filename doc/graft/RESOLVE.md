@@ -35,6 +35,9 @@ actors = ["builder", "planner"]
   on stdin. `url` receives an HTTP POST with a bearer token read from
   `token_file`.
 - `timeout`, `max_files`, `max_file_bytes`: bounds for each resolver call.
+  `max_files` bounds a request for an AI resolution only: the conflict package
+  lists every conflicting file, and the check of an agent's resolution covers
+  all its files.
 - `paths_allow`, `paths_deny`: glob lists with the same semantics as policy
   refs (`**` as a suffix matches any depth). A conflict in a denied path, or
   in a path that is not allowed, is not sent to the resolver. Apart from the
@@ -42,9 +45,12 @@ actors = ["builder", "planner"]
   `*.lock` denies `go.lock` but not `sub/go.lock`, and `*.env` does not deny
   `a/.env`. To deny a name at several depths, list one glob per depth
   (`*.env`, `*/.env`, `*/*/.env`) or deny whole directories (`secrets/**`).
-- `actors`: globs of the actors that may request resolution. Other actors get
-  the normal `merge_conflict` error. An empty list allows every caller that
-  may land. The actor is the authenticated identity of the caller, which only
+- `actors`: globs of the actors that may request an AI resolution. Other
+  actors get the normal `merge_conflict` error, with the conflict package. An
+  empty list allows every caller that may land. `actors` gates only the
+  requests for an AI resolution (`resolve_conflicts`): an agent's re-land with
+  its own resolution is allowed for every actor that may land, and the
+  resolver's `check` runs on it whatever the actor. The actor is the authenticated identity of the caller, which only
   agent authentication sets (see [AGENT-SECURITY](AGENT-SECURITY.md)):
   - with `[[graft.agent]]` configured, the agent name of a caller with an
     agent token, or `shared` for a caller with the shared `auth.token` (for
@@ -60,7 +66,8 @@ A client asks for resolution per call:
 - SDK: `LandOptions.ResolveConflicts`, and `LandResult` reports the
   resolved paths and the resolver name. On a conflict the server did not
   resolve, `sdk.LandConflict(err)` returns the conflict package,
-  `Repo.ConflictSides` reads the sides, and `LandOptions.Resolution`
+  `Repo.ConflictSides` reads the sides (a side that cannot be read is nil,
+  with its reason in `Unreadable`), and `LandOptions.Resolution`
   (start from `sdk.ResolutionFor`) lands the agent's resolution. `Land`
   refuses a resolution whose request exceeds `sdk.MaxLandRequestBytes`
   (4 MiB) before sending it.
@@ -68,11 +75,21 @@ A client asks for resolution per call:
   `graft land --resolve` prints the package when the land fails, and with
   `--conflicts-dir DIR` writes it: `DIR/files/<path>` is the merge with git's
   diff3 markers (the clean changes of both sides applied), the sides are in
-  `DIR/sides/<path>.base|.ours|.theirs`, the package in `DIR/conflict.json`.
-  The files and the sides live in separate directories, so no repository
-  path can collide with a side or the package. Edit the files under
-  `DIR/files`, then `graft land --resolved DIR` lands them: a present file is
-  written (with the tip side's mode), an absent one is deleted.
+  `DIR/sides/base/<path>`, `DIR/sides/ours/<path>` and
+  `DIR/sides/theirs/<path>`, the package in `DIR/conflict.json`. Each
+  directory mirrors the tree of the merge, so no repository path can collide
+  with a side, another path's side or the package. A side the package gives no
+  object ID (see `unavailable` below), or that the server cannot return, is
+  left out and reported; it fails neither its file nor the directory. The
+  file to edit is then the side there is, or, when no side can be read, a
+  conflict that the marker rule refuses until it is resolved. `DIR` must not
+  hold a conflicts directory yet: one being edited is never overwritten. A
+  path that cannot be a file under `DIR` on this system (a backslash, a
+  colon, a name the system reserves) is an error, and so are two paths that
+  the file system takes for one file (names that differ only in case on a
+  case-insensitive file system). Edit the files under `DIR/files`, then
+  `graft land --resolved DIR` lands them: a present file is written (with the
+  tip side's mode), an absent one is deleted.
 - RPC: `UserLandRequest.resolve_conflicts` (field 10). The response carries
   `resolved_paths` (field 7) and `resolver` (field 8). The re-land is
   `UserLandRequest.resolution` (field 11).
@@ -84,7 +101,9 @@ A client asks for resolution per call:
    ours and theirs sides (merge base of the tip and the landed commit; blobs
    and modes read through the object reader). The whole request is refused
    when resolution is not enabled, the actor may not resolve, there are more
-   than `max_files` files, or the history is criss-cross.
+   than `max_files` files, the history is criss-cross, or the merge is unclean
+   without a conflicting file (a directory rename split, say), which the
+   package then describes by the merge's messages.
 3. It decides for each file whether it may be sent (see
    [What is never sent](#what-is-never-sent)), sends the others to the
    resolver in one request (protocol below), and validates the answer (see
@@ -210,7 +229,14 @@ The server accepts an answer only if all of these hold:
 - `version` is 1.
 - `resolver` is 1 to 128 bytes of printable, single-line UTF-8.
 - Every conflicted path is answered exactly once, and no other path appears.
-- Modes are one of `100644`, `100755`, `120000`.
+- Modes are one of `100644`, `100755`, `120000`, and a written mode is one of
+  the modes of the file's sides: a merge does not turn a file into a symbolic
+  link or an executable that no side asked for. A file that breaks this is
+  `REJECTED`, and the land fails with the package.
+- No symbolic link is named `.gitmodules`, `.gitattributes`, `.gitignore` or
+  `.mailmap` in any directory, as git fsck and checkout require, nor any name
+  a file system takes for one of them (other case, the code points HFS+
+  ignores, NTFS trailing dots and spaces, streams and 8.3 short names).
 - Every content is at most `max_file_bytes` after decoding.
 - Text files contain no conflict marker lines. A marker line is one that
   starts with `<<<<<<< ` or `>>>>>>> `, or one that is `=======` followed by
@@ -322,14 +348,29 @@ the error unchanged. The package holds:
 - `tip`, `commit` and `merge_base` (empty when there is none);
 - both commit messages, cut to 4 KiB each, with `messages_truncated`;
 - `reason`, when the server did not attempt the request at all;
-- per file (at most `max_files`): the path, the kind, each side's blob OID and
-  mode, the conflicting hunks, the outcome and its reason (cut to 512 bytes).
+- every conflicting file: the path, the kind, each side's mode and blob OID,
+  the conflicting hunks, the outcome and its reason (cut to 512 bytes);
+- `messages`: git's messages about the merge (the paths, the type such as
+  `CONFLICT (rename/delete)`, the text), which also describe a conflict that
+  has no conflicting file.
+
+A side has a blob OID only when the blob is in the tree of the merge base,
+the tip or the landed commit, which the repository keeps. A side that the
+merge wrote for the conflict alone (such as the content merge of a renamed
+file) is discarded with the failed land, so it has no OID and `unavailable`
+says why; its hunks are still given.
 
 Each hunk gives line ranges of each side, 1-based and half-open (`[start,
 end)`), each counting the lines of the side it names. An empty range is an
-insertion point before line `start`. A file whose diff is too large to
-compute (more than about 2800 changed lines on a side) has no hunks. The
-outcomes are:
+insertion point before line `start`. When a content or add/add conflict has
+no hunks or only some, `hunks_omitted` says why: a side over
+`max_file_bytes`, a binary side, a diff over the cost bound of one file (more
+than about 2800 changed lines on a side), more than 256 conflicting regions
+(the first 256 are listed), or a package bound below. The package is bounded:
+at most 1000 files (a merge with more gets a package without files, whose
+`reason` says it cannot be resolved through a land), 1000 messages, 64 MiB of
+sides read and 64 Mi cells of diff work for its hunks, and 4 MiB encoded
+(over it the hunks are left out, and then the files). The outcomes are:
 
 | outcome | meaning |
 |---|---|
@@ -344,17 +385,25 @@ lands again with `UserLandRequest.resolution` (field 11): the `tip` and
 `commit` of the package and, for every conflicting path, `write` (mode and
 content) or `delete`. The server accepts it only when:
 
-- `resolution.commit` equals `commit_id` (otherwise `InvalidArgument`);
+- `resolution.commit` equals `commit_id`, and the strategy is not
+  `STRATEGY_FF_ONLY`, since the resolution lands as a merge commit (otherwise
+  `InvalidArgument`);
 - `resolution.tip` is the branch's current tip (otherwise the land fails
   with a fresh package for the new tip);
 - it resolves exactly the conflicting paths, each once;
 - every file passes the acceptance rules of an answer (modes, size, conflict
-  markers);
+  markers, no symbolic link named like a file git reads from the tree), and
+  writes a mode one of the conflict's sides has;
+- every conflicting path, and the actor, can be written in a commit trailer:
+  one line of printable UTF-8 (otherwise `FailedPrecondition`; such a path is
+  never sent to a resolver either, so its conflict cannot be resolved through
+  a land);
 - when a resolver is configured, the files that may be sent to it pass its
   `check`: the syntax check and the configured checks, as an `llm` answer.
   A check that cannot run fails the land, with the reason in the package.
   A file with a `syntax: unchecked` verdict lands, and is counted in
-  `graft_land_resolution_syntax_unchecked_total` and the server log.
+  `graft_land_resolution_syntax_unchecked_total`, once, when the land
+  succeeds, and in the server log.
 
 The merge commit has parents `[tip, commit]` and the trailers
 `Graft-Resolved-By: agent/<actor>` (`agent` without an identity) and, when the
@@ -711,7 +760,9 @@ in blank lines only, and the accepted results that got no syntax verdict.
 | verification run | 5 min, output kept 4 KiB | `verify.timeout` |
 | request body read by `graft-resolve` | 128 MiB (`protocol.DefaultMaxRequestBytes`) | `--max-request-bytes` |
 | land request with an agent's resolution | 4 MiB, the gRPC message limit | server; the SDK refuses larger ones |
-| package: files, reasons, messages | `max_files`; 512 bytes; 4 KiB each | server |
+| package: files, merge messages, encoded size | 1000; 1000; 4 MiB | server |
+| package: reasons and merge messages; commit messages | 512 bytes; 4 KiB each | server |
+| package hunks: per file; sides read; diff work | 256; 64 MiB; 64 Mi cells | server |
 | land attempts | 20 | `max_attempts` of the land |
 
 A resolver that hangs is killed at the timeout. Its stderr is kept in the

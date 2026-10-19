@@ -1,13 +1,16 @@
 package operations
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/feder-cr/git-ai/internal/git"
@@ -69,7 +72,8 @@ func TestLandConflictHunks(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := landConflictHunks([]byte(tc.base), []byte(tc.ours), []byte(tc.theirs))
+			got, ok := landConflictHunks([]byte(tc.base), []byte(tc.ours), []byte(tc.theirs))
+			require.True(t, ok)
 			require.Len(t, got, len(tc.want))
 			for i := range tc.want {
 				require.Equal(t, tc.want[i].String(), got[i].String(), "hunk %d", i)
@@ -86,6 +90,14 @@ func landConflictDetail(err error) *gitalypb.LandConflict {
 		}
 	}
 	return nil
+}
+
+// builtPackage builds the conflict package of an unresolved land, as landWithPackage does.
+func builtPackage(t *testing.T, ctx context.Context, e *landUnresolvedError) *gitalypb.LandConflict {
+	t.Helper()
+	pkg, err := e.listing.conflictPackage(ctx, e.reason)
+	require.NoError(t, err)
+	return pkg
 }
 
 // writeRawAnswer sets any JSON as the answer the resolver script of dir gives.
@@ -161,6 +173,28 @@ func TestUserLand_conflictPackage(t *testing.T) {
 			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_FAILED, f.GetOutcome(), p)
 			require.Contains(t, f.GetReason(), "unresolved", p)
 		}
+	})
+
+	t.Run("a refusal that marks every file resolved never writes", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, `cat "$DIR/answer.json"; exit 1`)
+		writeRawAnswer(t, dir, resolver.ErrorResponse{
+			Error: "refused",
+			Files: []resolver.FileOutcome{{Path: "a", Outcome: resolver.OutcomeResolved}, {Path: "b", Outcome: resolver.OutcomeResolved}},
+		})
+		fx := newResolveFixture(t, enabledResolver(argv))
+
+		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		for _, p := range []string{"a", "b"} {
+			f := packageFile(t, pkg, p)
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_FAILED, f.GetOutcome(), p)
+			require.Contains(t, f.GetReason(), "refused", p)
+		}
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 	})
 
 	t.Run("a lockfile is not sent, the other file is", func(t *testing.T) {
@@ -284,6 +318,50 @@ func TestUserLand_reland(t *testing.T) {
 		require.Equal(t, "agent-a\n", string(check.Resolution[0].Content))
 	})
 
+	t.Run("actors and max_files bound AI requests only: an actor they exclude re-lands, checked", func(t *testing.T) {
+		t.Parallel()
+
+		dir, argv := resolverScript(t, "")
+		writeRawAnswer(t, dir, resolver.CheckResponse{
+			Version: resolver.ProtocolVersion, Operation: resolver.OperationCheck, Resolver: "graft-resolve",
+			Files: []resolver.CheckFile{{Path: "a", OK: true, Syntax: resolver.SyntaxNone}, {Path: "b", OK: true, Syntax: resolver.SyntaxNone}},
+		})
+		rcfg := enabledResolver(argv)
+		rcfg.Actors = []string{"someone-else"}
+		rcfg.MaxFiles = 1
+		fx := newResolveFixture(t, rcfg)
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+
+		resp, err := fx.client.UserLand(fx.ctx, req)
+		require.NoError(t, err)
+		commit, err := fx.repo.ReadCommit(fx.ctx, git.ObjectID(resp.GetLandedCommitId()).Revision())
+		require.NoError(t, err)
+		require.Contains(t, string(commit.GetBody()), "Graft-Checked-By: graft-resolve\n")
+		require.Equal(t, 1, resolverCalls(t, dir), "the check ran, on both files, whatever the actor and max_files")
+		require.Len(t, resolverRequest(t, dir, 1).Resolution, 2)
+	})
+
+	t.Run("a written mode that no side has is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		fx := newResolveFixture(t, config.GraftResolver{})
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = resolutionOf(fx, "agent-a\n", "agent-b\n")
+		req.Resolution.Files[0].Mode = "100755"
+
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		a := packageFile(t, pkg, "a")
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_REJECTED, a.GetOutcome())
+		require.Contains(t, a.GetReason(), "mode 100755, which is none of the modes of the sides (100644)")
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+	})
+
 	t.Run("a failed check rejects the file", func(t *testing.T) {
 		t.Parallel()
 
@@ -389,5 +467,184 @@ func TestUserLand_reland(t *testing.T) {
 
 		_, err := fx.client.UserLand(fx.ctx, req)
 		require.Contains(t, err.Error(), "resolution is for commit")
+	})
+
+	t.Run("a conflicting path with a line break is refused before anything is written", func(t *testing.T) {
+		t.Parallel()
+
+		fx := newLineBreakPathFixture(t, config.GraftResolver{})
+		req := fx.request("Land")
+		req.ResolveConflicts = false
+		req.Resolution = &gitalypb.LandResolution{
+			Tip:    fx.tip.String(),
+			Commit: fx.commit.String(),
+			Files: []*gitalypb.LandResolvedFile{
+				{Path: []byte(lineBreakPath), Action: gitalypb.LandResolvedFile_ACTION_WRITE, Mode: "100644", Content: []byte("agent\n")},
+			},
+		}
+
+		_, err := fx.client.UserLand(fx.ctx, req)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
+		require.Contains(t, err.Error(), "Graft-Resolved-Path trailer")
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+	})
+}
+
+// lineBreakPath is a path that would inject a trailer if it were written as one.
+const lineBreakPath = "a\nGraft-Resolved-By: evil"
+
+// newLineBreakPathFixture is a fixture whose only conflict is on lineBreakPath.
+func newLineBreakPathFixture(t *testing.T, rcfg config.GraftResolver) resolveFixture {
+	return newResolveFixtureWith(t, rcfg,
+		[]gittest.TreeEntry{{Mode: "100644", Path: lineBreakPath, Content: "base\n"}},
+		[]gittest.TreeEntry{{Mode: "100644", Path: lineBreakPath, Content: "ours\n"}},
+		[]gittest.TreeEntry{{Mode: "100644", Path: lineBreakPath, Content: "theirs\n"}},
+	)
+}
+
+func TestUserLand_lineBreakPathIsNeverSent(t *testing.T) {
+	t.Parallel()
+
+	dir, argv := resolverScript(t, "")
+	writeAnswer(t, dir, validAnswer())
+	fx := newLineBreakPathFixture(t, enabledResolver(argv))
+
+	_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+	requireMergeConflict(t, err)
+	pkg := landConflictDetail(err)
+	require.NotNil(t, pkg)
+	f := packageFile(t, pkg, lineBreakPath)
+	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, f.GetOutcome())
+	require.Equal(t, landNotSentTrailerUnsafe, f.GetReason())
+	require.Equal(t, 0, resolverCalls(t, dir))
+	requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+}
+
+// seq returns the lines 1 to n, with the given lines replaced.
+func seq(n int, replace map[int]string) string {
+	var b strings.Builder
+	for i := 1; i <= n; i++ {
+		if r, ok := replace[i]; ok {
+			b.WriteString(r + "\n")
+			continue
+		}
+		fmt.Fprintf(&b, "%d\n", i)
+	}
+	return b.String()
+}
+
+// requirePackageOIDsKept checks that every object ID of the package is in the repository after the
+// land failed, so outside the quarantine of the request, and that a side without one says why.
+func requirePackageOIDsKept(t *testing.T, fx resolveFixture, pkg *gitalypb.LandConflict) {
+	t.Helper()
+	for _, f := range pkg.GetFiles() {
+		for _, s := range []*gitalypb.LandConflictSide{f.GetBase(), f.GetOurs(), f.GetTheirs()} {
+			if s == nil {
+				continue
+			}
+			if s.GetOid() == "" {
+				require.Equal(t, landSideUnavailable, s.GetUnavailable(), string(f.GetPath()))
+				continue
+			}
+			require.Empty(t, s.GetUnavailable())
+			gittest.Exec(t, fx.cfg, "-C", fx.repoPath, "cat-file", "-e", s.GetOid())
+		}
+	}
+}
+
+func TestUserLand_conflictPackageSidesAreKept(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a rename whose content merge is a side of its own", func(t *testing.T) {
+		t.Parallel()
+
+		// The tip renames a.txt to c.txt and changes line 19; the change changes line 2 of a.txt
+		// and adds a c.txt of its own. merge-tree merges the rename (the base, the tip's c.txt
+		// and the change's a.txt) into a blob it writes for the conflict, the tip's side of the
+		// add/add conflict on c.txt. That blob is in no tree, and the failed land discards it.
+		fx := newResolveFixtureWith(t, config.GraftResolver{},
+			[]gittest.TreeEntry{{Mode: "100644", Path: "a.txt", Content: seq(20, nil)}},
+			[]gittest.TreeEntry{{Mode: "100644", Path: "c.txt", Content: seq(20, map[int]string{19: "nineteen-ours"})}},
+			[]gittest.TreeEntry{
+				{Mode: "100644", Path: "a.txt", Content: seq(20, map[int]string{2: "two-theirs"})},
+				{Mode: "100644", Path: "c.txt", Content: "added by theirs\n"},
+			},
+		)
+
+		_, err := fx.client.UserLand(fx.ctx, fx.request("Land"))
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		c := packageFile(t, pkg, "c.txt")
+		require.Empty(t, c.GetOurs().GetOid(), "the merged rename is not kept")
+		require.Equal(t, landSideUnavailable, c.GetOurs().GetUnavailable())
+		require.Equal(t, "100644", c.GetOurs().GetMode())
+		require.NotEmpty(t, c.GetTheirs().GetOid())
+		// The hunks were computed from the side while the request could still read it.
+		require.NotEmpty(t, c.GetHunks())
+		requirePackageOIDsKept(t, fx, pkg)
+	})
+
+	t.Run("a criss-cross history", func(t *testing.T) {
+		t.Parallel()
+
+		// A resolver is enabled, so the request gets as far as the merge bases; it is never called.
+		dir, argv := resolverScript(t, "")
+		writeAnswer(t, dir, validAnswer())
+		fx := newResolveFixture(t, enabledResolver(argv))
+		// Two branches merge each other: tip and commit have two merge bases, x and y, and both
+		// change a.
+		x := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "x\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		y := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(fx.base), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "y\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		tip := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(x, y), gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "tip\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		commit := gittest.WriteCommit(t, fx.cfg, fx.repoPath, gittest.WithParents(y, x), gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "commit\n"}, gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+		fx.tip, fx.commit = tip, commit
+
+		req := fx.request("Land")
+		req.Strategy = gitalypb.UserLandRequest_STRATEGY_MERGE
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		require.Contains(t, pkg.GetReason(), "2 merge bases")
+		require.Len(t, pkg.GetFiles(), 1)
+		requirePackageOIDsKept(t, fx, pkg)
+		require.Equal(t, 0, resolverCalls(t, dir))
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, tip)
+	})
+
+	t.Run("an unclean merge without a conflicting file", func(t *testing.T) {
+		t.Parallel()
+
+		// The tip moves d/a to x/a and d/b to y/b; the change adds d/new. Git cannot tell where
+		// the directory d went (a directory rename split): the merge is unclean, with no stage
+		// entry, and only the merge's message describes it.
+		fx := newResolveFixtureWith(t, config.GraftResolver{},
+			[]gittest.TreeEntry{{Mode: "100644", Path: "d/a", Content: "1\n"}, {Mode: "100644", Path: "d/b", Content: "2\n"}},
+			[]gittest.TreeEntry{{Mode: "100644", Path: "x/a", Content: "1\n"}, {Mode: "100644", Path: "y/b", Content: "2\n"}},
+			[]gittest.TreeEntry{{Mode: "100644", Path: "d/a", Content: "1\n"}, {Mode: "100644", Path: "d/b", Content: "2\n"}, {Mode: "100644", Path: "d/new", Content: "new\n"}},
+		)
+		req := fx.request("Land")
+		req.Strategy = gitalypb.UserLandRequest_STRATEGY_MERGE
+		_, err := fx.client.UserLand(fx.ctx, req)
+		requireMergeConflict(t, err)
+		pkg := landConflictDetail(err)
+		require.NotNil(t, pkg)
+		require.Empty(t, pkg.GetFiles())
+		require.Equal(t, landNoConflictingFiles, pkg.GetReason())
+		var split bool
+		for _, m := range pkg.GetMessages() {
+			if m.GetType() == "CONFLICT(directory rename unclear split)" {
+				split = true
+				require.Equal(t, [][]byte{[]byte("d")}, m.GetPaths())
+				require.Contains(t, m.GetMessage(), "CONFLICT (directory rename split): Unclear where to rename d to")
+			}
+		}
+		require.True(t, split, "messages %v", pkg.GetMessages())
+		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 	})
 }

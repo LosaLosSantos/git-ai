@@ -63,32 +63,50 @@ func (s *Server) landWithResolution(
 	if err != nil {
 		return landResolution{}, err
 	}
-	maxFiles := s.resolveCfg.MaxFilesOrDefault()
+	if len(l.files) == 0 {
+		return landResolution{}, l.notAttempted(landNoConflictingFiles, nil)
+	}
 	if r.GetTip() != tip.String() {
-		return landResolution{}, l.notAttempted(ctx, maxFiles, fmt.Sprintf("the branch tip moved from %s to %s since the resolution was made: resolve the conflicts of this package", r.GetTip(), tip), nil)
+		return landResolution{}, l.notAttempted(fmt.Sprintf("the branch tip moved from %s to %s since the resolution was made: resolve the conflicts of this package", r.GetTip(), tip), nil)
 	}
 	if l.bases > 1 {
-		return landResolution{}, l.notAttempted(ctx, maxFiles, fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", l.bases), nil)
+		return landResolution{}, l.notAttempted(fmt.Sprintf("the change has %d merge bases (a criss-cross history), which are not resolved", l.bases), nil)
+	}
+
+	// The merge commit names the actor and every resolved path in its trailers: a value that cannot
+	// be one trailer line is refused before anything else, and resolving the path again cannot help.
+	actor := identity.Actor(ctx, "")
+	if !landTrailerValueValid(landAgentResolver(actor)) {
+		return landResolution{}, structerr.NewFailedPrecondition("the actor %q cannot be recorded in the %s trailer: it must be one line of printable UTF-8", actor, landTrailerResolvedBy)
+	}
+	for _, f := range l.files {
+		if !landTrailerValueValid(f.conflict.path) {
+			return landResolution{}, structerr.NewFailedPrecondition("the conflicting path %q cannot be recorded in the %s trailer: it must be one line of printable UTF-8, so its conflict cannot be resolved through a land", f.conflict.path, landTrailerResolvedPath)
+		}
 	}
 
 	resolved, reason := landResolutionFiles(r, l.files)
 	if reason != "" {
-		return landResolution{}, l.notAttempted(ctx, maxFiles, reason, nil)
+		return landResolution{}, l.notAttempted(reason, nil)
 	}
 
 	maxBytes := s.resolveCfg.MaxFileBytesOrDefault()
 	rejected := false
 	for _, f := range l.files {
-		if err := resolver.ValidateFile(resolved[f.conflict.path], maxBytes); err != nil {
+		rf := resolved[f.conflict.path]
+		err := resolver.ValidateFile(rf, maxBytes)
+		if err == nil {
+			err = landModeOfSides(f.conflict, rf)
+		}
+		if err != nil {
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
 			rejected = true
 		}
 	}
 
-	actor := identity.Actor(ctx, "")
-	checkedBy := ""
+	checkedBy, syntaxUnchecked := "", 0
 	if !rejected && s.conflictResolver != nil {
-		if checkedBy, err = s.landCheckResolution(ctx, in, repo, l, actor, resolved); err != nil {
+		if checkedBy, syntaxUnchecked, err = s.landCheckResolution(ctx, in, repo, l, actor, resolved); err != nil {
 			return landResolution{}, err
 		}
 	}
@@ -103,7 +121,7 @@ func (s *Server) landWithResolution(
 				f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_RESOLVED, ""
 			}
 		}
-		return landResolution{}, l.unresolved(ctx, maxFiles, "", "the resolution was rejected: "+landUnresolvedCause(l.files), nil)
+		return landResolution{}, l.unresolved("", "the resolution was rejected: "+landUnresolvedCause(l.files), nil)
 	}
 
 	resp := &resolver.Response{Version: resolver.ProtocolVersion, Resolver: landAgentResolver(actor)}
@@ -111,7 +129,8 @@ func (s *Server) landWithResolution(
 		resp.Files = append(resp.Files, resolved[f.conflict.path])
 	}
 	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, checkedBy)
-	return res, l.verifyRejected(ctx, maxFiles, err)
+	res.syntaxUnchecked = syntaxUnchecked
+	return res, l.verifyRejected(err)
 }
 
 // landResolutionFiles maps the files of the resolution to the conflicting paths. It returns a
@@ -159,8 +178,8 @@ func landResolutionFiles(r *gitalypb.LandResolution, files []*landFileState) (ma
 // landCheckResolution runs the resolver's checks on the files of the resolution that may be sent
 // to the resolver (landClassify), and sets the outcome of each checked file that fails them to
 // REJECTED. It returns the checker's name for the Graft-Checked-By trailer, or "" when no file
-// could be sent. The check fails closed: a check that cannot run is a *landUnresolvedError with a
-// fresh package.
+// could be sent, and the number of files accepted without a syntax verdict. The check fails
+// closed: a check that cannot run is a *landUnresolvedError with a fresh package.
 func (s *Server) landCheckResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -168,9 +187,9 @@ func (s *Server) landCheckResolution(
 	l landListing,
 	actor string,
 	resolved map[string]resolver.ResponseFile,
-) (string, error) {
+) (string, int, error) {
 	if err := s.landClassify(ctx, repo, l.files, l.base, l.tip, l.commitID); err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	req := resolver.Request{
@@ -202,18 +221,17 @@ func (s *Server) landCheckResolution(
 	}
 	if len(checked) == 0 {
 		s.logger.WithField("unchecked", unchecked).InfoContext(ctx, "graft: no file of the agent's resolution may be sent to the resolver's checks")
-		return "", nil
+		return "", 0, nil
 	}
 
 	// Fail closed: a check that cannot run (an error, an answer that is no valid check response, a
 	// resolver that does not know the check operation) fails the land with a fresh package.
-	maxFiles := s.resolveCfg.MaxFilesOrDefault()
 	resp, err := s.conflictResolver.Check(ctx, req)
 	if err != nil {
-		return "", l.notAttempted(ctx, maxFiles, fmt.Sprintf("the resolution could not be checked: %v", err), err)
+		return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: %v", err), err)
 	}
 	if !landResolverNameValid(resp.Resolver) {
-		return "", l.notAttempted(ctx, maxFiles, fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
+		return "", 0, l.notAttempted(fmt.Sprintf("the resolution could not be checked: the check names an invalid resolver %q", resp.Resolver), nil)
 	}
 	syntaxUnchecked := 0
 	for i, v := range resp.Files {
@@ -227,14 +245,11 @@ func (s *Server) landCheckResolution(
 			syntaxUnchecked++
 		}
 	}
-	if syntaxUnchecked > 0 {
-		landResolutionSyntaxUncheckedTotal.Add(float64(syntaxUnchecked))
-	}
 	s.logger.WithFields(log.Fields{
 		"checked_by":       resp.Resolver,
 		"checked":          len(checked),
 		"syntax_unchecked": syntaxUnchecked,
 		"not_checked":      unchecked,
 	}).InfoContext(ctx, "graft: agent's resolution checked")
-	return resp.Resolver, nil
+	return resp.Resolver, syntaxUnchecked, nil
 }

@@ -134,6 +134,10 @@ func TestLandResolutionLandsTheResolvedFiles(t *testing.T) {
 
 	_, err = ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: tip, Commit: "other", Files: nil})
 	require.ErrorContains(t, err, "not the pending commit")
+	// The backend refuses it too, as the server does, for a caller that goes around the workspace.
+	_, err = b.Land(context.Background(), LandOptions{Branch: "main", Commit: pending, Strategy: StrategyMerge, Committer: committer,
+		Resolution: &Resolution{Tip: tip, Commit: "other", Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}}}})
+	require.ErrorContains(t, err, `the resolution is for commit "other"`)
 
 	res, err := ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: tip, Commit: pending,
 		Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}}})

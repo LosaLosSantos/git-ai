@@ -204,11 +204,13 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		if err != nil {
 			var unresolved *landUnresolvedError
 			if errors.As(err, &unresolved) {
-				paths := make([][]byte, 0, len(unresolved.pkg.GetFiles()))
-				for _, f := range unresolved.pkg.GetFiles() {
-					paths = append(paths, f.GetPath())
+				// The paths of UserLandError are bounded like the files of the package.
+				files := unresolved.listing.files[:min(len(unresolved.listing.files), landMaxPackageFiles)]
+				paths := make([][]byte, 0, len(files))
+				for _, f := range files {
+					paths = append(paths, []byte(f.conflict.path))
 				}
-				return landStep{}, landWithPackage(landMergeConflictError(tip, commitID, paths, err), err)
+				return landStep{}, landWithPackage(ctx, landMergeConflictError(tip, commitID, paths, err), err)
 			}
 			return landStep{}, err
 		}
@@ -229,7 +231,7 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		if resolveErr != nil {
 			a.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
 				Info("graft: conflict resolution of land failed")
-			return landStep{}, landWithPackage(err, resolveErr)
+			return landStep{}, landWithPackage(ctx, err, resolveErr)
 		}
 
 		resolution = &res

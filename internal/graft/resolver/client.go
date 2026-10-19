@@ -41,9 +41,19 @@ type UnresolvableError struct {
 
 // validOutcomes returns files when it has exactly one entry per requested path
 // with a known outcome, and nil otherwise: a malformed list is not trusted in
-// part.
+// part. A refusal whose every file is resolved contradicts itself and is
+// malformed too.
 func validOutcomes(req Request, files []FileOutcome) []FileOutcome {
 	if len(files) != len(req.Files) {
+		return nil
+	}
+	unresolved := false
+	for _, f := range files {
+		if f.Outcome != OutcomeResolved {
+			unresolved = true
+		}
+	}
+	if !unresolved {
 		return nil
 	}
 	want := make(map[string]bool, len(req.Files))
@@ -181,7 +191,10 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 	req.Version = ProtocolVersion
 	req.Limits = Limits{MaxFileBytes: c.maxFileBytes}
 
-	if err := c.checkRequest(req); err != nil {
+	if err := c.checkResolvePolicy(req); err != nil {
+		return nil, err
+	}
+	if err := c.checkFiles(req); err != nil {
 		return nil, err
 	}
 
@@ -226,10 +239,11 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 	return &resp, nil
 }
 
-// checkRequest enforces the client's limits and policy on an outgoing request:
-// file count, per-side size, clean unique UTF-8 paths, known kinds, the path
-// policy and the actor policy.
-func (c *Client) checkRequest(req Request) error {
+// checkResolvePolicy enforces what bounds a request for an AI resolution only:
+// max_files and the actor policy. The check of an agent's resolution is not
+// such a request: it runs for every actor that may land, on every file the
+// agent resolved (PLAN10 12).
+func (c *Client) checkResolvePolicy(req Request) error {
 	if len(req.Files) > c.maxFiles {
 		return fmt.Errorf("resolve request has %d conflicted files, limit is %d", len(req.Files), c.maxFiles)
 	}
@@ -237,7 +251,13 @@ func (c *Client) checkRequest(req Request) error {
 	if !c.ActorAllowed(req.Actor) {
 		return fmt.Errorf("actor %q may not request conflict resolution", req.Actor)
 	}
+	return nil
+}
 
+// checkFiles enforces the client's rules on the files of an outgoing request,
+// a resolve or a check: per-side size, clean unique UTF-8 paths, known kinds
+// and the path policy.
+func (c *Client) checkFiles(req Request) error {
 	seen := make(map[string]struct{}, len(req.Files))
 	for _, f := range req.Files {
 		if !cleanRelPath(f.Path) {

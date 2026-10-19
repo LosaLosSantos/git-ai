@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
+	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"google.golang.org/grpc/status"
@@ -42,6 +43,18 @@ type landResolution struct {
 	commit        git.ObjectID
 	resolvedPaths [][]byte
 	resolver      string
+	// syntaxUnchecked is the number of files of an agent's resolution that the check accepted
+	// without a syntax verdict.
+	syntaxUnchecked int
+}
+
+// landed records a resolution whose land succeeded: the metric of files landed without a syntax
+// verdict counts them here, once per landed request, and not when they were checked, since the
+// land may still fail or be decided again.
+func (r *landResolution) landed() {
+	if r != nil && r.syntaxUnchecked > 0 {
+		landResolutionSyntaxUncheckedTotal.Add(float64(r.syntaxUnchecked))
+	}
 }
 
 // landBlob is one side of a conflicted file as merge-tree reports it: the mode and the blob.
@@ -84,8 +97,9 @@ func (s *Server) resolveLandConflicts(
 	}
 	base, hasBase, conflicts, files := l.base, l.hasBase, l.conflicts, l.files
 	tipMessage, commitMessage := l.tipMessage, l.commitMessage
+	// max_files bounds the request to the resolver only: the package lists every conflicting file.
 	maxFiles := s.resolveCfg.MaxFilesOrDefault()
-	notAttempted := func(reason string) error { return l.notAttempted(ctx, maxFiles, reason, nil) }
+	notAttempted := func(reason string) error { return l.notAttempted(reason, nil) }
 	criss := l.bases
 
 	// The actor is the authenticated identity only. The name in the request is chosen by the
@@ -93,6 +107,8 @@ func (s *Server) resolveLandConflicts(
 	// only an actor list that is empty (allows everyone) admits the request.
 	actor := identity.Actor(ctx, "")
 	switch {
+	case len(files) == 0:
+		return landResolution{}, notAttempted(landNoConflictingFiles)
 	case s.conflictResolver == nil:
 		return landResolution{}, notAttempted("conflict resolution is not enabled on this server")
 	case !s.conflictResolver.ActorAllowed(actor):
@@ -114,7 +130,9 @@ func (s *Server) resolveLandConflicts(
 		}
 	}
 
-	var resp *resolver.Response
+	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
+	// written, whatever its outcomes say: answer stays nil, and the land fails with the package.
+	var answer *resolver.Response
 	var resolveErr error
 	if len(sent) > 0 {
 		req := resolver.Request{
@@ -135,37 +153,44 @@ func (s *Server) resolveLandConflicts(
 		}
 
 		// The client applies the timeout, the request policy and the acceptance rules of the answer.
-		resp, resolveErr = s.conflictResolver.Resolve(ctx, req)
+		resp, err := s.conflictResolver.Resolve(ctx, req)
+		resolveErr = err
 		switch {
-		case resolveErr == nil && !landResolverNameValid(resp.Resolver):
+		case err != nil:
+			landRefusalOutcomes(files, err)
+		case !landResolverNameValid(resp.Resolver):
 			// The name is written into the commit trailers, so it must be a plain single-line name.
 			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
-			resp = nil
-		case resolveErr != nil:
-			landRefusalOutcomes(files, resolveErr)
 		default:
+			answer = resp
+			written := make(map[string]resolver.ResponseFile, len(resp.Files))
+			for _, rf := range resp.Files {
+				written[rf.Path] = rf
+			}
 			for _, f := range files {
-				if f.sent() {
-					f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
+				if !f.sent() {
+					continue
+				}
+				f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
+				if err := landModeOfSides(f.conflict, written[f.conflict.path]); err != nil {
+					f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
 				}
 			}
 		}
 	}
 
-	for _, f := range files {
-		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
-			return landResolution{}, l.unresolved(ctx, maxFiles, "", landUnresolvedCause(files), resolveErr)
-		}
+	if answer == nil || !landAllResolved(files) {
+		return landResolution{}, l.unresolved("", landUnresolvedCause(files), resolveErr)
 	}
 
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, "")
-	return res, l.verifyRejected(ctx, maxFiles, err)
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, answer, "")
+	return res, l.verifyRejected(err)
 }
 
 // verifyRejected turns a resolution that the verification rejected into the unresolved land with
 // its package, every file rejected with the reason of the verification. Any other error is
 // returned as is.
-func (l landListing) verifyRejected(ctx context.Context, maxFiles int, err error) error {
+func (l landListing) verifyRejected(err error) error {
 	var verifyErr *landVerifyError
 	if !errors.As(err, &verifyErr) {
 		return err
@@ -173,7 +198,7 @@ func (l landListing) verifyRejected(ctx context.Context, maxFiles int, err error
 	for _, f := range l.files {
 		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, verifyErr.Error()
 	}
-	return l.unresolved(ctx, maxFiles, "", verifyErr.Error(), err)
+	return l.unresolved("", verifyErr.Error(), err)
 }
 
 // landListing is the conflicting files of the merge of a tip and a change, with what the conflict
@@ -190,10 +215,17 @@ type landListing struct {
 	conflicts                 []landFileConflict
 	files                     []*landFileState
 	tipMessage, commitMessage string
+	// messages are merge-tree's messages about the merge. A merge can be unclean without a
+	// conflicting file (a directory rename split): then files is empty and only messages
+	// describe it.
+	messages []landMergeMessage
 }
 
+// landNoConflictingFiles is the reason of a merge that is unclean without a conflicting file.
+const landNoConflictingFiles = "the merge has conflicts without a conflicting file (see the messages of the package), which a resolution of files cannot resolve"
+
 // errLandNoConflicts is the error of landListConflicts when the merge is clean.
-var errLandNoConflicts = errors.New("the merge of the tip and the change reports no conflicting files")
+var errLandNoConflicts = errors.New("the merge of the tip and the change is clean")
 
 // landListConflicts lists the files that conflict between tip and commitID. A clean merge is an
 // error: when rebasing, the conflict may come from an intermediate commit that a later commit of
@@ -205,10 +237,11 @@ func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID 
 	if l.base, l.hasBase, l.bases, err = landMergeBase(ctx, repo, tip, commitID); err != nil {
 		return l, err
 	}
-	if l.mergedTree, l.conflicts, err = landMergeTree(ctx, repo, tip, commitID, l.base, l.hasBase); err != nil {
+	var clean bool
+	if l.mergedTree, l.conflicts, l.messages, clean, err = landMergeTree(ctx, repo, tip, commitID, l.base, l.hasBase); err != nil {
 		return l, err
 	}
-	if len(l.conflicts) == 0 {
+	if clean {
 		return l, errLandNoConflicts
 	}
 	if l.tipMessage, err = landCommitBody(ctx, repo, tip); err != nil {
@@ -223,65 +256,52 @@ func landListConflicts(ctx context.Context, repo *localrepo.Repo, tip, commitID 
 	return l, nil
 }
 
-// unresolved returns the error of a land left unresolved, with its conflict package. err is the
-// error of the resolver or of the check that caused it, if any. The sides that the hunks of the
-// package need and that were not read yet are read here, whatever the outcome of the file.
-func (l landListing) unresolved(ctx context.Context, maxFiles int, reason, cause string, err error) error {
-	if readErr := l.readForHunks(ctx, maxFiles); readErr != nil {
-		return readErr
-	}
-	return &landUnresolvedError{
-		pkg:   landPackage(l.tip, l.commitID, l.base, l.tipMessage, l.commitMessage, l.files, maxFiles, reason),
-		cause: cause,
-		err:   err,
-	}
-}
-
-// readForHunks reads the sides of the content and add/add conflicts of the package that are not
-// read yet and fit max_file_bytes, so that the package has their hunks. A larger side is not read:
-// its file gets no hunks, as a diff of that size is not computed anyway.
-func (l landListing) readForHunks(ctx context.Context, maxFiles int) error {
-	for i, f := range l.files {
-		if i == maxFiles {
-			break
-		}
-		if f.read || (f.kind != resolver.KindContent && f.kind != resolver.KindAddAdd) {
-			continue
-		}
-		var sides [3][]byte
-		fits := true
-		for j, b := range []*landBlob{f.conflict.base, f.conflict.ours, f.conflict.theirs} {
-			if b == nil {
-				continue
-			}
-			info, err := l.repo.ReadObjectInfo(ctx, b.oid.Revision())
-			if err != nil {
-				return fmt.Errorf("reading size of %q: %w", f.conflict.path, err)
-			}
-			if info.Size > l.maxFileBytes {
-				fits = false
-				break
-			}
-			content, err := l.repo.ReadObject(ctx, b.oid)
-			if err != nil {
-				return fmt.Errorf("reading blob of %q: %w", f.conflict.path, err)
-			}
-			sides[j] = content
-		}
-		if fits {
-			f.sides, f.read = sides, true
-		}
-	}
-	return nil
+// unresolved returns the error of a land left unresolved, which carries what its conflict package
+// is built from (landWithPackage). reason is the package's reason, cause the error's. err is the
+// error of the resolver or of the check that caused it, if any.
+func (l landListing) unresolved(reason, cause string, err error) error {
+	return &landUnresolvedError{listing: l, reason: reason, cause: cause, err: err}
 }
 
 // notAttempted returns the error of a land the server did not try to resolve at all, every file
 // NOT_ATTEMPTED and the package carrying the reason.
-func (l landListing) notAttempted(ctx context.Context, maxFiles int, reason string, err error) error {
+func (l landListing) notAttempted(reason string, err error) error {
 	for _, f := range l.files {
 		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, ""
 	}
-	return l.unresolved(ctx, maxFiles, reason, reason, err)
+	return l.unresolved(reason, reason, err)
+}
+
+// landModeOfSides refuses a written resolution whose mode is none of the modes of the conflict's
+// sides: a resolution merges the sides, and turning a file into a symbolic link or an executable
+// (or back) that no side asked for is not a merge. A deletion has no mode.
+func landModeOfSides(c landFileConflict, rf resolver.ResponseFile) error {
+	if rf.Action != resolver.ActionWrite {
+		return nil
+	}
+	var modes []string
+	for _, b := range []*landBlob{c.base, c.ours, c.theirs} {
+		if b == nil {
+			continue
+		}
+		if b.mode == rf.Mode {
+			return nil
+		}
+		if !slices.Contains(modes, b.mode) {
+			modes = append(modes, b.mode)
+		}
+	}
+	return fmt.Errorf("the resolution writes mode %s, which is none of the modes of the sides (%s)", rf.Mode, strings.Join(modes, ", "))
+}
+
+// landAllResolved reports whether every file of the land is resolved.
+func landAllResolved(files []*landFileState) bool {
+	for _, f := range files {
+		if f.outcome != gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			return false
+		}
+	}
+	return true
 }
 
 // landRequestFile is the file of the resolve request for a classified file that is sent.
@@ -368,6 +388,14 @@ func (s *Server) landWriteResolution(
 	paths := make([]string, 0, len(resp.Files))
 	for _, f := range resp.Files {
 		paths = append(paths, f.Path)
+	}
+	// The message comes first: a value that cannot be a trailer refuses the resolution before
+	// anything is written.
+	message, err := landResolveCommitMessage(in, commitID, resp.Resolver, checkedBy, paths)
+	if err != nil {
+		return landResolution{}, err
+	}
+	for _, f := range resp.Files {
 		if f.Action == resolver.ActionDelete {
 			if err := tree.Delete(f.Path); err != nil && !errors.Is(err, localrepo.ErrEntryNotFound) {
 				return landResolution{}, fmt.Errorf("deleting %q: %w", f.Path, err)
@@ -396,7 +424,7 @@ func (s *Server) landWriteResolution(
 
 	newTip, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{
 		TreeID:         tree.OID,
-		Message:        landResolveCommitMessage(in, commitID, resp.Resolver, checkedBy, paths),
+		Message:        message,
 		Parents:        []git.ObjectID{tip, commitID},
 		AuthorName:     committer.Name,
 		AuthorEmail:    committer.Email,
@@ -450,11 +478,11 @@ func (s *Server) landClassify(
 	for _, f := range files {
 		c := f.conflict
 		switch {
-		case !landTrailerSafe(c.path):
-			f.notSent(landNotSentTrailerUnsafe)
-			continue
 		case !utf8.ValidString(c.path):
 			f.notSent(landNotSentInvalidUTF8)
+			continue
+		case !landTrailerValueValid(c.path):
+			f.notSent(landNotSentTrailerUnsafe)
 			continue
 		case !s.conflictResolver.PathAllowed(c.path):
 			f.notSent(landNotSentDenied)
@@ -586,18 +614,12 @@ func (s *Server) landDeniedSource(
 			return fmt.Sprintf("a side is in no path of %s", side.rev), nil
 		}
 		for _, p := range sources {
-			if !landTrailerSafe(p) || !s.conflictResolver.PathAllowed(p) {
+			if !landTrailerValueValid(p) || !s.conflictResolver.PathAllowed(p) {
 				return fmt.Sprintf("a side comes from path %q, which may not be sent to the resolver", p), nil
 			}
 		}
 	}
 	return "", nil
-}
-
-// landTrailerSafe reports whether s can be written as a single line of a commit trailer: it must
-// hold no line break and no NUL byte.
-func landTrailerSafe(s string) bool {
-	return !strings.ContainsAny(s, "\r\n\x00")
 }
 
 // landTruncate returns s cut to at most n bytes, with a marker when it was cut. The result is
@@ -611,18 +633,9 @@ func landTruncate(s string, n int) string {
 
 // landResolverNameValid reports whether name can be the name of the resolver, which the answer
 // chooses and which is written into a commit trailer and the response. It must be non-empty, at
-// most maxResolverNameBytes long, valid UTF-8 and printable: control characters such as tab or
-// escape sequences, and Unicode line or paragraph separators, are rejected.
+// most maxResolverNameBytes long, and a valid trailer value (landTrailerValueValid).
 func landResolverNameValid(name string) bool {
-	if name == "" || len(name) > maxResolverNameBytes || !utf8.ValidString(name) {
-		return false
-	}
-	for _, r := range name {
-		if !unicode.IsPrint(r) {
-			return false
-		}
-	}
-	return true
+	return len(name) <= maxResolverNameBytes && landTrailerValueValid(name)
 }
 
 // landSide is one present side of a conflicting file and the commit whose tree it comes from.
@@ -707,26 +720,19 @@ func landListTree(ctx context.Context, repo *localrepo.Repo, rev git.ObjectID) (
 }
 
 // landResolveCommitMessage returns the message of the resolution commit: the merge message or
-// the default one, followed by the Graft-Resolved trailers.
-func landResolveCommitMessage(in *gitalypb.UserLandRequest, commitID git.ObjectID, resolverName, checkedBy string, paths []string) string {
+// the default one, followed by the trailers of landResolutionTrailers. An agent's resolution
+// records in Graft-Checked-By whether the resolver's checks ran on it: without a resolver it got
+// only the marker rule and the server's structural validation.
+func landResolveCommitMessage(in *gitalypb.UserLandRequest, commitID git.ObjectID, resolverName, checkedBy string, paths []string) (string, error) {
+	trailers, err := landResolutionTrailers(resolverName, checkedBy, paths)
+	if err != nil {
+		return "", err
+	}
 	subject := strings.TrimRight(string(in.GetMergeMessage()), "\n")
 	if subject == "" {
 		subject = fmt.Sprintf("Merge %s into %s", landShortOID(commitID), string(in.GetBranch()))
 	}
-
-	var b strings.Builder
-	b.WriteString(subject)
-	b.WriteString("\n\n")
-	b.WriteString("Graft-Resolved-By: " + resolverName + "\n")
-	// An agent's resolution records whether the resolver's checks ran on it: without a resolver
-	// it got only the marker rule and the server's structural validation.
-	if checkedBy != "" {
-		b.WriteString("Graft-Checked-By: " + checkedBy + "\n")
-	}
-	for _, p := range paths {
-		b.WriteString("Graft-Resolved-Path: " + p + "\n")
-	}
-	return b.String()
+	return subject + "\n\n" + trailers, nil
 }
 
 // landShortOID returns the abbreviated object ID used in default messages.
@@ -794,7 +800,7 @@ func landMergeTree(
 	repo *localrepo.Repo,
 	tip, commitID, base git.ObjectID,
 	hasBase bool,
-) (git.ObjectID, []landFileConflict, error) {
+) (git.ObjectID, []landFileConflict, []landMergeMessage, bool, error) {
 	flags := []gitcmd.Option{
 		gitcmd.Flag{Name: "-z"},
 		gitcmd.Flag{Name: "--write-tree"},
@@ -805,20 +811,22 @@ func landMergeTree(
 	}
 
 	var stdout, stderr bytes.Buffer
+	clean := true
 	if err := repo.ExecAndWait(ctx,
 		gitcmd.Command{Name: "merge-tree", Flags: flags, Args: []string{tip.String(), commitID.String()}},
 		gitcmd.WithStdout(&stdout),
 		gitcmd.WithStderr(&stderr),
 	); err != nil {
+		clean = false
 		// Exit status 1 means the merge has conflicts, and the tree is printed regardless.
 		if exitStatus, ok := command.ExitStatus(err); !ok || exitStatus != 1 {
-			return "", nil, fmt.Errorf("merge-tree: %w, stderr: %q", err, stderr.String())
+			return "", nil, nil, false, fmt.Errorf("merge-tree: %w, stderr: %q", err, stderr.String())
 		}
 	}
 
 	objectHash, err := repo.ObjectHash(ctx)
 	if err != nil {
-		return "", nil, fmt.Errorf("detecting object hash: %w", err)
+		return "", nil, nil, false, fmt.Errorf("detecting object hash: %w", err)
 	}
 
 	// The output is the tree OID, the conflicted file records and, after an empty field, the
@@ -826,12 +834,15 @@ func landMergeTree(
 	fields := strings.Split(stdout.String(), "\x00")
 	treeOID, err := objectHash.FromHex(fields[0])
 	if err != nil {
-		return "", nil, fmt.Errorf("parsing merge tree: %w", err)
+		return "", nil, nil, false, fmt.Errorf("parsing merge tree: %w", err)
 	}
 
 	var conflicts []landFileConflict
 	index := map[string]int{}
-	for _, record := range fields[1:] {
+	rest := fields[1:]
+	for len(rest) > 0 {
+		record := rest[0]
+		rest = rest[1:]
 		if record == "" {
 			break
 		}
@@ -839,12 +850,12 @@ func landMergeTree(
 		meta, p, ok := strings.Cut(record, "\t")
 		parts := strings.Fields(meta)
 		if !ok || p == "" || len(parts) != 3 {
-			return "", nil, fmt.Errorf("unexpected conflicted file record %q", record)
+			return "", nil, nil, false, fmt.Errorf("unexpected conflicted file record %q", record)
 		}
 
 		oid, err := objectHash.FromHex(parts[1])
 		if err != nil {
-			return "", nil, fmt.Errorf("parsing blob ID of %q: %w", p, err)
+			return "", nil, nil, false, fmt.Errorf("parsing blob ID of %q: %w", p, err)
 		}
 
 		i, found := index[p]
@@ -865,15 +876,47 @@ func landMergeTree(
 		case "3":
 			side = &c.theirs
 		default:
-			return "", nil, fmt.Errorf("unexpected stage %q of conflicted path %q", parts[2], p)
+			return "", nil, nil, false, fmt.Errorf("unexpected stage %q of conflicted path %q", parts[2], p)
 		}
 		if *side != nil {
-			return "", nil, fmt.Errorf("conflicted path %q has two entries of stage %s", p, parts[2])
+			return "", nil, nil, false, fmt.Errorf("conflicted path %q has two entries of stage %s", p, parts[2])
 		}
 		*side = &landBlob{mode: parts[0], oid: oid}
 	}
 
-	return treeOID, conflicts, nil
+	messages, err := landMergeMessages(rest)
+	if err != nil {
+		return "", nil, nil, false, err
+	}
+	return treeOID, conflicts, messages, clean, nil
+}
+
+// landMergeMessage is one of merge-tree's messages about the merge.
+type landMergeMessage struct {
+	paths   []string
+	kind    string
+	message string
+}
+
+// landMergeMessages parses the informational messages of merge-tree -z, which follow the empty
+// field after the conflicted file records: each is the number of paths, the paths, the type (such
+// as "CONFLICT (rename/delete)" or "Auto-merging") and the message, NUL-terminated. The output ends
+// with a NUL, so the last field is empty.
+func landMergeMessages(fields []string) ([]landMergeMessage, error) {
+	var messages []landMergeMessage
+	for len(fields) > 0 && !(len(fields) == 1 && fields[0] == "") {
+		n, err := strconv.Atoi(fields[0])
+		if err != nil || n < 0 || len(fields) < n+3 {
+			return nil, fmt.Errorf("unexpected merge-tree message %q", fields)
+		}
+		messages = append(messages, landMergeMessage{
+			paths:   slices.Clone(fields[1 : 1+n]),
+			kind:    fields[1+n],
+			message: strings.TrimRight(fields[2+n], "\n"),
+		})
+		fields = fields[3+n:]
+	}
+	return messages, nil
 }
 
 // isLandMergeConflict reports whether a landing failed because the change does not apply cleanly

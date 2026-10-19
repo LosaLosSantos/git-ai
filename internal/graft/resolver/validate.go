@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"path"
+	"strings"
 )
 
 // Validate applies the server's acceptance rules to a resolver answer. An
@@ -78,6 +80,12 @@ func validateFile(f ResponseFile, maxBytes int64) error {
 			return fmt.Errorf("invalid mode %q for write", f.Mode)
 		}
 
+		if f.Mode == ModeSymlink {
+			if special := gitSpecialFile(path.Base(f.Path)); special != "" {
+				return fmt.Errorf("a symbolic link named %s is refused: git fsck and checkout do not allow %s, .gitmodules, .gitattributes, .gitignore and .mailmap to be symbolic links", path.Base(f.Path), special)
+			}
+		}
+
 		if int64(len(f.Content)) > maxBytes {
 			return fmt.Errorf("content is %d bytes, limit is %d", len(f.Content), maxBytes)
 		}
@@ -100,6 +108,59 @@ func validateFile(f ResponseFile, maxBytes int64) error {
 	default:
 		return fmt.Errorf("invalid action %q", f.Action)
 	}
+}
+
+// gitSpecialFiles are the files git reads from the tree itself, which must not be symbolic links
+// (git fsck: gitmodulesSymlink, gitattributesSymlink, gitignoreSymlink, mailmapSymlink), each with
+// the stem of its NTFS short name when it is not the first six letters of its name.
+var gitSpecialFiles = []struct {
+	name, shortHash string
+}{
+	{".gitmodules", "gi7eba"},
+	{".gitattributes", "gi7d29"},
+	{".gitignore", "gi250a"},
+	{".mailmap", "maba30"},
+}
+
+// gitSpecialFile returns the special file that the tree entry name stands for on some file
+// system, or "". git compares names the way the file systems that check out the tree do:
+//   - case-insensitively, and ignoring the code points that HFS+ ignores (zero-width and
+//     directional marks, U+FEFF);
+//   - on NTFS, also with trailing spaces and dots, an alternate data stream (":stream"), and as
+//     an 8.3 short name: the first six letters of the name, or the stem above, then "~" and a
+//     digit.
+func gitSpecialFile(name string) string {
+	folded := strings.ToLower(strings.Map(func(r rune) rune {
+		if hfsIgnorable(r) {
+			return -1
+		}
+		return r
+	}, name))
+	ntfs := strings.ToLower(name)
+	if i := strings.IndexByte(ntfs, ':'); i >= 0 {
+		ntfs = ntfs[:i]
+	}
+	ntfs = strings.TrimRight(ntfs, " .")
+	for _, s := range gitSpecialFiles {
+		if folded == s.name || ntfs == s.name {
+			return s.name
+		}
+		for _, stem := range []string{s.name[1:7], s.shortHash} {
+			if len(ntfs) == len(stem)+2 && strings.HasPrefix(ntfs, stem+"~") && ntfs[len(stem)+1] >= '1' && ntfs[len(stem)+1] <= '9' {
+				return s.name
+			}
+		}
+	}
+	return ""
+}
+
+// hfsIgnorable reports whether HFS+ ignores r when it compares names.
+func hfsIgnorable(r rune) bool {
+	switch {
+	case r >= 0x200c && r <= 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x206a && r <= 0x206f, r == 0xfeff:
+		return true
+	}
+	return false
 }
 
 // validMode reports whether mode is a git file mode the server accepts.

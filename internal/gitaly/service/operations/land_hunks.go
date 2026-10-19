@@ -7,12 +7,12 @@ import (
 
 // landConflictHunks returns the conflicting regions of a three-way merge of base, ours and theirs
 // (merge3) as the hunks of the conflict package: line ranges of each side, 1-based and half-open,
-// each counting the lines of its own side. It returns nil when a diff exceeds merge3.MaxCells; the
+// each counting the lines of its own side. It returns false when a diff exceeds merge3.MaxCells; the
 // agent still has the sides.
-func landConflictHunks(base, ours, theirs []byte) []*gitalypb.LandConflictHunk {
+func landConflictHunks(base, ours, theirs []byte) ([]*gitalypb.LandConflictHunk, bool) {
 	result, ok := merge3.Merge(base, ours, theirs)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	var hunks []*gitalypb.LandConflictHunk
 	for _, h := range result.Hunks() {
@@ -22,7 +22,7 @@ func landConflictHunks(base, ours, theirs []byte) []*gitalypb.LandConflictHunk {
 			Theirs: landRange(h.Theirs),
 		})
 	}
-	return hunks
+	return hunks, true
 }
 
 // landRange returns the 1-based half-open range of the 0-based range r.

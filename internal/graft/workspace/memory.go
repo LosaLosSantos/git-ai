@@ -295,6 +295,10 @@ func (m *MemoryBackend) Land(_ context.Context, opts LandOptions) (LandResult, e
 	// Three-way merge of the commit's changes (relative to its parent) onto the tip. With a
 	// resolution, the conflicting names take the resolved files, as the server's merge commit
 	// does; the resolution must be made against this tip and resolve exactly those names.
+	// As on the server, a resolution for another commit is refused, whatever its files.
+	if opts.Resolution != nil && opts.Resolution.Commit != id {
+		return LandResult{}, fmt.Errorf("the resolution is for commit %q, not commit %q", opts.Resolution.Commit, id)
+	}
 	if opts.Resolution != nil && opts.Resolution.Tip != tip {
 		return LandResult{}, fmt.Errorf("the resolution was made against tip %s, the branch is at %s: %w", opts.Resolution.Tip, tip, ErrMergeConflict)
 	}

@@ -207,6 +207,7 @@ func landBatchResult(outcome landBatchOutcome) landlane.Result[*gitalypb.UserLan
 	if outcome.Resolution != nil {
 		resp.ResolvedPaths = outcome.Resolution.resolvedPaths
 		resp.Resolver = outcome.Resolution.resolver
+		outcome.Resolution.landed()
 	}
 
 	return landlane.Result[*gitalypb.UserLandResponse]{Value: resp}
