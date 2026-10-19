@@ -58,7 +58,8 @@ type LandOptions struct {
 	// merge conflict as without this option.
 	ResolveConflicts bool
 	// RetryUnavailable is how Land retries a call that the server answers
-	// with Unavailable (see UnavailableRetry). It is on by default.
+	// with Unavailable (see UnavailableRetry). It is on by default for
+	// LandMerge and LandFastForwardOnly, and off for LandRebase.
 	RetryUnavailable UnavailableRetry
 }
 
@@ -70,22 +71,25 @@ type LandOptions struct {
 // backoff with full jitter: before retry n it waits a random time between zero
 // and min(Cap, Base x 2^(n-1)). A context that ends stops the waiting.
 //
-// A land is safe to retry when the response of an earlier call was lost after
-// the server landed the change: the server lands by compare-and-swap, and the
-// retry finds the change on the branch. With LandMerge, LandFastForwardOnly or
-// ResolveConflicts, Commit is then reachable from the tip, and the retry is
-// reported as AlreadyLanded. With LandRebase the branch holds a rebased copy,
-// not Commit itself: the retry replays the change onto the tip, every commit
-// of it comes out empty and is dropped, and the branch is left unchanged; the
-// result then has LandedCommitID equal to the tip, Rewritten false and
-// AlreadyLanded false. A change that a later commit reverted in between is
-// replayed again, as git's cherry-pick would. A retried land with
-// ResolveConflicts may run the conflict resolver again, a model included, for
-// the same conflict; LandResult reports the retries (UnavailableRetries), so
-// that this cost is visible.
+// The response of a call can be lost after the server landed the change. With
+// LandMerge and LandFastForwardOnly, Commit is then reachable from the tip, and
+// the retry is reported as AlreadyLanded: these lands are retried by default.
+// With LandRebase, ResolveConflicts included (a land without conflicts is a
+// plain rebase), the branch holds a rebased copy, not Commit itself, and the
+// server cannot tell yet that the change landed: the retry replays the change
+// onto the tip. Every commit of it comes out empty and is dropped, unless a
+// later commit reverted the change in between, for example graft-verify
+// reverting the culprit: the retry would then land the change again. Rebase
+// lands are therefore not retried unless RebaseLands is set by a caller that
+// accepts this. A retried land with ResolveConflicts may run the conflict
+// resolver again, a model included, for the same conflict; LandResult reports
+// the retries (UnavailableRetries), so that this cost is visible.
 type UnavailableRetry struct {
 	// Disabled turns the retries off: Land returns Unavailable at once.
 	Disabled bool
+	// RebaseLands also retries LandRebase lands, which a retry after a lost
+	// response may land again when the change was reverted in between.
+	RebaseLands bool
 	// MaxRetries bounds the retries after the first call. Zero means 5.
 	MaxRetries int
 	// Base is the backoff of the first retry. Zero means 100ms.
@@ -118,9 +122,10 @@ func (r UnavailableRetry) backoff(n int) time.Duration {
 	return time.Duration(rand.Int64N(int64(limit) + 1))
 }
 
-func (r UnavailableRetry) maxRetries() int {
+// maxRetries returns the retries of a land with the given strategy.
+func (r UnavailableRetry) maxRetries(strategy LandStrategy) int {
 	switch {
-	case r.Disabled:
+	case r.Disabled, strategy == LandRebase && !r.RebaseLands:
 		return 0
 	case r.MaxRetries > 0:
 		return r.MaxRetries
@@ -215,7 +220,7 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 	)
 	for {
 		resp, err = r.client.operations.UserLand(ctx, req)
-		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries() {
+		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy) {
 			break
 		}
 		retries++

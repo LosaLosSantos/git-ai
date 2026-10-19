@@ -16,6 +16,44 @@ import (
 // fastRetry is the retry of Unavailable with a backoff short enough for tests.
 var fastRetry = sdk.UnavailableRetry{Base: time.Millisecond, Cap: 2 * time.Millisecond}
 
+// mergeLand is a land with LandMerge, which RetryUnavailable retries by default.
+func mergeLand() sdk.LandOptions {
+	opts := validLand()
+	opts.Strategy = sdk.LandMerge
+	return opts
+}
+
+func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		desc             string
+		resolve          bool
+		retry            sdk.UnavailableRetry
+		expectedRequests int
+	}{
+		{desc: "rebase", retry: fastRetry, expectedRequests: 1},
+		{desc: "rebase with conflict resolution", resolve: true, retry: fastRetry, expectedRequests: 1},
+		{desc: "rebase, opted in", retry: sdk.UnavailableRetry{RebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 6},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			fakes := newFakeServices()
+			fakes.operations.landErr = status.Error(codes.Unavailable, "still syncing")
+			repo := dialFake(t, fakes.register).Repo("repo")
+
+			opts := validLand()
+			opts.Strategy = sdk.LandRebase
+			opts.ResolveConflicts = tc.resolve
+			opts.RetryUnavailable = tc.retry
+			_, err := repo.Land(t.Context(), opts)
+			require.Equal(t, codes.Unavailable, sdk.Code(err))
+			require.Len(t, fakes.operations.landRequests, tc.expectedRequests)
+		})
+	}
+}
+
 func TestRepo_Land_RetriesUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -27,7 +65,7 @@ func TestRepo_Land_RetriesUnavailable(t *testing.T) {
 	fakes.operations.landResponse = &gitalypb.UserLandResponse{LandedCommitId: "landed-sha", Attempts: 1}
 	repo := dialFake(t, fakes.register).Repo("repo")
 
-	opts := validLand()
+	opts := mergeLand()
 	opts.RetryUnavailable = fastRetry
 	result, err := repo.Land(t.Context(), opts)
 	require.NoError(t, err)
@@ -56,7 +94,7 @@ func TestRepo_Land_UnavailableRetriesAreBounded(t *testing.T) {
 			fakes.operations.landErr = status.Error(codes.Unavailable, "still syncing")
 			repo := dialFake(t, fakes.register).Repo("repo")
 
-			opts := validLand()
+			opts := mergeLand()
 			opts.RetryUnavailable = tc.retry
 			_, err := repo.Land(t.Context(), opts)
 			require.Equal(t, codes.Unavailable, sdk.Code(err), "the last Unavailable is returned")
@@ -76,7 +114,7 @@ func TestRepo_Land_RetriesOnlyUnavailable(t *testing.T) {
 			fakes.operations.landErr = status.Error(code, "not to be retried")
 			repo := dialFake(t, fakes.register).Repo("repo")
 
-			opts := validLand()
+			opts := mergeLand()
 			opts.RetryUnavailable = fastRetry
 			_, err := repo.Land(t.Context(), opts)
 			require.Equal(t, code, sdk.Code(err))
@@ -95,7 +133,7 @@ func TestRepo_Land_ContextStopsTheRetries(t *testing.T) {
 	// The backoff is longer than the context, which ends during the first wait.
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	opts := validLand()
+	opts := mergeLand()
 	opts.RetryUnavailable = sdk.UnavailableRetry{Base: time.Hour, Cap: time.Hour}
 	// Each wait is drawn from [0, 1h]: the context ends during one of them unless five draws in
 	// a row fall below 50ms.
@@ -120,7 +158,7 @@ func TestRepo_Land_RetriedResolveLandReportsItsOutcome(t *testing.T) {
 	}
 	repo := dialFake(t, fakes.register).Repo("repo")
 
-	opts := validLand()
+	opts := mergeLand()
 	opts.ResolveConflicts = true
 	opts.RetryUnavailable = fastRetry
 	result, err := repo.Land(t.Context(), opts)
