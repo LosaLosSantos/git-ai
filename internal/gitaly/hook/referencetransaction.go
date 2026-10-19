@@ -74,7 +74,7 @@ func (m *GitLabHookManager) ReferenceTransactionHook(ctx context.Context, state 
 	// An aborted transaction gives up its place in the order of the changeset log, so that the
 	// transactions prepared after it do not wait for it.
 	case ReferenceTransactionAborted:
-		m.abortChangesets(ctx, payload, changes)
+		m.abortChangesets(payload, env, changes)
 		if m.storageVoter != nil {
 			m.storageVoter.Aborted(ctx, payload, changes)
 		}
@@ -156,42 +156,46 @@ func (m *GitLabHookManager) ReferenceTransactionHook(ctx context.Context, state 
 	// the order of the changeset log now. It does so only once the vote succeeded, because a
 	// failed hook aborts the transaction.
 	// In authoritative storage mode the file changelog is not written, so no order is kept for it.
+	// The mode is the storage core's configuration, fixed for the life of the process, so the
+	// prepared and the committed phase of a transaction decide alike.
 	if state == ReferenceTransactionPrepared && !m.storageAuthoritative() {
-		m.prepareChangesets(ctx, payload, changes)
+		m.prepareChangesets(payload, env, changes)
 	}
 
 	return nil
 }
 
-// changesetRepoPath returns the path of the repository whose changeset log records the given
-// hook input, or false when nothing of it is recorded.
-func (m *GitLabHookManager) changesetRepoPath(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) (string, bool) {
-	if m.cfg.Graft.Changelog.Disabled || len(changelog.ParseUpdates(changes)) == 0 {
-		return "", false
-	}
+// ordersChangesets reports whether the transaction with the given hook input takes a place in the
+// order of the changeset log of its repository.
+func (m *GitLabHookManager) ordersChangesets(payload gitcmd.HooksPayload, changes []byte) bool {
+	return !m.cfg.Graft.Changelog.Disabled && payload.Repo != nil && len(changelog.ParseUpdates(changes)) > 0
+}
 
-	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
+// changesetInvocation returns the invocation of the git process that runs the transaction, which
+// tells its ticket apart from those of the transactions of other processes (changesetTicketKey).
+// It is empty when the payload carries none; the prepared and the committed phase of a
+// transaction read the same environment, so they agree.
+func changesetInvocation(env []string) string {
+	meta, err := gitcmd.ChangelogMetaFromEnv(env)
 	if err != nil {
-		m.logger.WithError(err).ErrorContext(ctx, "ordering changesets: resolving repository path")
-		return "", false
+		return ""
 	}
-
-	return repoPath, true
+	return meta.Invocation
 }
 
 // prepareChangesets gives the prepared transaction its place in the order of the changeset log,
 // see changesetTickets.
-func (m *GitLabHookManager) prepareChangesets(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
-	if repoPath, ok := m.changesetRepoPath(ctx, payload, changes); ok {
-		takeChangesetTicket(repoPath, changes)
+func (m *GitLabHookManager) prepareChangesets(payload gitcmd.HooksPayload, env []string, changes []byte) {
+	if m.ordersChangesets(payload, changes) {
+		takeChangesetTicket(changesetQueueKey(payload.Repo), changesetInvocation(env), changes)
 	}
 }
 
 // abortChangesets gives up the place of the aborted transaction in the order of the changeset
 // log, see changesetTickets.
-func (m *GitLabHookManager) abortChangesets(ctx context.Context, payload gitcmd.HooksPayload, changes []byte) {
-	if repoPath, ok := m.changesetRepoPath(ctx, payload, changes); ok {
-		abortChangesetTicket(repoPath, changes)
+func (m *GitLabHookManager) abortChangesets(payload gitcmd.HooksPayload, env []string, changes []byte) {
+	if m.ordersChangesets(payload, changes) {
+		releaseChangesetTicket(changesetQueueKey(payload.Repo), changesetInvocation(env), changes)
 	}
 }
 
@@ -233,22 +237,23 @@ func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git
 		return
 	}
 
-	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
-	if err != nil {
-		m.logger.WithError(err).ErrorContext(ctx, "recording changesets: resolving repository path")
-		return
-	}
-
 	// The updates are recorded in the order in which their transactions were prepared, which
 	// is the order in which the references were updated. See changesetTickets. A transaction
 	// that records nothing gives up its place at once, so that later transactions do not wait
-	// for it: a packed-refs cleanup, a transaction whose metadata cannot be read, and one on
-	// the MVCC reference backend, whose updates are recorded after its commit.
-	ticket := findChangesetTicket(repoPath, changes)
+	// for it: one whose repository path cannot be resolved, a packed-refs cleanup, one whose
+	// metadata cannot be read, and one on the MVCC reference backend, whose updates are
+	// recorded after its commit.
+	queueKey := changesetQueueKey(payload.Repo)
+	invocation := changesetInvocation(env)
 	release := func() {
-		if ticket != nil {
-			releaseChangesetTicket(repoPath, ticket)
-		}
+		releaseChangesetTicket(queueKey, invocation, changes)
+	}
+
+	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
+	if err != nil {
+		release()
+		m.reportLostChangesets(ctx, updates, fmt.Errorf("resolving repository path: %w", err))
+		return
 	}
 
 	if packedCleanup {
@@ -282,16 +287,10 @@ func (m *GitLabHookManager) recordChangesets(ctx context.Context, objectHash git
 		return
 	}
 
-	// A transaction without a ticket, prepared before the changeset log was enabled or whose
-	// ticket expired, is recorded at once.
-	var recordErr error
-	if ticket == nil {
-		_, recordErr = changelog.Append(repoPath, record.Meta, record.Updates)
-	} else {
-		recordErr = recordInOrder(repoPath, ticket, record)
-	}
-	if recordErr != nil {
-		m.reportLostChangesets(ctx, updates, recordErr)
+	// A transaction without a queued ticket, prepared before the changeset log was enabled or
+	// whose ticket expired, is recorded at once (see recordChangeset).
+	if err := recordChangeset(queueKey, repoPath, invocation, changes, record); err != nil {
+		m.reportLostChangesets(ctx, updates, err)
 	}
 }
 
@@ -340,7 +339,9 @@ func (m *GitLabHookManager) observeCommitted(ctx context.Context, payload gitcmd
 // runs the hook for itself are tracked: their hooks payload carries the
 // invocation of the git process.
 func (m *GitLabHookManager) trackPendingTransaction(state ReferenceTransactionState, env []string, changes []byte) {
-	if m.cfg.Graft.Changelog.Disabled || m.pendingTransactions == nil {
+	// In authoritative storage mode recordChangesets does not run, so nothing would ever take a
+	// tracked transaction out again.
+	if m.cfg.Graft.Changelog.Disabled || m.pendingTransactions == nil || m.storageAuthoritative() {
 		return
 	}
 

@@ -244,7 +244,7 @@ func (m *GitLabHookManager) customHooksEnv(ctx context.Context, payload gitcmd.H
 // configuration, which the command factory applies after them.
 func (m *GitLabHookManager) fsyncConfiguration() []gitcmd.ConfigPair {
 	pairs := []gitcmd.ConfigPair{
-		{Key: "core.fsync", Value: "objects,derived-metadata,reference"},
+		{Key: "core.fsync", Value: gitcmd.FsyncComponents},
 		{Key: "core.fsyncMethod", Value: "fsync"},
 	}
 

@@ -395,8 +395,12 @@ update hook and update-ref); batch publishing (pack mode) and unbatched publishi
 
 ## 4. Invariants (each has a test, section 10)
 
-* L1 The changeset log is dense and ordered: sequences are consecutive, assigned in
-  ticket order, across groups and across processes.
+* L1 The changeset log is dense and ordered: sequences are consecutive across groups
+  and across processes (the log's lock file serializes the appends of every process),
+  and within the process that serves the hooks they are assigned in ticket order. A
+  transaction whose ticket expired before its committed phase is the exception: it is
+  recorded at once, after the transactions that did not wait for it, and counted
+  (`graft_changelog_unordered_records_total`).
 * L2 No RPC returns before its entries are durable, and no reader returns an entry
   that is not durable.
 * L3 A reader with a cursor never skips an entry, including across a crash before
@@ -425,7 +429,15 @@ update hook and update-ref); batch publishing (pack mode) and unbatched publishi
 | housekeeping removes a fan-out directory after the link | its descriptor is fsynced; the objects are in a pack |
 | crash during pass 1 | any prefix of the links; the quarantine is removed; unreferenced objects at most, as today |
 | crash during pass 2 | links durable up to the last committed journal transaction, in order |
-| reader before the first append of the process | loads the state, fsyncs the file, reads up to its valid end |
+| reader before the first append of the process | loads the state, fsyncs the file and the log's directories, reads up to its valid end (amended after review: the directories were not synced, and a writer that crashed between its file and its directory fsync left entries a reader served that a crash could take back) |
+| a committed phase runs after its ticket expired | (amended after review) the ticket is found and made ready in one step under the queue's lock; an expired or released ticket is not found, so the transaction is appended at once, out of order, and counted; never taken for written (the first version could, in the window between finding the ticket and making it ready, and lost the entries silently) |
+| a transaction with the same hook input in another process | the ticket key holds the invocation of the git process, or of the `UserCommitFiles`/land call that drives the hook in process, so an abort or a commit never takes another transaction's ticket |
+| the group write panics | the panic is the group's error: every member reports its updates lost, the queue stops writing and goes on |
+| the log's lock file is not granted (a holder that never releases it) | the append or the read fails after `lockWaitTimeout` (30 s); the append's updates are reported lost |
+| an fsync never returns (hung I/O) | not bounded: its group's members wait with it, and later appends fail at `lockWaitTimeout` |
+| the committed phase cannot resolve the repository path | the ticket is released (queues are kept by storage and relative path) and the updates are reported lost |
+| another process's cache overlaps (graceful restart) | a cache that knows of bytes after its last entry is never trusted by size: the state is loaded again, so an append never cuts off another process's durable entries (amended after review); a cache without such bytes is also checked against the last entry |
+| the storage mode changes between the prepared and the committed phase | cannot: the mode is the storage core's configuration, fixed for the life of the process |
 
 ## 6. Config and API changes (exact)
 
@@ -459,6 +471,9 @@ and Markdown output.
   fsync.
 * `graft_changeset_ticket_wait_seconds` (histogram): time from the committed phase
   to its entry being durable.
+* `graft_changelog_unordered_records_total` (counter, added after review): committed
+  transactions recorded without their place in the order, because their ticket
+  expired before their committed phase or they took none.
 
 ## 8. Work packages
 

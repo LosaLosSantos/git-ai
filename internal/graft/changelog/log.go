@@ -326,8 +326,9 @@ func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
 //     the repository itself, so entries written there would be lost.
 //   - Each Gitaly node keeps its own log and its own sequences. Behind Praefect,
 //     reads may be routed to a replica whose log lags or differs.
-//   - The lock is taken without a timeout. A holder that never releases it blocks
-//     every append to the repository.
+//   - The wait for the lock is bounded by lockWaitTimeout: an append that does
+//     not get it fails. An fsync that never returns is not bounded: its append
+//     holds the lock, and the appends after it fail at lockWaitTimeout.
 func AppendGroup(repoPath string, records []Record) ([][]Entry, error) {
 	entries := make([][]Entry, len(records))
 
@@ -415,7 +416,9 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 		return fmt.Errorf("stat changelog: %w", err)
 	}
 
-	if !s.loaded || info.Size() != s.fileSize {
+	if valid, err := s.cacheDescribes(f, info.Size()); err != nil {
+		return err
+	} else if !valid {
 		if err := s.load(f, info.Size()); err != nil {
 			return err
 		}
@@ -513,6 +516,43 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 	}
 
 	return nil
+}
+
+// cacheDescribes reports whether the cached state still describes the file f, whose size is
+// size, so that it need not be loaded again. The caller must hold s.mu.
+//
+// The size alone does not tell: while the cache knows of bytes after its last valid entry (a torn
+// tail, or the untrusted bytes of a failed append), another process may have cut them off and
+// appended durable entries that end at the same size, and acting on the cache would cut those
+// off. Such a cache is therefore never trusted. A cache without such bytes can only see the file
+// grow, as no process cuts the file below the end of the durable entries; it is trusted when the
+// size is unchanged and the line before its end still holds its last entry.
+func (s *logState) cacheDescribes(f *os.File, size int64) (bool, error) {
+	if !s.loaded || size != s.fileSize || s.fileSize != s.validEnd {
+		return false, nil
+	}
+	if s.validEnd == 0 {
+		return s.lastSeq == 0, nil
+	}
+
+	nl := s.validEnd - 1
+	prev, err := lastNewlineBefore(f, nl)
+	if err != nil {
+		return false, err
+	}
+	line := make([]byte, nl-(prev+1)+1)
+	if _, err := f.ReadAt(line, prev+1); err != nil {
+		return false, fmt.Errorf("reading changelog: %w", err)
+	}
+	if line[len(line)-1] != '\n' {
+		return false, nil
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(line[:len(line)-1], &entry); err != nil {
+		return false, nil
+	}
+	return entry.Sequence == s.lastSeq, nil
 }
 
 // discardFrom cuts off the bytes that a failed append wrote from end on. When
@@ -716,8 +756,10 @@ var truncateFile = func(f *os.File, size int64) error {
 // or the file changed since it was (an append of another process), the state is
 // loaded again under the log's lock file, which waits for an append of another
 // process, and the file is fsync'd first: bytes that a crashed writer left in the
-// page cache are durable once a reader may see them.
-func (s *logState) durableView(path string, f *os.File) (int64, uint64, error) {
+// page cache are durable once a reader may see them. So are the directory entries
+// of the log, which that writer may have crashed before syncing (see
+// syncLogDirs), unless this process synced them already.
+func (s *logState) durableView(repoPath, path string, f *os.File) (int64, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -725,7 +767,9 @@ func (s *logState) durableView(path string, f *os.File) (int64, uint64, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("stat changelog: %w", err)
 	}
-	if s.loaded && info.Size() == s.fileSize {
+	if valid, err := s.cacheDescribes(f, info.Size()); err != nil {
+		return 0, 0, err
+	} else if valid && s.dirsSynced {
 		return s.validEnd, s.lastSeq, nil
 	}
 
@@ -737,6 +781,12 @@ func (s *logState) durableView(path string, f *os.File) (int64, uint64, error) {
 
 	if err := syncFile(f); err != nil {
 		return 0, 0, fmt.Errorf("syncing changelog: %w", err)
+	}
+	if !s.dirsSynced {
+		if err := syncLogDirs(repoPath, path); err != nil {
+			return 0, 0, err
+		}
+		s.dirsSynced = true
 	}
 
 	info, err = f.Stat()
@@ -763,23 +813,57 @@ var syncDir = func(dir string) error {
 	return d.Sync()
 }
 
+// lockWaitTimeout bounds the wait for the log's lock file, which another process holds for one
+// append. A holder that never releases it would otherwise block every append and every reader of
+// the repository's log: the wait fails instead, and the appends see the error (their updates are
+// reported lost). Each wait that failed keeps a goroutine and a descriptor until the holder
+// releases the lock. Tests lower it.
+var lockWaitTimeout = 30 * time.Second
+
 // lockFile takes an exclusive flock on the file at path and returns the
-// function that releases it.
+// function that releases it. It waits at most lockWaitTimeout.
 func lockFile(path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("opening changelog lock: %w", err)
 	}
+	unlock := func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return unlock, nil
+	}
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
 		f.Close()
 		return nil, fmt.Errorf("locking changelog: %w", err)
 	}
 
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	// Another process holds the lock: wait for it in a goroutine, which owns the file if the
+	// wait gives up first and releases the lock once it is granted.
+	locked := make(chan error, 1)
+	go func() { locked <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX) }()
+
+	timer := time.NewTimer(lockWaitTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-locked:
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("locking changelog: %w", err)
+		}
+		return unlock, nil
+	case <-timer.C:
+		go func() {
+			if err := <-locked; err == nil {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			}
+			_ = f.Close()
+		}()
+		return nil, fmt.Errorf("locking changelog: the lock was not granted within %s", lockWaitTimeout)
+	}
 }
 
 // Scan calls fn for every entry of the log of the repository whose git
@@ -804,7 +888,7 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 	}
 	defer f.Close()
 
-	end, _, err := state.durableView(path, f)
+	end, _, err := state.durableView(repoPath, path, f)
 	if err != nil {
 		return err
 	}
@@ -868,7 +952,7 @@ func LastSequence(repoPath string) (uint64, error) {
 	}
 	defer f.Close()
 
-	_, lastSeq, err := state.durableView(path, f)
+	_, lastSeq, err := state.durableView(repoPath, path, f)
 	if err != nil {
 		return 0, err
 	}

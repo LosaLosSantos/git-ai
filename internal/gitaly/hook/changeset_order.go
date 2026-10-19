@@ -2,9 +2,12 @@ package hook
 
 import (
 	"crypto/sha256"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
+	"github.com/feder-cr/git-ai/internal/gitaly/storage"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -44,13 +47,24 @@ var (
 		Name: "graft_changelog_records_lost_total",
 		Help: "Committed reference updates that the changeset log does not record, because writing them failed.",
 	})
+
+	changelogUnorderedRecordsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "graft_changelog_unordered_records_total",
+		Help: "Committed reference transactions recorded in the changeset log without their place in the order: their ticket expired before their committed phase, or they took none.",
+	})
 )
+
+// appendChangesetGroup writes a group of records to the changeset log. Tests replace it.
+var appendChangesetGroup = changelog.AppendGroup
 
 // changesetTicket is the place of a prepared reference transaction in the order of the changeset
 // log of its repository.
 type changesetTicket struct {
-	// key identifies the transaction: the digest of the updates the hook was given. Git gives
-	// the same updates to every phase of a transaction.
+	// key identifies the transaction: the digest of the invocation of the git process that runs
+	// it and of the updates the hook was given (changesetTicketKey). Git gives the same updates to
+	// every phase of a transaction, and the invocation tells apart the transactions of different
+	// processes, so that a transaction with the same updates as another never takes, releases or
+	// records the other's ticket.
 	key [sha256.Size]byte
 	// done is closed when the entries of the transaction were written (see err), or when the
 	// transaction was aborted, expired or records nothing.
@@ -98,46 +112,81 @@ func (q *changesetQueue) signal() {
 // The tickets live in the process that serves the hook calls, which is the Gitaly process that
 // spawned Git. A ticket whose transaction never reports its outcome expires after
 // changesetTicketTimeout, after which the later transactions record without waiting for it.
+//
+// A ticket is in one of three states, and every change of state happens under the lock: queued
+// (in the queue, without record), ready (in the queue, with its record: only the group writer
+// removes it, once its entries are written), or gone (out of the queue: written, aborted,
+// released or expired). The committed phase finds its queued ticket and makes it ready in one
+// step (recordChangeset), so a ticket that expired or was released before that step is never
+// mistaken for a written one: the transaction is then recorded at once, out of order, and counted.
+//
+// The queues are kept by repository (changesetQueueKey), not by path, so that a committed phase
+// that cannot resolve the path of its repository can still give up its place.
 var changesetTickets = struct {
 	sync.Mutex
 	queues map[string]*changesetQueue
 }{queues: map[string]*changesetQueue{}}
 
-// changesetTicketKey returns the key of the transaction with the given hook input.
-func changesetTicketKey(changes []byte) [sha256.Size]byte {
-	return sha256.Sum256(changes)
+// changesetQueueKey returns the key of the queue of the repository: its storage and relative
+// path, which every hook payload of the repository carries, whatever its object directories.
+func changesetQueueKey(repo storage.Repository) string {
+	return repo.GetStorageName() + "\x00" + repo.GetRelativePath()
 }
 
-// changesetQueueLocked returns the queue of the repository at repoPath, creating it. The caller
-// must hold changesetTickets.
-func changesetQueueLocked(repoPath string) *changesetQueue {
-	q, ok := changesetTickets.queues[repoPath]
+// changesetTicketKey returns the key of the transaction that the git process with the given
+// invocation runs with the given hook input.
+func changesetTicketKey(invocation string, changes []byte) [sha256.Size]byte {
+	digest := sha256.New()
+	digest.Write([]byte(invocation))
+	digest.Write([]byte{0})
+	digest.Write(changes)
+
+	var key [sha256.Size]byte
+	digest.Sum(key[:0])
+	return key
+}
+
+// changesetQueueLocked returns the queue with the given key, creating it. The caller must hold
+// changesetTickets.
+func changesetQueueLocked(queueKey string) *changesetQueue {
+	q, ok := changesetTickets.queues[queueKey]
 	if !ok {
 		q = &changesetQueue{changed: make(chan struct{})}
-		changesetTickets.queues[repoPath] = q
+		changesetTickets.queues[queueKey] = q
 	}
 	return q
 }
 
-// dropIfIdleLocked forgets the queue of repoPath when it holds nothing. The caller must hold
-// changesetTickets.
-func dropIfIdleLocked(repoPath string, q *changesetQueue) {
-	if len(q.tickets) == 0 && !q.writing && changesetTickets.queues[repoPath] == q {
-		delete(changesetTickets.queues, repoPath)
+// dropIfIdleLocked forgets the queue q with the given key when it holds nothing. The caller must
+// hold changesetTickets.
+func dropIfIdleLocked(queueKey string, q *changesetQueue) {
+	if len(q.tickets) == 0 && !q.writing && changesetTickets.queues[queueKey] == q {
+		delete(changesetTickets.queues, queueKey)
 	}
 }
 
-// takeChangesetTicket appends a ticket for the prepared transaction with the given hook input to
-// the queue of the repository at repoPath.
-func takeChangesetTicket(repoPath string, changes []byte) {
+// queuedTicketLocked returns the position and the queued ticket with the given key in q, the
+// oldest one if there are several, or nil. The caller must hold changesetTickets.
+func queuedTicketLocked(q *changesetQueue, key [sha256.Size]byte) (int, *changesetTicket) {
+	for i, ticket := range q.tickets {
+		if ticket.key == key && ticket.record == nil {
+			return i, ticket
+		}
+	}
+	return -1, nil
+}
+
+// takeChangesetTicket appends a ticket for the prepared transaction that the git process with the
+// given invocation runs with the given hook input to the queue with the given key.
+func takeChangesetTicket(queueKey, invocation string, changes []byte) {
 	changesetTickets.Lock()
 	defer changesetTickets.Unlock()
 
 	now := time.Now()
-	q := changesetQueueLocked(repoPath)
+	q := changesetQueueLocked(queueKey)
 	pruneExpiredChangesetTickets(q, now)
 	q.tickets = append(q.tickets, &changesetTicket{
-		key:      changesetTicketKey(changes),
+		key:      changesetTicketKey(invocation, changes),
 		done:     make(chan struct{}),
 		deadline: now.Add(changesetTicketTimeout),
 	})
@@ -161,78 +210,58 @@ func pruneExpiredChangesetTickets(q *changesetQueue, now time.Time) {
 	}
 }
 
-// findChangesetTicket returns the oldest ticket of the transaction with the given hook input in
-// the queue of the repository at repoPath. It returns nil when the transaction has none, for
-// example because it was prepared before the changeset log was enabled or its ticket expired.
-func findChangesetTicket(repoPath string, changes []byte) *changesetTicket {
+// releaseChangesetTicket gives up the place of the transaction that the git process with the
+// given invocation runs with the given hook input, in the queue with the given key: its ticket, if
+// it is still queued, is removed, and the transactions that wait for it are woken. It is for a
+// transaction that was aborted or records nothing.
+func releaseChangesetTicket(queueKey, invocation string, changes []byte) {
 	changesetTickets.Lock()
 	defer changesetTickets.Unlock()
 
-	q, ok := changesetTickets.queues[repoPath]
-	if !ok {
-		return nil
-	}
-
-	key := changesetTicketKey(changes)
-	for _, ticket := range q.tickets {
-		if ticket.key == key && ticket.record == nil {
-			return ticket
-		}
-	}
-
-	return nil
-}
-
-// releaseChangesetTicket removes the ticket, whose transaction records nothing, from the queue of
-// the repository at repoPath and wakes the transactions that wait for it.
-func releaseChangesetTicket(repoPath string, ticket *changesetTicket) {
-	changesetTickets.Lock()
-	defer changesetTickets.Unlock()
-
-	q, ok := changesetTickets.queues[repoPath]
+	q, ok := changesetTickets.queues[queueKey]
 	if !ok {
 		return
 	}
 
-	for i, queued := range q.tickets {
-		if queued != ticket {
-			continue
-		}
-
+	if i, ticket := queuedTicketLocked(q, changesetTicketKey(invocation, changes)); ticket != nil {
 		close(ticket.done)
 		q.tickets = append(q.tickets[:i:i], q.tickets[i+1:]...)
 		q.signal()
-		break
 	}
 
-	dropIfIdleLocked(repoPath, q)
+	dropIfIdleLocked(queueKey, q)
 }
 
-// abortChangesetTicket releases the ticket of the aborted transaction with the given hook input,
-// if it has one.
-func abortChangesetTicket(repoPath string, changes []byte) {
-	if ticket := findChangesetTicket(repoPath, changes); ticket != nil {
-		releaseChangesetTicket(repoPath, ticket)
-	}
-}
-
-// recordInOrder records the record of the transaction of ticket in the changeset log of the
-// repository at repoPath, after the transactions whose tickets are before it, and returns once
-// its entries are durable or failed to be written.
+// recordChangeset records record, the committed transaction that the git process with the given
+// invocation runs with the given hook input, in the changeset log of the repository at repoPath,
+// whose queue has the given key. It returns once the entries are durable or failed to be written.
 //
-// The ticket becomes ready. While no group is being written and the ticket at the head of the
-// queue is ready, the caller writes every ready ticket at the head with one call of
-// changelog.AppendGroup, one write and one fsync, and wakes their committed phases with the
+// The ticket of the transaction is found and made ready in one step. Without a queued ticket
+// (it expired, or the transaction took none) the record is appended at once, out of order, and
+// counted (graft_changelog_unordered_records_total). Otherwise it is recorded after the
+// transactions whose tickets are before it: while no group is being written and the ticket at
+// the head of the queue is ready, the caller writes every ready ticket at the head with one call
+// of changelog.AppendGroup, one write and one fsync, and wakes their committed phases with the
 // outcome. Otherwise it waits for the queue to change or for the ticket at the head to expire.
 // The wait does not end with the request: the updates are committed in git already, so their
 // entries are always written, in order. It ends at the latest once every ticket before this one
 // was written, aborted or expired, which changesetTicketTimeout bounds.
-func recordInOrder(repoPath string, ticket *changesetTicket, record changelog.Record) error {
+func recordChangeset(queueKey, repoPath, invocation string, changes []byte, record changelog.Record) error {
 	start := time.Now()
 	defer func() { changesetTicketWaitSeconds.Observe(time.Since(start).Seconds()) }()
 
 	changesetTickets.Lock()
-	q := changesetQueueLocked(repoPath)
+	var ticket *changesetTicket
+	q, ok := changesetTickets.queues[queueKey]
+	if ok {
+		_, ticket = queuedTicketLocked(q, changesetTicketKey(invocation, changes))
+	}
+	if ticket == nil {
+		changesetTickets.Unlock()
+		changelogUnorderedRecordsTotal.Inc()
+		_, err := appendChangesetGroup(repoPath, []changelog.Record{record})
+		return err
+	}
 	ticket.record = &record
 	q.signal()
 
@@ -247,7 +276,7 @@ func recordInOrder(repoPath string, ticket *changesetTicket, record changelog.Re
 		pruneExpiredChangesetTickets(q, time.Now())
 
 		if !q.writing && len(q.tickets) > 0 && q.tickets[0].record != nil {
-			writeChangesetGroupLocked(repoPath, q)
+			writeChangesetGroupLocked(queueKey, repoPath, q)
 			continue
 		}
 
@@ -273,10 +302,10 @@ func recordInOrder(repoPath string, ticket *changesetTicket, record changelog.Re
 	}
 }
 
-// writeChangesetGroupLocked writes the ready tickets at the head of q, the queue of the repository
-// at repoPath, as one group. The caller must hold changesetTickets, which is released while the
-// group is written.
-func writeChangesetGroupLocked(repoPath string, q *changesetQueue) {
+// writeChangesetGroupLocked writes the ready tickets at the head of q, the queue with the given
+// key of the repository at repoPath, as one group. The caller must hold changesetTickets, which is
+// released while the group is written and held again when the function returns.
+func writeChangesetGroupLocked(queueKey, repoPath string, q *changesetQueue) {
 	n := 0
 	for n < len(q.tickets) && q.tickets[n].record != nil {
 		n++
@@ -291,7 +320,7 @@ func writeChangesetGroupLocked(repoPath string, q *changesetQueue) {
 	}
 
 	start := time.Now()
-	_, err := changelog.AppendGroup(repoPath, records)
+	err := appendChangesetGroupRecovering(repoPath, records)
 	changelogAppendSeconds.Observe(time.Since(start).Seconds())
 	changelogGroupTransactions.Observe(float64(len(group)))
 
@@ -314,5 +343,19 @@ func writeChangesetGroupLocked(repoPath string, q *changesetQueue) {
 	q.tickets = remaining
 	q.writing = false
 	q.signal()
-	dropIfIdleLocked(repoPath, q)
+	dropIfIdleLocked(queueKey, q)
+}
+
+// appendChangesetGroupRecovering writes the group of records and turns a panic of the write into
+// its error. The group's committed phases, which wait for its outcome, then all see the failure
+// and report their updates as lost, and the queue is not left behind a writer that never ends.
+func appendChangesetGroupRecovering(repoPath string, records []changelog.Record) (returnedErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			returnedErr = fmt.Errorf("writing the changeset group panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	_, err := appendChangesetGroup(repoPath, records)
+	return err
 }

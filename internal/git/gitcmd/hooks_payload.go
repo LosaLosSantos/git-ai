@@ -139,12 +139,13 @@ type ChangelogMeta struct {
 	// Rewritten is true when the updates rewrite history.
 	Rewritten bool `json:"rewritten,omitempty"`
 	// Invocation identifies the git process that runs the reference-transaction
-	// hook with this payload. It is a random value set for each git command that
-	// git runs the hook for, so the recording hook can tell the transactions of
-	// one process apart from those of concurrent processes. Git runs two
-	// transactions to delete a packed reference, and the recording hook pairs
-	// them by this value. It is empty when the payload drives the hook in process
-	// or when the changeset log is disabled.
+	// hook with this payload, or the call of updateref.UpdaterWithHooks that drives
+	// the hook in process. It is a random value set for each git command that git
+	// runs the hook for and for each such call, so the recording hook can tell the
+	// transactions of one process apart from those of concurrent processes, also
+	// when they have the same updates. Git runs two transactions to delete a
+	// packed reference, and the recording hook pairs them by this value. It is
+	// empty when the changeset log is disabled.
 	Invocation string `json:"invocation,omitempty"`
 	// MVCCCommit is the commit handle (see mvcc.CommitHandle) of the MVCC cache of
 	// the request that builds the payload. On a repository that uses the MVCC
