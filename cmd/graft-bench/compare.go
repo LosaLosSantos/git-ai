@@ -43,6 +43,10 @@ var comparisonMetrics = []comparisonMetric{
 	{"latency p95 (landed)", func(r Result) string { return fmt.Sprintf("%.1fms", r.P95MS) }},
 	{"latency p99 (landed)", func(r Result) string { return fmt.Sprintf("%.1fms", r.P99MS) }},
 	{"latency p95 (failed)", func(r Result) string { return fmt.Sprintf("%.1fms", r.FailedP95MS) }},
+	{"UserCommitFiles p50", func(r Result) string { return fmt.Sprintf("%.1fms", r.RPCs[rpcCommitFiles].P50MS) }},
+	{"UserCommitFiles p99", func(r Result) string { return fmt.Sprintf("%.1fms", r.RPCs[rpcCommitFiles].P99MS) }},
+	{"UserLand p50", func(r Result) string { return fmt.Sprintf("%.1fms", r.RPCs[rpcLand].P50MS) }},
+	{"UserLand p99", func(r Result) string { return fmt.Sprintf("%.1fms", r.RPCs[rpcLand].P99MS) }},
 }
 
 // writeComparison prints the runs side by side, one column per run, labelled

@@ -3,6 +3,7 @@ package hook
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,16 +17,48 @@ import (
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
-// changesetOrderSetup is a repository with a branch history base -> a -> b and a hook manager that
-// records its reference updates in the changeset log.
+// changesetOrderSetup is a repository with a branch history base -> a -> b -> c and a hook manager
+// that records its reference updates in the changeset log.
 type changesetOrderSetup struct {
 	repoPath string
-	// first moves the branch from base to a, second from a to b.
-	first, second string
-	run           func(state ReferenceTransactionState, changes string) error
+	// queueKey is the key of the repository's queue of tickets.
+	queueKey string
+	// first moves the branch from base to a, second from a to b, third from b to c. other creates
+	// another branch at base.
+	first, second, third, other string
+	run                         func(state ReferenceTransactionState, changes string) error
+	// runWith runs the hook with the context ctx.
+	runWith func(ctx context.Context, state ReferenceTransactionState, changes string) error
+	// runAs runs the hook as the git process with the given invocation.
+	runAs func(invocation string, state ReferenceTransactionState, changes string) error
+}
+
+// queuedTicket is a ticket of a queue as it was when queuedTickets read it.
+type queuedTicket struct {
+	ready    bool
+	deadline time.Time
+}
+
+// queuedTickets returns the tickets of the queue with the given key, read under the queue's
+// lock, nil when there is none.
+func queuedTickets(queueKey string) []queuedTicket {
+	changesetTickets.Lock()
+	defer changesetTickets.Unlock()
+
+	q, ok := changesetTickets.queues[queueKey]
+	if !ok {
+		return nil
+	}
+	tickets := make([]queuedTicket, 0, len(q.tickets))
+	for _, ticket := range q.tickets {
+		tickets = append(tickets, queuedTicket{ready: ticket.record != nil, deadline: ticket.deadline})
+	}
+	return tickets
 }
 
 func setupChangesetOrder(t *testing.T, ctx context.Context) changesetOrderSetup {
@@ -39,24 +72,42 @@ func setupChangesetOrder(t *testing.T, ctx context.Context) changesetOrderSetup 
 	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithMessage("base"))
 	a := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithMessage("a"))
 	b := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(a), gittest.WithMessage("b"))
+	c := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(b), gittest.WithMessage("c"))
 
 	manager := NewManager(cfg, config.NewLocator(cfg), testhelper.SharedLogger(t), gittest.NewCommandFactory(t, cfg), nil, &transaction.MockManager{}, gitlab.NewMockClient(
 		t, gitlab.MockAllowed, gitlab.MockPreReceive, gitlab.MockPostReceive,
 	), NewPostReceiveRegistry())
 
-	payload, err := gitcmd.NewHooksPayload(ctx, cfg, repo, gittest.DefaultObjectHash, nil, &gitcmd.UserDetails{
-		UserID:   "user-1",
-		Username: "user",
-		Protocol: "web",
-	}, gitcmd.ReferenceTransactionHook, nil).Env()
-	require.NoError(t, err)
+	payloadAs := func(invocation string) string {
+		payload := gitcmd.NewHooksPayload(ctx, cfg, repo, gittest.DefaultObjectHash, nil, &gitcmd.UserDetails{
+			UserID:   "user-1",
+			Username: "user",
+			Protocol: "web",
+		}, gitcmd.ReferenceTransactionHook, nil)
+		payload.Changelog.Invocation = invocation
+		env, err := payload.Env()
+		require.NoError(t, err)
+		return env
+	}
+	payload := payloadAs("")
+
+	runWith := func(ctx context.Context, state ReferenceTransactionState, changes string) error {
+		return manager.ReferenceTransactionHook(ctx, state, []string{payload}, strings.NewReader(changes))
+	}
 
 	return changesetOrderSetup{
 		repoPath: repoPath,
+		queueKey: changesetQueueKey(repo),
 		first:    fmt.Sprintf("%s %s refs/heads/main\n", base, a),
 		second:   fmt.Sprintf("%s %s refs/heads/main\n", a, b),
+		third:    fmt.Sprintf("%s %s refs/heads/main\n", b, c),
+		other:    fmt.Sprintf("%s %s refs/heads/other\n", gittest.DefaultObjectHash.ZeroOID, base),
 		run: func(state ReferenceTransactionState, changes string) error {
-			return manager.ReferenceTransactionHook(ctx, state, []string{payload}, strings.NewReader(changes))
+			return runWith(ctx, state, changes)
+		},
+		runWith: runWith,
+		runAs: func(invocation string, state ReferenceTransactionState, changes string) error {
+			return manager.ReferenceTransactionHook(ctx, state, []string{payloadAs(invocation)}, strings.NewReader(changes))
 		},
 	}
 }
@@ -131,7 +182,7 @@ func TestReferenceTransactionHook_changesetOrder(t *testing.T) {
 		require.Equal(t, []string{setup.first}, recordedChanges(t, setup.repoPath))
 	})
 
-	t.Run("canceled context stops waiting", func(t *testing.T) {
+	t.Run("a committed phase whose caller went away still records in order", func(t *testing.T) {
 		t.Parallel()
 
 		setup := setupChangesetOrder(t, ctx)
@@ -139,21 +190,183 @@ func TestReferenceTransactionHook_changesetOrder(t *testing.T) {
 		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
 		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.second))
 
-		// The ticket of the first transaction is still pending, but the caller of the second
-		// committed phase went away. The update is recorded regardless.
-		repoPath := setup.repoPath
-		ticket, earlier := findChangesetTicket(repoPath, []byte(setup.second))
-		require.NotNil(t, ticket)
-		require.Len(t, earlier, 1)
-
+		// The caller of the second committed phase went away while the first transaction is
+		// still pending. Its update is committed in git, so it is recorded all the same, after
+		// the first one.
 		canceledCtx, cancel := context.WithCancel(ctx)
 		cancel()
-		require.False(t, waitForChangesetTickets(canceledCtx, earlier))
+		secondDone := make(chan error, 1)
+		go func() { secondDone <- setup.runWith(canceledCtx, ReferenceTransactionCommitted, setup.second) }()
 
-		require.NoError(t, setup.run(ReferenceTransactionAborted, setup.first))
-		require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.second))
-		require.Equal(t, []string{setup.second}, recordedChanges(t, setup.repoPath))
+		select {
+		case err := <-secondDone:
+			require.FailNow(t, "second transaction recorded before the first", "err: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.first))
+		require.NoError(t, <-secondDone)
+		require.Equal(t, []string{setup.first, setup.second}, recordedChanges(t, setup.repoPath))
 	})
+
+	t.Run("transactions on other references are recorded in order too", func(t *testing.T) {
+		t.Parallel()
+
+		setup := setupChangesetOrder(t, ctx)
+
+		// A later transaction may have read what an earlier one wrote to another reference, so it
+		// is recorded after it.
+		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.other))
+		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
+
+		firstDone := make(chan error, 1)
+		go func() { firstDone <- setup.run(ReferenceTransactionCommitted, setup.first) }()
+
+		select {
+		case err := <-firstDone:
+			require.FailNow(t, "transaction recorded before an earlier one on another reference", "err: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.other))
+		require.NoError(t, <-firstDone)
+		require.Equal(t, []string{setup.other, setup.first}, recordedChanges(t, setup.repoPath))
+	})
+
+	t.Run("ready transactions are written as one group", func(t *testing.T) {
+		t.Parallel()
+
+		setup := setupChangesetOrder(t, ctx)
+
+		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
+		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.second))
+		require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.third))
+
+		// The committed phases of the later transactions run first and wait for the first one.
+		laterDone := make(chan error, 2)
+		for _, changes := range []string{setup.third, setup.second} {
+			go func() { laterDone <- setup.run(ReferenceTransactionCommitted, changes) }()
+		}
+
+		// Both later tickets are ready before the first transaction commits.
+		require.Eventually(t, func() bool {
+			changesetTickets.Lock()
+			defer changesetTickets.Unlock()
+			q := changesetTickets.queues[setup.queueKey]
+			return q != nil && len(q.tickets) == 3 && q.tickets[1].record != nil && q.tickets[2].record != nil
+		}, 10*time.Second, 5*time.Millisecond)
+		require.Empty(t, recordedChanges(t, setup.repoPath))
+
+		// The first committed phase writes all three with one write: their entries share the
+		// time of that write. It returns only once its entry is durable, so it is in the log.
+		require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.first))
+		require.Equal(t, []string{setup.first, setup.second, setup.third}, recordedChanges(t, setup.repoPath))
+		require.NoError(t, <-laterDone)
+		require.NoError(t, <-laterDone)
+
+		entries, err := changelog.List(setup.repoPath, 0, 10)
+		require.NoError(t, err)
+		require.Len(t, entries, 3)
+		require.Equal(t, entries[0].RecordedAt, entries[1].RecordedAt)
+		require.Equal(t, entries[0].RecordedAt, entries[2].RecordedAt)
+
+		require.Nil(t, queuedTickets(setup.queueKey), "the queue is dropped once it is empty")
+	})
+
+	t.Run("a transaction with the same updates in another process keeps the other's ticket", func(t *testing.T) {
+		t.Parallel()
+
+		setup := setupChangesetOrder(t, ctx)
+
+		// Process A prepared the update. Process B tried the same update, could not lock the
+		// reference and aborted: its abort must not give up A's place.
+		require.NoError(t, setup.runAs("process-a", ReferenceTransactionPrepared, setup.first))
+		require.NoError(t, setup.runAs("process-b", ReferenceTransactionAborted, setup.first))
+		require.Len(t, queuedTickets(setup.queueKey), 1)
+
+		// B's committed phase, had it committed, would not record with A's ticket either: A's
+		// committed phase finds its own.
+		require.NoError(t, setup.runAs("process-a", ReferenceTransactionPrepared, setup.second))
+		secondDone := make(chan error, 1)
+		go func() { secondDone <- setup.runAs("process-a", ReferenceTransactionCommitted, setup.second) }()
+		require.Eventually(t, func() bool {
+			tickets := queuedTickets(setup.queueKey)
+			return len(tickets) == 2 && tickets[1].ready
+		}, 10*time.Second, 5*time.Millisecond)
+		require.Empty(t, recordedChanges(t, setup.repoPath), "the second waits for the first")
+
+		require.NoError(t, setup.runAs("process-a", ReferenceTransactionCommitted, setup.first))
+		require.NoError(t, <-secondDone)
+		require.Equal(t, []string{setup.first, setup.second}, recordedChanges(t, setup.repoPath))
+	})
+}
+
+// TestReferenceTransactionHook_changesetCommittedAfterExpiry is not parallel because it lowers the
+// ticket timeout of the package and reads global counters. A committed phase that runs after its
+// ticket expired, and after a later transaction was recorded without it, is recorded too: out of
+// order, counted as such, and not lost.
+func TestReferenceTransactionHook_changesetCommittedAfterExpiry(t *testing.T) {
+	ctx := testhelper.Context(t)
+
+	defaultTimeout := changesetTicketTimeout
+	changesetTicketTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { changesetTicketTimeout = defaultTimeout })
+
+	setup := setupChangesetOrder(t, ctx)
+	unordered := testutil.ToFloat64(changelogUnorderedRecordsTotal)
+	lost := testutil.ToFloat64(changelogRecordsLostTotal)
+
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.second))
+	// The second waits for the first's ticket to expire, then records.
+	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.second))
+	require.Equal(t, []string{setup.second}, recordedChanges(t, setup.repoPath))
+
+	// The first's ticket is gone: its committed phase is recorded at once.
+	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.first))
+	require.Equal(t, []string{setup.second, setup.first}, recordedChanges(t, setup.repoPath))
+	require.InDelta(t, 1, testutil.ToFloat64(changelogUnorderedRecordsTotal)-unordered, 0)
+	require.InDelta(t, 0, testutil.ToFloat64(changelogRecordsLostTotal)-lost, 0)
+	require.Nil(t, queuedTickets(setup.queueKey), "no queue is left behind")
+}
+
+// TestReferenceTransactionHook_changesetGroupPanic is not parallel because it replaces the group
+// writer of the package and reads a global counter. A write that panics fails its group, whose
+// updates are reported lost, and leaves the queue usable.
+func TestReferenceTransactionHook_changesetGroupPanic(t *testing.T) {
+	ctx := testhelper.Context(t)
+	setup := setupChangesetOrder(t, ctx)
+
+	appendChangesetGroup = func(string, []changelog.Record) ([][]changelog.Entry, error) {
+		panic("injected")
+	}
+	t.Cleanup(func() { appendChangesetGroup = changelog.AppendGroup })
+
+	lost := testutil.ToFloat64(changelogRecordsLostTotal)
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
+	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.first), "recording never fails the update")
+	require.InDelta(t, 1, testutil.ToFloat64(changelogRecordsLostTotal)-lost, 0)
+	require.Nil(t, queuedTickets(setup.queueKey), "the queue is not left writing")
+
+	appendChangesetGroup = changelog.AppendGroup
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.second))
+	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.second))
+	require.Equal(t, []string{setup.second}, recordedChanges(t, setup.repoPath))
+}
+
+// TestReferenceTransactionHook_changesetRecordsLost is not parallel because it reads the counter
+// of lost records, which is global.
+func TestReferenceTransactionHook_changesetRecordsLost(t *testing.T) {
+	ctx := testhelper.Context(t)
+	setup := setupChangesetOrder(t, ctx)
+
+	// The log cannot be written: a directory takes the place of its file.
+	require.NoError(t, os.MkdirAll(changelog.Path(setup.repoPath), 0o755))
+
+	before := testutil.ToFloat64(changelogRecordsLostTotal)
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
+	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.first), "recording never fails the update")
+	require.InDelta(t, 1, testutil.ToFloat64(changelogRecordsLostTotal)-before, 0)
 }
 
 // TestReferenceTransactionHook_changesetOrderExpiredTicket is not parallel because it lowers the
@@ -171,20 +384,43 @@ func TestReferenceTransactionHook_changesetOrderExpiredTicket(t *testing.T) {
 	// records once the ticket of the first one expired.
 	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
 	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.second))
+	firstDeadline := queuedTickets(setup.queueKey)[0].deadline
 
-	start := time.Now()
+	// The second records only once the first's ticket expired: not before its deadline.
 	require.NoError(t, setup.run(ReferenceTransactionCommitted, setup.second))
-	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+	require.False(t, time.Now().Before(firstDeadline), "recorded before the earlier ticket expired")
 
 	require.Equal(t, []string{setup.second}, recordedChanges(t, setup.repoPath))
 
-	// The expired ticket is dropped when the next transaction is prepared.
-	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.first))
-	changesetTickets.Lock()
-	queue := changesetTickets.queues[setup.repoPath]
-	changesetTickets.Unlock()
-	require.Len(t, queue, 1)
-	require.NoError(t, setup.run(ReferenceTransactionAborted, setup.first))
+	// The expired ticket was dropped: the next transaction finds an empty queue.
+	require.NoError(t, setup.run(ReferenceTransactionPrepared, setup.third))
+	require.Len(t, queuedTickets(setup.queueKey), 1)
+	require.NoError(t, setup.run(ReferenceTransactionAborted, setup.third))
+}
+
+// TestReferenceTransactionHook_changesetUnresolvedRepository is not parallel because it reads a
+// global counter. A committed phase that cannot resolve its repository path gives up its place, so
+// that later transactions do not wait for it, and reports its updates lost.
+func TestReferenceTransactionHook_changesetUnresolvedRepository(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+
+	manager := NewManager(cfg, config.NewLocator(cfg), testhelper.SharedLogger(t), gittest.NewCommandFactory(t, cfg), nil, &transaction.MockManager{}, gitlab.NewMockClient(
+		t, gitlab.MockAllowed, gitlab.MockPreReceive, gitlab.MockPostReceive,
+	), NewPostReceiveRegistry())
+
+	// The repository does not exist: its path does not resolve.
+	repo := &gitalypb.Repository{StorageName: cfg.Storages[0].Name, RelativePath: "missing.git"}
+	payload, err := gitcmd.NewHooksPayload(ctx, cfg, repo, gittest.DefaultObjectHash, nil, nil, gitcmd.ReferenceTransactionHook, nil).Env()
+	require.NoError(t, err)
+	changes := fmt.Sprintf("%s %s refs/heads/main\n", gittest.DefaultObjectHash.ZeroOID, gittest.DefaultObjectHash.EmptyTreeOID)
+
+	lost := testutil.ToFloat64(changelogRecordsLostTotal)
+	require.NoError(t, manager.ReferenceTransactionHook(ctx, ReferenceTransactionPrepared, []string{payload}, strings.NewReader(changes)))
+	require.Len(t, queuedTickets(changesetQueueKey(repo)), 1)
+	require.NoError(t, manager.ReferenceTransactionHook(ctx, ReferenceTransactionCommitted, []string{payload}, strings.NewReader(changes)))
+	require.Nil(t, queuedTickets(changesetQueueKey(repo)), "the ticket is released")
+	require.InDelta(t, 1, testutil.ToFloat64(changelogRecordsLostTotal)-lost, 0)
 }
 
 func TestReferenceTransactionHook_changesetOrderDisabled(t *testing.T) {
@@ -210,8 +446,5 @@ func TestReferenceTransactionHook_changesetOrderDisabled(t *testing.T) {
 	require.NoError(t, manager.ReferenceTransactionHook(ctx, ReferenceTransactionPrepared, []string{payload}, strings.NewReader(changes)))
 
 	// Without the changeset log, transactions are not ordered.
-	changesetTickets.Lock()
-	_, ok := changesetTickets.queues[repoPath]
-	changesetTickets.Unlock()
-	require.False(t, ok)
+	require.Nil(t, queuedTickets(changesetQueueKey(repo)))
 }

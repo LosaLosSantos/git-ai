@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/feder-cr/git-ai/internal/git"
-	"github.com/feder-cr/git-ai/internal/git/gitcmd"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/git/remoterepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/hook"
@@ -256,6 +256,16 @@ func applyAction(
 		if err := root.Modify(
 			action.Path,
 			func(entry *localrepo.TreeEntry) error {
+				// Only files have an executable mode. A tree or a submodule given a file's mode
+				// would make a tree that git refuses, or one whose entry is no longer a
+				// submodule.
+				if entry.Type != localrepo.Blob {
+					return indexError{
+						path:      action.Path,
+						errorType: errFileNotFound,
+					}
+				}
+
 				if action.ExecutableMode {
 					if entry.Mode != "100755" {
 						entry.Mode = "100755"
@@ -317,6 +327,8 @@ func applyAction(
 				OID:  git.ObjectID(action.OID),
 				Mode: mode,
 				Path: filepath.Base(action.NewPath),
+				// The moved entry is a file: a later action of the request sees it as one.
+				Type: entry.Type,
 			},
 			localrepo.WithOverwriteDirectory(),
 		); err != nil {
@@ -399,6 +411,15 @@ func applyAction(
 // translateLocalrepoError converts errors returned by the `localrepo` package into nice errors that we can return to the caller.
 // Most importantly, these errors will carry metadata that helps to figure out what exactly has gone wrong.
 func translateError(err error, path string) error {
+	// A file in the way of the path: the error names that file, which already exists.
+	var fileInPath localrepo.FileInPathError
+	if errors.As(err, &fileInPath) {
+		return indexError{
+			path:      fileInPath.Path,
+			errorType: errFileExists,
+		}
+	}
+
 	switch {
 	case errors.Is(err, localrepo.ErrEntryNotFound) ||
 		errors.Is(err, localrepo.ErrObjectNotFound):
@@ -439,6 +460,7 @@ func (s *Server) userCommitFilesGit(
 	header *gitalypb.UserCommitFilesRequestHeader,
 	parentCommitOID git.ObjectID,
 	quarantineRepo *localrepo.Repo,
+	reader catfile.ObjectReader,
 	repoPath string,
 	actions []commitAction,
 ) (git.ObjectID, error) {
@@ -450,8 +472,9 @@ func (s *Server) userCommitFilesGit(
 	var treeish git.ObjectID
 
 	if parentCommitOID != "" {
-		treeish, err = quarantineRepo.ResolveRevision(
+		treeish, err = quarantineRepo.ResolveRevisionWithReader(
 			ctx,
+			reader,
 			git.Revision(fmt.Sprintf("%s^{tree}", parentCommitOID)),
 		)
 		if err != nil {
@@ -465,11 +488,8 @@ func (s *Server) userCommitFilesGit(
 	}
 
 	if treeish != "" {
-		treeEntry, err = quarantineRepo.ReadTree(
-			ctx,
-			git.Revision(treeish),
-			localrepo.WithRecursive(),
-		)
+		// Only the trees the actions descend into are read.
+		treeEntry, err = quarantineRepo.ReadTreeLazily(ctx, reader, treeish)
 		if err != nil {
 			return "", fmt.Errorf("reading tree: %w", err)
 		}
@@ -486,10 +506,7 @@ func (s *Server) userCommitFilesGit(
 		}
 	}
 
-	if err := treeEntry.Write(
-		ctx,
-		quarantineRepo,
-	); err != nil {
+	if err := writeTreeEntries(ctx, quarantineRepo, treeEntry); err != nil {
 		return "", fmt.Errorf("writing tree %w", err)
 	}
 
@@ -539,6 +556,22 @@ func (s *Server) userCommitFilesGit(
 	)
 }
 
+// writeTreeEntries writes the trees of tree that changed through one tree writer, which it closes
+// on every path: once it returns, every tree it wrote is in the object directory.
+func writeTreeEntries(ctx context.Context, repo *localrepo.Repo, tree *localrepo.TreeEntry) (returnedErr error) {
+	treeWriter, err := repo.NewTreeWriter(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := treeWriter.Close(); err != nil && returnedErr == nil {
+			returnedErr = err
+		}
+	}()
+
+	return tree.WriteWith(treeWriter)
+}
+
 func (s *Server) userCommitFiles(
 	ctx context.Context,
 	header *gitalypb.UserCommitFilesRequestHeader,
@@ -565,24 +598,46 @@ func (s *Server) userCommitFiles(
 		remoteRepo = nil
 	}
 
-	targetBranchName := git.NewReferenceNameFromBranchName(string(header.GetBranchName()))
-	targetBranchCommit, err := quarantineRepo.ResolveRevision(ctx, targetBranchName.Revision()+"^{commit}")
+	// One object reader serves every revision and tree the request reads (PLAN9, WP96). It reads
+	// the quarantined repository, so it sees the objects the request writes.
+	reader, cancelReader, err := quarantineRepo.RequestObjectReader(ctx)
 	if err != nil {
-		if !errors.Is(err, git.ErrReferenceNotFound) {
-			return fmt.Errorf("resolve target branch commit: %w", err)
-		}
-
-		// the branch is being created
+		return err
+	}
+	defer cancelReader()
+	if s.testHook != nil {
+		s.testHook("UserCommitFiles: reader taken")
 	}
 
+	// The branches are resolved by their exact names: a missing branch never resolves through a
+	// tag or another reference that git's DWIM rules would try after it.
+	targetBranchName := git.NewReferenceNameFromBranchName(string(header.GetBranchName()))
+	branchNames := []git.ReferenceName{targetBranchName}
+	var startBranchName git.ReferenceName
+	if header.GetStartSha() == "" && remoteRepo == nil && len(header.GetStartBranchName()) > 0 {
+		startBranchName = git.NewReferenceNameFromBranchName(string(header.GetStartBranchName()))
+		branchNames = append(branchNames, startBranchName)
+	}
+	branches, err := quarantineRepo.ResolveBranchesExactly(ctx, reader, branchNames...)
+	if err != nil {
+		return fmt.Errorf("resolve branches: %w", err)
+	}
+	// Empty when the branch is being created.
+	targetBranchCommit := branches[targetBranchName]
+
 	var parentCommitOID git.ObjectID
+	// startBranchResolved is whether the start branch resolved in the repository, which then has
+	// a branch.
+	var startBranchResolved bool
 	if header.GetStartSha() == "" {
-		parentCommitOID, err = s.resolveParentCommit(
+		parentCommitOID, startBranchResolved, err = s.resolveParentCommit(
 			ctx,
 			quarantineRepo,
+			branches,
 			remoteRepo,
 			targetBranchName,
 			targetBranchCommit,
+			startBranchName,
 			string(header.GetStartBranchName()),
 		)
 		if err != nil {
@@ -596,7 +651,7 @@ func (s *Server) userCommitFiles(
 	}
 
 	if parentCommitOID != targetBranchCommit {
-		if err := s.fetchMissingCommit(ctx, quarantineRepo, remoteRepo, parentCommitOID); err != nil {
+		if err := s.fetchMissingCommit(ctx, quarantineRepo, reader, remoteRepo, parentCommitOID); err != nil {
 			return fmt.Errorf("fetch missing commit: %w", err)
 		}
 	}
@@ -718,6 +773,7 @@ func (s *Server) userCommitFiles(
 		header,
 		parentCommitOID,
 		quarantineRepo,
+		reader,
 		repoPath,
 		actions,
 	)
@@ -729,9 +785,13 @@ func (s *Server) userCommitFiles(
 		return err
 	}
 
-	hasBranches, err := quarantineRepo.HasBranches(ctx)
-	if err != nil {
-		return fmt.Errorf("was repo created: %w", err)
+	// A branch that resolved already tells that the repository has branches.
+	hasBranches := targetBranchCommit != "" || startBranchResolved
+	if !hasBranches {
+		hasBranches, err = quarantineRepo.HasBranches(ctx)
+		if err != nil {
+			return fmt.Errorf("was repo created: %w", err)
+		}
 	}
 
 	var oldRevision git.ObjectID
@@ -775,29 +835,58 @@ func sameRepository(repoA, repoB *gitalypb.Repository) bool {
 		repoA.GetRelativePath() == repoB.GetRelativePath()
 }
 
+// resolveParentCommit returns the parent commit of the new commit, and whether it is the start
+// branch of local, which then has a branch. localBranches holds the commits of the target and
+// start branches of local that exist under their exact names.
 func (s *Server) resolveParentCommit(
 	ctx context.Context,
-	local gitcmd.Repository,
+	local *localrepo.Repo,
+	localBranches map[git.ReferenceName]git.ObjectID,
 	remote *gitalypb.Repository,
 	targetBranch git.ReferenceName,
 	targetBranchCommit git.ObjectID,
+	localStartBranch git.ReferenceName,
 	startBranch string,
-) (git.ObjectID, error) {
+) (git.ObjectID, bool, error) {
 	if remote == nil && startBranch == "" {
-		return targetBranchCommit, nil
+		return targetBranchCommit, false, nil
 	}
 
-	repo := local
-	if remote != nil {
-		var err error
-		repo, err = remoterepo.New(ctx, remote, s.conns)
-		if err != nil {
-			return "", fmt.Errorf("remote repository: %w", err)
+	branch := targetBranch
+	if startBranch != "" {
+		branch = git.NewReferenceNameFromBranchName(startBranch)
+	}
+	refish := branch + "^{commit}"
+
+	if remote == nil {
+		if commit, ok := localBranches[localStartBranch]; ok {
+			return commit, true, nil
 		}
+
+		// A repository whose target branch exists has branches: the workaround below matters
+		// only when it does not.
+		hasBranches := targetBranchCommit != ""
+		if !hasBranches {
+			var err error
+			if hasBranches, err = local.HasBranches(ctx); err != nil {
+				return "", false, fmt.Errorf("has branches: %w", err)
+			}
+		}
+		if !hasBranches {
+			// The first branch is being created: see the workaround below.
+			return targetBranchCommit, false, nil
+		}
+
+		return "", false, fmt.Errorf("resolving refish %q in %T: %w", refish, local, git.ErrReferenceNotFound)
+	}
+
+	repo, err := remoterepo.New(ctx, remote, s.conns)
+	if err != nil {
+		return "", false, fmt.Errorf("remote repository: %w", err)
 	}
 
 	if hasBranches, err := repo.HasBranches(ctx); err != nil {
-		return "", fmt.Errorf("has branches: %w", err)
+		return "", false, fmt.Errorf("has branches: %w", err)
 	} else if !hasBranches {
 		// GitLab sends requests to UserCommitFiles where target repository
 		// and start repository are the same. If the request hits Gitaly directly,
@@ -817,30 +906,27 @@ func (s *Server) resolveParentCommit(
 		// already resolved locally.
 		//
 		// See: https://gitlab.com/gitlab-org/gitaly/-/issues/3294
-		return targetBranchCommit, nil
+		return targetBranchCommit, false, nil
 	}
 
-	branch := targetBranch
-	if startBranch != "" {
-		branch = git.NewReferenceNameFromBranchName(startBranch)
-	}
-	refish := branch + "^{commit}"
-
-	commit, err := repo.ResolveRevision(ctx, git.Revision(refish))
+	// By its exact name, as in the local repository: a missing branch does not resolve through
+	// a tag or another reference of the start repository.
+	commit, err := repo.ResolveBranch(ctx, strings.TrimPrefix(branch.String(), "refs/heads/"))
 	if err != nil {
-		return "", fmt.Errorf("resolving refish %q in %T: %w", refish, repo, err)
+		return "", false, fmt.Errorf("resolving refish %q in %T: %w", refish, repo, err)
 	}
 
-	return commit, nil
+	return commit, false, nil
 }
 
 func (s *Server) fetchMissingCommit(
 	ctx context.Context,
 	localRepo *localrepo.Repo,
+	localReader catfile.ObjectInfoReader,
 	remoteRepo *gitalypb.Repository,
 	commit git.ObjectID,
 ) error {
-	if _, err := localRepo.ResolveRevision(ctx, commit.Revision()+"^{commit}"); err != nil {
+	if _, err := localRepo.ResolveRevisionWithReader(ctx, localReader, commit.Revision()+"^{commit}"); err != nil {
 		if !errors.Is(err, git.ErrReferenceNotFound) || remoteRepo == nil {
 			return fmt.Errorf("lookup parent commit: %w", err)
 		}

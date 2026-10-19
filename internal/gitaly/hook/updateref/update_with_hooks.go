@@ -232,7 +232,22 @@ func (u *UpdaterWithHooks) UpdateReference(
 		quarantinedRepo = quarantineDir.QuarantinedRepo()
 	}
 
-	hooksPayload, err := gitcmd.NewHooksPayload(ctx, u.cfg, quarantinedRepo, objectHash, transaction, &receiveHooksPayload, gitcmd.ReceivePackHooks, featureflag.FromContext(ctx)).Env()
+	// This function drives the reference-transaction hook of one transaction itself. The
+	// changeset log tells it apart from every other transaction, also from one with the same
+	// updates, by a value unique to this call, as it does for a git process that runs the hook.
+	var invocation string
+	if !u.cfg.Graft.Changelog.Disabled {
+		if invocation, err = gitcmd.NewChangelogInvocation(); err != nil {
+			return err
+		}
+	}
+	newHooksPayload := func(repo *gitalypb.Repository) (string, error) {
+		payload := gitcmd.NewHooksPayload(ctx, u.cfg, repo, objectHash, transaction, &receiveHooksPayload, gitcmd.ReceivePackHooks, featureflag.FromContext(ctx))
+		payload.Changelog.Invocation = invocation
+		return payload.Env()
+	}
+
+	hooksPayload, err := newHooksPayload(quarantinedRepo)
 	if err != nil {
 		return fmt.Errorf("constructing hooks payload: %w", err)
 	}
@@ -254,7 +269,7 @@ func (u *UpdaterWithHooks) UpdateReference(
 		// We only need to update the hooks payload to the unquarantined repo in case we
 		// had a quarantine environment. Otherwise, the initial hooks payload is for the
 		// real repository anyway.
-		hooksPayload, err = gitcmd.NewHooksPayload(ctx, u.cfg, repoProto, objectHash, transaction, &receiveHooksPayload, gitcmd.ReceivePackHooks, featureflag.FromContext(ctx)).Env()
+		hooksPayload, err = newHooksPayload(repoProto)
 		if err != nil {
 			return fmt.Errorf("constructing quarantined hooks payload: %w", err)
 		}

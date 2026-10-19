@@ -202,6 +202,13 @@ type logState struct {
 	fileSize int64
 	// rescans counts the times the cache was filled from the file. Tests use it.
 	rescans int
+	// untrusted is set when an append failed after writing and could not cut its
+	// bytes off again: the file from untrustedFrom on may hold bytes that are not
+	// durable although they read back (after a failed fsync, the kernel may have
+	// dropped them), so loading the state ignores them and the next append
+	// truncates them.
+	untrusted     bool
+	untrustedFrom int64
 	// dirsSynced is true once this process has fsync'd the directories that hold
 	// the log (see syncLogDirs) and the append succeeded. It is reset when an
 	// append fails. While it is false every append syncs them, so that the
@@ -279,11 +286,36 @@ func evictIdleStates() {
 	}
 }
 
+// Record is the updates of one reference transaction with the metadata of the
+// operation that performed them. AppendGroup records several of them at once.
+type Record struct {
+	Meta    Meta
+	Updates []Update
+}
+
 // Append records updates in the changeset log of the repository whose git
-// directory is repoPath and returns the recorded entries. The entries of one
-// call get consecutive sequences and are written with a single write. Appends
-// are serialized within the process and across processes with an flock on the
-// log's lock file, and are fsync'd before Append returns.
+// directory is repoPath and returns the recorded entries. It is AppendGroup with
+// one record.
+func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
+	entries, err := AppendGroup(repoPath, []Record{{Meta: meta, Updates: updates}})
+	if err != nil {
+		return nil, err
+	}
+
+	return entries[0], nil
+}
+
+// AppendGroup records the records in the changeset log of the repository whose
+// git directory is repoPath, in the order given, and returns the entries of each
+// record. The entries of all records get consecutive sequences and are written
+// with a single write and a single fsync. Appends are serialized within the
+// process and across processes with an flock on the log's lock file, and are
+// fsync'd before AppendGroup returns.
+//
+// The entries become visible to the readers of the log (Scan, List,
+// LastSequence) only once they are durable, so a reader never returns an entry
+// that a crash could take back. When AppendGroup fails, none of its entries is
+// durable or was visible, and the next append writes over whatever it wrote.
 //
 // A torn last line, left behind by a crashed writer, is ignored and truncated
 // before the new entries are written.
@@ -294,19 +326,38 @@ func evictIdleStates() {
 //     the repository itself, so entries written there would be lost.
 //   - Each Gitaly node keeps its own log and its own sequences. Behind Praefect,
 //     reads may be routed to a replica whose log lags or differs.
-//   - The lock is taken without a timeout. A holder that never releases it blocks
-//     every append to the repository.
-func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
-	if len(updates) == 0 {
-		return nil, nil
-	}
+//   - Each wait for the lock file is bounded by lockWaitTimeout: an append that
+//     does not get it fails. The appends of this process queue on the state's
+//     mutex before that wait, which is not bounded. An fsync that never returns
+//     is not bounded either: its append holds the lock, and the appends of other
+//     processes fail at lockWaitTimeout.
+func AppendGroup(repoPath string, records []Record) ([][]Entry, error) {
+	entries := make([][]Entry, len(records))
 
-	// The updates are already committed when Append runs, so a malformed member must
-	// not fail the call and lose the entries of the whole batch. Such a member is
-	// dropped instead, and the entries say that their members are incomplete.
-	if members, dropped := validMembers(meta.Members); dropped {
-		meta.Members = members
-		meta.MembersTruncated = true
+	empty := true
+	for i := range records {
+		if len(records[i].Updates) > 0 {
+			empty = false
+		}
+
+		// The updates are already committed when they are recorded, so a malformed
+		// member must not fail the call and lose the entries of the whole batch.
+		// Such a member is dropped instead, and the entries say that their members
+		// are incomplete.
+		meta := &records[i].Meta
+		if members, dropped := validMembers(meta.Members); dropped {
+			meta.Members = members
+			meta.MembersTruncated = true
+		}
+
+		// Proto strings, which serve these fields, must be valid UTF-8, and JSON
+		// would replace the invalid bytes anyway. Replace them here, so that the
+		// returned entries match the recorded ones.
+		meta.Operation = strings.ToValidUTF8(meta.Operation, string(utf8.RuneError))
+		meta.Actor = strings.ToValidUTF8(meta.Actor, string(utf8.RuneError))
+	}
+	if empty {
+		return entries, nil
 	}
 
 	path := Path(repoPath)
@@ -317,14 +368,8 @@ func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
 	state, release := acquireState(path)
 	defer release()
 
-	// Proto strings, which serve these fields, must be valid UTF-8, and JSON would
-	// replace the invalid bytes anyway. Replace them here, so that the returned
-	// entries match the recorded ones.
-	meta.Operation = strings.ToValidUTF8(meta.Operation, string(utf8.RuneError))
-	meta.Actor = strings.ToValidUTF8(meta.Actor, string(utf8.RuneError))
-
 	state.mu.Lock()
-	entries, err := state.appendLocked(repoPath, path, meta, updates)
+	err := state.appendLocked(repoPath, path, records, entries)
 	if err != nil {
 		// Whatever state we cached may be stale now, so force a rescan on the
 		// next append. The failed append may also have created the log or its
@@ -344,12 +389,15 @@ func Append(repoPath string, meta Meta, updates []Update) ([]Entry, error) {
 	return entries, nil
 }
 
-// appendLocked writes the entries to the log at path, which belongs to the
-// repository whose git directory is repoPath. The caller must hold s.mu.
-func (s *logState) appendLocked(repoPath, path string, meta Meta, updates []Update) ([]Entry, error) {
+// appendLocked writes the entries of the records to the log at path, which
+// belongs to the repository whose git directory is repoPath, and stores the
+// entries of record i in entries[i]. The caller must hold s.mu. The cached state,
+// and so what readers see, moves past the new entries only after they are
+// durable.
+func (s *logState) appendLocked(repoPath, path string, records []Record, entries [][]Entry) error {
 	unlock, err := lockFile(path + lockSuffix)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer unlock()
 
@@ -361,77 +409,89 @@ func (s *logState) appendLocked(repoPath, path string, meta Meta, updates []Upda
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("opening changelog: %w", err)
+		return fmt.Errorf("opening changelog: %w", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat changelog: %w", err)
+		return fmt.Errorf("stat changelog: %w", err)
 	}
 
-	if !s.loaded || info.Size() != s.fileSize {
-		if err := s.rescan(f, info.Size()); err != nil {
-			return nil, err
+	if valid, err := s.cacheDescribes(f, info.Size()); err != nil {
+		return err
+	} else if !valid {
+		if err := s.load(f, info.Size()); err != nil {
+			return err
 		}
 	}
 
-	// Drop a torn tail left behind by a crashed writer. It is never valid, so
-	// nothing that was acknowledged is lost.
+	// Drop a torn tail left behind by a crashed writer, or the bytes of an append
+	// that failed. They were never durable and never visible, so nothing that was
+	// acknowledged is lost.
 	if s.fileSize > s.validEnd {
-		if err := f.Truncate(s.validEnd); err != nil {
-			return nil, fmt.Errorf("truncating torn changelog tail: %w", err)
+		if err := truncateFile(f, s.validEnd); err != nil {
+			return fmt.Errorf("truncating torn changelog tail: %w", err)
 		}
 		s.fileSize = s.validEnd
+		s.untrusted = false
 	}
 
-	recordedAt := meta.RecordedAt
-	if recordedAt.IsZero() {
-		recordedAt = time.Now()
-	}
-	recordedAt = recordedAt.UTC()
+	now := time.Now()
 
 	var (
 		buf    bytes.Buffer
 		points []indexPoint
 	)
-	entries := make([]Entry, 0, len(updates))
 	seq := s.lastSeq
-	for _, update := range updates {
-		seq++
-		entry := Entry{
-			Sequence:         seq,
-			Reference:        update.Reference,
-			OldOID:           update.OldOID,
-			NewOID:           update.NewOID,
-			Operation:        meta.Operation,
-			Actor:            meta.Actor,
-			RecordedAt:       recordedAt,
-			Rewritten:        meta.Rewritten,
-			Members:          normalizeMembers(meta.Members),
-			MembersTruncated: meta.MembersTruncated,
+	for i, record := range records {
+		meta := record.Meta
+		recordedAt := meta.RecordedAt
+		if recordedAt.IsZero() {
+			recordedAt = now
 		}
+		recordedAt = recordedAt.UTC()
 
-		line, err := json.Marshal(entry)
-		if err != nil {
-			return nil, fmt.Errorf("encoding changelog entry: %w", err)
+		recorded := make([]Entry, 0, len(record.Updates))
+		for _, update := range record.Updates {
+			seq++
+			entry := Entry{
+				Sequence:         seq,
+				Reference:        update.Reference,
+				OldOID:           update.OldOID,
+				NewOID:           update.NewOID,
+				Operation:        meta.Operation,
+				Actor:            meta.Actor,
+				RecordedAt:       recordedAt,
+				Rewritten:        meta.Rewritten,
+				Members:          normalizeMembers(meta.Members),
+				MembersTruncated: meta.MembersTruncated,
+			}
+
+			line, err := json.Marshal(entry)
+			if err != nil {
+				return fmt.Errorf("encoding changelog entry: %w", err)
+			}
+
+			if seq%indexInterval == 0 {
+				points = append(points, indexPoint{sequence: seq, offset: s.validEnd + int64(buf.Len())})
+			}
+
+			buf.Write(line)
+			buf.WriteByte('\n')
+			recorded = append(recorded, entry)
 		}
-
-		if seq%indexInterval == 0 {
-			points = append(points, indexPoint{sequence: seq, offset: s.validEnd + int64(buf.Len())})
-		}
-
-		buf.Write(line)
-		buf.WriteByte('\n')
-		entries = append(entries, entry)
+		entries[i] = recorded
 	}
 
 	if _, err := f.WriteAt(buf.Bytes(), s.validEnd); err != nil {
-		return nil, fmt.Errorf("writing changelog: %w", err)
+		s.discardFrom(f, s.validEnd)
+		return fmt.Errorf("writing changelog: %w", err)
 	}
 
-	if err := f.Sync(); err != nil {
-		return nil, fmt.Errorf("syncing changelog: %w", err)
+	if err := syncFile(f); err != nil {
+		s.discardFrom(f, s.validEnd)
+		return fmt.Errorf("syncing changelog: %w", err)
 	}
 
 	// The entries are only durable once the directory entries of the log file and
@@ -442,7 +502,8 @@ func (s *logState) appendLocked(repoPath, path string, meta Meta, updates []Upda
 	// append.
 	if created || !s.dirsSynced {
 		if err := syncLogDirs(repoPath, path); err != nil {
-			return nil, err
+			s.discardFrom(f, s.validEnd)
+			return err
 		}
 		s.dirsSynced = true
 	}
@@ -456,7 +517,75 @@ func (s *logState) appendLocked(repoPath, path string, meta Meta, updates []Upda
 		s.addIndexPoint(point.sequence, point.offset)
 	}
 
-	return entries, nil
+	return nil
+}
+
+// cacheDescribes reports whether the cached state still describes the file f, whose size is
+// size, so that it need not be loaded again. The caller must hold s.mu.
+//
+// The size alone does not tell: while the cache knows of bytes after its last valid entry (a torn
+// tail, or the untrusted bytes of a failed append), another process may have cut them off and
+// appended durable entries that end at the same size, and acting on the cache would cut those
+// off. Such a cache is therefore never trusted. A cache without such bytes can only see the file
+// grow, as no process cuts the file below the end of the durable entries; it is trusted when the
+// size is unchanged and the line before its end still holds its last entry.
+func (s *logState) cacheDescribes(f *os.File, size int64) (bool, error) {
+	if !s.loaded || size != s.fileSize || s.fileSize != s.validEnd {
+		return false, nil
+	}
+	if s.validEnd == 0 {
+		return s.lastSeq == 0, nil
+	}
+
+	nl := s.validEnd - 1
+	prev, err := lastNewlineBefore(f, nl)
+	if err != nil {
+		return false, err
+	}
+	line := make([]byte, nl-(prev+1)+1)
+	if _, err := f.ReadAt(line, prev+1); err != nil {
+		return false, fmt.Errorf("reading changelog: %w", err)
+	}
+	if line[len(line)-1] != '\n' {
+		return false, nil
+	}
+
+	var entry Entry
+	if err := json.Unmarshal(line[:len(line)-1], &entry); err != nil {
+		return false, nil
+	}
+	return entry.Sequence == s.lastSeq, nil
+}
+
+// discardFrom cuts off the bytes that a failed append wrote from end on. When
+// that fails too, the bytes are remembered as untrusted, so that no reader takes
+// them for entries. The caller must hold s.mu.
+func (s *logState) discardFrom(f *os.File, end int64) {
+	if err := truncateFile(f, end); err == nil {
+		return
+	}
+
+	if !s.untrusted || end < s.untrustedFrom {
+		s.untrusted = true
+		s.untrustedFrom = end
+	}
+}
+
+// load fills the cache from the file, whose size is size, ignoring the
+// untrusted bytes of a failed append (see discardFrom). The caller must hold
+// s.mu.
+func (s *logState) load(f *os.File, size int64) error {
+	scanned := size
+	if s.untrusted && scanned > s.untrustedFrom {
+		scanned = s.untrustedFrom
+	}
+
+	if err := s.rescan(f, scanned); err != nil {
+		return err
+	}
+	s.fileSize = size
+
+	return nil
 }
 
 // rescan fills the cache from the file, whose size is size. It reads backwards
@@ -609,6 +738,71 @@ func syncLogDirs(repoPath, path string) error {
 	return nil
 }
 
+// syncFile fsyncs the log file f. Tests replace it.
+var syncFile = func(f *os.File) error {
+	return f.Sync()
+}
+
+// truncateFile cuts the log file f to size. Tests replace it.
+var truncateFile = func(f *os.File, size int64) error {
+	return f.Truncate(size)
+}
+
+// durableView returns the end of the durable entries of the log at path and the
+// sequence of the last of them. f is the log file, opened by the caller. Readers
+// read the log only up to that end.
+//
+// The cached state only moves past entries once they are durable, so while it
+// describes the file it is the answer; taking s.mu waits for an append of this
+// process that is between its write and its fsync. When the state is not loaded,
+// or the file changed since it was (an append of another process), the state is
+// loaded again under the log's lock file, which waits for an append of another
+// process, and the file is fsync'd first: bytes that a crashed writer left in the
+// page cache are durable once a reader may see them. So are the directory entries
+// of the log, which that writer may have crashed before syncing (see
+// syncLogDirs), unless this process synced them already.
+func (s *logState) durableView(repoPath, path string, f *os.File) (int64, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat changelog: %w", err)
+	}
+	if valid, err := s.cacheDescribes(f, info.Size()); err != nil {
+		return 0, 0, err
+	} else if valid && s.dirsSynced {
+		return s.validEnd, s.lastSeq, nil
+	}
+
+	unlock, err := lockFile(path + lockSuffix)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer unlock()
+
+	if err := syncFile(f); err != nil {
+		return 0, 0, fmt.Errorf("syncing changelog: %w", err)
+	}
+	if !s.dirsSynced {
+		if err := syncLogDirs(repoPath, path); err != nil {
+			return 0, 0, err
+		}
+		s.dirsSynced = true
+	}
+
+	info, err = f.Stat()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat changelog: %w", err)
+	}
+	if err := s.load(f, info.Size()); err != nil {
+		s.loaded = false
+		return 0, 0, err
+	}
+
+	return s.validEnd, s.lastSeq, nil
+}
+
 // syncDir fsyncs the directory dir, so that the entries it holds are durable.
 // Tests replace it.
 var syncDir = func(dir string) error {
@@ -621,29 +815,65 @@ var syncDir = func(dir string) error {
 	return d.Sync()
 }
 
+// lockWaitTimeout bounds one wait for the log's lock file, which another process holds for one
+// append. A holder that never releases it would otherwise block that wait forever: it fails
+// instead, and an append sees the error (its updates are reported lost). The bound is per wait
+// for the lock file, not per call: the appends and readers of this process that wait for the
+// state's mutex (s.mu) behind such a wait are not bounded by it, and each then waits for the
+// lock file in turn. A wait that failed keeps its goroutine, blocked in flock(2) on an OS
+// thread, and its descriptor until the holder releases the lock. Tests lower it.
+var lockWaitTimeout = 30 * time.Second
+
 // lockFile takes an exclusive flock on the file at path and returns the
-// function that releases it.
+// function that releases it. It waits at most lockWaitTimeout.
 func lockFile(path string) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("opening changelog lock: %w", err)
 	}
+	unlock := func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return unlock, nil
+	}
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
 		f.Close()
 		return nil, fmt.Errorf("locking changelog: %w", err)
 	}
 
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	// Another process holds the lock: wait for it in a goroutine, which owns the file if the
+	// wait gives up first and releases the lock once it is granted.
+	locked := make(chan error, 1)
+	go func() { locked <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX) }()
+
+	timer := time.NewTimer(lockWaitTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-locked:
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("locking changelog: %w", err)
+		}
+		return unlock, nil
+	case <-timer.C:
+		go func() {
+			if err := <-locked; err == nil {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			}
+			_ = f.Close()
+		}()
+		return nil, fmt.Errorf("locking changelog: the lock was not granted within %s", lockWaitTimeout)
+	}
 }
 
 // Scan calls fn for every entry of the log of the repository whose git
 // directory is repoPath with a sequence greater than after, in ascending order.
-// Scanning stops when fn returns false or an error. A torn last line is
-// ignored, so Scan can run concurrently with Append.
+// Scanning stops when fn returns false or an error. Scan reads the durable
+// entries only (see AppendGroup), so it can run concurrently with appends.
 //
 // The scan starts at the closest index point before after, so its cost depends
 // on the entries that follow after and not on the size of the log.
@@ -662,12 +892,17 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 	}
 	defer f.Close()
 
-	offset := state.scanOffset(f, after)
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return fmt.Errorf("seeking changelog: %w", err)
+	end, _, err := state.durableView(repoPath, path, f)
+	if err != nil {
+		return err
 	}
 
-	r := bufio.NewReader(f)
+	offset := state.scanOffset(f, after)
+	if offset >= end {
+		return nil
+	}
+
+	r := bufio.NewReader(io.NewSectionReader(f, offset, end-offset))
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
@@ -701,12 +936,11 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 	}
 }
 
-// LastSequence returns the sequence of the last valid entry of the log of the
+// LastSequence returns the sequence of the last durable entry of the log of the
 // repository whose git directory is repoPath, 0 when the log is empty or does
-// not exist. It uses the cached state of the log while the file size is
-// unchanged and otherwise reads the file backwards from its end, so its cost
-// does not depend on the size of the log. It takes no lock on the log: an
-// append that runs concurrently may or may not be included.
+// not exist. An entry whose append has not fsync'd it yet is not included (see
+// AppendGroup). It uses the cached state of the log while it describes the file,
+// so its cost does not depend on the size of the log.
 func LastSequence(repoPath string) (uint64, error) {
 	path := Path(repoPath)
 
@@ -722,26 +956,12 @@ func LastSequence(repoPath string) (uint64, error) {
 	}
 	defer f.Close()
 
-	info, err := f.Stat()
+	_, lastSeq, err := state.durableView(repoPath, path, f)
 	if err != nil {
-		return 0, fmt.Errorf("stat changelog: %w", err)
-	}
-
-	state.mu.Lock()
-	if state.loaded && info.Size() == state.fileSize {
-		defer state.mu.Unlock()
-		return state.lastSeq, nil
-	}
-	state.mu.Unlock()
-
-	// The cache is only filled by appends, which hold the log's lock file: the
-	// file is read into a state of its own.
-	var scratch logState
-	if err := scratch.rescan(f, info.Size()); err != nil {
 		return 0, err
 	}
 
-	return scratch.lastSeq, nil
+	return lastSeq, nil
 }
 
 // List returns up to limit entries with a sequence greater than after, in

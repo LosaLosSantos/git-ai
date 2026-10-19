@@ -41,6 +41,18 @@ func (f *CountingCommandFactory) CommandCount(cmd string) uint64 {
 	return c
 }
 
+// Counts returns a copy of the count of every git command.
+func (f *CountingCommandFactory) Counts() map[string]uint64 {
+	f.m.Lock()
+	defer f.m.Unlock()
+
+	counts := make(map[string]uint64, len(f.counts))
+	for cmd, c := range f.counts {
+		counts[cmd] = c
+	}
+	return counts
+}
+
 // RequireCommandCount checks if the count for the given command equals the
 // expected count.
 func (f *CountingCommandFactory) RequireCommandCount(tb testing.TB, cmd string, expected interface{}) {
