@@ -136,11 +136,15 @@ func TestAdmissionHoldBoundEndsALostAdmission(t *testing.T) {
 func TestAdmissionHoldBoundTimer(t *testing.T) {
 	t.Parallel()
 	ctx := testhelper.Context(t)
-	a, waiting := queued(time.Hour, 20*time.Millisecond)
+	a := NewAdmission(time.Hour, 20*time.Millisecond)
 
+	// The first writer never releases: only the hold bound ends its admission.
+	// The bound may pass before the second writer queues (it is then admitted
+	// at once) or while it waits (it is then handed the admission): either way
+	// it is admitted, by the expiry, and long before its own wait bound.
 	require.True(t, a.Acquire(ctx, "repo", key(0), WriterHook))
-	require.True(t, <-acquireAsync(ctx, t, a, waiting, "repo", key(1)))
-	require.GreaterOrEqual(t, testutil.ToFloat64(a.expired), 1.0)
+	require.True(t, a.Acquire(ctx, "repo", key(1), WriterHook))
+	require.Equal(t, 1.0, testutil.ToFloat64(a.expired))
 }
 
 func TestAdmissionUniqueKeysAreOrdered(t *testing.T) {
