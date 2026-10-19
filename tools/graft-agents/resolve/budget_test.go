@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,15 +20,24 @@ import (
 // wp4Prices costs $1 per million input tokens and $10 per million output tokens.
 var wp4Prices = Prices{InputPerMillion: 1, OutputPerMillion: 10}
 
-func wp4Near(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+// wp4USD returns an exact amount written in dollars.
+func wp4USD(t *testing.T, usd string) nanoUSD {
+	t.Helper()
+	n, err := parseNanoUSD(usd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
 
-func wp4Spent(t *testing.T, b *Budget) float64 {
+// wp4Spent returns the exact spend of the month.
+func wp4Spent(t *testing.T, b *Budget) nanoUSD {
 	t.Helper()
 	s, err := b.Snapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s.SpentUSD
+	return nanoUSD(s.SpentNanoUSD)
 }
 
 func TestBudgetReserveAndBook(t *testing.T) {
@@ -41,13 +50,13 @@ func TestBudgetReserveAndBook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := wp4Spent(t, b); !wp4Near(got, 0.2) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "0.2") {
 		t.Fatalf("spent after reserve = %v, want the worst case 0.2", got)
 	}
 	if err := r.Book(llm.Usage{InputTokens: 30_000, OutputTokens: 2_000}); err != nil {
 		t.Fatal(err)
 	}
-	if got := wp4Spent(t, b); !wp4Near(got, 0.05) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "0.05") {
 		t.Fatalf("spent after book = %v, want the real cost 0.05", got)
 	}
 }
@@ -65,7 +74,7 @@ func TestBudgetRefusesBeyondCap(t *testing.T) {
 		t.Fatalf("message %q", err)
 	}
 	s, _ := b.Snapshot()
-	if !wp4Near(s.SpentUSD, 0.2) || s.Exhausted != 1 || s.Calls != 1 {
+	if nanoUSD(s.SpentNanoUSD) != wp4USD(t, "0.2") || s.Exhausted != 1 || s.Calls != 1 {
 		t.Fatalf("snapshot %+v: a refused call must book nothing", s)
 	}
 	// A smaller call still fits.
@@ -80,7 +89,7 @@ func TestBudgetUnknownUsageKeepsReservation(t *testing.T) {
 	if err := r.Book(llm.Usage{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := wp4Spent(t, b); !wp4Near(got, 0.2) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "0.2") {
 		t.Fatalf("spent = %v, want the reservation kept", got)
 	}
 }
@@ -92,7 +101,7 @@ func TestBudgetNoCapTracksSpend(t *testing.T) {
 			t.Fatalf("call %d refused without a cap: %v", i, err)
 		}
 	}
-	if got := wp4Spent(t, b); !wp4Near(got, 100) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "100") {
 		t.Fatalf("spent = %v", got)
 	}
 }
@@ -108,7 +117,7 @@ func TestBudgetStateFileSurvivesRestartAndIsShared(t *testing.T) {
 
 	// Another process (or a restart) sees the spend.
 	b, _ := NewBudget(1, wp4Prices, state)
-	if got := wp4Spent(t, b); !wp4Near(got, 0.1) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "0.1") {
 		t.Fatalf("restarted budget spent = %v, want 0.1", got)
 	}
 	if _, err := b.Reserve(800_000, 0); err != nil { // 0.90 total
@@ -123,7 +132,7 @@ func TestBudgetStateFileSurvivesRestartAndIsShared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &st); err != nil || st.Month != time.Now().UTC().Format("2006-01") || !wp4Near(st.SpentUSD, 0.9) {
+	if err := json.Unmarshal(data, &st); err != nil || st.Month != time.Now().UTC().Format("2006-01") || st.Spent != wp4USD(t, "0.9") {
 		t.Fatalf("state %s (%v)", data, err)
 	}
 	if matches, _ := filepath.Glob(state + ".tmp-*"); len(matches) != 0 {
@@ -159,7 +168,7 @@ func TestBudgetConcurrentReservationsNeverExceedCap(t *testing.T) {
 	if granted != 50 {
 		t.Fatalf("granted %d calls of $0.01 under a $0.50 cap, want 50", granted)
 	}
-	if got := wp4Spent(t, budgets[0]); !wp4Near(got, 0.5) {
+	if got := wp4Spent(t, budgets[0]); got != wp4USD(t, "0.5") {
 		t.Fatalf("spent = %v", got)
 	}
 }
@@ -230,7 +239,7 @@ func TestBudgetProviderReservesInputBytesAndMaxTokens(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No usage reported: the reservation stays, 1 + 1000 bytes + 256 of framing.
-	if got := wp4Spent(t, b); got != 1257 {
+	if got := wp4Spent(t, b); got != wp4USD(t, "1257") {
 		t.Fatalf("reserved %v input tokens, want 1257", got)
 	}
 }
@@ -279,7 +288,7 @@ func TestLLMStrategyBudgetConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 1000 × $2/M + 100 × $10.5/M = $0.00305.
-	if got := wp4Spent(t, b); !wp4Near(got, 0.00305) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "0.00305") {
 		t.Fatalf("spent = %v", got)
 	}
 	if !strings.Contains(resp.Explanation, "llm: AI spend ") || !strings.Contains(resp.Explanation, "cap $5.00") {
@@ -361,7 +370,7 @@ func TestResolverUseBudget(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("a.txt"))); err != nil {
 		t.Fatal(err)
 	}
-	if got := wp4Spent(t, b); !wp4Near(got, 1) {
+	if got := wp4Spent(t, b); got != wp4USD(t, "1") {
 		t.Fatalf("spent = %v, want $1", got)
 	}
 

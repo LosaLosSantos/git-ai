@@ -58,6 +58,10 @@ func TestOpenRouterPricing(t *testing.T) {
 	if real.Prompt != 0.0000002 || real.Completion != 0.000001 || real.Reasoning != 0 || real.Request != 0 {
 		t.Fatalf("pricing %+v", real)
 	}
+	// Per million in decimal: 2e-7 per token is 0.2, not 0.19999999999999998.
+	if got := real.Prices(); got.InputPerMillion != 0.2 || got.OutputPerMillion != 1 {
+		t.Fatalf("prices %+v", got)
+	}
 	// Without a bound every tier counts.
 	all, err := OpenRouterPricing(context.Background(), srv.Client(), srv.URL, "a/real", 0)
 	if err != nil {

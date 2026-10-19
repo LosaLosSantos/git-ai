@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -39,10 +40,26 @@ type Pricing struct {
 // prices on every output token can only overstate the cost.
 func (p Pricing) Prices() resolve.Prices {
 	return resolve.Prices{
-		InputPerMillion:  p.Prompt * 1e6,
-		OutputPerMillion: (p.Completion + p.Reasoning) * 1e6,
+		InputPerMillion:  PerMillion(p.Prompt),
+		OutputPerMillion: PerMillion(p.Completion, p.Reasoning),
 		PerRequest:       p.Request,
 	}
+}
+
+// PerMillion returns the sum of per-token prices times a million, computed in decimal from the
+// shortest representation of each price (the decimal OpenRouter wrote), so that 0.0000002 per
+// token is exactly 0.2 per million rather than 0.19999999999999998.
+func PerMillion(perToken ...float64) float64 {
+	sum := new(big.Rat)
+	for _, v := range perToken {
+		r, ok := new(big.Rat).SetString(strconv.FormatFloat(v, 'g', -1, 64))
+		if !ok {
+			return math.NaN()
+		}
+		sum.Add(sum, r)
+	}
+	f, _ := sum.Mul(sum, big.NewRat(1_000_000, 1)).Float64()
+	return f
 }
 
 type openRouterEndpoints struct {

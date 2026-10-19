@@ -1,15 +1,14 @@
 package resolve
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,8 +16,8 @@ import (
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
-// Prices are the prices of a model in USD. OutputPerMillion applies to every output token,
-// reasoning included (providers count reasoning tokens as output).
+// Prices are the prices of a model in USD, as configured. OutputPerMillion applies to every
+// output token, reasoning included (providers count reasoning tokens as output).
 type Prices struct {
 	InputPerMillion  float64
 	OutputPerMillion float64
@@ -26,20 +25,40 @@ type Prices struct {
 	PerRequest float64
 }
 
-func (p Prices) cost(inputTokens, outputTokens int) float64 {
-	return float64(inputTokens)*p.InputPerMillion/1e6 + float64(outputTokens)*p.OutputPerMillion/1e6 + p.PerRequest
+// prices are Prices in nano-dollars, converted exactly (usdToNano).
+type prices struct {
+	inputPerMillion, outputPerMillion, perRequest nanoUSD
 }
 
-func (p Prices) validate() error {
-	for _, v := range []float64{p.InputPerMillion, p.OutputPerMillion, p.PerRequest} {
-		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
-			return fmt.Errorf("invalid price %v", v)
+func (p Prices) exact() (prices, error) {
+	var out prices
+	for _, f := range []struct {
+		usd float64
+		dst *nanoUSD
+	}{{p.InputPerMillion, &out.inputPerMillion}, {p.OutputPerMillion, &out.outputPerMillion}, {p.PerRequest, &out.perRequest}} {
+		n, err := usdToNano(f.usd)
+		if err != nil {
+			return prices{}, fmt.Errorf("invalid price: %w", err)
 		}
+		*f.dst = n
 	}
-	if p.InputPerMillion == 0 && p.OutputPerMillion == 0 && p.PerRequest == 0 {
-		return errors.New("no price is set")
+	if out == (prices{}) {
+		return prices{}, errors.New("no price is set")
 	}
-	return nil
+	return out, nil
+}
+
+// cost returns the cost of a call with the given tokens, rounded up.
+func (p prices) cost(inputTokens, outputTokens int) (nanoUSD, error) {
+	in, err := tokenCost(inputTokens, p.inputPerMillion)
+	if err != nil {
+		return 0, err
+	}
+	out, err := tokenCost(outputTokens, p.outputPerMillion)
+	if err != nil {
+		return 0, err
+	}
+	return addNano(in, out, p.perRequest)
 }
 
 // Budget tracks the AI spend of a calendar month (UTC) and caps it (PLAN10 3.5). Before every
@@ -48,17 +67,23 @@ func (p Prices) validate() error {
 // cost of the usage the provider reports. So the recorded spend is never below the real one, and
 // a process that dies between the two steps leaves its reservation booked.
 //
+// Money is counted in whole nano-dollars: the prices and the cap are converted exactly from
+// their decimal form, a call's cost is rounded up, and sums and the comparison with the cap are
+// exact.
+//
 // With a state file the spend survives restarts and is shared by every graft-resolve process
 // that uses the file: each update holds an exclusive lock (flock on state + ".lock"), reads the
 // file, and writes it again atomically (temporary file, fsync, rename, fsync of the directory).
 // Without a state file the spend lives in memory (the benchmark).
 type Budget struct {
-	// MonthlyUSD is the cap; 0 means no cap (the spend is still tracked).
+	// MonthlyUSD is the cap as configured; 0 means no cap (the spend is still tracked).
 	MonthlyUSD float64
 	Prices     Prices
 
-	state string
-	now   func() time.Time
+	monthly nanoUSD
+	prices  prices
+	state   string
+	now     func() time.Time
 
 	mu    sync.Mutex
 	mem   budgetState
@@ -67,18 +92,46 @@ type Budget struct {
 	exhausted atomic.Int64
 }
 
+// budgetState is the content of the state file: {"month": "2026-10", "spent_usd": 1.250000000},
+// the spend written as an exact decimal number.
 type budgetState struct {
-	Month    string  `json:"month"`
-	SpentUSD float64 `json:"spent_usd"`
+	Month string
+	Spent nanoUSD
+}
+
+type budgetStateJSON struct {
+	Month    string      `json:"month"`
+	SpentUSD json.Number `json:"spent_usd"`
+}
+
+func (st budgetState) MarshalJSON() ([]byte, error) {
+	return json.Marshal(budgetStateJSON{Month: st.Month, SpentUSD: json.Number(st.Spent.String())})
+}
+
+func (st *budgetState) UnmarshalJSON(data []byte) error {
+	var w budgetStateJSON
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&w); err != nil {
+		return err
+	}
+	spent, err := parseNanoUSD(w.SpentUSD.String())
+	if err != nil {
+		return fmt.Errorf("spent_usd: %w", err)
+	}
+	*st = budgetState{Month: w.Month, Spent: spent}
+	return nil
 }
 
 // NewBudget returns a budget with the cap monthlyUSD (0: none) and the prices of the model,
 // kept in stateFile ("" keeps it in memory).
-func NewBudget(monthlyUSD float64, prices Prices, stateFile string) (*Budget, error) {
-	if monthlyUSD < 0 || math.IsNaN(monthlyUSD) || math.IsInf(monthlyUSD, 0) {
-		return nil, fmt.Errorf("budget: invalid monthly cap %v", monthlyUSD)
+func NewBudget(monthlyUSD float64, p Prices, stateFile string) (*Budget, error) {
+	monthly, err := usdToNano(monthlyUSD)
+	if err != nil {
+		return nil, fmt.Errorf("budget: invalid monthly cap: %w", err)
 	}
-	if err := prices.validate(); err != nil {
+	exact, err := p.exact()
+	if err != nil {
 		return nil, fmt.Errorf("budget: %w", err)
 	}
 	if stateFile != "" {
@@ -89,7 +142,7 @@ func NewBudget(monthlyUSD float64, prices Prices, stateFile string) (*Budget, er
 			return nil, err
 		}
 	}
-	return &Budget{MonthlyUSD: monthlyUSD, Prices: prices, state: stateFile, now: time.Now}, nil
+	return &Budget{MonthlyUSD: monthlyUSD, Prices: p, monthly: monthly, prices: exact, state: stateFile, now: time.Now}, nil
 }
 
 func (b *Budget) month() string {
@@ -145,9 +198,6 @@ func readBudgetState(file string) (budgetState, error) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return st, fmt.Errorf("budget: state file %s: %w", file, err)
 	}
-	if st.SpentUSD < 0 || math.IsNaN(st.SpentUSD) || math.IsInf(st.SpentUSD, 0) {
-		return st, fmt.Errorf("budget: state file %s: invalid spend %v", file, st.SpentUSD)
-	}
 	return st, nil
 }
 
@@ -191,32 +241,37 @@ func writeBudgetState(file string, st budgetState) error {
 type Reservation struct {
 	b     *Budget
 	month string
-	usd   float64
+	worst nanoUSD
 }
 
 // Reserve books the worst case of a call with at most inputTokens of input and maxOutputTokens of
 // output. It fails with ErrBudgetExhausted, without booking anything, when the month's spend plus
 // the worst case would exceed the cap.
 func (b *Budget) Reserve(inputTokens, maxOutputTokens int) (*Reservation, error) {
-	worst := b.Prices.cost(inputTokens, maxOutputTokens)
+	worst, err := b.prices.cost(inputTokens, maxOutputTokens)
+	if err != nil {
+		return nil, fmt.Errorf("budget: %w", err)
+	}
 	st, err := b.update(func(st *budgetState) error {
-		// The margin absorbs the rounding of sums of float prices (49 calls of $0.01 add up
-		// to a little more than $0.49); it lets the spend pass the cap by a nano-dollar at most.
-		if b.MonthlyUSD > 0 && st.SpentUSD+worst > b.MonthlyUSD+1e-9 {
+		total, err := addNano(st.Spent, worst)
+		if err != nil {
+			return err
+		}
+		if b.monthly > 0 && total > b.monthly {
 			return ErrBudgetExhausted
 		}
-		st.SpentUSD += worst
+		st.Spent = total
 		return nil
 	})
 	if errors.Is(err, ErrBudgetExhausted) {
 		b.exhausted.Add(1)
-		return nil, fmt.Errorf("%w: $%.4f spent of $%.2f this month, the next call may cost up to $%.4f", ErrBudgetExhausted, st.SpentUSD, b.MonthlyUSD, worst)
+		return nil, fmt.Errorf("%w: $%s spent of $%s this month, the next call may cost up to $%s", ErrBudgetExhausted, st.Spent, b.monthly, worst)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("budget: %w", err)
 	}
 	b.calls.Add(1)
-	return &Reservation{b: b, month: st.Month, usd: worst}, nil
+	return &Reservation{b: b, month: st.Month, worst: worst}, nil
 }
 
 // Book replaces the reservation with the cost of the usage the provider reported. A usage with no
@@ -226,12 +281,21 @@ func (r *Reservation) Book(u llm.Usage) error {
 	if r == nil || (u.InputTokens == 0 && u.OutputTokens == 0) {
 		return nil
 	}
-	actual := r.b.Prices.cost(u.InputTokens, u.OutputTokens)
-	_, err := r.b.update(func(st *budgetState) error {
+	actual, err := r.b.prices.cost(u.InputTokens, u.OutputTokens)
+	if err != nil {
+		return fmt.Errorf("budget: %w", err)
+	}
+	_, err = r.b.update(func(st *budgetState) error {
 		if st.Month != r.month {
 			return nil
 		}
-		st.SpentUSD = math.Max(0, st.SpentUSD+actual-r.usd)
+		// The worst case was booked; the reported usage replaces it. A usage above the worst case
+		// (a provider that passed max_tokens) is booked in full.
+		spent, err := addNano(st.Spent-min(st.Spent, r.worst), actual)
+		if err != nil {
+			return err
+		}
+		st.Spent = spent
 		return nil
 	})
 	return err
@@ -239,11 +303,13 @@ func (r *Reservation) Book(u llm.Usage) error {
 
 // BudgetSnapshot is the state of a budget, for metrics and reports.
 type BudgetSnapshot struct {
-	Month      string
-	SpentUSD   float64
-	MonthlyUSD float64
-	Calls      int64
-	Exhausted  int64
+	Month string
+	// SpentUSD and MonthlyUSD are for display; SpentNanoUSD is exact.
+	SpentUSD     float64
+	SpentNanoUSD int64
+	MonthlyUSD   float64
+	Calls        int64
+	Exhausted    int64
 }
 
 // Snapshot returns the spend of the current month.
@@ -252,7 +318,10 @@ func (b *Budget) Snapshot() (BudgetSnapshot, error) {
 	if err != nil && !errors.Is(err, errReadOnly) {
 		return BudgetSnapshot{}, err
 	}
-	return BudgetSnapshot{Month: st.Month, SpentUSD: st.SpentUSD, MonthlyUSD: b.MonthlyUSD, Calls: b.calls.Load(), Exhausted: b.exhausted.Load()}, nil
+	return BudgetSnapshot{
+		Month: st.Month, SpentUSD: st.Spent.USD(), SpentNanoUSD: int64(st.Spent), MonthlyUSD: b.monthly.USD(),
+		Calls: b.calls.Load(), Exhausted: b.exhausted.Load(),
+	}, nil
 }
 
 var errReadOnly = errors.New("read only")
@@ -261,7 +330,7 @@ var errReadOnly = errors.New("read only")
 func (s BudgetSnapshot) String() string {
 	limit := "no cap"
 	if s.MonthlyUSD > 0 {
-		limit = "cap $" + strconv.FormatFloat(s.MonthlyUSD, 'f', 2, 64)
+		limit = fmt.Sprintf("cap $%.2f", s.MonthlyUSD)
 	}
 	return fmt.Sprintf("AI spend %s: $%.4f (%s)", s.Month, s.SpentUSD, limit)
 }

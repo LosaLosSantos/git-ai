@@ -122,7 +122,7 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 	if p := rep.Pricing; p != nil {
 		fmt.Fprintf(&b, "Model %s, priced at run time (%s, %s, highest of %d endpoints): $%g per million input tokens, $%g per million output tokens (completion $%g + internal reasoning $%g), $%g per request.\n\n",
 			p.Model, p.Source, p.FetchedAt.Format(time.RFC3339), p.Endpoints,
-			p.Prompt*1e6, (p.Completion+p.Reasoning)*1e6, p.Completion*1e6, p.Reasoning*1e6, p.Request)
+			PerMillion(p.Prompt), PerMillion(p.Completion, p.Reasoning), PerMillion(p.Completion), PerMillion(p.Reasoning), p.Request)
 	}
 	b.WriteString("| family | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | abstained | error rate |\n")
 	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
