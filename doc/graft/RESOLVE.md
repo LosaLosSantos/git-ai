@@ -256,6 +256,44 @@ resolver when the rules above let it. Use `paths_deny` for paths that must
 never leave the server. `graft-resolve bench` applies the same rules (3 to 7);
 both are tested against `internal/graft/resolver/testdata/never-send.json`.
 
+## Optional verification of a resolution
+
+`[graft.land.resolver.verify]`, off by default, runs a command on the merged
+tree of every resolution before it lands, a resolver's answer or an agent's
+resolution alike:
+
+```toml
+[graft.land.resolver.verify]
+enabled = true
+command = ["/usr/local/bin/graft-check-build"]
+timeout = "5m"
+```
+
+The server archives the merged tree (the resolution included) into a
+temporary directory and runs `command` there, with a minimal environment
+(`PATH`, and `HOME` and `TMPDIR` in a directory of their own). A non-zero exit or a
+timeout rejects the resolution: the land fails, every file of the package is
+`REJECTED`, and the reason is `verification failed:` with the exit status and
+the first 4 KiB of the output. The command runs on the server, with the
+server's rights, on code that agents wrote: treat it as a custom hook. It
+also costs time on every resolution, which is why it is off by default; the
+trailers and `graft-verify` remain the safety net.
+
+## Finding and reverting AI resolutions
+
+Every resolution carries its trailers, so it can be found and undone:
+
+- `Graft-Resolved-By` names the resolver (`graft-resolve/llm`, `agent/<actor>`)
+  and `Graft-Resolved-Path` each resolved path; `Graft-Checked-By` says that a
+  resolver checked an agent's resolution. In a clone, `git log
+  --grep='^Graft-Resolved-By:'` lists them; `graft show --json REV` prints the
+  trailers of one commit.
+- The server logs every resolution at info level (`graft: conflicts of land
+  resolved`, with the actor, the resolver, the paths and the explanation).
+- `graft-verify` ([VERIFY.md](VERIFY.md)) tests the tip after landing,
+  bisects a failure to the commit that broke it and reverts it with
+  `UserRevert`, whether it was an AI resolution or not.
+
 ## The conflict package and the re-land
 
 When a land with `resolve_conflicts` (or with a `resolution`) fails on its

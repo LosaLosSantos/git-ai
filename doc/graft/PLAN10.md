@@ -192,9 +192,9 @@ need the agent. Nothing partial lands.
 `[graft.land.resolver.verify]`: `enabled = false` (default), `command` (argv run in a
 temporary checkout of the merged tree, minimal environment), `timeout` (default 5
 min, hard). A failure or timeout rejects the resolution, and the package says so.
-RESOLVE.md gets "finding and reverting AI resolutions": the trailers
-(`graft log --grep Graft-Resolved-By`), the info log, graft-verify's bisect and
-revert.
+RESOLVE.md gets "finding and reverting AI resolutions": the trailers (`git log
+--grep='^Graft-Resolved-By:'` in a clone, `graft show --json`; `graft log` lists
+changesets and has no grep), the info log, graft-verify's bisect and revert.
 
 ### 3.7 The benchmark (G8)
 

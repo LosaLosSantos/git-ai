@@ -41,6 +41,27 @@ func TestGraftResolverValidateSendRules(t *testing.T) {
 	}
 }
 
+func TestGraftResolverValidateVerify(t *testing.T) {
+	t.Parallel()
+
+	// Off by default, and validated even without a resolver (agents' resolutions get it too).
+	require.NoError(t, GraftResolver{}.validate())
+	require.NoError(t, GraftResolver{Verify: GraftResolverVerify{Enabled: true, Command: []string{"make", "test"}}}.validate())
+
+	d, err := GraftResolverVerify{}.TimeoutOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, "5m0s", d.String())
+
+	for name, v := range map[string]GraftResolverVerify{
+		"no command":    {Enabled: true},
+		"empty program": {Enabled: true, Command: []string{""}},
+		"bad timeout":   {Enabled: true, Command: []string{"x"}, Timeout: "soon"},
+		"zero timeout":  {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
+	} {
+		require.Error(t, GraftResolver{Verify: v}.validate(), name)
+	}
+}
+
 func TestGraftResolverMinifiedDefaults(t *testing.T) {
 	t.Parallel()
 

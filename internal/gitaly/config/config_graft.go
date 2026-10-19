@@ -314,6 +314,50 @@ type GraftResolver struct {
 	GeneratedMarkers []string `json:"generated_markers" toml:"generated_markers,omitempty"`
 	// Minified tells minified files apart; they are never sent to the resolver.
 	Minified GraftResolverMinified `json:"minified" toml:"minified,omitempty"`
+	// Verify runs a command on the merged tree of every resolution before it
+	// lands (a resolver's answer or an agent's resolution). Off by default.
+	Verify GraftResolverVerify `json:"verify" toml:"verify,omitempty"`
+}
+
+// GraftResolverVerify is the optional verification of a resolution: Command
+// runs in a temporary checkout of the merged tree, and a failure or a timeout
+// rejects the resolution.
+type GraftResolverVerify struct {
+	// Enabled turns the verification on. Off by default.
+	Enabled bool `json:"enabled" toml:"enabled,omitempty"`
+	// Command is the program and arguments, run in the checkout with a
+	// minimal environment (PATH, HOME and TMPDIR inside the checkout).
+	Command []string `json:"command" toml:"command,omitempty"`
+	// Timeout bounds one run, as a Go duration. Empty means
+	// DefaultGraftResolverVerifyTimeout.
+	Timeout string `json:"timeout" toml:"timeout,omitempty"`
+}
+
+// DefaultGraftResolverVerifyTimeout is the default GraftResolverVerify.Timeout.
+const DefaultGraftResolverVerifyTimeout = "5m"
+
+// TimeoutOrDefault parses Timeout, applying the default.
+func (v GraftResolverVerify) TimeoutOrDefault() (time.Duration, error) {
+	s := v.Timeout
+	if s == "" {
+		s = DefaultGraftResolverVerifyTimeout
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("graft land resolver verify: invalid timeout %q", v.Timeout)
+	}
+	return d, nil
+}
+
+func (v GraftResolverVerify) validate() error {
+	if !v.Enabled {
+		return nil
+	}
+	if len(v.Command) == 0 || v.Command[0] == "" {
+		return fmt.Errorf("graft land resolver verify: command is required when enabled")
+	}
+	_, err := v.TimeoutOrDefault()
+	return err
 }
 
 // GraftResolverMinified are the rules that mark a conflicting file minified.
@@ -407,6 +451,10 @@ func (g Graft) Validate() error {
 }
 
 func (r GraftResolver) validate() error {
+	// The verification also applies to agents' resolutions, which land without a resolver.
+	if err := r.Verify.validate(); err != nil {
+		return err
+	}
 	if !r.Enabled {
 		return nil
 	}

@@ -196,6 +196,9 @@ here. The protocol, the validation rules and `graft-resolve` are described in
 | `minified.globs` | array of strings | empty | Base-name globs of minified files, besides the built-in `*.min.js`, `*.min.mjs`, `*.min.css` and `*.bundle.js`. Such files are never sent. |
 | `minified.average_line_bytes` | int | `300` | A side larger than 2 KiB whose average line is longer is minified. |
 | `minified.longest_line_bytes` | int | `5000` | A side larger than 2 KiB with a longer line is minified. |
+| `verify.enabled` | bool | `false` | Run `verify.command` on the merged tree of every resolution (a resolver's or an agent's) before it lands; it applies even when `enabled` is false. |
+| `verify.command` | array of strings | empty | Program and arguments, run in a temporary checkout of the merged tree with `PATH`, `HOME` and `TMPDIR` only. A non-zero exit rejects the resolution. |
+| `verify.timeout` | string | `"5m"` | Bound on one run (Go duration); a run that does not finish rejects the resolution. |
 
 A file that is never sent goes to the agent with its reason in the conflict
 package: large (a side over `max_file_bytes`), binary (a NUL byte), lockfile,

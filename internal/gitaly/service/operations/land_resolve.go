@@ -158,7 +158,22 @@ func (s *Server) resolveLandConflicts(
 		}
 	}
 
-	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, "")
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, "")
+	return res, l.verifyRejected(ctx, maxFiles, err)
+}
+
+// verifyRejected turns a resolution that the verification rejected into the unresolved land with
+// its package, every file rejected with the reason of the verification. Any other error is
+// returned as is.
+func (l landListing) verifyRejected(ctx context.Context, maxFiles int, err error) error {
+	var verifyErr *landVerifyError
+	if !errors.As(err, &verifyErr) {
+		return err
+	}
+	for _, f := range l.files {
+		f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, verifyErr.Error()
+	}
+	return l.unresolved(ctx, maxFiles, "", verifyErr.Error(), err)
 }
 
 // landListing is the conflicting files of the merge of a tip and a change, with what the conflict
@@ -371,6 +386,12 @@ func (s *Server) landWriteResolution(
 	}
 	if err := tree.Write(ctx, repo); err != nil {
 		return landResolution{}, fmt.Errorf("writing merged tree: %w", err)
+	}
+	// The optional verification runs on the merged tree, the resolution included, before it lands.
+	if s.resolveCfg.Verify.Enabled {
+		if err := s.landVerify(ctx, repo, tree.OID); err != nil {
+			return landResolution{}, err
+		}
 	}
 
 	newTip, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{

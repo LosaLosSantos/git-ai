@@ -110,7 +110,8 @@ func (s *Server) landWithResolution(
 	for _, f := range l.files {
 		resp.Files = append(resp.Files, resolved[f.conflict.path])
 	}
-	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, checkedBy)
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, actor, resp, checkedBy)
+	return res, l.verifyRejected(ctx, maxFiles, err)
 }
 
 // landResolutionFiles maps the files of the resolution to the conflicting paths. It returns a
