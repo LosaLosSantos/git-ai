@@ -491,7 +491,8 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
     default (`RebaseLands` turns it on). The branch holds a rebased copy of the
     change, and the server cannot yet tell that this change landed: a retry
     replays it, and a change that a later commit reverted in between (for
-    example graft-verify reverting the culprit) would land again.
+    example graft-verify reverting the culprit) would land again. The land
+    identity index of [PLAN11](PLAN11.md) removes this limit.
 - A land that arrives alone waits up to `window` before its batch runs. Set
   `window = "0s"` to remove the wait, or `disabled = true` to remove batching.
 - Requests that do not qualify (see *When a land is batched*) run unbatched and
