@@ -400,6 +400,40 @@ graft storage gc --removed -address unix:/var/opt/graft/gitaly.sock [-storage de
 These commands are for operators: they need the shared token. A per-agent token
 can never call the storage core service, whatever `agent_rpcs` says.
 
+### Upgrades
+
+Upgrading from v0.2.x to this release changes the storage core's database
+(migration `20261018000000_graft_storage_gc`) and the keys of the packs in the
+bucket (owned keys, see Packs). A node of the old version cannot work next to
+a node of the new one:
+- **It cannot start.** A v0.2.x node that restarts after the migration
+  refuses the database, with an error about an unknown migration
+  (`20261018000000_graft_storage_gc`).
+- **It cannot read.** A v0.2.x node still running reads only the old 64-hex
+  pack keys, so its reads of a repository that a new node wrote fail with
+  "invalid pack key".
+- **It cannot write.** Its writes carry old keys, and the database refuses
+  them ("the pack key is not an owned key; every node must run the same
+  version").
+
+So upgrade the whole deployment at once:
+1. Stop `gitaly serve` on every node.
+2. Install the new binaries on every node.
+3. Start the nodes. The first one migrates the database; the others find it
+   migrated.
+
+**Downgrade is not supported past this migration.** The database keeps the
+data of the new version (checkpoints, tombstones, owned keys) that a v0.2.x
+binary cannot read, and there is no down migration that would make the
+bucket's owned keys readable to it. Going back means restoring the database and
+the bucket from a backup taken before the upgrade.
+
+A binary that finds a database migrated by a newer version refuses to start:
+"the database was migrated by a newer version of the storage core (unknown
+migrations ...): this binary cannot run on it; every node must run the same
+version, so upgrade this node". This is how a node left on the older release
+shows up after the next upgrade, too.
+
 ### Switching from shadow to authoritative
 
 1. Run every node in shadow mode and import every repository
@@ -594,14 +628,8 @@ or re-import the repository from scratch (see
     A kept copy whose history files cannot be read cannot be imported: repair
     them, or extract what is readable by hand. Removing a kept copy loses only
     its history that was not imported.
-  - *Downgrade*: a release without this rule (v0.2.x) ignores the markers. It
-    would serve a repository that is untrusted, or dirty from an unclean
-    shutdown. Before a downgrade, stop `gitaly serve` cleanly: the final step
-    makes every repository durable. Then check that
-    `<storage>/+gitaly/graft-ref-durability/` holds no `*.json` marker. A
-    marker left there names a repository that is untrusted or that a live
-    process kept. Move that repository out of the storage first; its next
-    request after the downgrade hydrates it.
+  - *Downgrade*: not supported past this release's storage migration (see
+    [Upgrades](#upgrades)). A v0.2.x binary would also ignore the markers.
   - *Clean stop*: after the servers stopped, `gitaly serve` makes every dirty
     repository durable and removes its marker, so a clean reboot hydrates
     nothing.

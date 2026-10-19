@@ -235,6 +235,10 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect, limit int
 	set := migrate.MigrationSet{TableName: migrationTable}
 	source := &migrate.MemoryMigrationSource{Migrations: migrations}
 
+	if err := refuseUnknownMigrations(set, db, name, dialect); err != nil {
+		return err
+	}
+
 	var err error
 	for attempt := 0; attempt < attempts; attempt++ {
 		if _, err = set.Exec(db, name, source, migrate.Up); err == nil {
@@ -248,6 +252,41 @@ func applyMigrations(ctx context.Context, db *sql.DB, dialect Dialect, limit int
 	}
 
 	return err
+}
+
+// ErrUnknownMigrations is returned by Open when the database holds migrations
+// that this binary does not know: a newer version migrated it. This version
+// cannot run on it: its writes and its reads of the newer data are not
+// compatible (doc/graft/STORAGE.md, Upgrades).
+var ErrUnknownMigrations = errors.New("storage core: the database was migrated by a newer version of the storage core")
+
+// refuseUnknownMigrations returns ErrUnknownMigrations, naming the migrations,
+// when the database records a migration that is not among the migrations of
+// this binary for the dialect (all of them, whatever limit applies).
+func refuseUnknownMigrations(set migrate.MigrationSet, db *sql.DB, name string, dialect Dialect) error {
+	records, err := set.GetMigrationRecords(db, name)
+	if err != nil {
+		return fmt.Errorf("read the applied migrations: %w", err)
+	}
+	all := sqliteMigrations
+	if dialect == Postgres {
+		all = postgresMigrations
+	}
+	known := make(map[string]struct{}, len(all))
+	for _, m := range all {
+		known[m.Id] = struct{}{}
+	}
+	var unknown []string
+	for _, r := range records {
+		if _, ok := known[r.Id]; !ok {
+			unknown = append(unknown, r.Id)
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("%w (unknown migrations %s): this binary cannot run on it; every node must run the same version, so upgrade this node (doc/graft/STORAGE.md, Upgrades)",
+			ErrUnknownMigrations, strings.Join(unknown, ", "))
+	}
+	return nil
 }
 
 // Dialect returns the dialect of the store.
