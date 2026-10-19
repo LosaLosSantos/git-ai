@@ -7,7 +7,10 @@ node can rebuild. It is configured in the `[graft.storage]` section (see
 
 This page covers the architecture, the modes, the configuration, the operations
 (import, verify, switching modes), the benchmark and the limits. The binding
-design is [PLAN6.md](PLAN6.md).
+designs are [PLAN6.md](PLAN6.md) (the storage core: modes, write path,
+catch-up, import) and [PLAN7.md](PLAN7.md) (milestone 3: local reference
+writes, checkpoints, garbage collection, review roots, background
+maintenance). Where they differ, PLAN7.md is the later decision.
 
 ## Architecture
 
@@ -107,8 +110,11 @@ design is [PLAN6.md](PLAN6.md).
   head move costs one reference transaction, so one changeset and no changelog
   entry. GitLab's own `refs/keep-around/<commit>` references are never touched.
   The daily housekeeping of every repository (on by default) also writes the
-  references that open reviews lack and deletes those no open review uses;
-  watch `graft_review_roots_sweep_failures_total` and
+  references that open reviews lack and deletes those no open review uses,
+  before it prunes objects. In authoritative mode every checkpoint build does
+  the same first, so a checkpoint, and the garbage collection behind it, never
+  goes without the commits of an open review (a build whose backfill fails
+  records no checkpoint); watch `graft_review_roots_sweep_failures_total` and
   `graft_review_roots_missing_total`. A review written by an older version
   whose commit was lost since can still be read and closed, but `UpdateReview`
   refuses it with `FailedPrecondition` naming the review and the commit.
@@ -323,9 +329,10 @@ the node ID. It does not catch up, so it shows a node that is behind.
 `graft storage verify` compares every local reference with the database and
 lists the divergences. With `--connectivity` it also runs `git fsck
 --connectivity-only` on the local copy and checks the bucket: it indexes the
-pack of every changeset into an empty repository in the storage's temporary
-directory (a dry hydration: it downloads every pack of the repository) and
-checks that every object the database references reach is there. A failure of
+pack of the newest checkpoint, if there is one, and the pack of every changeset
+after it into an empty repository in the storage's temporary directory (a dry
+hydration: it downloads what a hydration would) and checks that every object
+the database references reach is there. A failure of
 either check is reported as a connectivity error; a bucket problem starts with
 `storage core objects:`. In authoritative mode it catches the local copy up
 first, so a divergence means a real inconsistency. In shadow mode it compares
@@ -550,7 +557,8 @@ or re-import the repository from scratch (see
   is logged and counted.
 - **A node dies after uploading a pack and before the database commit.** The
   pack is an orphan: no changeset references it, no node serves it, and the
-  write can be retried. Orphan packs are not collected yet (see limits).
+  write can be retried. Garbage collection deletes an orphan `gc_grace` after
+  a collection first observed it (see [Garbage collection](#garbage-collection)).
 - **A node dies after the database commit and before git committed.** The
   database has the write, other nodes serve it, and the node's own copy is
   behind until its next request catches it up. The counter
@@ -578,7 +586,8 @@ or re-import the repository from scratch (see
     previous boot, and the first request hydrates it again from the database and
     the bucket. This hydration starts from the newest checkpoint when there is
     one, so its cost is bounded by how recent the checkpoints are (the
-    maintenance that creates them is WP77; until then, by the full history).
+    background maintenance creates them, see `checkpoints`; with checkpoints
+    off, by the full history).
     Nothing acknowledged is lost. Cost after a power
     loss: one hydration per repository that had a write in the second before the
     loss, or that was still being written. On a busy node that can be every
@@ -693,9 +702,19 @@ without a single divergence.
 | `graft_storage_untracked_writes_total` | Shadow mode writes of repositories that are not imported. |
 | `graft_storage_mvcc_skipped_total` | Shadow mode transactions of MVCC repositories, skipped. Authoritative mode rejects every repository that is not reftable (MVCC included) with `FailedPrecondition` and does not count it here. |
 | `graft_storage_local_commit_failures_total` | Transactions committed to the database that git then aborted. |
-| `graft_storage_sync_total{result}` | Catch-ups before a request; results `fresh`, `caught_up`, `hydrated`, `error`. |
+| `graft_storage_sync_total{result}` | Sync rounds before a request; results `fresh`, `caught_up`, `hydrated`, `partial` (the round ran out of its budget before the head; the request fails with `Unavailable` and the next round goes on from there), `seeding` (the round ended while the repository was being seeded from its checkpoint in the background), `error`. |
 | `graft_storage_sync_seconds` | Duration of the catch-up before a request. |
 | `graft_storage_sync_changesets_total`, `graft_storage_sync_bytes_total` | Changesets applied and pack bytes downloaded by catch-up and hydration. |
+| `graft_storage_sync_checkpoint_seeds_total` | Hydrations that started from a checkpoint instead of changeset 1. |
+| `graft_storage_maintenance_runs_total{result}` | Runs of the background maintenance; `ok`, or `error` when at least one step failed. |
+| `graft_storage_maintenance_checkpoints_total` | Checkpoints created by the background maintenance. |
+| `graft_storage_maintenance_packs_deleted_total`, `graft_storage_maintenance_bytes_reclaimed_total` | Bucket objects, and their bytes, deleted by the background garbage collection. |
+| `graft_storage_maintenance_skipped_total{reason}` | Repositories the background maintenance skipped: `no_local_copy`, `nothing_due` (no checkpoint due, no superseded checkpoint, no collection; decided without the lease), `lease_held`. |
+| `graft_storage_maintenance_failures_total{step}` | Failed steps of the background maintenance: `collect_removed`, `list`, `lease`, `checkpoint`, `collect`. |
+| `graft_review_roots_backfilled_total` | Keep-around references of open-review commits written by the backfill (daily housekeeping and before every checkpoint). |
+| `graft_review_roots_deleted_total` | Keep-around references deleted because no open review uses them. |
+| `graft_review_roots_missing_total` | Open-review commits the backfill found missing from the repository; the review can only be closed. |
+| `graft_review_roots_sweep_failures_total{trigger}` | Failed sweeps of review keep-around references: `close`, `housekeeping`. |
 | `graft_storage_ref_admission_wait_seconds{writer}` | Wait of a local reference writer (`hook`, `syncer`) for its turn at the repository's reference lock. |
 | `graft_storage_ref_admission_waiting` | Writers waiting for their turn, all repositories. |
 | `graft_storage_ref_admission_bypassed_total{writer}` | Writers that went on to git's lock without their turn after `reftable.lockTimeout` (10 s). |
@@ -790,12 +809,15 @@ show:
 - **Git still needs a local repository.** "Stateless" means that the local
   repository of a node is a cache that the node can rebuild from the database
   and the bucket, not that nodes keep no local state. Every request runs git
-  on a local copy, a node's first request for a repository downloads all of its
-  packs, and there is no virtual filesystem.
+  on a local copy, a node's first request for a repository downloads the pack
+  of its newest checkpoint and every changeset pack after it, and there is no
+  virtual filesystem.
 - **Pack garbage collection runs in the background only with `gc = "auto"`**
-  (authoritative mode; off by default). Otherwise it runs when an operator runs
-  `graft storage gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)),
-  and packs are never deleted. The background checkpoints are on by default.
+  (authoritative mode; off by default). Otherwise changeset packs, orphans and
+  the objects of removed repositories are deleted only when an operator runs
+  `graft storage gc` (see [Checkpoints and garbage collection](#checkpoints-and-garbage-collection)).
+  The background maintenance still drops superseded checkpoints and their
+  packs with `gc = "off"`. The background checkpoints are on by default.
   With `checkpoints = "off"` and no `graft storage checkpoint`, a hydration
   replays every changeset of the repository from 1. Its rounds resume, but that
   takes many requests on a long history.

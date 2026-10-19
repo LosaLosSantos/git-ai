@@ -33,9 +33,14 @@ cache pass-through use for agent work:
 - changesets (`ChangesetService`, read only);
 - derived data (`DerivedDataService`);
 - code search (`SearchService`, read only, used by `graft search`);
-- reviews (`ReviewService`, used by `graft review`). Its mutators write only
-  the review store of the repository, never references, and record the
-  token's identity as the actor, so an agent cannot approve as another agent;
+- reviews (`ReviewService`, used by `graft review`). Its mutators write the
+  review store of the repository and the keep-around references of the
+  review's head and base commits (`refs/keep-around/review/<commit>`, which
+  keep those commits from garbage collection while the review is open). The
+  reference name is derived from a commit that must already be in the
+  repository, so a review cannot write a branch, a tag or any other name, nor
+  add an object. They record the token's identity as the actor, so an agent
+  cannot approve as another agent;
 - landing and commits: `UserLand`, `UserCommitFiles`, `UserCreateBranch`,
   `UserDeleteBranch` (through policy);
 - read accessors of the commit, ref, blob, tree and diff services
