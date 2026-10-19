@@ -26,6 +26,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -75,6 +76,9 @@ func testFetchRemote(t *testing.T, ctx context.Context) {
 		expectedRefs     map[string]git.ObjectID
 		expectedResponse *gitalypb.FetchRemoteResponse
 		expectedErr      error
+		// expectedErrOneOf, when set, are the errors of which the run must return
+		// one, where more than one is correct.
+		expectedErrOneOf []error
 	}
 
 	type setupData struct {
@@ -1179,7 +1183,13 @@ func testFetchRemote(t *testing.T, ctx context.Context) {
 						},
 						Timeout: 1,
 					},
-					runs: []run{{expectedErr: structerr.NewInternal("fetch remote: signal: killed: context deadline exceeded")}},
+					// When the deadline passes, exec.CommandContext kills git with SIGKILL
+					// while the command's teardown sends SIGTERM to its process group:
+					// whichever signal lands first is reported, and both are correct.
+					runs: []run{{expectedErrOneOf: []error{
+						structerr.NewInternal("fetch remote: signal: killed: context deadline exceeded"),
+						structerr.NewInternal("fetch remote: signal: terminated: context deadline exceeded"),
+					}}},
 				}
 			},
 		},
@@ -1193,7 +1203,16 @@ func testFetchRemote(t *testing.T, ctx context.Context) {
 
 			for _, run := range setupData.runs {
 				response, err := client.FetchRemote(ctx, setupData.request)
-				testhelper.RequireGrpcError(t, run.expectedErr, err)
+				if len(run.expectedErrOneOf) > 0 {
+					matched := false
+					for _, expected := range run.expectedErrOneOf {
+						matched = matched || (status.Code(err) == status.Code(expected) &&
+							status.Convert(err).Message() == status.Convert(expected).Message())
+					}
+					require.True(t, matched, "%v is none of %v", err, run.expectedErrOneOf)
+				} else {
+					testhelper.RequireGrpcError(t, run.expectedErr, err)
+				}
 				testhelper.ProtoEqual(t, run.expectedResponse, response)
 
 				existFetchedRepo, _ := client.RepositoryExists(ctx, &gitalypb.RepositoryExistsRequest{
