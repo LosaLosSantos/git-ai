@@ -143,6 +143,22 @@ func (g gitRepo) blob(ctx context.Context, oid string) ([]byte, error) {
 	return out, err
 }
 
+// oursMessage returns the commit message that explains OURS' change to the path, as the server finds
+// it: the newest commit between the merge base of ours and theirs and ours that touched the path.
+// Empty when there is none, or no merge base.
+func (g gitRepo) oursMessage(ctx context.Context, ours, theirs, path string) (string, error) {
+	mb, code, err := g.run(ctx, nil, []int{1}, "merge-base", ours, theirs)
+	if err != nil || code != 0 {
+		return "", err
+	}
+	base := strings.TrimSpace(string(mb))
+	if base == "" {
+		return "", nil
+	}
+	out, _, err := g.run(ctx, nil, nil, "log", "-1", "--format=%B", base+".."+ours, "--", ":(literal)"+path)
+	return strings.TrimSpace(string(out)), err
+}
+
 // message returns the full commit message of a commit.
 func (g gitRepo) message(ctx context.Context, oid string) (string, error) {
 	out, _, err := g.run(ctx, nil, nil, "log", "-1", "--format=%B", oid)

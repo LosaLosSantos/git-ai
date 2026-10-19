@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,6 +81,20 @@ func landAnswerProposes(answer *resolver.Response) bool {
 	return false
 }
 
+// landProposalExplanation is the explanation of a file's proposal: the composition report of the
+// resolver (what the proposal keeps, drops and repeats of the two sides' changes, PLAN10 15.3), then
+// the explanation of the answer, cut to the size of a reason.
+func landProposalExplanation(f resolver.ResponseFile, explanation string) string {
+	if len(f.Report) == 0 {
+		return landCutString(explanation, landPackageReasonBytes)
+	}
+	text := "report: " + strings.Join(f.Report, "; ")
+	if explanation != "" {
+		text += ". " + explanation
+	}
+	return landCutString(text, landPackageReasonBytes)
+}
+
 // landWriteProposals keeps the resolver's answer for the agent: the written contents as blobs, a
 // commit whose tree holds them by path (its parents the tip and the landed commit), and the
 // proposal reference of (branch, commit) pointing at it, replacing an older one. The objects are
@@ -99,9 +114,8 @@ func (s *Server) landWriteProposals(ctx context.Context, in *gitalypb.UserLandRe
 	repo := s.localRepoFactory.Build(in.GetRepository())
 	tree := &localrepo.TreeEntry{Type: localrepo.Tree, Mode: "040000"}
 	byPath := make(map[string]*gitalypb.LandConflictProposal, len(answer.Files))
-	explanation := landCutString(answer.Explanation, landPackageReasonBytes)
 	for _, f := range answer.Files {
-		p := &gitalypb.LandConflictProposal{Action: f.Action, Resolver: answer.Resolver, Explanation: explanation}
+		p := &gitalypb.LandConflictProposal{Action: f.Action, Resolver: answer.Resolver, Explanation: landProposalExplanation(f, answer.Explanation)}
 		if f.Action == resolver.ActionWrite {
 			blob, err := repo.WriteBlob(ctx, bytes.NewReader(f.Content), localrepo.WriteBlobConfig{Path: f.Path})
 			if err != nil {

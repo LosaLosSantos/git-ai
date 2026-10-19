@@ -812,6 +812,30 @@ differently there is one model call, whose request holds:
   conflicting regions of the file for reference, and the directives last,
   closest to the answer.
 
+Three things are added to the request and the answer, each with an option of its
+own on the `[[strategy]]` table, on by default (PLAN10 15.10):
+
+- `symmetric_context`: beside THEIRS' PATCH the model gets OURS' own change to
+  the region (OURS CHANGE: a diff from BASE to the CODE) and the commit message
+  of OURS (the newest commit of the tip's side that touched the path, found by
+  the server). `max_context_bytes` (default 4096) caps OURS CHANGE and, by a
+  quarter each, the two messages; the request says when it cut.
+- `abstain`: the model may answer that the two changes contradict each other,
+  with a reason, instead of the patched code. The file is then abstained: no
+  proposal, and the reason goes to the agent in the package.
+- `repair`: one repair round per region, driven only by what the deterministic
+  checks found, quoted back in their exact words with the previous answer: a
+  rule of an answer that was broken, a change that the answer drops or repeats
+  (the composition check), the first syntax error of the file mapped to its
+  region. A region is asked again once at most; the repaired answer is kept if
+  it passes the rules and has fewer findings.
+
+A proposal also carries the composition report of its answer (what it keeps,
+drops and repeats of the two sides' changes, in exact words), as the start of
+the explanation of the proposal in the package. It is a report: nothing in it
+decides whether anything lands. With the three options set to `false` the
+request is the one of the previous version.
+
 A file whose sides all break their lines with CRLF reaches the model with LF,
 since a model answers with LF; its answer is read as LF (CRLF in it too) and
 the resolved file is CRLF again. A file with mixed line endings is sent as it

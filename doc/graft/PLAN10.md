@@ -949,7 +949,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  The resolver is never called inside the lane, and neither is the verification of a model's resolution.
 
  PACKAGE to the agent (merge_conflict detail): sides by OID, hunks, per-file outcome + reason,
-   per-file proposal (+ its report, planned), the proposals kept under refs/graft/proposals/ (14),
+   per-file proposal (+ its report, in its explanation), the proposals kept under refs/graft/proposals/ (14),
    or, when they cannot be stored, "proposal not stored: <cause>" on each file
      -> the agent resolves (takes, edits or replaces the proposals) and re-lands with resolution
  every request and response of an agent: the refs/graft/ visibility filter (agentrefs);
@@ -975,16 +975,26 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  split into regions (3-way line diff); regions only one side changed are merged locally
    |-- more than max_regions (20) ------------------------> AGENT (NOT_SENT: regions)
    v
- for each region, one call: PATCH = base->theirs (3 context lines), CODE = ours (3 anchors),
- THEIRS' commit message; per-region checks: last answer block, anchors, newline rule, not a
- patch, size, markers
+ for each region, one call (15.10): PATCH = base->theirs (3 context lines), OURS CHANGE = base->ours
+ (symmetric context, capped), CODE = ours (3 anchors), THEIRS' and OURS' commit messages (capped);
+ the answer is the last block: patched code, or ABSTAIN with a reason
+   |-- ABSTAIN ----------------------------------------------> AGENT (abstained: the model's reason;
+   |                                                            no proposal, no guess)
+   v
+ per-region checks: anchors, newline rule, not a patch, size, markers; composition of the region
+ (15.3): drops and duplicates
+   |-- a check finds something, and the region was not answered again -> ONE REPAIR ROUND: the same
+   |       request, the previous answer and the findings quoted exactly; the new answer replaces the
+   |       first if it passes the checks and has fewer findings; a second rejection rejects the region
    |-- any region fails -------------------------------------> AGENT (REJECTED, reason; no proposal:
    |                                                            all or nothing)
    v
- assemble the file; file checks: markers, tree-sitter syntax, operator checks
+ assemble the file; syntax of the file (tree-sitter): the first error is mapped to its region and, if
+ that region was not answered again, quoted back in the same one repair round
+ file checks: markers, tree-sitter syntax, operator checks
    |-- a check fails ----------------------------------------> AGENT (REJECTED, reason)
    v
- composition report (15.3) (planned; a report, not a gate)
+ composition report (15.3) of the regions (a report, not a gate)
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
    v
@@ -996,7 +1006,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  passes --> LANDS, if it is still the tree to land (decideLand, 15.4), signed Graft-Checked-By: verify:...
 ```
 
-### 15.3 Composition report (planned; a report, not a gate)
+### 15.3 Composition report (a report, not a gate)
 
 ```
  base B, ours O, theirs T, result R (normalized lines)
@@ -1064,7 +1074,9 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | refs/graft/ visibility filter (agents) | `checkAgentRefs`, `filterAgentRefs`, `agentRefField`; `agentrefs.RevisionHidden` | gitaly/server/auth/agent_refs.go; graft/agentrefs |
 | refs/graft/ hidden from agents' git | `hiddenUploadPackRefPrefixes`, `hiddenReceivePackRefPrefixes` | git/gitcmd/command_description.go |
 | refs/graft/ reserved for the server | `graftReservedDenial` | gitaly/hook/referencetransaction.go |
-| composition report | (planned) | (planned: graft/resolver, with a parity-tested copy in tools/) |
+| composition report | `llmCompose`, `llmReport`, `CompositionVerdict` (whole file, for the parity test), `landProposalExplanation` | tools/.../resolve/llm_compose.go, llm_compose_file.go, llm_patch.go; operations/land_proposals.go |
+| symmetric context, abstain, repair | `llmPatchSystem`, `llmPatchUser`, `llmParseAnswer`, `llmRepairUser`, `llmResolvePatch` | tools/.../resolve/llm_patch.go |
+| intent of OURS | `landOursMessage` | operations/land_resolve.go |
 
 ### 15.6 The composition check, measured: a report, not a gate
 
@@ -1364,3 +1376,53 @@ and the tree it verifies depends on the tip.
   the lane never verifies; the verify pool bounds the verifications at once, those of rules and of
   agents' resolutions as well; and the table test of decideLand, whose one rule is compared by tree
   object ID.
+
+### 15.10 Design step: symmetric context, abstaining, one deterministic repair, the report
+
+The design work of 15.6 (decision 5), as ONE change measured as one step against R1b on the same 300
+cases. Each element has an option to switch it off, so that an ablation removes one element and the
+step with all off is R1b byte for byte (the request of every test that pins R1b runs with all three
+off). All are on by default until the measurement says otherwise.
+
+* **Symmetric context** (`symmetric_context`). Beside THEIRS' PATCH the request gets OURS' own change
+  to the region (OURS CHANGE, the unified diff base -> the CODE with the same three lines of context)
+  and the commit message of OURS (`FileConflict.ours_message`: the newest commit between the merge
+  base and the tip that touched the path, `git log -1 base..tip -- path`, found by the server, cut to
+  4 KiB; the bench finds it the same way from the case's merge base). Both messages and OURS CHANGE
+  are capped (`max_context_bytes`, default 4096: OURS CHANGE up to the cap, each message up to a
+  quarter), and the request says when it cut. The verdict of a file is still kept by its sides, not by
+  this message: it is a function of the tip's history of the path, which OURS' blob stands for.
+* **Abstaining** (`abstain`). The model may answer, instead of the patched code, an ABSTAIN block with
+  one or two sentences on which lines contradict and why. The last block of either kind in the answer
+  is the answer. One abstaining region abstains the file: no proposal, no guess; the attempt is
+  `abstained` and its reason ("the model abstained on region 2: ...", one line, 400 bytes) goes to the
+  agent in the package (outcome FAILED, the reason is the model's). The bench counts these apart.
+* **One repair round, driven only by deterministic findings** (`repair`). A region is asked again at
+  most once, and only for what a check found, quoted in its exact words after the same request and
+  the model's previous answer: a rule of an answer that was broken (the anchors, the newline, a
+  patch, markers, size, no block at all), a drop or a duplicate of the composition of the region
+  (15.3), or the first syntax error of the assembled file, mapped to the region it is in (an error at
+  the line of its answer or one line before or after). Nothing in a repair is the model's opinion of
+  itself. The repaired answer replaces the first if it passes the rules and, for a composition
+  finding, has fewer findings; a failed optional repair (a call that fails, a worse answer) keeps the
+  first answer. A rule-breaking answer that stays broken after the round is rejected. A model that
+  abstains in the round abstains. The calls and the repair rounds are counted.
+* **The composition report** is no longer planned. For the answer of each region it words, from
+  the definition frozen in 15.6: what the answer drops ("drops THEIRS' change at base line 6: the line
+  "T6" it adds is missing"), what it repeats ("duplicates a line both sides added"), the contested
+  changes it resolved freely, the lines found in neither side, and "keeps every uncontested change of
+  both sides (n)" when nothing is wrong. It is a report and not a gate (the finding of 15.6 stands). It
+  goes with the proposal: `ResolvedFile.report` in graft-resolve's protocol, `ResponseFile.report` in
+  the server's, and the start of the proposal's explanation ("report: ...; ...", cut to the 512 bytes
+  of a reason, so a long report is cut). "Changes lines outside the conflicts" cannot happen to an
+  answer the strategy assembles from the base and the regions; `CompositionVerdict` checks a whole file
+  for it. NTFS-style folding is not part of this check.
+* **Parity with the prototype.** The check is a port of compose2.py with the regions of this package's
+  line diff, and `CompositionVerdict` is compared with the prototype's verdicts on the 244 accepted
+  answers of R1b (offline, `TestCompositionParity`, GRAFT_COMPOSE_PARITY): 226 of 230 verdicts agree
+  (98.3%), 4 differ (the prototype's drop, duplicate and outside against the port's pass, and one
+  duplicate of "}" that the prototype passes), and for 14 the port finds no conflicting region where
+  git's merge-file finds one (the llm strategy then merges without the model).
+* **Measurement.** One step against R1b (all three elements off) on the same 300 cases with Luna, then
+  one ablation per element that removes it, only to justify that element. The result goes here when it
+  is in.

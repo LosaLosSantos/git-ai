@@ -22,6 +22,10 @@ const (
 	defaultLLMContextLines   = 3
 	defaultLLMMaxAnswerBytes = 1 << 20
 	defaultLLMMaxRegions     = 20
+	// defaultLLMContextBytes caps the symmetric context of a region (OURS' change; the messages get
+	// a quarter each): about a thousand tokens, so that the context of a conflict stays in step with
+	// the PATCH and the CODE it explains.
+	defaultLLMContextBytes = 4 << 10
 	// defaultLLMCallTimeout bounds one model call; the strategy's timeout bounds the whole file.
 	defaultLLMCallTimeout  = 120 * time.Second
 	defaultLLMMaxDiffCells = 8 << 20
@@ -35,6 +39,10 @@ var (
 	// is absent, the content is binary, or the diff is too large). The
 	// strategy chain continues with the next strategy.
 	ErrLLMNotApplicable = errors.New("resolve: llm strategy not applicable")
+
+	// ErrLLMAbstained means the model answered that the two changes cannot both hold, and said why
+	// (the design step, PLAN10 15.10). It is no failure and no guess: the agent gets the reason.
+	ErrLLMAbstained = errors.New("resolve: llm abstained")
 
 	// ErrLLMRejected means the model answered but the answer failed
 	// validation (no patched code, the context lines, the newline, conflict
@@ -65,6 +73,16 @@ type LLMOptions struct {
 	// the whole file that the caller's context carries. Zero means the
 	// default.
 	CallTimeout time.Duration
+	// NoSymmetricContext leaves out OURS' side of the context: its change from the BASE as a diff
+	// and its commit message. Without them the request is the one of R1b, which the measurement of
+	// the design step (PLAN10 15.10) takes as its baseline.
+	NoSymmetricContext bool
+	// NoAbstain does not offer the model the answer "the two changes cannot both hold".
+	NoAbstain bool
+	// NoRepair makes no second call: an answer that the deterministic checks reject is rejected.
+	NoRepair bool
+	// MaxContextBytes caps the symmetric context of a region. Zero means the default.
+	MaxContextBytes int
 }
 
 func (o LLMOptions) withDefaults() (LLMOptions, error) {
@@ -82,6 +100,9 @@ func (o LLMOptions) withDefaults() (LLMOptions, error) {
 	}
 	if o.MaxRegions <= 0 {
 		o.MaxRegions = defaultLLMMaxRegions
+	}
+	if o.MaxContextBytes <= 0 {
+		o.MaxContextBytes = defaultLLMContextBytes
 	}
 	if o.CallTimeout < 0 {
 		return o, fmt.Errorf("resolve: invalid llm call timeout %s", o.CallTimeout)
@@ -106,6 +127,10 @@ type LLMFile struct {
 	Ours          []byte
 	Theirs        []byte
 	TheirsMessage string
+	// OursMessage is the commit message that explains OURS' change to this file (the newest commit
+	// of the tip's side that touched it), the intent of OURS as TheirsMessage is THEIRS'. Untrusted
+	// data, cut, and may be empty.
+	OursMessage string
 }
 
 // LLMResult is a validated model resolution of one file. Nothing the model
@@ -124,6 +149,12 @@ type LLMResult struct {
 	// RegionsEqualOurs is the number of those regions whose answer is OURS'
 	// region unchanged.
 	RegionsEqualOurs int
+	// Report is the composition report of the answer (PLAN10 15.3), in exact words: what it keeps,
+	// drops and repeats of the two changes, and how many contested regions it resolved freely. It is
+	// a report and not a gate, and goes to the agent with the proposal.
+	Report []string
+	// Calls and Repairs are the model calls of the file and those of them that were repair rounds.
+	Calls, Repairs int
 }
 
 // LLMRegionStats receives, from the llm strategy, the counts of the last file
@@ -137,6 +168,52 @@ type LLMRegionStats struct {
 	recorded           bool
 	rejected           []string
 	usage              llm.Usage
+	calls, repairs     int
+	abstained          string
+	report             []string
+}
+
+// RecordCalls adds the model calls of a file and those of them that were repair rounds.
+func (s *LLMRegionStats) RecordCalls(calls, repairs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls += calls
+	s.repairs += repairs
+}
+
+// Calls returns the model calls recorded and the repair rounds among them.
+func (s *LLMRegionStats) Calls() (calls, repairs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls, s.repairs
+}
+
+// RecordAbstained keeps why the model abstained.
+func (s *LLMRegionStats) RecordAbstained(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.abstained = reason
+}
+
+// Abstained returns why the model abstained, or "".
+func (s *LLMRegionStats) Abstained() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abstained
+}
+
+// RecordReport keeps the composition report of the last file resolved.
+func (s *LLMRegionStats) RecordReport(report []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.report = append([]string(nil), report...)
+}
+
+// Report returns the composition report of the last file resolved.
+func (s *LLMRegionStats) Report() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.report...)
 }
 
 // RecordUsage adds the token usage of one model call, answered or rejected.

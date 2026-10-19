@@ -17,7 +17,7 @@ func TestLLMStrategyRejectsAnswerWithoutPatchedCode(t *testing.T) {
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
 		return llmRawAnswer(`{"merged":"base\nours\ntheirs\n"}`), nil
 	})
-	r := wp19Build(t, wp19LLMConfig)
+	r := wp19Build(t, strings.Replace(wp19LLMConfig, `paths = ["*.txt", "**/*.txt"]`, "paths = [\"*.txt\", \"**/*.txt\"]\nrepair = false", 1))
 
 	resp, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("a/b.txt")))
 	if err == nil {

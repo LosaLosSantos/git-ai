@@ -37,7 +37,8 @@ const (
 	// OutcomeStopped: the run stopped before the case (Runner.Stop), for example because the
 	// provider refused a call for lack of credit; the reason is the result's.
 	OutcomeStopped = "not_run_stopped"
-	// OutcomeAbstained: no strategy applied to the file.
+	// OutcomeAbstained: no strategy applied to the file, or the model answered that the two changes
+	// cannot both hold (Result.ModelAbstained, the reason is the model's).
 	OutcomeAbstained = "abstained"
 )
 
@@ -65,6 +66,13 @@ type Result struct {
 	// (synthmerge's no-change check, per region).
 	Regions          int `json:"regions,omitempty"`
 	RegionsEqualOurs int `json:"regions_equal_ours,omitempty"`
+	// ModelAbstained marks an abstained result that is the model's answer (PLAN10 15.10); Calls and
+	// Repairs count the model calls of the case and those that were repair rounds; Report is the
+	// composition report of an accepted answer (PLAN10 15.3).
+	ModelAbstained bool     `json:"model_abstained,omitempty"`
+	Calls          int      `json:"calls,omitempty"`
+	Repairs        int      `json:"repairs,omitempty"`
+	Report         []string `json:"report,omitempty"`
 	// LineEndings are those of the sides of a content conflict (resolve.LLMLineEndings): the llm
 	// strategy sends a CRLF file as LF, and a mixed one as it is.
 	LineEndings string `json:"line_endings,omitempty"`
@@ -221,6 +229,10 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	if err != nil {
 		return res, err
 	}
+	oursMessage, err := g.oursMessage(ctx, c.Ours, c.Theirs, c.Path)
+	if err != nil {
+		return res, err
+	}
 
 	// The request is the server's (PLAN10 15.8): no tip, no merge base, no message of the tip, which
 	// a verdict reused at another tip must not depend on.
@@ -233,6 +245,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		Actor:      "bench",
 		Files: []protocol.FileConflict{{
 			Path: c.Path, Kind: c.Kind, Base: sides["base"], Ours: sides["ours"], Theirs: sides["theirs"],
+			OursMessage: oursMessage,
 		}},
 		Limits: protocol.Limits{MaxFileBytes: maxBytes},
 	}
@@ -246,12 +259,14 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	res.Seconds = time.Since(start).Seconds()
 	usage := regionStats.Usage()
 	res.InputTokens, res.OutputTokens, res.ReasoningTokens = usage.InputTokens, usage.OutputTokens, usage.ReasoningTokens
+	res.Calls, res.Repairs = regionStats.Calls()
 	if err != nil {
 		var unresolved *resolve.UnresolvedError
 		if !errors.As(err, &unresolved) || len(unresolved.Failures) != 1 {
 			return res, err
 		}
 		res.Outcome, res.Strategy, res.Reason = classifyFailure(unresolved.Failures[0])
+		res.ModelAbstained = res.Outcome == OutcomeAbstained && regionStats.Abstained() != ""
 		// The raw text of a rejected model answer is kept beside the answers, for audit.
 		if rejected := regionStats.Rejected(); r.AnswersDir != "" && len(rejected) > 0 {
 			raw := strings.Join(rejected, "\n===== next rejected answer =====\n")
@@ -261,7 +276,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		}
 		// A content conflict with more regions than the llm strategy sends is declined before
 		// any call: it is not sent, for that reason.
-		if res.Outcome == OutcomeAbstained && c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {
+		if res.Outcome == OutcomeAbstained && !res.ModelAbstained && c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {
 			if max := r.Resolver.LLMMaxRegions(); max > 0 && resolve.LLMConflictRegions(sideBytes(sides["base"]), sideBytes(sides["ours"]), sideBytes(sides["theirs"])) > max {
 				res.Outcome, res.Reason = OutcomeNotSent, NotSentRegions
 			}
@@ -272,6 +287,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	f := resp.Files[0]
 	res.Strategy = strings.TrimPrefix(resp.Resolver, "graft-resolve/")
 	res.Answer = f.Action
+	res.Report = f.Report
 	if r.AnswersDir != "" && f.Action != protocol.ActionDelete {
 		if err := os.WriteFile(answerPath(r.AnswersDir, c.ID), f.Content, 0o600); err != nil {
 			return res, err
@@ -378,6 +394,8 @@ func classifyFailure(f resolve.Failure) (outcome, strategy, reason string) {
 	last := f.Attempts[len(f.Attempts)-1]
 	reason = truncate(fmt.Sprint(last.Err), 512)
 	switch {
+	case last.Kind == resolve.AttemptAbstained:
+		return OutcomeAbstained, last.Strategy, reason
 	case errors.Is(last.Err, resolve.ErrBudgetExhausted):
 		return OutcomeNotRun, last.Strategy, reason
 	case last.Kind == resolve.AttemptRejected || last.Kind == resolve.AttemptCheckFailed:

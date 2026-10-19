@@ -127,6 +127,10 @@ type FileConflict struct {
 	Base   *Side  `json:"base"`
 	Ours   *Side  `json:"ours"`
 	Theirs *Side  `json:"theirs"`
+	// OursMessage is the commit message that explains OURS' change to this file: the newest commit
+	// of the tip's side (merge base..tip) that touched the path. It is the intent of OURS, as
+	// Messages.Commit is THEIRS', and is untrusted data. Empty when the server found none.
+	OursMessage string `json:"ours_message,omitempty"`
 }
 
 // Side is one version of a file.
@@ -158,6 +162,10 @@ type ResolvedFile struct {
 	Origin string `json:"origin,omitempty"`
 	// Proposal is the older mark of a model's resolution, still sent with OriginModel.
 	Proposal bool `json:"proposal,omitempty"`
+	// Report is the composition report of a model's resolution (PLAN10 15.3): in exact words what it
+	// keeps, drops and repeats of the two sides' changes. A report and not a gate: nothing in it
+	// decides whether the resolution lands. It goes to the agent with the proposal.
+	Report []string `json:"report,omitempty"`
 }
 
 // The origins of a resolved file (see ResolvedFile.Origin).
