@@ -352,19 +352,26 @@ func TestDecideLand(t *testing.T) {
 	rules := &resolver.Response{Resolver: "graft-resolve/trivial,union", Files: []resolver.ResponseFile{
 		{Path: "a", Origin: resolver.OriginRule}, {Path: "b", Origin: resolver.OriginRule},
 	}}
-	require.True(t, decideLand(rules, resolved(), "", ""), "rules resolved every file")
-	require.True(t, decideLand(rules, resolved(), "t1", "t2"), "rules land whatever tree was verified: their verification stays in the lane")
-	require.False(t, decideLand(nil, resolved(), "t1", "t1"), "no answer")
+	require.True(t, decideLand(rules, resolved(), "", "", false), "rules resolved every file")
+	require.True(t, decideLand(rules, resolved(), "t1", "t2", false), "rules land whatever tree was verified when no verification is configured")
+	require.False(t, decideLand(nil, resolved(), "t1", "t1", false), "no answer")
 
 	left := resolved()
 	left[1].outcome = gitalypb.LandConflictFile_OUTCOME_NOT_SENT
-	require.False(t, decideLand(rules, left, "", ""), "a file left to the agent")
+	require.False(t, decideLand(rules, left, "", "", false), "a file left to the agent")
 	rejected := resolved()
 	rejected[0].outcome = gitalypb.LandConflictFile_OUTCOME_REJECTED
-	require.False(t, decideLand(rules, rejected, "", ""), "a file the answer is refused for")
+	require.False(t, decideLand(rules, rejected, "", "", false), "a file the answer is refused for")
 	proposedByRules := resolved()
 	proposedByRules[0].outcome = gitalypb.LandConflictFile_OUTCOME_PROPOSED
-	require.False(t, decideLand(rules, proposedByRules, "", ""), "a PROPOSED file in an answer that does not propose")
+	require.False(t, decideLand(rules, proposedByRules, "", "", false), "a PROPOSED file in an answer that does not propose")
+
+	// With a verification configured the rule holds for rules as well (15.9): their resolution lands
+	// only on the tree that passed, and the lane runs nothing.
+	require.True(t, decideLand(rules, resolved(), "t1", "t1", true), "rules, verified on this very tree")
+	require.False(t, decideLand(rules, resolved(), "t1", "", true), "rules, nothing verified")
+	require.False(t, decideLand(rules, resolved(), "t1", "t2", true), "rules, verified on another tree (the tip moved)")
+	require.False(t, decideLand(rules, resolved(), "", "", true), "rules, no tree at all: empty is not equal")
 
 	// THE rule (PLAN10 15.9): a file that proposes may land only if verify.command passed on the exact
 	// tree that lands, compared by object ID.
@@ -376,18 +383,18 @@ func TestDecideLand(t *testing.T) {
 		return []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}, {outcome: gitalypb.LandConflictFile_OUTCOME_PROPOSED}}
 	}
 	for desc, answer := range map[string]*resolver.Response{"a file marked as a proposal": flagged, "a file that says nothing": unmarked} {
-		require.True(t, decideLand(answer, proposing(), "tree-1", "tree-1"), "%s: verified on this very tree", desc)
-		require.False(t, decideLand(answer, proposing(), "tree-1", ""), "%s: nothing verified", desc)
-		require.False(t, decideLand(answer, proposing(), "tree-1", "tree-2"), "%s: verified on another tree (the tip moved)", desc)
-		require.False(t, decideLand(answer, proposing(), "", ""), "%s: no tree at all: empty is not equal", desc)
-		require.False(t, decideLand(answer, resolved(), "tree-1", ""), "%s: even with every outcome RESOLVED", desc)
+		require.True(t, decideLand(answer, proposing(), "tree-1", "tree-1", false), "%s: verified on this very tree", desc)
+		require.False(t, decideLand(answer, proposing(), "tree-1", "", false), "%s: nothing verified", desc)
+		require.False(t, decideLand(answer, proposing(), "tree-1", "tree-2", false), "%s: verified on another tree (the tip moved)", desc)
+		require.False(t, decideLand(answer, proposing(), "", "", false), "%s: no tree at all: empty is not equal", desc)
+		require.False(t, decideLand(answer, resolved(), "tree-1", "", false), "%s: even with every outcome RESOLVED", desc)
 
 		leftOver := proposing()
 		leftOver[0].outcome = gitalypb.LandConflictFile_OUTCOME_FAILED
-		require.False(t, decideLand(answer, leftOver, "tree-1", "tree-1"), "%s: verified, but a file is left to the agent", desc)
+		require.False(t, decideLand(answer, leftOver, "tree-1", "tree-1", false), "%s: verified, but a file is left to the agent", desc)
 		refused := proposing()
 		refused[1].outcome = gitalypb.LandConflictFile_OUTCOME_REJECTED
-		require.False(t, decideLand(answer, refused, "tree-1", "tree-1"), "%s: verified, but a file is refused", desc)
+		require.False(t, decideLand(answer, refused, "tree-1", "tree-1", false), "%s: verified, but a file is refused", desc)
 	}
 }
 

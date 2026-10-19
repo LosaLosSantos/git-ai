@@ -207,17 +207,18 @@ func landTrailerValueOrQuoted(v string) string {
 
 // decideLand is the one decision point of a land that asked the server to resolve its conflicts
 // (PLAN10 15.4): it lands only when the resolver answered and every conflicting file is resolved,
-// by a rule (RESOLVED) or by a model (PROPOSED). The one rule about a model: a file that proposes
-// may land only if verify.command ran and passed on the exact tree that lands. tree is the tree
-// the land would write and verified the tree the verification passed on, compared by object ID,
-// not by the tip they were made at; a verified tree is never the empty ID. No other code path
-// lands a model's resolution.
-func decideLand(answer *resolver.Response, files []*landFileState, tree, verified git.ObjectID) bool {
+// by a rule (RESOLVED) or by a model (PROPOSED). The one rule: a resolution lands only on a tree
+// that verify.command ran and passed on, whenever a verification is configured (verifyRequired), and a
+// model's resolution lands on no other, with or without one configured (without, it never lands).
+// tree is the tree the land would write and verified the tree the verification passed on, compared
+// by object ID, not by the tip they were made at; a verified tree is never the empty ID. Every
+// verification, whatever made the resolution, runs out of the lane, so that the lane only compares.
+func decideLand(answer *resolver.Response, files []*landFileState, tree, verified git.ObjectID, verifyRequired bool) bool {
 	if answer == nil {
 		return false
 	}
 	proposes := landAnswerProposes(answer)
-	if proposes && (verified == "" || verified != tree) {
+	if (proposes || verifyRequired) && (verified == "" || verified != tree) {
 		return false
 	}
 	for _, f := range files {

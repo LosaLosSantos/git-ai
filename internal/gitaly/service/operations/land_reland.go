@@ -149,6 +149,13 @@ type landPrecheck struct {
 	tip, commit git.ObjectID
 	result      landCheckResult
 	skipped     string
+	// verified is the tree that verify.command passed on, out of the lane (15.9), when a
+	// verification is configured and the resolution passed the checks; verifyErr is why it was not
+	// verified: a *landVerifyError (the command failed, the checkout was refused) or a
+	// plain error (the deadline). The lane only compares the tree it would write with
+	// verified.
+	verified  git.ObjectID
+	verifyErr error
 }
 
 // landPrecheckResolution runs the resolver's checks of the request's resolution before the land
@@ -164,7 +171,7 @@ type landPrecheck struct {
 // is not checked (skipped): the lane refuses or answers it. It returns nil when no resolver is
 // configured. A failure to check is the result's failure, with its cause, which the lane reports.
 func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLandRequest, repo *localrepo.Repo) (*landPrecheck, error) {
-	if s.conflictResolver == nil {
+	if s.conflictResolver == nil && !s.resolveCfg.Verify.Enabled {
 		return nil, nil
 	}
 	objectHash, err := repo.ObjectHash(ctx)
@@ -211,14 +218,85 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 		return &landPrecheck{tip: tip, commit: commitID, result: landCheckResult{failure: fmt.Sprintf("listing the conflicts: %v", err), failureErr: err}}, nil
 	}
 
+	var result landCheckResult
+	if s.conflictResolver != nil {
+		timeout, err := s.resolveCfg.TimeoutOrDefault()
+		if err != nil {
+			return nil, structerr.NewInternal("resolver timeout: %w", err)
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		result = s.landCheckResolution(checkCtx, in, repo, review.listing, review.actor, review.resolved)
+	}
+	pc := &landPrecheck{tip: tip, commit: commitID, result: result}
+	if s.resolveCfg.Verify.Enabled && result.failure == "" && !landCheckRejects(result) {
+		if err := s.landPrecheckVerify(ctx, in, repo, review, pc); err != nil {
+			return nil, err
+		}
+	}
+	return pc, nil
+}
+
+// landCheckRejects reports whether the check rejected a file of the resolution: the lane then
+// refuses it, and there is nothing to verify.
+func landCheckRejects(r landCheckResult) bool {
+	for _, v := range r.verdicts {
+		if v.rejected != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// landAgentResponse is the agent's resolution as a resolver answer, the files in the order of the
+// listing: what landWriteResolution writes.
+func landAgentResponse(review landReview) *resolver.Response {
+	resp := &resolver.Response{Version: resolver.ProtocolVersion, Resolver: landAgentResolver(review.actor)}
+	for _, f := range review.listing.files {
+		resp.Files = append(resp.Files, review.resolved[f.conflict.path])
+	}
+	return resp
+}
+
+// landPrecheckVerify verifies the tree of the agent's resolution out of the lane (15.9), with a slot
+// of the verify pool, before the land enters its lane, and records the outcome in pc. The deadline is
+// the resolver's timeout plus the verification's; a verification that the deadline cut is recorded
+// as unfinished, and one that the caller cut is the caller's cancellation. The resolution was made
+// against the tip the branch is at, which the lane insists on, so the tree it would write there is
+// the tree verified here.
+func (s *Server) landPrecheckVerify(ctx context.Context, in *gitalypb.UserLandRequest, repo *localrepo.Repo, review landReview, pc *landPrecheck) error {
 	timeout, err := s.resolveCfg.TimeoutOrDefault()
 	if err != nil {
-		return nil, structerr.NewInternal("resolver timeout: %w", err)
+		return structerr.NewInternal("resolver timeout: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	verifyTimeout, err := s.resolveCfg.Verify.TimeoutOrDefault()
+	if err != nil {
+		return structerr.NewInternal("verify timeout: %w", err)
+	}
+	tree, err := s.landResolvedTree(ctx, repo, review.listing.mergedTree, landAgentResponse(review))
+	if err != nil {
+		return structerr.NewInternal("building the tree to verify: %w", err)
+	}
+	vctx, cancel := context.WithTimeout(ctx, timeout+verifyTimeout)
 	defer cancel()
-	result := s.landCheckResolution(ctx, in, repo, review.listing, review.actor, review.resolved)
-	return &landPrecheck{tip: tip, commit: commitID, result: result}, nil
+	var verifyErr *landVerifyError
+	switch err := s.landVerifyOutOfLane(vctx, in.GetRepository(), repo, tree); {
+	case err == nil:
+		pc.verified = tree
+	case errors.As(err, &verifyErr):
+		pc.verifyErr = err
+	default:
+		var unfinished *landVerifyUnfinishedError
+		if errors.As(err, &unfinished) && ctx.Err() == nil {
+			pc.verifyErr = fmt.Errorf("could not verify before the deadline of %s", timeout+verifyTimeout)
+			return nil
+		}
+		if ctx.Err() != nil {
+			return landCallerGaveUp(ctx, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // landWithResolution lands commitID onto tip with the caller's resolution of the conflicts
@@ -302,13 +380,48 @@ func (s *Server) landWithResolution(
 		return landResolution{}, l.unresolved("", "the resolution was rejected: "+landUnresolvedCause(l.files), nil)
 	}
 
-	resp := &resolver.Response{Version: resolver.ProtocolVersion, Resolver: landAgentResolver(review.actor)}
-	for _, f := range l.files {
-		resp.Files = append(resp.Files, review.resolved[f.conflict.path])
+	resp := landAgentResponse(review)
+	// The verification ran out of the lane (15.9): the lane compares the tree it would write with
+	// the one that passed, and writes nothing that did not.
+	var built git.ObjectID
+	verified := false
+	if s.resolveCfg.Verify.Enabled {
+		switch reason := landPrecheckUnusable(precheck, tip, commitID); {
+		case reason != "":
+			return landResolution{}, l.notAttempted("the resolution could not be verified: "+reason, nil)
+		case precheck.verifyErr != nil:
+			var verifyErr *landVerifyError
+			if errors.As(precheck.verifyErr, &verifyErr) {
+				return landResolution{}, l.verifyRejected(precheck.verifyErr)
+			}
+			return landResolution{}, l.notAttempted("the resolution could not be verified: "+precheck.verifyErr.Error(), nil)
+		}
+		tree, err := s.landResolvedTree(ctx, repo, l.mergedTree, resp)
+		if err != nil {
+			return landResolution{}, err
+		}
+		if precheck.verified == "" || precheck.verified != tree {
+			return landResolution{}, l.notAttempted("the resolution could not be verified: the tree to land is not the tree that was verified", nil)
+		}
+		built, verified = tree, true
 	}
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, review.actor, resp, checkedBy, "", false)
+	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, review.actor, resp, checkedBy, built, verified)
 	res.syntaxUnchecked = syntaxUnchecked
-	return res, l.verifyRejected(err)
+	return res, err
+}
+
+// landPrecheckUnusable says why the precheck of a land cannot vouch for the tip and commit the lane
+// has, or "" when it can.
+func landPrecheckUnusable(pc *landPrecheck, tip, commitID git.ObjectID) string {
+	switch {
+	case pc == nil:
+		return "it was not verified before the land"
+	case pc.skipped != "":
+		return fmt.Sprintf("it was not verified before the land, since %s", pc.skipped)
+	case pc.tip != tip || pc.commit != commitID:
+		return fmt.Sprintf("it was verified against tip %s and commit %s, not tip %s and commit %s", pc.tip, pc.commit, tip, commitID)
+	}
+	return ""
 }
 
 // landResolutionFiles maps the files of the resolution to the conflicting paths. It returns a

@@ -829,7 +829,7 @@ func TestAcquireVerifySlot_boundsTheVerificationsAtOnce(t *testing.T) {
 	_, err = disabled.AcquireVerifySlot(ctx, "a")
 	require.ErrorIs(t, err, ErrDisabled)
 
-	require.Equal(t, config.DefaultGraftResolverVerifyConcurrency, cap(newClient(t, commandConfig([]string{"/bin/true"})).verifySlots))
+	require.Equal(t, config.DefaultGraftResolverVerifyConcurrency, cap(newClient(t, commandConfig([]string{"/bin/true"})).verify.slots))
 }
 
 // TestAcquireVerifySlot_oneRepositoryCannotTakeThePool: at most verify_per_repository verifications run
@@ -841,7 +841,7 @@ func TestAcquireVerifySlot_oneRepositoryCannotTakeThePool(t *testing.T) {
 	cfg.VerifyConcurrency = 2
 	client := newClient(t, cfg)
 	ctx := testhelper.Context(t)
-	require.Equal(t, config.DefaultGraftResolverVerifyPerRepository, client.verifyPerRepo)
+	require.Equal(t, config.DefaultGraftResolverVerifyPerRepository, client.verify.perRepo)
 
 	first, err := client.AcquireVerifySlot(ctx, "busy")
 	require.NoError(t, err)
@@ -862,9 +862,9 @@ func TestAcquireVerifySlot_oneRepositoryCannotTakeThePool(t *testing.T) {
 		waiting <- err
 	}()
 	require.Eventually(t, func() bool {
-		client.verifyMu.Lock()
-		defer client.verifyMu.Unlock()
-		return client.verifyRepos["busy"] != nil && client.verifyRepos["busy"].users == 2
+		client.verify.mu.Lock()
+		defer client.verify.mu.Unlock()
+		return client.verify.repos["busy"] != nil && client.verify.repos["busy"].users == 2
 	}, 5*time.Second, 5*time.Millisecond, "the second land never waited")
 	other, err := client.AcquireVerifySlot(ctx, "other")
 	require.NoError(t, err, "a land that waits for its repository holds nothing of the pool")
@@ -874,18 +874,18 @@ func TestAcquireVerifySlot_oneRepositoryCannotTakeThePool(t *testing.T) {
 	require.NoError(t, <-waiting)
 	other.Release()
 
-	client.verifyMu.Lock()
-	require.Empty(t, client.verifyRepos, "nothing is kept of a repository without holder or waiter")
-	client.verifyMu.Unlock()
+	client.verify.mu.Lock()
+	require.Empty(t, client.verify.repos, "nothing is kept of a repository without holder or waiter")
+	client.verify.mu.Unlock()
 
 	// A waiter that gave up leaves no trace either.
 	held, err := client.AcquireVerifySlot(ctx, "gone")
 	require.NoError(t, err)
 	require.Error(t, timedOut(t, client, "gone"))
 	held.Release()
-	client.verifyMu.Lock()
-	require.Empty(t, client.verifyRepos)
-	client.verifyMu.Unlock()
+	client.verify.mu.Lock()
+	require.Empty(t, client.verify.repos)
+	client.verify.mu.Unlock()
 
 	// Configured, the cap is the number of verifications of one repository at once.
 	cfg.VerifyPerRepository = 2

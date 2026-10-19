@@ -41,12 +41,25 @@ type Server struct {
 	// landCheckBatchHook, when set, runs in every check batch while it holds its slot, with the
 	// context of the batch; only tests set it.
 	landCheckBatchHook func(ctx context.Context)
+	// verifyAfterWriteHook, when set, runs between the writing of a checkout and its read-back; only
+	// tests set it, to let a deadline pass there.
+	verifyAfterWriteHook func()
+	// verifyTmpDir is where the checkouts of the verification are made; empty means the system's
+	// temporary directory (TMPDIR). Tests set it to see what is left behind.
+	verifyTmpDir string
+	// landLaneHook, when set, runs in the lane when it applies the verdicts of a land, holding the
+	// lane for as long as it runs; only tests set it, to keep a lane busy.
+	landLaneHook func()
 	// landResolveHook, when set, runs in every resolver call while it holds its resolve slot; only
 	// tests set it.
 	landResolveHook func()
 	// landFinalPassHook, when set, runs in every pass of the final pass of a land between its
 	// pre-resolution and its lane, with the number of the pass; only tests set it.
 	landFinalPassHook func(pass int)
+	// verifyPool bounds the verifications of the process (PLAN10 15.9): the operator's command runs
+	// on the tree of every land that needs it, out of the lane, whatever made the resolution. It is
+	// set whenever verify.enabled is, with or without an AI resolver.
+	verifyPool *resolver.VerifyPool
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
 	// or when the configured resolver cannot be built: then resolverErr says why, and every land
 	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).
@@ -79,7 +92,7 @@ func NewServer(deps *service.Dependencies) *Server {
 			deps.GetLogger().WithError(shared.Err).Error("graft: the conflict resolver of land cannot be built: lands that need it fail")
 		}
 	}
-	conflictResolver, resolverErr := shared.Client, shared.Err
+	conflictResolver, resolverErr, verifyPool := shared.Client, shared.Err, shared.Verify
 	if conflictResolver != nil && resolverActorsUnmatchable(deps.GetCfg().Graft) {
 		deps.GetLogger().Warn("graft: [graft.land.resolver] actors is set but no [[graft.agent]] is " +
 			"configured, so callers carry no identity and no landing may resolve conflicts")
@@ -99,6 +112,7 @@ func NewServer(deps *service.Dependencies) *Server {
 		resolveCfg:       resolveCfg,
 		conflictResolver: conflictResolver,
 		resolverErr:      resolverErr,
+		verifyPool:       verifyPool,
 		shutdownCtx:      deps.GetShutdownContext(),
 		storageSync:      deps.GetGraftStorageSyncer(),
 	}

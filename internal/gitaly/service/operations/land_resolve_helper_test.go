@@ -21,11 +21,10 @@ func (s *Server) resolveLandConflicts(ctx context.Context, in *gitalypb.UserLand
 	// As the lane does for a model's resolution: the tree is the one verify.command passed on, out
 	// of the lane, or the answer would not have been landable.
 	var tree git.ObjectID
-	if landAnswerProposes(answer) {
+	if landAnswerProposes(answer) || s.resolveCfg.Verify.Enabled {
 		if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, answer); err != nil {
 			return landResolution{}, err
 		}
 	}
-	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "", tree, pre.isVerified(tree))
-	return res, l.verifyRejected(err)
+	return s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, "", tree, pre.isVerified(tree))
 }

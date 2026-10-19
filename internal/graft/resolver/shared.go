@@ -10,13 +10,24 @@ type Shared struct {
 	Client *Client
 	// Err is why the configured resolver cannot be built, if it cannot.
 	Err error
+	// Verify is the pool of verifications of the process (PLAN10 15.9). It is set whenever
+	// verify.enabled is, with or without an AI resolver: an agent's resolution and the rules' are
+	// verified too, out of the lane, and the pool bounds all of them together.
+	Verify *VerifyPool
 }
 
 // NewShared builds the resolver client of the process from cfg.
 func NewShared(cfg config.GraftResolver) *Shared {
+	var pool *VerifyPool
+	if cfg.Verify.Enabled {
+		pool = NewVerifyPool(cfg)
+	}
 	client, err := New(cfg)
 	if err != nil {
-		return &Shared{Err: err}
+		return &Shared{Err: err, Verify: pool}
 	}
-	return &Shared{Client: client}
+	if client != nil && pool != nil {
+		client.verify = pool
+	}
+	return &Shared{Client: client, Verify: pool}
 }

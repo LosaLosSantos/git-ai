@@ -897,6 +897,8 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |                               branch moved / change already landed -> skipped (lane answers)
    |                               review: exact paths, modes, markers, pointer lines, size
    |                               resolver check (syntax + operator checks), bounded slots
+   |                               VERIFY (below) the exact tree the resolution would land: fails ->
+   |                               PACKAGE (every file REJECTED, the output); not in time -> PACKAGE
    |
    |-- resolve_conflicts? --yes--> PRE-RESOLVE, before the lane, in a discarded quarantine (15.8)
    |                               tip T read as the lane reads it; no branch / already landed /
@@ -904,35 +906,38 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
    |                               agent may not update the branch (policy) -> PermissionDenied
    |                               the conflicting files not yet resolved -> one VERDICT per file
    |                               (15.2), each kept by its key (path, base, ours, theirs, modes),
-   |                               resolve slots; a model's answer: verify.command runs on the exact
-   |                               tree that would land, verify slots (15.9); decideLand (15.4):
+   |                               resolve slots; VERIFY (the one verify box, 15.9): when verify.command
+   |                               is configured, or the answer holds a model's resolution, it runs on
+   |                               the exact tree that would land, with a slot of the verify pool
+   |                               (verify_concurrency, verify_per_repository); decideLand (15.4):
    |                                 not landable -> proposals kept (14) and PACKAGE now: the lane
    |                                                 is not entered; a model's files are PROPOSED,
-   |                                                 with the verify output when verify failed
+   |                                                 a rule's REJECTED, with the verify output when
+   |                                                 verify failed; NOT_ATTEMPTED (a rule's) or PROPOSED
+   |                                                 (a model's) with the reason when the deadline cut it
    |                                 landable ----> the verdicts, and the verified tree, go to the lane
    v
  LANE (one per branch)
    |-- a resolution -----> landWithResolution: tip moved -> refuse, fresh PACKAGE
    |                         applies the precheck's verdicts; any failure -> PACKAGE
-   |                         operator verify.command on the merged tree; fails -> PACKAGE
-   |                         all good -> LAND as agent/<actor> (+ Graft-Checked-By)
+   |                         the tree it would write is the tree the precheck verified, else PACKAGE
+   |                         (the lane runs no command) -> LAND as agent/<actor> (+ Graft-Checked-By)
    v
  3-way merge (rebase or merge) of the tip and the change
    |-- clean -------------------------------------------------------------> LAND
    |-- conflicts, no resolve_conflicts ------------------------------------> merge_conflict
    |-- conflicts, every conflicting file has a verdict with its key, and the lane's
    |   classification of the file agrees with the verdict's
-   |       rules only -> operator verify.command (in the lane, for now); passes -> merge commit
-   |                     signed by the rules -> LAND;  fails -> PACKAGE (every file REJECTED, reason)
-   |       a model's file -> decideLand (15.4) on the tree the lane would write: it LANDS only if
-   |                     that tree is the tree verify.command passed on (tree object IDs). The lane
-   |                     runs no verification of a model's resolution. Merge commit signed
-   |                     Graft-Resolved-By: <resolver> + Graft-Checked-By: verify:<command>.
+   |       decideLand (15.4) on the tree the lane would write: with a verify.command configured, any
+   |                     resolution (a rule's, a model's) LANDS only if that tree is the tree
+   |                     verify.command passed on (tree object IDs), and a model's on no other tree,
+   |                     configured or not. The lane runs no verification of any resolution. Merge
+   |                     commit signed Graft-Resolved-By: <resolver> + Graft-Checked-By: verify:<command>.
    |                     Another tree (the tip moved) -> NEEDS VERIFICATION, below
    |-- conflicts, a file without such a verdict (new, or its sides changed)
    |       -> NEEDS RESOLUTION, out of the lane: PRE-RESOLVE only those files against the new tip,
    |          keeping the other verdicts, and enter the lane again
-   |-- a model's answer whose tree is not the verified one (the tip moved)
+   |-- an answer whose tree is not the verified one (the tip moved)
            -> NEEDS VERIFICATION, out of the lane: rebuild the tree from the same verdicts (the
               resolver is called only for files that changed), VERIFY it, enter the lane again
  The rounds are bounded by the deadline of the land (the resolver's timeout, plus verify.timeout when
@@ -1018,7 +1023,8 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 ```
  decideLand(answer, files, tree, verified): the pre-resolution calls it with the tree it verified,
  the lane with the tree it would write
-   every file resolved by an operator rule ...... LAND (then verify.command, in the lane)
+   every file resolved by an operator rule ...... LAND, and with a verify.command configured only if it ran
+                                                  and passed on THIS tree (tree object ID equality)
    a file a model resolved ...................... LAND only if verify.command ran and passed on THIS
                                                   tree: tree object ID equality, not the tip
    anything else ................................ PACKAGE (the model's files are proposals)
@@ -1039,7 +1045,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | out of the lane: rounds, deadline | `landResolving`, `landPreResolve` | operations/land_preresolve.go |
 | per-file verdicts, decide | `landResolveAt`, `landSetOutcomes`, `decideLand`, `landAnswerProposes`, `landKeyOf` | operations/land_resolve.go, land_proposals.go, land_preresolve.go |
 | the tree that would land | `landResolvedTree` | operations/land_resolve.go |
-| verify a model's resolution, out of the lane | `landVerifyOutOfLane`, `landVerify`, `Client.AcquireVerifySlot` | operations/land_verify.go; graft/resolver/check.go |
+| VERIFY, the one box, out of the lane, for every resolution | `landVerifyOutOfLane`, `landVerify`, `landPrecheckVerify` (an agent's), `VerifyPool.Acquire` | operations/land_verify.go, land_reland.go; graft/resolver/check.go |
 | verdicts applied in the lane | `landApplyVerdicts`, `landNeedsResolution` | operations/land_resolve.go, land_preresolve.go |
 | unverified in time: proposals | `landUnverified`, `landNotVerifiedReason` | operations/land_preresolve.go |
 | resolver call, bounded slots | `Client.AcquireResolveSlot`, `ResolveSlot.Resolve` | graft/resolver/check.go |
@@ -1050,7 +1056,7 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | regions, assemble | `llmRegions`, `llmAssemble` | tools/.../resolve/llm_core.go |
 | one call per region, its checks | `llmPatchSystem`, `llmPatchUser`, `llmPatchAnswer`, `llmCheckPatched`, `llmCheckAnswer` | tools/.../resolve/llm_patch.go, llm_core.go |
 | proposal mark, no recording | `proposer`, `Resolver.resolveFile` | tools/.../resolve/llm_strategy.go, resolve.go |
-| verify.command | `landVerify`, `verifyRejected` | operations/land_verify.go, land_resolve.go |
+| verify.command's checkout | `landCheckoutTree`, `landMaterializer.add`, `landCheckMaterialized`, `landRemoveCheckout`, `resolver.IsGitDirName` | operations/land_verify.go; graft/resolver/validate.go |
 | merge commit, trailers | `landWriteResolution` | operations/land_resolve.go |
 | PACKAGE | `landWithPackage`, `landListing.conflictPackage` | operations/land_package.go |
 | proposals, hidden reference | `landWriteProposals`, `proposals.Update`, `proposals.Prune`, `landProposalsNotStored` | operations/land_proposals.go; graft/proposals |
@@ -1199,10 +1205,9 @@ The resolution is bound to the files instead (the PM's correction):
   long resolutions starve the checks, and fairness inside one pool needs a scheduler for no gain
   over two plain semaphores; the memory bound of the process is the sum of the two pools' requests.
   Each request waits for its slot within the resolver's timeout and fails closed when it expires.
-* **Still in the lane, stated:** verify.command, the operator's tests on the merged tree, runs in
-  the lane for the rules' resolutions and for agents' resolutions alike. For a model's resolution
-  it already runs out of the lane (15.9). Moving the other two onto the same mechanism is the next
-  step, measured on its own, so that in the end there is one verification mechanism.
+* **Nothing is verified in the lane any more.** This bullet said that verify.command still ran in the
+  lane for the rules' resolutions and for agents'; it does not (15.9): every verification runs out
+  of the lane, on one mechanism.
 * **Measured (TestLandResolveBench, GRAFT_LAND_BENCH=1).** Six lands that the server resolves,
   all on the same file, and six plain lands that conflict with nothing, at once through the lanes
   of a standalone server, with a resolver that takes 500 ms; the same bench on the tree before
@@ -1241,8 +1246,24 @@ The final ruling of 14: an AI resolution lands only through the operator's verif
 verification runs the operator's tests, which take minutes, so it cannot run in the lane (15.8),
 and the tree it verifies depends on the tip.
 
+* **One mechanism, for every verification (PM ruling after the review of the checkout).** The
+  verification that was left in the lane for the rules' resolutions and for agents' went out of it
+  too: whatever made the resolution, verify.command runs on the exact tree, out of the lane, with a
+  slot of the process's pool, and the lane compares tree object IDs. Why: in the lane it was bounded
+  by nothing but one per branch, so the number of commands running in the process was unbounded;
+  now every one goes through verify_concurrency and verify_per_repository, and the pool exists
+  whenever verify.enabled is set, with or without an AI resolver. The costs, stated: a rules'
+  land whose tip moved after its tree was verified is verified again (it is a model's land in this
+  respect: liveness is the deadline's, and at the deadline the rules' files are NOT_ATTEMPTED and
+  an agent's resolution gets "could not verify before the deadline of <t>" with its package); an
+  agent's resolution is verified in its precheck, at the only tip the lane accepts it at. The
+  per-process worst case of a verification, so that the operator can size it: inodes and disk at
+  most verify_concurrency x (verify.max_tree_entries inodes, verify.max_tree_bytes of files), heap
+  at most verify_concurrency x (the paths kept, 128 MiB by the charge of the materializer; the
+  entries and the target of no link), and a TMPDIR on tmpfs turns that disk into memory: point it
+  at a disk, or lower the limits.
 * **Verification out of the lane, on the exact tree.** For an answer that holds a model's
-  resolution, and when nothing else keeps the land from landing (every file resolved or proposed),
+  resolution (or any answer, with a verify.command), and when nothing else keeps the land from landing (every file resolved or proposed),
   the pre-resolution builds the tree that would land (`landResolvedTree`: the merged tree of the
   tip and the change, the answer's files written in) and runs verify.command on it, in the
   quarantine, with a slot of the verify pool (`verify_concurrency`, default 2, a pool of its own:
@@ -1320,9 +1341,13 @@ and the tree it verifies depends on the tip.
   a fixed 128 MiB the memory of the paths, each entry and each directory charged twice (the sets that
   look for links and for folded names). The limits are checked entry by entry, from the listing
   (ls-tree -l), BEFORE that entry's content is read, not from a first pass over the whole listing: the
-  listing and the blobs are streamed through two commands, so the memory is that of the paths kept (the
-  fixed budget), and an entry that would go over stops the checkout with the earlier ones already
-  written. The context is checked at every entry. A name over 255 bytes, a path that with the
+  listing and the blobs are streamed through two commands, and what stays in memory is exactly what
+  the materializer charges against the fixed 128 MiB budget (landMaxPathBytes): each entry its path
+  plus 256 bytes, each distinct prefix twice its length plus 64 (the folded key and the spelling),
+  each directory made its path plus 64, each link its path plus 64, and nothing of the target of a link
+  or the content of a file (the read-back hashes what is on disk). A link target is at most 4095
+  bytes, refused up front. An entry that would go over a limit stops the checkout with the earlier ones
+  already written. The context is checked at every entry. A name over 255 bytes, a path that with the
   directory reaches PATH_MAX, a NUL in the target of a link, and a system call that fails (a name
   that exists already, no room) are refused with the reason, not errors of the server. The checkout
   runs inside verify.timeout, as the command does. A refusal is no error of the server: nothing is
@@ -1336,6 +1361,6 @@ and the tree it verifies depends on the tip.
   proposal; a tip that moved gets its new tree verified and lands, with no resolver call; a tip that
   moved to the same tree keeps the verification; churn past the deadline gives a proposal, and so does
   the cap on the rounds; the lane is free while a verification runs (a plain land passes through it);
-  the lane never verifies a model's resolution; the verify pool bounds the verifications at once;
-  rules keep their verification in the lane; and the table test of decideLand, whose one rule is
-  compared by tree object ID.
+  the lane never verifies; the verify pool bounds the verifications at once, those of rules and of
+  agents' resolutions as well; and the table test of decideLand, whose one rule is compared by tree
+  object ID.

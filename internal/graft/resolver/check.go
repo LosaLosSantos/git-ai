@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -135,6 +136,31 @@ var verifySlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
 })
 
+// VerifyPool is the pool of verifications of a process (PLAN10 15.9): the operator's command runs on
+// the exact tree of a land, out of the lane, whatever made the resolution (a rule, an agent, a
+// model), and at most verify_concurrency of them run at once in the whole process, and at most
+// verify_per_repository for one repository. Every verification takes a slot; there is no other way
+// to run the command.
+type VerifyPool struct {
+	slots chan struct{}
+	// repos are the slots of each repository that has a verification running or waiting, taken
+	// before a slot of the pool so that one repository cannot hold the whole pool; an entry lives as
+	// long as it has a holder or a waiter. perRepo is their number.
+	mu      sync.Mutex
+	repos   map[string]*repoVerifySlots
+	perRepo int
+}
+
+// NewVerifyPool builds the pool of cfg: verify_concurrency slots, verify_per_repository of them for
+// one repository.
+func NewVerifyPool(cfg config.GraftResolver) *VerifyPool {
+	return &VerifyPool{
+		slots:   make(chan struct{}, cfg.VerifyConcurrencyOrDefault()),
+		repos:   map[string]*repoVerifySlots{},
+		perRepo: cfg.VerifyPerRepositoryOrDefault(),
+	}
+}
+
 // repoVerifySlots are the verify slots of one repository: its verifications at once, and the
 // number of those holding or waiting for one, which keeps the entry in the map.
 type repoVerifySlots struct {
@@ -147,7 +173,7 @@ type repoVerifySlots struct {
 // (AcquireVerifySlot), in a pool apart from the checks' and the resolutions'. Release it when the
 // verification is done.
 type VerifySlot struct {
-	c        *Client
+	p        *VerifyPool
 	repo     string
 	released bool
 }
@@ -160,22 +186,30 @@ func (c *Client) AcquireVerifySlot(ctx context.Context, repo string) (*VerifySlo
 	if c == nil {
 		return nil, ErrDisabled
 	}
+	return c.verify.Acquire(ctx, repo)
+}
+
+// Acquire waits for a verify slot of repo and then for one of the pool; see Client.AcquireVerifySlot.
+func (p *VerifyPool) Acquire(ctx context.Context, repo string) (*VerifySlot, error) {
+	if p == nil {
+		return nil, ErrDisabled
+	}
 	start := time.Now()
 	observe := func() { verifySlotWait.Observe(time.Since(start).Seconds()) }
 
-	c.verifyMu.Lock()
-	r, ok := c.verifyRepos[repo]
+	p.mu.Lock()
+	r, ok := p.repos[repo]
 	if !ok {
-		r = &repoVerifySlots{slots: make(chan struct{}, c.verifyPerRepo)}
-		c.verifyRepos[repo] = r
+		r = &repoVerifySlots{slots: make(chan struct{}, p.perRepo)}
+		p.repos[repo] = r
 	}
 	r.users++
-	c.verifyMu.Unlock()
+	p.mu.Unlock()
 	leave := func() {
-		c.verifyMu.Lock()
-		defer c.verifyMu.Unlock()
+		p.mu.Lock()
+		defer p.mu.Unlock()
 		if r.users--; r.users == 0 {
-			delete(c.verifyRepos, repo)
+			delete(p.repos, repo)
 		}
 	}
 
@@ -187,9 +221,9 @@ func (c *Client) AcquireVerifySlot(ctx context.Context, repo string) (*VerifySlo
 		return nil, fmt.Errorf("waiting for a verify slot of the repository: %w", ctx.Err())
 	}
 	select {
-	case c.verifySlots <- struct{}{}:
+	case p.slots <- struct{}{}:
 		observe()
-		return &VerifySlot{c: c, repo: repo}, nil
+		return &VerifySlot{p: p, repo: repo}, nil
 	case <-ctx.Done():
 		observe()
 		<-r.slots
@@ -204,14 +238,14 @@ func (s *VerifySlot) Release() {
 		return
 	}
 	s.released = true
-	<-s.c.verifySlots
+	<-s.p.slots
 
-	s.c.verifyMu.Lock()
-	defer s.c.verifyMu.Unlock()
-	r := s.c.verifyRepos[s.repo]
+	s.p.mu.Lock()
+	defer s.p.mu.Unlock()
+	r := s.p.repos[s.repo]
 	<-r.slots
 	if r.users--; r.users == 0 {
-		delete(s.c.verifyRepos, s.repo)
+		delete(s.p.repos, s.repo)
 	}
 }
 

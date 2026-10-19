@@ -533,7 +533,14 @@ ends with the merge conflict and its package: the files that changed under it ar
 `NOT_ATTEMPTED` with the reason `the files changed again before they could be
 resolved`, the others keep their verdicts (a model's `PROPOSED`).
 
-`verify.command` still runs in the lane, on the merged tree of the lane's tip.
+`verify.command` runs out of the lane, whatever made the resolution (a rule, an agent, a model): on
+the exact tree that would land, with a slot of the process's verify pool, before the lane, which only
+compares the tree it would write with the one that passed. A land whose tip moved after its tree was
+verified is verified again; at the deadline the files of a rules' land are `NOT_ATTEMPTED` with the
+reason, and an agent's resolution gets the package with "could not verify before the deadline". A
+verification costs, per process, at most `verify_concurrency` times the inodes and bytes of
+`verify.max_tree_entries` and `verify.max_tree_bytes` on disk and the paths of the tree in memory;
+with `TMPDIR` on tmpfs that disk is memory.
 
 ## The conflict package and the re-land
 

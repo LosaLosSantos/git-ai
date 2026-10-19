@@ -5,10 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -317,7 +319,7 @@ func TestLandCheckMaterialized_failsClosed(t *testing.T) {
 		entries, contents := fakeEntries(t)
 		dir := t.TempDir()
 		require.NoError(t, landMaterialize(entries, batchOf(contents, entries), dir))
-		require.NoError(t, landCheckMaterialized(entries, dir), "an exact checkout passes")
+		require.NoError(t, landCheckMaterialized(context.Background(), entries, dir), "an exact checkout passes")
 		return entries, dir
 	}
 
@@ -361,7 +363,7 @@ func TestLandCheckMaterialized_failsClosed(t *testing.T) {
 	} {
 		entries, dir := materialized(t)
 		damage(t, dir)
-		require.ErrorContains(t, landCheckMaterialized(entries, dir), "the checkout differs from the tree", name)
+		require.ErrorContains(t, landCheckMaterialized(context.Background(), entries, dir), "the checkout differs from the tree", name)
 	}
 }
 
@@ -426,6 +428,19 @@ func TestUserLand_verifySeesTheWholeTree(t *testing.T) {
 			require.Equal(t, "must be seen\n", fx.blobAt(t, landed, "hidden.txt"))
 		})
 	}
+}
+
+// landMaterialize writes the entries under dir without limits, reading the contents of the files and
+// links from batch in their order (the answer of git-cat-file(1) --batch to the blobs of the listing,
+// gitlinks left out).
+func landMaterialize(entries []landTreeEntry, batch *bufio.Reader, dir string) error {
+	m := newLandMaterializer(context.Background(), dir, landCheckoutLimits{})
+	for i := range entries {
+		if err := m.add(&entries[i], batch); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // fakeTreeEntry is an entry of a tree that landMaterialize writes, with the content that git-cat-file(1)
@@ -775,17 +790,19 @@ func TestLandMaterialize_refusesWhatTheFileSystemWouldNot(t *testing.T) {
 	}
 	for name, tc := range map[string]struct {
 		dir     func(t *testing.T) string
+		prepare func(t *testing.T, dir string)
 		entries []fakeTreeEntry
 		reason  string
 	}{
 		"a name of more than 255 bytes": {entries: []fakeTreeEntry{{reg, longName, "x"}}, reason: "more than 255 bytes"},
 		"a path that reaches PATH_MAX":  {entries: []fakeTreeEntry{{reg, strings.Join(longPath, "/"), "x"}}, reason: "too long"},
 		"a NUL in the target of a link": {entries: []fakeTreeEntry{{link, "l", "a\x00b"}}, reason: "NUL"},
-		"a system call that fails": {
-			dir:     func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") },
-			entries: []fakeTreeEntry{{reg, "a/b", "x"}},
-			reason:  "cannot be written on this file system",
+		"a name that exists already": {
+			prepare: func(t *testing.T, dir string) { require.NoError(t, os.WriteFile(filepath.Join(dir, "a"), nil, 0o644)) },
+			entries: []fakeTreeEntry{{reg, "a", "x"}},
+			reason:  "open a: file exists",
 		},
+		"a link target over 4095 bytes": {entries: []fakeTreeEntry{{link, "l", strings.Repeat("t", 4096)}}, reason: "more than the 4095 that Linux takes"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -794,11 +811,37 @@ func TestLandMaterialize_refusesWhatTheFileSystemWouldNot(t *testing.T) {
 			if tc.dir != nil {
 				dir = tc.dir(t)
 			}
+			if tc.prepare != nil {
+				tc.prepare(t, dir)
+			}
 			var refusal *landCheckoutRefusal
 			require.ErrorAs(t, materializeFake(t, dir, tc.entries...), &refusal)
 			require.Contains(t, refusal.reason, tc.reason)
+			require.NotContains(t, refusal.reason, dir, "a reason names the path inside the checkout, not the directory of the server")
 		})
 	}
+
+	// What the server's own file system does is no refusal: a fault, for the log and a metric, never a
+	// proposal or a rejection of the agent's files.
+	t.Run("a failure of the server's file system is a fault", func(t *testing.T) {
+		t.Parallel()
+
+		err := materializeFake(t, filepath.Join(t.TempDir(), "missing"), fakeTreeEntry{reg, "a/b", "x"})
+		var fault *landCheckoutFault
+		var refusal *landCheckoutRefusal
+		require.ErrorAs(t, err, &fault)
+		require.False(t, errors.As(err, &refusal))
+	})
+
+	t.Run("the link target at the limit is written", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		require.NoError(t, materializeFake(t, dir, fakeTreeEntry{link, "l", strings.Repeat("t", 4095)}))
+		got, err := os.Readlink(filepath.Join(dir, "l"))
+		require.NoError(t, err)
+		require.Len(t, got, 4095)
+	})
 
 	t.Run("a context that ended stops the next entry", func(t *testing.T) {
 		t.Parallel()
@@ -809,4 +852,135 @@ func TestLandMaterialize_refusesWhatTheFileSystemWouldNot(t *testing.T) {
 		entries, contents := fakeEntries(t)
 		require.ErrorIs(t, m.add(&entries[0], batchOf(contents, entries)), context.Canceled)
 	})
+}
+
+// TestLandMaterialize_theDirectoryClauseOfPathMax: a path that is short itself but with the directory
+// of the checkout reaches PATH_MAX is refused up front with its own reason, not left to fail on the
+// system call.
+func TestLandMaterialize_theDirectoryClauseOfPathMax(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	for i := 0; i < 15; i++ {
+		dir = filepath.Join(dir, strings.Repeat("d", 250))
+		require.NoError(t, os.Mkdir(dir, 0o755))
+	}
+	// The path is 300 bytes in names of at most 100: far from the limits of its own, over PATH_MAX with the directory.
+	long := strings.Join([]string{strings.Repeat("a", 100), strings.Repeat("b", 100), strings.Repeat("c", 98)}, "/")
+	require.Less(t, len(long), landMaxTreePath)
+	require.GreaterOrEqual(t, len(dir)+1+len(long), landPathMax)
+
+	var refusal *landCheckoutRefusal
+	require.ErrorAs(t, materializeFake(t, dir, fakeTreeEntry{0o100644, long, "x"}), &refusal)
+	require.Contains(t, refusal.reason, "too long to write", "refused by the clause of the directory, not by the system call")
+}
+
+// TestLandCheckoutTree_aSymlinkHeavyTreeStaysSmall: the targets of the links are not kept. A tree of
+// 20000 links to one 4095-byte blob would hold 80 MB of targets in the entries; what is kept is the
+// paths, which is a fraction of it. The heap is read while the checkout is complete and not yet
+// checked, when everything it keeps is live. Not parallel: the heap is the process's.
+func TestLandCheckoutTree_aSymlinkHeavyTreeStaysSmall(t *testing.T) {
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+
+	blob := gittest.WriteBlob(t, cfg, repoPath, []byte(strings.Repeat("a", 4095)))
+	var links []gittest.TreeEntry
+	for i := 0; i < 1000; i++ {
+		links = append(links, gittest.TreeEntry{Mode: "120000", Path: fmt.Sprintf("l%04d", i), OID: blob})
+	}
+	sub := gittest.WriteTree(t, cfg, repoPath, links)
+	var root []gittest.TreeEntry
+	for i := 0; i < 20; i++ {
+		root = append(root, gittest.TreeEntry{Mode: "040000", Path: fmt.Sprintf("n%02d", i), OID: sub})
+	}
+	tree := gittest.WriteTree(t, cfg, repoPath, root)
+
+	heap := func() uint64 {
+		var m runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+	before := heap()
+	var during uint64
+	dir := t.TempDir()
+	require.NoError(t, landCheckoutTreeThen(ctx, repo, tree, dir, landCheckoutLimits{entries: 100000, depth: 64, pathBytes: landMaxPathBytes}, func() { during = heap() }))
+	grew := int64(during) - int64(before)
+	t.Logf("heap while the checkout is complete: +%d KiB for 20000 links of 4095 bytes", grew/1024)
+	require.Less(t, grew, int64(24<<20), "the targets of the links are not kept")
+	got, err := os.Readlink(filepath.Join(dir, "n19", "l0999"))
+	require.NoError(t, err)
+	require.Len(t, got, 4095)
+}
+
+// TestLandCheckMaterialized_stopsWithItsContext: the read-back looks at the context at every entry and
+// while it hashes a file, and an ended context is the error, not a difference of the checkout.
+func TestLandCheckMaterialized_stopsWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	entries, contents := fakeEntries(t)
+	dir := t.TempDir()
+	require.NoError(t, landMaterialize(entries, batchOf(contents, entries), dir))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := landCheckMaterialized(ctx, entries, dir)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotContains(t, err.Error(), "differs from the tree")
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(2 * time.Millisecond)
+	require.ErrorIs(t, landCheckMaterialized(ctx, entries, dir), context.DeadlineExceeded)
+
+	// Through the checkout: a context that ends between the writing and the read-back ends it with the
+	// context's error, which the verification turns into the timeout of its verdict.
+	fx := newTreeFixture(t)
+	hookCtx, hookCancel := context.WithCancel(testhelper.Context(t))
+	defer hookCancel()
+	require.ErrorIs(t, landCheckoutTreeThen(hookCtx, fx.repo, fx.tree, t.TempDir(), landCheckoutLimits{}, hookCancel), context.Canceled)
+}
+
+// TestLandVerify_cleansUpWhatTheCommandLeaves: a command that makes directories unreadable and
+// read-only leaves nothing behind, and a directory that cannot be removed is counted.
+func TestLandVerify_cleansUpWhatTheCommandLeaves(t *testing.T) {
+	t.Parallel()
+
+	fx := newTreeFixture(t)
+	vdir, vargv := countingVerify(t, `mkdir -p locked/inner
+echo x > locked/inner/f
+chmod 000 locked/inner
+chmod 555 locked
+chmod 555 dir
+exit 0`)
+	rcfg := withVerify(config.GraftResolver{}, vargv, "")
+	s := newResolveFixture(t, rcfg).server(t, rcfg)
+	s.verifyTmpDir = t.TempDir()
+
+	require.NoError(t, s.landVerify(testhelper.Context(t), fx.repo, fx.tree))
+	require.Equal(t, 1, verifyRuns(t, vdir))
+	left, err := os.ReadDir(s.verifyTmpDir)
+	require.NoError(t, err)
+	require.Empty(t, left, "the verification directory is gone, whatever the command made of its permissions")
+}
+
+// TestLandVerify_aDeadlineAfterTheCheckoutIsTheTimeoutOfTheVerdict: the timeout covers the read-back too. A
+// verification whose deadline passes between the writing of the checkout and its read-back ends as the
+// rejection that says it did not finish (PROPOSED for a model, with the reason), never as an error of
+// the server, and the command does not run.
+func TestLandVerify_aDeadlineAfterTheCheckoutIsTheTimeoutOfTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	fx := newTreeFixture(t)
+	vdir, vargv := countingVerify(t, "exit 0")
+	rcfg := withVerify(config.GraftResolver{}, vargv, "200ms")
+	s := newResolveFixture(t, rcfg).server(t, rcfg)
+	s.verifyAfterWriteHook = func() { time.Sleep(600 * time.Millisecond) }
+
+	err := s.landVerify(testhelper.Context(t), fx.repo, fx.tree)
+	var verifyErr *landVerifyError
+	require.ErrorAs(t, err, &verifyErr)
+	require.Contains(t, verifyErr.reason, "did not finish within 200ms")
+	require.Equal(t, 0, verifyRuns(t, vdir))
 }

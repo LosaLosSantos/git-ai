@@ -75,7 +75,7 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	// The check of an agent's resolution runs an external process: it runs here, before the land
 	// enters its lane, so that no branch is held while it runs (landPrecheckResolution).
 	var precheck *landPrecheck
-	if in.GetResolution() != nil && s.conflictResolver != nil {
+	if in.GetResolution() != nil && (s.conflictResolver != nil || s.resolveCfg.Verify.Enabled) {
 		if precheck, err = s.landPrecheckInQuarantine(ctx, in); err != nil {
 			return nil, err
 		}
@@ -429,7 +429,7 @@ func landLostRace(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict
 // proposals, not an error about a branch it has nothing to do with. The others get
 // landKeptMovingError.
 func landKeptMoving(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempts int) error {
-	if pre.hasModel() {
+	if pre.mustVerify() {
 		return &landNeedsResolution{tip: conflict.newOID, commit: git.ObjectID(in.GetCommitId()), moved: true}
 	}
 	return landKeptMovingError(in, conflict, attempts)

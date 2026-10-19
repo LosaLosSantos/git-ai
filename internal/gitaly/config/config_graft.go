@@ -402,6 +402,8 @@ const (
 	DefaultGraftResolverVerifyMaxTreeBytes int64 = 2 << 30
 	// DefaultGraftResolverVerifyMaxTreeDepth is the default GraftResolverVerify.MaxTreeDepth.
 	DefaultGraftResolverVerifyMaxTreeDepth = 64
+	// MaxGraftResolverVerifyMaxTreeDepth is the highest max_tree_depth a configuration may set.
+	MaxGraftResolverVerifyMaxTreeDepth = 256
 )
 
 // MaxTreeDepthOrDefault returns MaxTreeDepth or its default.
@@ -444,6 +446,9 @@ func (v GraftResolverVerify) TimeoutOrDefault() (time.Duration, error) {
 func (v GraftResolverVerify) validate() error {
 	if v.MaxTreeEntries < 0 || v.MaxTreeBytes < 0 || v.MaxTreeDepth < 0 {
 		return fmt.Errorf("graft land resolver verify: max_tree_entries, max_tree_bytes and max_tree_depth must not be negative (0 means the default)")
+	}
+	if v.MaxTreeDepth > MaxGraftResolverVerifyMaxTreeDepth {
+		return fmt.Errorf("graft land resolver verify: max_tree_depth %d is over %d: the checks of a path cost more with its depth", v.MaxTreeDepth, MaxGraftResolverVerifyMaxTreeDepth)
 	}
 	if !v.Enabled {
 		return nil

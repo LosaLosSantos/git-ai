@@ -218,17 +218,19 @@ func (s *Server) landResolveAt(
 		}
 	}
 
-	// A model's resolution lands only through the operator's verification (15.9): verify.command
-	// runs here, out of the lane, on the exact tree that would land, once nothing else stops the
-	// land. Whatever keeps a model's file from landing is said in the reason of its file.
+	// A resolution lands only through the operator's verification (15.9): verify.command runs
+	// here, out of the lane, on the exact tree that would land, once nothing else stops the land,
+	// whoever made the resolution: a model's, whose files stay proposals without one, and a rule's,
+	// when a verification is configured. Whatever keeps a file from landing is said in its reason.
+	verifyRequired := s.resolveCfg.Verify.Enabled
 	var tree, verified git.ObjectID
-	if combined != nil && landAnswerProposes(combined) {
+	if combined != nil && (landAnswerProposes(combined) || verifyRequired) {
 		switch {
 		case pre.unverifiable != "":
-			landAnnotateProposed(files, pre.unverifiable)
-		case !s.resolveCfg.Verify.Enabled && len(s.resolveCfg.Verify.Command) > 0:
+			landAnnotateUnverified(files, combined, pre.unverifiable)
+		case !verifyRequired && len(s.resolveCfg.Verify.Command) > 0:
 			landAnnotateProposed(files, landVerifyDisabledReason)
-		case !s.resolveCfg.Verify.Enabled:
+		case !verifyRequired:
 			landAnnotateProposed(files, landNoVerifyReason)
 		case landAllAnswered(files):
 			var err error
@@ -248,15 +250,19 @@ func (s *Server) landResolveAt(
 				verified = tree
 				pre.markVerified(tree)
 				s.logger.WithFields(log.Fields{"branch": string(in.GetBranch()), "tip": tip.String(), "commit": commitID.String(), "tree": tree.String()}).
-					InfoContext(ctx, "graft: a model's resolution passed the verification out of the lane")
+					InfoContext(ctx, "graft: a resolution passed the verification out of the lane")
 			case errors.As(err, &verifyErr):
-				landAnnotateProposed(files, verifyErr.Error())
+				if landAnswerProposes(combined) {
+					landAnnotateProposed(files, verifyErr.Error())
+				} else {
+					landRejectResolved(files, verifyErr.Error())
+				}
 			default:
 				return l, nil, err
 			}
 		}
 	}
-	landed := decideLand(combined, files, tree, verified)
+	landed := decideLand(combined, files, tree, verified, verifyRequired)
 	// An answer that does not land, because a model made part of it or another file is left, is
 	// kept for the agent: the files that rules resolved can be landed as they are. The proposals
 	// are an aid and the package is the contract: when they cannot be kept, the package still goes
@@ -315,6 +321,31 @@ func landAllAnswered(files []*landFileState) bool {
 }
 
 // landAnnotateProposed adds why a model's files did not land to the reason of each.
+// landAnnotateUnverified says why a land that needs the verification could not be verified in time:
+// a model's files are PROPOSED with the reason, and the files of an answer made by rules only are
+// NOT_ATTEMPTED with it, since nothing of them lands without the verification.
+func landAnnotateUnverified(files []*landFileState, answer *resolver.Response, why string) {
+	if landAnswerProposes(answer) {
+		landAnnotateProposed(files, why)
+		return
+	}
+	for _, f := range files {
+		if f.outcome == gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, why
+		}
+	}
+}
+
+// landRejectResolved marks every resolved file of a rules' answer REJECTED with the reason of the
+// verification that failed: the land does not happen, and the package says why.
+func landRejectResolved(files []*landFileState, why string) {
+	for _, f := range files {
+		if f.outcome == gitalypb.LandConflictFile_OUTCOME_RESOLVED {
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, why
+		}
+	}
+}
+
 func landAnnotateProposed(files []*landFileState, why string) {
 	for _, f := range files {
 		if f.outcome != gitalypb.LandConflictFile_OUTCOME_PROPOSED {
@@ -410,6 +441,9 @@ func (s *Server) landApplyVerdicts(
 	committer git.Signature,
 	pre *landPreResolution,
 ) (landResolution, error) {
+	if s.landLaneHook != nil {
+		s.landLaneHook()
+	}
 	l, err := landListConflicts(ctx, repo, tip, commitID, s.resolveCfg.MaxFileBytesOrDefault())
 	if err != nil {
 		return landResolution{}, err
@@ -453,12 +487,14 @@ func (s *Server) landApplyVerdicts(
 	answer := landCombinedAnswer(nil, reused, names, false)
 	landSetOutcomes(answer, l.files)
 
-	// The one rule about a model's resolution, asked of the tree this tip would land: it lands only
-	// if verify.command passed on this very tree (tree OIDs, not tips). When the tip moved, the tree
-	// is another one, and the land goes back out of the lane to be verified again. The lane never
-	// runs the verification of a model's resolution.
+	// The one rule, asked of the tree this tip would land: it lands only if verify.command passed on
+	// this very tree (tree OIDs, not tips), whoever made the resolution, whenever a verification is
+	// configured, and a model's resolution on no other. When the tip moved, the tree is another one,
+	// and the land goes back out of the lane to be verified again. The lane never runs a
+	// verification: it compares.
+	verifyRequired := s.resolveCfg.Verify.Enabled
 	var tree, verified git.ObjectID
-	if landAnswerProposes(answer) {
+	if landAnswerProposes(answer) || verifyRequired {
 		if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, answer); err != nil {
 			return landResolution{}, err
 		}
@@ -466,7 +502,7 @@ func (s *Server) landApplyVerdicts(
 			verified = tree
 		}
 	}
-	if !decideLand(answer, l.files, tree, verified) {
+	if !decideLand(answer, l.files, tree, verified, verifyRequired) {
 		need := &landNeedsResolution{tip: tip, commit: commitID, unverified: tree}
 		if tree == "" {
 			// Nothing to verify, yet not landable: a file the answer rejects. Resolving again says why.
@@ -481,7 +517,7 @@ func (s *Server) landApplyVerdicts(
 		checkedBy = s.landVerifyTrailer()
 	}
 	res, err := s.landWriteResolution(ctx, in, repo, tip, commitID, l.mergedTree, committer, identity.Actor(ctx, ""), answer, checkedBy, tree, verified != "")
-	return res, l.verifyRejected(err)
+	return res, err
 }
 
 // verifyRejected turns a resolution that the verification rejected into the unresolved land with
@@ -675,9 +711,8 @@ func landUnresolvedCause(files []*landFileState) string {
 // tree and commits it with parents [tip, commitID]; checkedBy names what checked it, if anything
 // did. The commit message carries the trailers. built is the resolved tree when the caller already
 // built it (landResolvedTree). verified says that verify.command passed on that very tree, out of
-// the lane (15.9), so that it is not run again; otherwise the operator's verification runs here,
-// in the lane, on the merged tree, before it lands: that is a resolution made by rules or by an
-// agent, which keeps its verification in the lane for now.
+// the lane (15.9). The lane runs no verification: when one is configured and the tree is not the
+// one it passed on, the resolution is refused here, closed, whatever the caller did.
 func (s *Server) landWriteResolution(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -707,12 +742,10 @@ func (s *Server) landWriteResolution(
 			return landResolution{}, err
 		}
 	}
-	// The optional verification runs on the merged tree, the resolution included, before it lands,
-	// unless it already passed on this tree out of the lane.
+	// The verification ran out of the lane, on this very tree, before it got here (15.9): no
+	// resolution lands on a tree it did not pass on, and no code path verifies in the lane.
 	if s.resolveCfg.Verify.Enabled && !verified {
-		if err := s.landVerify(ctx, repo, treeID); err != nil {
-			return landResolution{}, err
-		}
+		return landResolution{}, errors.New("a resolution reached the lane without the verification of its tree")
 	}
 
 	newTip, err := repo.WriteCommit(ctx, localrepo.WriteCommitConfig{

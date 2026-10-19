@@ -67,6 +67,9 @@ type landPreResolution struct {
 	// verdicts kept, only these are the land's now. A verdict of a file that has since changed (its
 	// key is another) is stale, and decides nothing about the land.
 	current map[landFileKey]bool
+	// verifyAll says that a verification is configured: every resolution then needs a verified tree
+	// to land, a rule's as well as a model's (15.9).
+	verifyAll bool
 }
 
 func newLandPreResolution() *landPreResolution {
@@ -90,6 +93,23 @@ func (p *landPreResolution) hasModel() bool {
 	}
 	for k, v := range p.verdicts {
 		if p.current[k] && v.file.FromModel() {
+			return true
+		}
+	}
+	return false
+}
+
+// mustVerify reports whether the land has a resolution whose landing needs a verified tree: a
+// model's, or any when a verification is configured. A stale verdict does not count.
+func (p *landPreResolution) mustVerify() bool {
+	if p == nil {
+		return false
+	}
+	if !p.verifyAll {
+		return p.hasModel()
+	}
+	for k := range p.verdicts {
+		if p.current[k] {
 			return true
 		}
 	}
@@ -230,6 +250,7 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 	defer cancel()
 
 	pre := newLandPreResolution()
+	pre.verifyAll = s.resolveCfg.Verify.Enabled
 	var need *landNeedsResolution
 	// deadline reports whether the land ran out of its own timeout, and not its caller.
 	deadline := func() bool {

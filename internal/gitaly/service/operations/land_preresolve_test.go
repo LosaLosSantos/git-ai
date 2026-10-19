@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,28 +176,45 @@ type heldLane struct {
 	release func()
 }
 
-func newHeldLane(t *testing.T) heldLane {
+// newHeldLane starts the land of a, which holds the lane. With verify, a verification is configured (it runs
+// out of the lane, 15.9): every land then needs the tree that passed, and lands one by one when the tip moves.
+func newHeldLane(t *testing.T, verify bool) heldLane {
 	t.Helper()
 
 	dir, argv := resolverScript(t, answerByCall)
 	vdir := t.TempDir()
-	// The first verification, the land of a's, waits for the release, at most a minute so that a
-	// failed test never hangs; the others pass at once.
-	verify := verifyScript(t, fmt.Sprintf(`V='%s'
+	// Every verification runs out of the lane (PLAN10 15.9) and passes at once, except when the test
+	// asks for a failure after the first. The lane is held by the land of a: the first land that
+	// applies its verdicts in it waits for the release, at most a minute so that a failed test never
+	// hangs.
+	verifyArgv := verifyScript(t, fmt.Sprintf(`V='%s'
 N=$(cat "$V/calls" 2>/dev/null || echo 0)
 N=$((N+1))
 echo "$N" > "$V/calls"
-if [ "$N" = 1 ]; then
-  i=0
-  while [ ! -f "$V/release" ] && [ "$i" -lt 600 ]; do sleep 0.1; i=$((i+1)); done
-fi
 if [ "$N" != 1 ] && [ -f "$V/fail" ]; then
   echo "tests failed"
   exit 3
 fi
 exit 0`, vdir))
+	var laneCalls atomic.Int32
+	entered, released := make(chan struct{}), make(chan struct{})
+	operationServerHooks.Store(t.Name(), func(s *Server) {
+		s.landLaneHook = func() {
+			if laneCalls.Add(1) != 1 {
+				return
+			}
+			close(entered)
+			select {
+			case <-released:
+			case <-time.After(time.Minute):
+			}
+		}
+	})
 	graft := batchingGraft()
-	graft.Land.Resolver = withVerify(enabledResolver(argv), verify, "")
+	graft.Land.Resolver = enabledResolver(argv)
+	if verify {
+		graft.Land.Resolver = withVerify(graft.Land.Resolver, verifyArgv, "")
+	}
 
 	fx := newResolveFixtureIn(t, graft,
 		entries("a", "base\n", "b", "base\n", "c", "base\n"),
@@ -210,14 +228,15 @@ exit 0`, vdir))
 	writeAnswerN(t, dir, 1, answerOf("a"))
 
 	var once sync.Once
-	release := func() {
-		once.Do(func() { require.NoError(t, os.WriteFile(filepath.Join(vdir, "release"), nil, 0o600)) })
-	}
+	release := func() { once.Do(func() { close(released) }) }
 	t.Cleanup(release)
 
 	first := landAsync(fx, fx.commit, "Land a")
-	require.Eventually(t, func() bool { return countIn(t, filepath.Join(vdir, "calls")) == 1 },
-		30*time.Second, 10*time.Millisecond, "the land of a never reached its verification")
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "the land of a never reached the lane")
+	}
 
 	return heldLane{fx: fx, dir: dir, vdir: vdir, b: b, c: c, first: first, release: release}
 }
@@ -233,14 +252,13 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 	t.Run("the resolver answers while another land holds the lane", func(t *testing.T) {
 		t.Parallel()
 
-		h := newHeldLane(t)
+		h := newHeldLane(t, false)
 		writeAnswerN(t, h.dir, 2, answerOf("b"))
 
 		second := landAsync(h.fx, h.b, "Land b")
 		require.Eventually(t, func() bool { return countIn(t, filepath.Join(h.dir, "calls")) == 2 },
 			30*time.Second, 10*time.Millisecond, "b was not resolved while the lane was held")
 		requireRunning(t, h.first, "the land of a")
-		require.Equal(t, 1, h.verifications(t))
 
 		h.release()
 		first := requireLanded(t, h.first)
@@ -261,7 +279,7 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 	t.Run("an answer that does not land never enters the lane", func(t *testing.T) {
 		t.Parallel()
 
-		h := newHeldLane(t)
+		h := newHeldLane(t, true)
 		// A model's answer for b, whose verification fails: b cannot land (15.9). The verification
 		// runs out of the lane too, while the lane is held.
 		proposal := answerOf("b")
@@ -277,7 +295,7 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 		requireMergeConflict(t, err)
 		require.Equal(t, [][]byte{[]byte("b")}, landErrorDetail(t, err).GetMergeConflict().GetConflictingFiles())
 		requireRunning(t, h.first, "the land of a")
-		require.Equal(t, 2, h.verifications(t), "a's, held in the lane, and b's, out of it")
+		require.Equal(t, 2, h.verifications(t), "a's and b's, both out of the lane")
 		require.Contains(t, packageFile(t, landConflictDetail(err), "b").GetReason(), "verification failed: exit status 3: tests failed")
 
 		// The proposal was kept although the lane was busy with a batch: it was written before the
@@ -301,7 +319,7 @@ func TestUserLand_resolvesOutOfTheLane(t *testing.T) {
 	t.Run("verdicts made before a batch are applied in it, each on the one before", func(t *testing.T) {
 		t.Parallel()
 
-		h := newHeldLane(t)
+		h := newHeldLane(t, false)
 		writeAnswerN(t, h.dir, 2, answerOf("b"))
 		writeAnswerN(t, h.dir, 3, answerOf("c"))
 

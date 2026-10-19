@@ -254,8 +254,12 @@ func (fx resolveFixture) server(t *testing.T, rcfg config.GraftResolver) *Server
 	require.NoError(t, err)
 	cache := catfile.NewCache(fx.cfg)
 	t.Cleanup(cache.Stop)
+	var pool *resolver.VerifyPool
+	if rcfg.Verify.Enabled {
+		pool = resolver.NewVerifyPool(rcfg)
+	}
 	return &Server{
-		logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client,
+		logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client, verifyPool: pool,
 		localRepoFactory: localrepo.NewFactory(testhelper.NewLogger(t), config.NewLocator(fx.cfg), gittest.NewCommandFactory(t, fx.cfg), cache),
 	}
 }

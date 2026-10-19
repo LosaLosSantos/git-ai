@@ -535,9 +535,9 @@ func TestLandApplyVerdicts_neverVerifiesAModelsResolution(t *testing.T) {
 	require.Equal(t, 1, verifyRuns(t, vdir))
 }
 
-// TestUserLand_verifiedRulesKeepTheirVerificationInTheLane: a resolution made by rules alone keeps its
-// verify.command in the lane, as before (15.9): the next step moves it.
-func TestUserLand_verifiedRulesKeepTheirVerificationInTheLane(t *testing.T) {
+// TestUserLand_verifiedRulesAreVerifiedOutOfTheLane: a resolution made by rules alone is verified like
+// any other (15.9): out of the lane, once, and the trailer names what ran.
+func TestUserLand_verifiedRulesAreVerifiedOutOfTheLane(t *testing.T) {
 	t.Parallel()
 
 	fx, _, vdir := verifiedFixture(t, validAnswer(), "grep -qx merged-a a", nil)
@@ -547,7 +547,7 @@ func TestUserLand_verifiedRulesKeepTheirVerificationInTheLane(t *testing.T) {
 	commit, _ := landedCommit(t, fx, resp)
 	require.Equal(t, 1, verifyRuns(t, vdir))
 	require.Contains(t, string(commit.GetBody()), "Graft-Resolved-By: graft-resolve/fake\n")
-	require.NotContains(t, string(commit.GetBody()), "Graft-Checked-By", "rules are unchanged")
+	require.Contains(t, string(commit.GetBody()), "Graft-Checked-By: verify:verify.sh\n", "the trailer names what ran")
 
 	failing, _, failingDir := verifiedFixture(t, validAnswer(), "exit 1", nil)
 	_, err = failing.client.UserLand(failing.ctx, failing.request("Land"))
@@ -617,7 +617,7 @@ func TestUserLand_verifiedModelResolution_aBusyRepositoryEndsInProposals(t *test
 	s.locator = config.NewLocator(fx.cfg) // the land quarantines the objects it makes
 
 	// Another land of the repository is being verified: its slot is the repository's.
-	busy, err := s.conflictResolver.AcquireVerifySlot(fx.ctx, landVerifyRepoKey(fx.repoProto))
+	busy, err := s.verifyPool.Acquire(fx.ctx, landVerifyRepoKey(fx.repoProto))
 	require.NoError(t, err)
 
 	_, err = s.landResolving(fx.ctx, fx.request("Land"), fx.committer())
@@ -637,7 +637,7 @@ func TestUserLand_verifiedModelResolution_aBusyRepositoryEndsInProposals(t *test
 	busy.Release()
 
 	// Another repository is not held back by the first one's.
-	other, err := s.conflictResolver.AcquireVerifySlot(fx.ctx, landVerifyRepoKey(&gitalypb.Repository{StorageName: "default", RelativePath: "another.git"}))
+	other, err := s.verifyPool.Acquire(fx.ctx, landVerifyRepoKey(&gitalypb.Repository{StorageName: "default", RelativePath: "another.git"}))
 	require.NoError(t, err)
 	other.Release()
 }

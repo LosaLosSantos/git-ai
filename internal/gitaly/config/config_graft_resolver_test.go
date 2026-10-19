@@ -61,13 +61,14 @@ func TestGraftResolverValidateVerify(t *testing.T) {
 	require.Equal(t, int64(9), GraftResolverVerify{MaxTreeBytes: 9}.MaxTreeBytesOrDefault())
 
 	for name, v := range map[string]GraftResolverVerify{
-		"no command":       {Enabled: true},
-		"empty program":    {Enabled: true, Command: []string{""}},
-		"bad timeout":      {Enabled: true, Command: []string{"x"}, Timeout: "soon"},
-		"zero timeout":     {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
-		"negative entries": {MaxTreeEntries: -1},
-		"negative bytes":   {MaxTreeBytes: -1},
-		"negative depth":   {MaxTreeDepth: -1},
+		"no command":           {Enabled: true},
+		"empty program":        {Enabled: true, Command: []string{""}},
+		"bad timeout":          {Enabled: true, Command: []string{"x"}, Timeout: "soon"},
+		"zero timeout":         {Enabled: true, Command: []string{"x"}, Timeout: "0s"},
+		"negative entries":     {MaxTreeEntries: -1},
+		"negative bytes":       {MaxTreeBytes: -1},
+		"negative depth":       {MaxTreeDepth: -1},
+		"depth over the bound": {MaxTreeDepth: 257},
 	} {
 		require.Error(t, GraftResolver{Verify: v}.validate(), name)
 	}
