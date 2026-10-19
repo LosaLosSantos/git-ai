@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -507,13 +508,11 @@ func TestStorageBackgroundMaintenanceCheckpoints(t *testing.T) {
 func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
 	t.Parallel()
 
-	// The daily worker starts at a minute of the clock: the next one that the
-	// server is sure to see as future.
-	start := time.Now().Add(time.Minute)
-	if start.Second() > 40 {
-		start = start.Add(time.Minute)
-	}
+	// The daily worker starts at a minute of the clock, chosen after the slow
+	// part of the setup (the node's binaries), two minutes ahead: the server
+	// must schedule it before that minute, which is checked below.
 	n := newRealNode(t)
+	start := time.Now().Add(3 * time.Minute).Truncate(time.Minute)
 	n.cfg.DailyMaintenance = config.DailyJob{
 		Hour:     uint(start.Hour()),
 		Minute:   uint(start.Minute()),
@@ -522,6 +521,14 @@ func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
 	}
 	n.cfgPath = testcfg.WriteTemporaryGitalyConfigFile(t, n.cfg)
 	n.start(t)
+	require.Eventually(t, func() bool {
+		data, err := os.ReadFile(n.logPath)
+		require.NoError(t, err)
+		return bytes.Contains(data, []byte("maintenance: daily scheduled"))
+	}, time.Minute, 100*time.Millisecond, "the server schedules its daily maintenance")
+	require.True(t, time.Now().Before(start),
+		"the server scheduled its daily maintenance after %s, the minute the test chose, so for tomorrow: it started slower than the test's two-minute margin",
+		start.Format(time.TimeOnly))
 
 	rel := n.createRepository(t)
 	onA := n.agent(t, rel)
@@ -551,7 +558,7 @@ func TestStorageHousekeepingBackfillsReviewRoots(t *testing.T) {
 			}
 		}
 		return true
-	}, 4*time.Minute, time.Second, "the daily housekeeping backfills the roots")
+	}, time.Until(start)+3*time.Minute, time.Second, "the daily housekeeping backfills the roots")
 	require.GreaterOrEqual(t, n.counter(t, "graft_review_roots_backfilled_total"), float64(len(roots)))
 	for _, root := range roots {
 		require.NotEmpty(t, n.git(t, rel, "rev-parse", "--verify", root), "the node has %s", root)
