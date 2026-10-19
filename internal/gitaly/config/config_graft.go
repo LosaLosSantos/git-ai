@@ -323,6 +323,10 @@ type GraftResolver struct {
 	// each holds a check request of up to GraftResolverMaxCheckRequestBytes. Zero means
 	// DefaultGraftResolverCheckConcurrency.
 	CheckConcurrency int `json:"check_concurrency" toml:"check_concurrency,omitempty"`
+	// ProposalTTL is how long the server keeps the proposals of a failed land
+	// (refs/graft/proposals/), as a Go duration ("168h"). Empty means
+	// DefaultGraftResolverProposalTTL.
+	ProposalTTL string `json:"proposal_ttl" toml:"proposal_ttl,omitempty"`
 }
 
 // GraftResolverVerify is the optional verification of a resolution: Command
@@ -502,6 +506,9 @@ func (r GraftResolver) validate() error {
 	if _, err := r.TimeoutOrDefault(); err != nil {
 		return err
 	}
+	if _, err := r.ProposalTTLOrDefault(); err != nil {
+		return err
+	}
 	if r.MaxFiles < 0 || r.MaxFileBytes < 0 || r.CheckConcurrency < 0 {
 		return fmt.Errorf("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")
 	}
@@ -569,6 +576,22 @@ func (r GraftResolver) CheckConcurrencyOrDefault() int {
 		return r.CheckConcurrency
 	}
 	return DefaultGraftResolverCheckConcurrency
+}
+
+// DefaultGraftResolverProposalTTL is the default of GraftResolver.ProposalTTL: a week.
+const DefaultGraftResolverProposalTTL = "168h"
+
+// ProposalTTLOrDefault parses ProposalTTL, or returns its default.
+func (r GraftResolver) ProposalTTLOrDefault() (time.Duration, error) {
+	s := r.ProposalTTL
+	if s == "" {
+		s = DefaultGraftResolverProposalTTL
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("graft land resolver: invalid proposal_ttl %q", r.ProposalTTL)
+	}
+	return d, nil
 }
 
 // MaxFilesOrDefault returns MaxFiles or its default.

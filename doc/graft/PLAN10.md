@@ -727,3 +727,92 @@ whole series under $5 real, and a run over $1.00 real stops the series until the
   whitespace counted as correct, the cases where the human changed lines outside the conflict
   regions as their own category and a rate without them, acceptance and rejections by reason, the
   flips against the previous step and R0 with an exact McNemar p-value, and the spend.
+
+## 14. The agent always resolves; the server's AI only proposes (Federico, PM-approved design)
+
+This supersedes "AI lands with trace only". The server never lands a resolution of the llm strategy
+by itself: it is a proposal, which the agent reviews, edits or replaces, and lands with its own
+resolution (UserLandRequest.resolution, Graft-Resolved-By: agent/<actor>). The deterministic
+strategies that the operator configures (trivial, union, rerere, command) are rules, not AI: a
+resolution made by rules alone still lands. The llm auto-land path is removed, not kept behind a
+flag.
+
+* **Protocol (additive).** A ResponseFile gains `"proposal": true`; graft-resolve sets it on every
+  file whose result came from the llm strategy, and only there. The server treats an answer with any
+  proposal file as not landable; it also refuses to land any answer whose resolver names the llm
+  strategy, should the flag be missing.
+* **Server.** With resolve_conflicts, a resolution by rules alone lands as today. When a file is a
+  proposal, the land fails with the LandConflict package: proposal files get OUTCOME_PROPOSED,
+  files that rules resolved keep OUTCOME_RESOLVED, and nothing lands partially. Every file with
+  content carries `LandConflictFile.proposal` (OID, mode, action, strategy, and the explanation cut
+  to 512 bytes), so that the agent can re-land rule results unchanged. No llm trailer exists any
+  more; the agent's re-land records the agent.
+* **Delivery: a hidden reference.** On a failed land with proposals the server writes the proposed
+  blobs and one commit (its tree the proposals by path, its message the tip, the commit and the
+  strategies), written into the repository itself (the land's quarantine is discarded), and updates
+  `refs/graft/proposals/<first 16 hex of sha256(branch)>/<commit>` through the same reference
+  transaction a land uses. One reference per (branch, landed commit), replaced by every failed land
+  of that commit. On every land of a branch that asks for or brings a resolution (a plain land pays
+  nothing; only those lands write proposals) the server deletes the branch's proposal references
+  older than `proposal_ttl` (default 7 days) and keeps at most 20 per branch; the agent's land of
+  the change drops its proposal. A proposal reference
+  that cannot be written fails the land with Internal, not with a package without proposals.
+* **(a) Authoritative storage mode (checked).** UserLand updates references through the
+  reference-transaction hook (STORAGE.md, the voter): the proposal reference and its expiry
+  deletions go through it like the branch, so in authoritative mode each is a changeset committed
+  with the database compare-and-swap, with the pack of its objects uploaded before. They are not
+  changelog entries: `changelog.ParseUpdates` and `corestore.IsChangelogRef` admit only refs/heads/
+  and refs/tags/. The objects reach other nodes with the changeset pack, so the agent can read them
+  on any node.
+* **(b) Visibility and access (checked).** refs/graft/ is not hidden today:
+  `git.InternalRefPrefixes` lists refs/environments, refs/keep-around, refs/merge-requests,
+  refs/pipelines, refs/remotes and refs/tmp only. `refs/graft/proposals/` is added as an
+  InternalReferenceTypeHidden prefix, so receive-pack hides it (no client can create, update or
+  delete it by a push) and upload-pack does not advertise it. Agents cannot write references
+  directly (WriteRef, UpdateReferences and DeleteRefs are never allowed for agents,
+  AGENT-SECURITY.md). The agent reads the proposal with ObjectService.GetObjects, which agents may
+  call and which reads objects by OID with git cat-file, without a reachability check. Observation,
+  left as it is: graft-verify's refs/graft/green/ is not hidden either (advertised and pushable).
+* **CLI and SDK.** `graft land --conflicts-dir DIR` writes each proposal to DIR/proposals/<path> (a
+  proposal that cannot be read is reported and fails nothing else) and prints which files have one;
+  `--resolved` is unchanged, so a proposal copied into DIR/files lands as the agent's. The SDK's
+  ConflictSides gains the proposal (content, strategy, explanation), and ResolutionFromProposals
+  starts a resolution from them (ResolutionFor is unchanged).
+* **The PM's four conditions (implemented).**
+  1. One writer, one prefix: landUpdateProposalRefs is the only function that writes these
+     references. It refuses any name but refs/graft/proposals/<16 hex>/<object ID> before git
+     runs, and updates as the server (no request identity), so the agent's policy does not judge
+     the server's write. It is called only by landWriteProposals and the pruning.
+  2. refs/graft/** is reserved: the reference-transaction hook refuses any update under it by an
+     agent identity, whatever the policy says and even with no policy, so a push, UpdateReferences,
+     DeleteRefs, WriteRef or an operation RPC fails. CheckAgentPolicy refuses it early too.
+     graft-verify writes refs/graft/green/ with the shared token, which is not an agent.
+  3. Hidden: refs/graft/proposals/ is hidden from advertisement and push. Two points are not
+     covered, stated here: graft-verify's refs/graft/green/ is still advertised (hiding it changes
+     graft-verify's users and needs its own decision), and an agent's read accessors (ListRefs,
+     FindRefsByOID and the like) still list the names and OIDs of refs/graft/ references (no
+     content; the blobs are read by OID as before). Filtering those is a change of the ref service
+     for agents, proposed as its own step.
+  4. Trace: the proposals' commit carries `Requested-By: <actor>` (the agent, or the user ID of the
+     request) and the resolver; the server logs the reference, the actor and the resolver. The
+     update itself is the server's.
+  An end-to-end test runs the real graft-resolve with a model behind the command provider, under the
+  example policy that gives the agent no refs/graft/ rule: the server proposes, the SDK reads the
+  proposal, the agent lands it as its own (Graft-Resolved-By: agent/<actor>), and the proposal
+  reference is dropped.
+* **Amendment: Federico's product decision (2026-10-19, relayed by the PM).** "When the server AI
+  is configured, the server always tries to resolve, and it LANDS its resolution by itself ONLY if
+  the proposal passes every deterministic check: syntax, anchors, no markers, and the composition
+  check from §15 (keeps both changes, no duplicated both-added lines). There is still no
+  self-declared confidence. If any check fails, the resolution goes to the agent as a proposal,
+  with its report. If no AI is configured, the agent always resolves."
+  * Gated on §15: until the composition check exists and is measured, a model's resolution stays a
+    proposal, as implemented above. The composition check is what turns a proposal into a landable
+    resolution; the rule "the server never lands llm output" becomes "the server lands llm output
+    only when the composition check passed in this process", in one function, with tests.
+  * Before it is enabled: the coverage (how many land by themselves) and the precision (how many of
+    those are wrong), per language with a confidence interval, on the 300 cases; the default goes on
+    only with Federico's OK after he sees them.
+  * An AI-landed merge is signed Graft-Resolved-By: llm/<model> and Graft-Checked-By:
+    syntax,composition, and the trace records the proposal and the report.
+  * Everything above still applies: a resolution that fails a check is a proposal.

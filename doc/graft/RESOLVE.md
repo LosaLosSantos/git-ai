@@ -74,8 +74,9 @@ A client asks for resolution per call:
   resolved paths and the resolver name. On a conflict the server did not
   resolve, `sdk.LandConflict(err)` returns the conflict package,
   `Repo.ConflictSides` reads the sides (a side that cannot be read is nil,
-  with its reason in `Unreadable`), and `LandOptions.Resolution`
-  (start from `sdk.ResolutionFor`) lands the agent's resolution. `Land`
+  with its reason in `Unreadable`) and the proposal of a file that has one,
+  and `LandOptions.Resolution` (start from `sdk.ResolutionFor`, or from the
+  proposals with `sdk.ResolutionFromProposals`) lands the agent's resolution. `Land`
   refuses a resolution whose request exceeds `sdk.MaxLandRequestBytes`
   (4 MiB) before sending it.
 - CLI: `graft land --resolve`, `graft commit --land BRANCH --resolve`.
@@ -83,7 +84,8 @@ A client asks for resolution per call:
   `--conflicts-dir DIR` writes it: `DIR/files/<path>` is the merge with git's
   diff3 markers (the clean changes of both sides applied), the sides are in
   `DIR/sides/base/<path>`, `DIR/sides/ours/<path>` and
-  `DIR/sides/theirs/<path>`, the package in `DIR/conflict.json`. Each
+  `DIR/sides/theirs/<path>`, a proposal in `DIR/proposals/<path>` (copy it
+  over the file to land it as yours), the package in `DIR/conflict.json`. Each
   directory mirrors the tree of the merge, so no repository path can collide
   with a side, another path's side or the package. A side the package gives no
   object ID (see `unavailable` below), or that the server cannot return, is
@@ -131,7 +133,7 @@ A client asks for resolution per call:
    [What is never sent](#what-is-never-sent)), sends the others to the
    resolver in one request (protocol below), and validates the answer (see
    [Validation](#validation)).
-4. Only when every file is resolved, it builds the merged tree from the
+4. Only when every file is resolved by rules alone, it builds the merged tree from the
    merge-tree result, writes the resolved
    files as new blobs or deletes them, and creates a merge commit with parents
    `[tip, commit]`. The message is `merge_message` or
@@ -149,11 +151,40 @@ A client asks for resolution per call:
    against the new tip.
 
 Otherwise (resolution disabled or refused, a file that is never sent, an
-invalid answer, a timeout, an unresolvable file) the land fails with the
-normal `merge_conflict` error, the reason is logged, and the error carries the
-conflict package as a second detail (see
+invalid answer, a timeout, an unresolvable file, or a file a model resolved)
+the land fails with the normal `merge_conflict` error, the reason is logged,
+and the error carries the conflict package as a second detail (see
 [The conflict package and the re-land](#the-conflict-package-and-the-re-land)).
 Nothing lands partially: the branch is never left in a partial state.
+
+### Proposals: a model's resolution never lands
+
+The server never lands what a model resolved: the agent always resolves
+(PLAN10 14). graft-resolve marks every file its `llm` strategy resolved as a
+proposal (`"proposal": true`), and the server treats an answer as proposing
+when a file is marked, or when the resolver names the `llm` strategy without
+marking any. Such a land fails with the package: the model's files are
+`PROPOSED`, the files the rules resolved keep `RESOLVED`, and every file the
+answer resolved carries its `proposal` (action, blob OID, mode, resolver, and
+the explanation cut to 512 bytes). An answer that does not land for another
+reason (a file left to the agent, a mode no side has) is kept the same way, so
+that the agent can land the rules' files as they are.
+
+The proposals are kept under a hidden reference,
+`refs/graft/proposals/<first 16 hex of sha256(branch)>/<commit>`, named in the
+package's `proposal_ref`: a commit whose tree holds the proposed files by
+path, with parents `[tip, commit]`, whose message names the resolver and
+`Requested-By:` the actor of the land. One reference per branch and landed
+commit, replaced by every failed land of that commit. The server writes it
+itself, through the reference transaction like any update (and so the storage
+core in authoritative mode), and refuses to write any other reference this
+way. The agent reads the proposals by OID with `GetBlobs`; it cannot see the
+reference in an advertisement nor push to it, and no agent may update
+anything under `refs/graft/`, whatever the policy says. Every land that asks
+for resolution or brings one prunes the branch's proposals older than
+`proposal_ttl` (default 7 days) and keeps at most 20; the agent's land of the
+change drops that change's proposal. A proposal that cannot be written fails
+the land with `Internal`, never with a package that lacks it.
 
 Every resolution is logged at info level as `graft: conflicts of land
 resolved`, with the branch, the tip, the landed commit, the merge commit, the
@@ -375,7 +406,9 @@ the error unchanged. The package holds:
 - both commit messages, cut to 4 KiB each, with `messages_truncated`;
 - `reason`, when the server did not attempt the request at all;
 - every conflicting file: the path, the kind, each side's mode and blob OID,
-  the conflicting hunks, the outcome and its reason (cut to 512 bytes);
+  the conflicting hunks, the outcome and its reason (cut to 512 bytes), and
+  the resolver's `proposal`, when it made one;
+- `proposal_ref`, the hidden reference that keeps the proposals;
 - `messages`: git's messages about the merge (the paths, the type such as
   `CONFLICT (rename/delete)`, the text), which also describe a conflict that
   has no conflicting file.
@@ -405,7 +438,8 @@ sides read and 64 Mi cells of diff work for its hunks, and 4 MiB encoded
 | `NOT_SENT` | never sent (see above); the reason says why |
 | `REJECTED` | the result failed a rule or a check, e.g. a syntax error at line:column |
 | `FAILED` | the resolver failed on it: a model error, `AI budget exhausted`, no strategy applied |
-| `RESOLVED` | resolved, but the land failed because another file was not |
+| `RESOLVED` | resolved by rules, but the land failed because another file was not; see `proposal` |
+| `PROPOSED` | a model resolved it: proposed, never landed; see `proposal` |
 | `NOT_ATTEMPTED` | the request was not attempted; see `reason` |
 
 The agent reads the sides by OID with `GetBlobs`, resolves every file, and

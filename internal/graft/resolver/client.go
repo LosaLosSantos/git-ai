@@ -128,6 +128,9 @@ func New(cfg config.GraftResolver) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if _, err := cfg.ProposalTTLOrDefault(); err != nil {
+		return nil, err
+	}
 
 	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 {
 		return nil, errors.New("graft land resolver: max_files, max_file_bytes and check_concurrency must not be negative")

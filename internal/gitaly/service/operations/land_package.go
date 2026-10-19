@@ -88,6 +88,9 @@ type landFileState struct {
 	hunksOmitted string
 	// unavailable is set when a present side's blob is not kept in the repository.
 	unavailable bool
+	// proposal is the resolver's resolution of the file in a land that did not happen, kept under
+	// the proposal reference of the package (landWriteProposals).
+	proposal *gitalypb.LandConflictProposal
 }
 
 // sent reports whether the file is sent to the resolver.
@@ -139,8 +142,13 @@ func (e *landUnresolvedError) Unwrap() error {
 // landWithPackage adds the conflict package of resolveErr, when it carries one, to the merge
 // conflict error of the land as a second detail, after UserLandError. Clients that know only
 // UserLandError see the error unchanged. A package that cannot be built (a side that cannot be
-// read) is an internal error: the merge conflict alone would hide it.
+// read), or a resolver's answer that cannot be kept as proposals, is an internal error: the merge
+// conflict alone would hide it.
 func landWithPackage(ctx context.Context, mergeConflict, resolveErr error) error {
+	var proposalsErr *landProposalsError
+	if errors.As(resolveErr, &proposalsErr) {
+		return structerr.NewInternal("%w", proposalsErr)
+	}
 	var unresolved *landUnresolvedError
 	var se structerr.Error
 	if !errors.As(resolveErr, &unresolved) || !errors.As(mergeConflict, &se) {
@@ -197,6 +205,7 @@ func (l landListing) conflictPackage(ctx context.Context, reason string) (*gital
 		CommitMessage:     cm,
 		MessagesTruncated: tipCut || commitCut,
 		Reason:            landCutString(reason, landPackageReasonBytes),
+		ProposalRef:       l.proposalRef.String(),
 	}
 	for i, m := range l.messages {
 		if i == landMaxPackageMessages {
@@ -223,6 +232,7 @@ func (l landListing) conflictPackage(ctx context.Context, reason string) (*gital
 			Outcome:         f.outcome,
 			Reason:          landCutString(f.reason, landPackageReasonBytes),
 			SyntaxUnchecked: f.syntaxUnchecked,
+			Proposal:        f.proposal,
 		}
 		f.unavailable = false
 		for _, s := range []struct {

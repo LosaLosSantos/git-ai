@@ -20,6 +20,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
@@ -207,7 +208,12 @@ func (fx resolveFixture) server(t *testing.T, rcfg config.GraftResolver) *Server
 
 	client, err := resolver.New(rcfg)
 	require.NoError(t, err)
-	return &Server{logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client}
+	cache := catfile.NewCache(fx.cfg)
+	t.Cleanup(cache.Stop)
+	return &Server{
+		logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client,
+		localRepoFactory: localrepo.NewFactory(testhelper.NewLogger(t), config.NewLocator(fx.cfg), gittest.NewCommandFactory(t, fx.cfg), cache),
+	}
 }
 
 func (fx resolveFixture) request(message string) *gitalypb.UserLandRequest {

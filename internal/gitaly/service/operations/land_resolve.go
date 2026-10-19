@@ -134,8 +134,11 @@ func (s *Server) resolveLandConflicts(
 
 	// answer is the resolver's accepted answer, the only thing ever written. A refusal is never
 	// written, whatever its outcomes say: answer stays nil, and the land fails with the package.
+	// An answer that holds a model's resolution is never landed: it is kept as proposals for the
+	// agent, who lands its own resolution (PLAN10 14).
 	var answer *resolver.Response
 	var resolveErr error
+	proposes := false
 	if len(sent) > 0 {
 		req := resolver.Request{
 			Version: resolver.ProtocolVersion,
@@ -165,6 +168,10 @@ func (s *Server) resolveLandConflicts(
 			landFailSent(files, gitalypb.LandConflictFile_OUTCOME_FAILED, fmt.Sprintf("the resolver's answer names an invalid resolver %q", resp.Resolver))
 		default:
 			answer = resp
+			proposes = landAnswerProposes(resp)
+			// A resolver that names the llm strategy but marks no file is taken to have proposed
+			// every file: the mark may be missing, never the other way round.
+			flagged := landAnswerFlagsProposals(resp)
 			written := make(map[string]resolver.ResponseFile, len(resp.Files))
 			for _, rf := range resp.Files {
 				written[rf.Path] = rf
@@ -173,14 +180,28 @@ func (s *Server) resolveLandConflicts(
 				if !f.sent() {
 					continue
 				}
+				rf := written[f.conflict.path]
 				f.outcome = gitalypb.LandConflictFile_OUTCOME_RESOLVED
-				if err := landModeOfSides(f.conflict, written[f.conflict.path]); err != nil {
+				switch err := landModeOfSides(f.conflict, rf); {
+				case err != nil:
 					f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
+				case rf.Proposal || (proposes && !flagged):
+					f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
 				}
 			}
 		}
 	}
 
+	// An answer that does not land, because a model made part of it or another file is left, is
+	// kept for the agent: the files that rules resolved can be landed as they are. Failing to keep
+	// it fails the land with Internal, not with a package that lacks the proposals.
+	if answer != nil && (proposes || !landAllResolved(files)) {
+		ref, err := s.landWriteProposals(ctx, in, l, answer, committer)
+		if err != nil {
+			return landResolution{}, &landProposalsError{err: err}
+		}
+		l.proposalRef = ref
+	}
 	if answer == nil || !landAllResolved(files) {
 		return landResolution{}, l.unresolved("", landUnresolvedCause(files), resolveErr)
 	}
@@ -223,6 +244,9 @@ type landListing struct {
 	// conflicting file (a directory rename split): then files is empty and only messages
 	// describe it.
 	messages []landMergeMessage
+	// proposalRef is the reference that keeps the resolver's answer of a land that did not
+	// happen (landWriteProposals), empty when there is none.
+	proposalRef git.ReferenceName
 }
 
 // landNoConflictingFiles is the reason of a merge that is unclean without a conflicting file.

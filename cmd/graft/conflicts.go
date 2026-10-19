@@ -29,6 +29,10 @@ import (
 //	DIR/sides/base/<path>     the three sides; a side that is absent or cannot be read has no file
 //	DIR/sides/ours/<path>
 //	DIR/sides/theirs/<path>
+//	DIR/proposals/<path>      the resolver's proposal for the path, when it made one (a model's
+//	                          resolution, which the server never lands, or the rules' of a land
+//	                          that failed for another file); copy it over DIR/files/<path> to
+//	                          land it as yours
 //	DIR/conflict.json         the conflict package
 //
 // Each directory mirrors the tree of the merge, so that no repository path, whatever its name, can
@@ -36,9 +40,10 @@ import (
 // lands the files of DIR/files as the resolution: a path whose file is present is written, one
 // whose file is absent is deleted.
 const (
-	conflictsFilesDir = "files"
-	conflictsSidesDir = "sides"
-	conflictsPackage  = "conflict.json"
+	conflictsFilesDir     = "files"
+	conflictsSidesDir     = "sides"
+	conflictsProposalsDir = "proposals"
+	conflictsPackage      = "conflict.json"
 )
 
 // conflictSides are the sides of a conflicting file, in the order of the package.
@@ -95,7 +100,7 @@ func conflictPath(dir, sub, p string) (string, error) {
 // Two paths that this file system takes for the same file (such as names that differ in case on a
 // case-insensitive one) are an error, since one would overwrite the other.
 func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandConflict, dir string, out io.Writer) error {
-	for _, sub := range []string{conflictsFilesDir, conflictsSidesDir, conflictsPackage} {
+	for _, sub := range []string{conflictsFilesDir, conflictsSidesDir, conflictsProposalsDir, conflictsPackage} {
 		if _, err := os.Lstat(filepath.Join(dir, sub)); err == nil {
 			return fmt.Errorf("%s already holds a conflicts directory (%s): land it with --resolved, or remove it", dir, sub)
 		} else if !errors.Is(err, fs.ErrNotExist) {
@@ -142,6 +147,9 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 		if err := create(target, p, content); err != nil {
 			return err
 		}
+		if err := writeProposal(out, dir, f, blobs, missing, create); err != nil {
+			return err
+		}
 	}
 
 	raw, err := protojson.MarshalOptions{Multiline: true}.Marshal(c)
@@ -149,6 +157,39 @@ func writeConflicts(ctx context.Context, ws *workspace.Workspace, c *gitalypb.La
 		return err
 	}
 	return create(filepath.Join(dir, conflictsPackage), conflictsPackage, append(raw, '\n'))
+}
+
+// writeProposal writes the resolver's proposal of f, if it has one, to DIR/proposals/<path>, and
+// says so. A proposal to delete the path has no file; a proposal that cannot be read is reported
+// and fails nothing else.
+func writeProposal(out io.Writer, dir string, f *gitalypb.LandConflictFile, blobs map[string][]byte, missing map[string]string, create func(target, p string, data []byte) error) error {
+	prop := f.GetProposal()
+	if prop == nil {
+		return nil
+	}
+	p := string(f.GetPath())
+	by := displayText(prop.GetResolver())
+	if prop.GetAction() == "delete" {
+		fmt.Fprintf(out, "  %s: %s proposes to delete it\n", displayText(p), by)
+		return nil
+	}
+	b, ok := blobs[prop.GetOid()]
+	if !ok {
+		fmt.Fprintf(out, "  %s: the proposal %s of %s cannot be read: %s\n", displayText(p), shortOID(prop.GetOid()), by, displayText(missing[prop.GetOid()]))
+		return nil
+	}
+	if b == nil {
+		b = []byte{}
+	}
+	target, err := conflictPath(dir, conflictsProposalsDir, p)
+	if err != nil {
+		return err
+	}
+	if err := create(target, p, b); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "  %s: %s proposes %s\n", displayText(p), by, filepath.ToSlash(filepath.Join(conflictsProposalsDir, p)))
+	return nil
 }
 
 // conflictsWriter creates the files of a conflicts directory, each once.
@@ -185,9 +226,9 @@ func (w conflictsWriter) create(target, p string, data []byte) error {
 	return f.Close()
 }
 
-// fetchSides reads the sides of the package that have an object ID, all at once. When the server
-// cannot return them all, it reads them one by one, so that a side it cannot return costs only that
-// side: missing gives the error of each side that could not be read.
+// fetchSides reads the sides and the proposals of the package that have an object ID, all at once.
+// When the server cannot return them all, it reads them one by one, so that a blob it cannot return
+// costs only that blob: missing gives the error of each one that could not be read.
 func fetchSides(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandConflict) (map[string][]byte, map[string]string) {
 	var oids []string
 	seen := map[string]bool{}
@@ -197,6 +238,10 @@ func fetchSides(ctx context.Context, ws *workspace.Workspace, c *gitalypb.LandCo
 				seen[oid] = true
 				oids = append(oids, oid)
 			}
+		}
+		if oid := f.GetProposal().GetOid(); oid != "" && !seen[oid] {
+			seen[oid] = true
+			oids = append(oids, oid)
 		}
 	}
 	missing := map[string]string{}

@@ -59,6 +59,14 @@ These can never be enabled, not even through `graft.agent_rpcs`:
 - `CleanupService`, `ObjectPoolService`, `HookService`, `InternalGitaly`,
   `PartitionService`.
 
+Whatever the RPC and whatever the policy says, an agent never creates,
+updates or deletes a reference under `refs/graft/`: the reference-transaction
+hook refuses it, so a push, `UpdateReferences`, `DeleteRefs`, `WriteRef` or an
+operation RPC that would do so fails. The namespace is the server's: the
+proposals of a land (`refs/graft/proposals/`, hidden from advertisement and
+push, written by the server) and graft-verify's green references (written with
+the shared token).
+
 Every other RPC that is not on the allowlist (for example the other
 `OperationService` RPCs such as `UserMergeBranch`, or `SSHService`) is denied
 by default and can be enabled with `graft.agent_rpcs`.

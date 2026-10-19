@@ -99,12 +99,14 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 		r    GraftResolver
 		want string
 	}{
-		"empty command":       {GraftResolver{Command: []string{""}}, "empty command"},
-		"url without scheme":  {GraftResolver{URL: "resolver.example/resolve"}, "http or https URL with a host"},
-		"url of another kind": {GraftResolver{URL: "ftp://resolver.example/"}, "http or https URL with a host"},
-		"url without host":    {GraftResolver{URL: "http:///resolve"}, "http or https URL with a host"},
-		"missing token file":  {GraftResolver{URL: "https://resolver.example/", TokenFile: filepath.Join(dir, "absent")}, "read token file"},
-		"empty token file":    {GraftResolver{URL: "https://resolver.example/", TokenFile: empty}, "is empty"},
+		"empty command":               {GraftResolver{Command: []string{""}}, "empty command"},
+		"url without scheme":          {GraftResolver{URL: "resolver.example/resolve"}, "http or https URL with a host"},
+		"url of another kind":         {GraftResolver{URL: "ftp://resolver.example/"}, "http or https URL with a host"},
+		"url without host":            {GraftResolver{URL: "http:///resolve"}, "http or https URL with a host"},
+		"missing token file":          {GraftResolver{URL: "https://resolver.example/", TokenFile: filepath.Join(dir, "absent")}, "read token file"},
+		"empty token file":            {GraftResolver{URL: "https://resolver.example/", TokenFile: empty}, "is empty"},
+		"proposal_ttl not a duration": {GraftResolver{Command: []string{"graft-resolve"}, ProposalTTL: "a week"}, "proposal_ttl"},
+		"proposal_ttl zero":           {GraftResolver{Command: []string{"graft-resolve"}, ProposalTTL: "0s"}, "proposal_ttl"},
 		"negative check_concurrency": {
 			GraftResolver{Command: []string{"graft-resolve"}, CheckConcurrency: -1}, "must not be negative",
 		},
@@ -120,6 +122,9 @@ func TestGraftResolverValidateBuildable(t *testing.T) {
 		})
 	}
 
+	ttl, err := GraftResolver{}.ProposalTTLOrDefault()
+	require.NoError(t, err)
+	require.Equal(t, "168h0m0s", ttl.String())
 	require.Equal(t, DefaultGraftResolverCheckConcurrency, GraftResolver{}.CheckConcurrencyOrDefault())
 	require.Equal(t, 5, GraftResolver{CheckConcurrency: 5}.CheckConcurrencyOrDefault())
 }

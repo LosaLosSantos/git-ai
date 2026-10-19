@@ -122,6 +122,14 @@ func testInfoRefsUploadPackInternalRefs(t *testing.T, ctx context.Context) {
 				"refs/heads/main\n",
 			},
 		},
+		{
+			// The proposals of a land (PLAN10 14) are read by object ID only.
+			ref: "refs/graft/proposals/0123456789abcdef/1",
+			expectedAdvertisements: []string{
+				"HEAD",
+				"refs/heads/main\n",
+			},
+		},
 	} {
 		t.Run(tc.ref, func(t *testing.T) {
 			repo, repoPath := gittest.CreateRepository(t, ctx, cfg)

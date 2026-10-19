@@ -24,10 +24,25 @@ func LandConflict(err error) (*gitalypb.LandConflict, bool) {
 
 // ConflictSides are the contents of the sides of a conflicting file. An absent side is nil, and so
 // is a side that cannot be read: Unreadable gives the reason of each, by side ("base", "ours",
-// "theirs").
+// "theirs"), and "proposal" for a proposal whose content cannot be read.
 type ConflictSides struct {
 	Base, Ours, Theirs []byte
 	Unreadable         map[string]string
+	// Proposal is the resolver's resolution of the file, when it made one: a model's, which the
+	// server never lands (OUTCOME_PROPOSED), or the rules' in a land that failed for another file.
+	// Land it, edited or not, as your own (ResolutionFromProposals).
+	Proposal *Proposal
+}
+
+// Proposal is the resolver's resolution of one conflicting file.
+type Proposal struct {
+	// Delete proposes to delete the path; otherwise Content is written with Mode. Content is nil
+	// when it cannot be read (ConflictSides.Unreadable["proposal"]).
+	Delete  bool
+	Mode    string
+	Content []byte
+	// Resolver names what made it; Explanation is the resolver's, cut to 512 bytes.
+	Resolver, Explanation string
 }
 
 // ConflictSides reads the sides of every file of a conflict package, by path, with GetObjects. A
@@ -43,6 +58,10 @@ func (r *Repo) ConflictSides(ctx context.Context, c *gitalypb.LandConflict) (map
 				seen[oid] = true
 				oids = append(oids, oid)
 			}
+		}
+		if oid := f.GetProposal().GetOid(); oid != "" && !seen[oid] {
+			seen[oid] = true
+			oids = append(oids, oid)
 		}
 	}
 	data := make(map[string][]byte, len(oids))
@@ -80,6 +99,21 @@ func (r *Repo) ConflictSides(ctx context.Context, c *gitalypb.LandConflict) (map
 			}
 		}
 		cs := ConflictSides{Base: sides[0], Ours: sides[1], Theirs: sides[2]}
+		if prop := f.GetProposal(); prop != nil {
+			cs.Proposal = &Proposal{Delete: prop.GetAction() == "delete", Resolver: prop.GetResolver(), Explanation: prop.GetExplanation()}
+			if !cs.Proposal.Delete {
+				cs.Proposal.Mode = prop.GetMode()
+				switch {
+				case prop.GetOid() == "" || missing[prop.GetOid()]:
+					unreadable["proposal"] = "the blob " + prop.GetOid() + " of the proposal is missing from the repository"
+				default:
+					cs.Proposal.Content = data[prop.GetOid()]
+					if cs.Proposal.Content == nil {
+						cs.Proposal.Content = []byte{}
+					}
+				}
+			}
+		}
 		if len(unreadable) > 0 {
 			cs.Unreadable = unreadable
 		}
@@ -110,6 +144,25 @@ type ResolvedFile struct {
 // file yet.
 func ResolutionFor(c *gitalypb.LandConflict) *Resolution {
 	return &Resolution{Tip: c.GetTip(), Commit: c.GetCommit()}
+}
+
+// ResolutionFromProposals returns the resolution of the conflicts of c that takes every readable
+// proposal of sides (ConflictSides) as it is. The paths without one are left out: add them, and
+// review or edit the proposals, before landing it. The proposals land as yours.
+func ResolutionFromProposals(c *gitalypb.LandConflict, sides map[string]ConflictSides) *Resolution {
+	res := ResolutionFor(c)
+	for _, f := range c.GetFiles() {
+		p := string(f.GetPath())
+		prop := sides[p].Proposal
+		switch {
+		case prop == nil:
+		case prop.Delete:
+			res.Files = append(res.Files, ResolvedFile{Path: p, Delete: true})
+		case prop.Content != nil:
+			res.Files = append(res.Files, ResolvedFile{Path: p, Mode: prop.Mode, Content: prop.Content})
+		}
+	}
+	return res
 }
 
 // toProto returns the resolution as the request field.

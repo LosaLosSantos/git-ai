@@ -205,10 +205,13 @@ type Response struct {
 }
 
 // ResponseFile is the resolution of one conflicting path. Content is base64
-// on the wire and is only meaningful for ActionWrite.
+// on the wire and is only meaningful for ActionWrite. Proposal marks a
+// resolution made by a model: the server never lands it, it proposes it to the
+// agent (PLAN10 14).
 type ResponseFile struct {
-	Path    string `json:"path"`
-	Action  string `json:"action"`
-	Mode    string `json:"mode,omitempty"`
-	Content []byte `json:"content,omitempty"`
+	Path     string `json:"path"`
+	Action   string `json:"action"`
+	Mode     string `json:"mode,omitempty"`
+	Content  []byte `json:"content,omitempty"`
+	Proposal bool   `json:"proposal,omitempty"`
 }

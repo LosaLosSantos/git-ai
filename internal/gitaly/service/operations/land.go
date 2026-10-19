@@ -82,13 +82,19 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	}
 
 	if s.landBatchable(ctx, in) {
-		return s.userLandBatched(ctx, in, committer, precheck)
+		resp, err := s.userLandBatched(ctx, in, committer, precheck)
+		if err != nil {
+			return nil, err
+		}
+		s.landPruneAfterLand(ctx, in)
+		return resp, nil
 	}
 
 	resp, err := s.landWithRetries(ctx, in, committer, precheck)
 	if err != nil {
 		return nil, err
 	}
+	s.landPruneAfterLand(ctx, in)
 
 	// A request that lands alone is a batch of one.
 	resp.BatchSize = 1

@@ -1310,6 +1310,10 @@ message LandConflict {
   string reason = 8;
   // messages are the messages of the merge about its conflicts, at most 1000.
   repeated LandConflictMessage messages = 9;
+  // proposal_ref is the hidden reference that keeps the proposals of the package
+  // (refs/graft/proposals/...), empty when no file has a proposal. Its blobs are
+  // read by the oids of LandConflictProposal.
+  string proposal_ref = 10;
 }
 
 // LandConflictFile is one conflicting file of a LandConflict.
@@ -1345,6 +1349,9 @@ message LandConflictFile {
     // OUTCOME_NOT_ATTEMPTED: the request was not resolved at all (see
     // LandConflict.reason).
     OUTCOME_NOT_ATTEMPTED = 5;
+    // OUTCOME_PROPOSED: a model resolved the file; the server never lands a
+    // model's resolution, it proposes it (see proposal).
+    OUTCOME_PROPOSED = 6;
   }
   // path is the path of the conflict in the merged tree.
   bytes path = 1;
@@ -1371,6 +1378,26 @@ message LandConflictFile {
   // than a file lists, or a package over its size bound. It is empty when hunks is
   // complete, and for the kinds of conflict that have no hunks.
   string hunks_omitted = 10;
+  // proposal is the resolution the resolver made of the file, for a file that a
+  // model proposed (OUTCOME_PROPOSED) or that the rules resolved in a land that
+  // failed for another file (OUTCOME_RESOLVED), so that the agent can land it as
+  // it is or edit it.
+  LandConflictProposal proposal = 11;
+}
+
+// LandConflictProposal is the resolver's resolution of one conflicting file.
+message LandConflictProposal {
+  // action is "write" or "delete".
+  string action = 1;
+  // oid is the blob of the resolved content, for a write; it is kept in the
+  // repository by LandConflict.proposal_ref.
+  string oid = 2;
+  // mode is the file mode of a write.
+  string mode = 3;
+  // resolver names what made it: the resolver and its strategies.
+  string resolver = 4;
+  // explanation is the resolver's explanation, cut to 512 bytes.
+  string explanation = 5;
 }
 
 // LandConflictSide is one side of a conflicting file; its content is read by oid.

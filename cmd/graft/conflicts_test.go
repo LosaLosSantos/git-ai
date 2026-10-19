@@ -204,6 +204,36 @@ func TestReadResolutionAcceptsAPointerLineOfTheSides(t *testing.T) {
 	require.Len(t, res.Files, 1)
 }
 
+// TestWriteProposal: a proposal is written to DIR/proposals/<path> and named on the output; a
+// proposal to delete has no file; one that cannot be read is reported and fails nothing.
+func TestWriteProposal(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	w := conflictsWriter{written: map[string]string{}}
+	blobs := map[string][]byte{"p1": []byte("proposed\n")}
+	missing := map[string]string{"p2": "the server did not return it"}
+	var out strings.Builder
+	for _, f := range []*gitalypb.LandConflictFile{
+		{Path: []byte("a/x.go"), Proposal: &gitalypb.LandConflictProposal{Action: "write", Oid: "p1", Mode: "100644", Resolver: "graft-resolve/llm"}},
+		{Path: []byte("gone.go"), Proposal: &gitalypb.LandConflictProposal{Action: "delete", Resolver: "graft-resolve/trivial"}},
+		{Path: []byte("lost.go"), Proposal: &gitalypb.LandConflictProposal{Action: "write", Oid: "p2", Mode: "100644", Resolver: "graft-resolve/llm"}},
+		{Path: []byte("none.go")},
+	} {
+		require.NoError(t, writeProposal(&out, dir, f, blobs, missing, w.create))
+	}
+	content, err := os.ReadFile(filepath.Join(dir, "proposals", "a", "x.go"))
+	require.NoError(t, err)
+	require.Equal(t, "proposed\n", string(content))
+	require.NoFileExists(t, filepath.Join(dir, "proposals", "gone.go"))
+	require.NoFileExists(t, filepath.Join(dir, "proposals", "lost.go"))
+	require.NoFileExists(t, filepath.Join(dir, "proposals", "none.go"))
+	require.Contains(t, out.String(), "a/x.go: graft-resolve/llm proposes proposals/a/x.go")
+	require.Contains(t, out.String(), "gone.go: graft-resolve/trivial proposes to delete it")
+	require.Contains(t, out.String(), "lost.go: the proposal p2 of graft-resolve/llm cannot be read: the server did not return it")
+	require.NotContains(t, out.String(), "none.go")
+}
+
 // TestReadResolutionModes: the mode is the first file mode of ours, theirs and the base; a path
 // that is a file on none of its sides (a submodule) can only be deleted.
 func TestReadResolutionModes(t *testing.T) {
