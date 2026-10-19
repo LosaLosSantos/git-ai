@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -179,6 +180,7 @@ func TestLookupLand(t *testing.T) {
 	t.Run("without a log", func(t *testing.T) {
 		_, found := lookup(t, repoPath, "refs/heads/main", landOID(1))
 		require.False(t, found)
+		require.NoDirExists(t, filepath.Join(repoPath, dirName), "a lookup writes nothing without a log")
 	})
 
 	first := appendLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
@@ -458,6 +460,25 @@ func TestLandsIndexRecovers(t *testing.T) {
 		record, found := lookup(t, repoPath, "refs/heads/main", landOID(10))
 		require.True(t, found)
 		require.Equal(t, LandRecord{Sequence: seqs[0], Landed: landOID(11)}, record)
+	})
+
+	t.Run("an index of a log that is gone answers nothing", func(t *testing.T) {
+		repoPath, seqs := setUp(t)
+		requireAll(t, repoPath, seqs)
+
+		// The repository is created again at the same path, without a log yet: the index of
+		// this process and the file are of the old log.
+		require.NoError(t, os.Remove(Path(repoPath)))
+		forgetLog(t, repoPath)
+		_, found := lookup(t, repoPath, "refs/heads/main", landOID(10))
+		require.False(t, found)
+
+		seq := appendLand(t, repoPath, "refs/heads/main", landOID(50), landOID(51))
+		_, found = lookup(t, repoPath, "refs/heads/main", landOID(10))
+		require.False(t, found)
+		record, found := lookup(t, repoPath, "refs/heads/main", landOID(50))
+		require.True(t, found)
+		require.Equal(t, LandRecord{Sequence: seq, Landed: landOID(51)}, record)
 	})
 
 	t.Run("the index of another process is read again", func(t *testing.T) {

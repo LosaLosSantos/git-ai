@@ -164,6 +164,12 @@ func (i *landsIndex) catchUp(repoPath string) error {
 	if err != nil {
 		return err
 	}
+	if last == 0 {
+		// A log without entries recorded no land. The index, in memory or in its file, is of
+		// another log if it holds anything, and is rebuilt once this log has entries.
+		i.reset(0)
+		return nil
+	}
 	if i.loaded && last == i.mark.sequence {
 		return nil
 	}
