@@ -789,6 +789,14 @@ them. Cost: two model calls per region.
   any other server the model is not called and the file stays unresolved, with the reason "the server cannot hold or
   verify a model's resolution; upgrade the server". The rules are unaffected. A client of the protocol of your own that
   sends no capabilities gets no model's resolution either.
+* *An older `graft-resolve` and the inline resolution of the rules.* A server of this release asks `graft-resolve` for
+  its rules only (`"rules_only": true`, see "Out of the lane") when the lane resolves a member inline. An older
+  `graft-resolve` ignores the field, so it may call a model for that request: the lane gives the call `inline_timeout`
+  (default `1s`) and drops the answer, which is not a rule's, whatever it is. The first lands that meet a conflict in the
+  lane, at the same time, each pay such a call, at most `inline_timeout` of the lane each, until the first answer that
+  does not echo `rules_only` makes the server stop asking, for the life of the process (`graft: the resolver did not
+  honour a request for its rules only` in the log). After that the rules are resolved out of the lane, with the queue,
+  as before this release. Set `inline_timeout = "0s"` to avoid even those calls with an older `graft-resolve`.
 
 Upgrade both in the same maintenance window anyway.
 
