@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
@@ -53,6 +54,9 @@ type Server struct {
 	// landResolveHook, when set, runs in every resolver call while it holds its resolve slot; only
 	// tests set it.
 	landResolveHook func()
+	// landInlineOff is set when the resolver did not honour a request for its rules only (an older
+	// graft-resolve): the lane then never resolves inline for the life of the process (land_inline.go).
+	landInlineOff atomic.Bool
 	// landFinalPassHook, when set, runs in every pass of the final pass of a land between its
 	// pre-resolution and its lane, with the number of the pass; only tests set it.
 	landFinalPassHook func(pass int)

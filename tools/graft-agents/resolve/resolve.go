@@ -336,8 +336,9 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 	}
 
 	resp := protocol.Response{
-		Version: protocol.Version,
-		Files:   make([]protocol.ResolvedFile, 0, len(req.Files)),
+		Version:   protocol.Version,
+		Files:     make([]protocol.ResolvedFile, 0, len(req.Files)),
+		RulesOnly: req.RulesOnly,
 	}
 	var used []string
 	seen := map[string]bool{}
@@ -444,6 +445,10 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			return protocol.ResolvedFile{}, "", nil, err
 		}
 		if !matchPaths(b.Paths, f.Path) {
+			continue
+		}
+		// The lane asked for the rules only: a model is not called, and the strategy is not a failure.
+		if req.RulesOnly && originOf(b.Strategy) == protocol.OriginModel {
 			continue
 		}
 		// A model's resolution is given only to a server that says it holds and verifies it. An older

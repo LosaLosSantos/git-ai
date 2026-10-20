@@ -311,6 +311,12 @@ type GraftResolver struct {
 	// Timeout bounds one resolver call, as a Go duration ("120s"). Empty means
 	// DefaultGraftResolverTimeout.
 	Timeout string `json:"timeout" toml:"timeout,omitempty"`
+	// InlineTimeout bounds the call that the lane makes to resolve a member's conflicting files inline
+	// (PLAN10 15.8), as a Go duration ("1s"). Empty means DefaultGraftResolverInlineTimeout; "0s"
+	// turns the inline resolution off. The lane asks the resolver for its rules only; if the call does
+	// not end in time, the member goes back out of the lane, to be resolved there. Without
+	// verify.enabled only: with a verification every tree is verified out of the lane.
+	InlineTimeout string `json:"inline_timeout" toml:"inline_timeout,omitempty"`
 	// MaxFiles bounds the number of conflicting files sent in one request; a
 	// conflict touching more files is not sent. Zero means
 	// DefaultGraftResolverMaxFiles.
@@ -604,6 +610,9 @@ func (r GraftResolver) validate() error {
 	if _, err := r.TimeoutOrDefault(); err != nil {
 		return err
 	}
+	if _, err := r.InlineTimeoutOrDefault(); err != nil {
+		return err
+	}
 	if _, err := r.ProposalTTLOrDefault(); err != nil {
 		return err
 	}
@@ -661,6 +670,22 @@ func (r GraftResolver) TimeoutOrDefault() (time.Duration, error) {
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("graft land resolver: invalid timeout %q", r.Timeout)
+	}
+	return d, nil
+}
+
+// DefaultGraftResolverInlineTimeout is the default of GraftResolver.InlineTimeout.
+const DefaultGraftResolverInlineTimeout = "1s"
+
+// InlineTimeoutOrDefault parses InlineTimeout, applying the default. Zero turns the inline resolution off.
+func (r GraftResolver) InlineTimeoutOrDefault() (time.Duration, error) {
+	s := r.InlineTimeout
+	if s == "" {
+		s = DefaultGraftResolverInlineTimeout
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("graft land resolver: invalid inline_timeout %q", r.InlineTimeout)
 	}
 	return d, nil
 }

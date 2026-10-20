@@ -276,9 +276,18 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 		pre.ticket.release()
 		landResolutionRounds.Observe(float64(used))
 	}()
+	// When the lane resolves the rules itself (land_inline.go), the first round enters it at once: a land
+	// without conflicts needs no pre-resolution at all, and one with conflicts that a rule resolves is
+	// resolved there, in its batch. What the rules cannot resolve is handed back, and resolved out of the
+	// lane in the next round.
+	laneFirst := s.landInlineEnabled()
 	for round := 1; round <= rounds; round++ {
 		used = round
-		if err := s.landPreResolve(resolveCtx, in, committer, pre); err != nil {
+		var preErr error
+		if !(round == 1 && laneFirst) {
+			preErr = s.landPreResolve(resolveCtx, in, committer, pre)
+		}
+		if err := preErr; err != nil {
 			// The deadline ended a step of the round: the listing, the tree, the resolution or the
 			// verification. A refusal of the policy is not a deadline.
 			if deadline() && status.Code(err) != codes.PermissionDenied {

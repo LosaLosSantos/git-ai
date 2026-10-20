@@ -524,6 +524,16 @@ func (s *Server) landApplyVerdicts(
 			Warn("graft: the merge at the lane's tip has conflicts without a conflicting file")
 		return landResolution{}, l.notAttempted(landNoConflictingFiles, nil)
 	}
+	// The rules are resolved here, in the lane, within a bound of time (land_inline.go): the member rides
+	// the batch, as it did before the resolution left the lane. What a rule cannot resolve goes out.
+	if len(missing) > 0 && pre != nil && s.conflictResolver != nil && l.bases <= 1 && s.landResolveInline(ctx, in, tip, commitID, l, pre) {
+		missing = missing[:0]
+		for _, f := range l.files {
+			if _, ok := pre.verdicts[landKeyOf(f.conflict)]; !ok || !f.sent() {
+				missing = append(missing, f.conflict.path)
+			}
+		}
+	}
 	if len(missing) > 0 {
 		return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: missing}
 	}

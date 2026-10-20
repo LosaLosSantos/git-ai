@@ -23,8 +23,17 @@ import (
 
 // unionResolver writes a resolver command that resolves every file of the request with the union of the
 // lines of the two sides, as a rule, and counts its runs in dir/calls.log. The runs are concurrent, so
-// each reads its own request file.
+// each reads its own request file. It honours a request for the rules only, and counts those requests
+// in dir/inline.log.
 func unionResolver(t *testing.T) (string, []string) {
+	t.Helper()
+	return unionResolverMode(t, "")
+}
+
+// unionResolverMode is unionResolver with a mode: "slow" takes 3 s to answer a request for the rules only
+// (a rule that does not end in time), "noecho" does not say that it honoured the request (an older
+// graft-resolve).
+func unionResolverMode(t *testing.T, mode string) (string, []string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -32,9 +41,14 @@ func unionResolver(t *testing.T) (string, []string) {
 DIR='%s'
 echo x >> "$DIR/calls.log"
 cat > "$DIR/req-$$.json"
-python3 - "$DIR/req-$$.json" <<'PY'
-import base64, json, sys
+python3 - "$DIR/req-$$.json" "$DIR" '%s' <<'PY'
+import base64, json, sys, time
 req = json.load(open(sys.argv[1]))
+rules = bool(req.get("rules_only"))
+if rules:
+    open(sys.argv[2] + "/inline.log", "a").write("x\n")
+    if sys.argv[3] == "slow":
+        time.sleep(3)
 files = []
 for f in req["files"]:
     ours = base64.b64decode(f["ours"]["content"]).decode().splitlines()
@@ -42,12 +56,27 @@ for f in req["files"]:
     merged = ours + [l for l in theirs if l not in ours]
     files.append({"path": f["path"], "action": "write", "mode": "100644", "origin": "rule",
                   "content": base64.b64encode(("\n".join(merged) + "\n").encode()).decode()})
-json.dump({"version": 1, "resolver": "graft-resolve/union", "files": files}, sys.stdout)
+resp = {"version": 1, "resolver": "graft-resolve/union", "files": files}
+if sys.argv[3] != "noecho":
+    resp["rules_only"] = rules
+json.dump(resp, sys.stdout)
 PY
-`, dir)
+`, dir, mode)
 	path := filepath.Join(dir, "resolver.sh")
 	require.NoError(t, os.WriteFile(path, []byte(script), 0o755))
 	return dir, []string{path}
+}
+
+// inlineCalls is the number of requests for the rules only that the resolver of dir got.
+func inlineCalls(t *testing.T, dir string) int {
+	t.Helper()
+
+	raw, err := os.ReadFile(filepath.Join(dir, "inline.log"))
+	if os.IsNotExist(err) {
+		return 0
+	}
+	require.NoError(t, err)
+	return len(raw) / 2
 }
 
 // unionCalls is the number of runs of the resolver of dir.
@@ -78,8 +107,13 @@ type queueFixture struct {
 
 func newQueueFixture(t *testing.T, n int, tune func(*config.GraftResolver)) queueFixture {
 	t.Helper()
+	return newQueueFixtureMode(t, n, "", tune)
+}
 
-	dir, argv := unionResolver(t)
+func newQueueFixtureMode(t *testing.T, n int, mode string, tune func(*config.GraftResolver)) queueFixture {
+	t.Helper()
+
+	dir, argv := unionResolverMode(t, mode)
 	rcfg := enabledResolver(argv)
 	if tune != nil {
 		tune(&rcfg)

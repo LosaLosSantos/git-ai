@@ -756,3 +756,42 @@ func TestAHoldIsNeverSentToAServerThatCannotHoldIt(t *testing.T) {
 		t.Fatalf("a server that holds must get the hold: %v %+v", err, resp.Files)
 	}
 }
+
+// TestARequestForTheRulesOnlyNeverCallsAModel: the lane asks for the rules only when it resolves a member
+// inline. A strategy that is a model's is not called and is not a failure, what the rules resolve is
+// answered, and the answer says that the request was honoured (the server drops the answer of a
+// resolver that does not).
+func TestARequestForTheRulesOnlyNeverCallsAModel(t *testing.T) {
+	model := &proposingStrategy{fakeStrategy{fn: answer(protocol.ModeFile, "from the model\n")}}
+	rule := &fakeStrategy{fn: answer(protocol.ModeFile, "from the rule\n")}
+
+	rulesOnly := request(conflict("a.go"))
+	rulesOnly.RulesOnly = true
+
+	// The model comes first in the chain, and is skipped; the rule behind it answers.
+	r := newTestResolver(t, nil, Binding{Name: "model", Strategy: model}, Binding{Name: "rule", Strategy: rule})
+	resp, err := r.Resolve(context.Background(), rulesOnly)
+	if err != nil || len(resp.Files) != 1 || string(resp.Files[0].Content) != "from the rule\n" || resp.Files[0].Origin != protocol.OriginRule {
+		t.Fatalf("%v %+v", err, resp.Files)
+	}
+	if !resp.RulesOnly {
+		t.Fatal("the answer does not say that the request for the rules only was honoured")
+	}
+	if model.calls.Load() != 0 {
+		t.Fatalf("the model was called %d times for a request for the rules only", model.calls.Load())
+	}
+
+	// A model alone leaves the file unresolved, as a failure of the chain and not of the model.
+	r = newTestResolver(t, nil, Binding{Name: "model", Strategy: model})
+	_, err = r.Resolve(context.Background(), rulesOnly)
+	var unresolved *UnresolvedError
+	if !errors.As(err, &unresolved) || model.calls.Load() != 0 {
+		t.Fatalf("err = %v, model calls %d", err, model.calls.Load())
+	}
+
+	// An ordinary request calls the model, and does not claim the rules only.
+	resp, err = r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil || resp.RulesOnly || model.calls.Load() != 1 || resp.Files[0].Origin != protocol.OriginModel {
+		t.Fatalf("%v rules_only=%v calls=%d %+v", err, resp.RulesOnly, model.calls.Load(), resp.Files)
+	}
+}
