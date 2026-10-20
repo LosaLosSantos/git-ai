@@ -255,7 +255,7 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 	if err != nil {
 		return nil, err
 	}
-	v.observeStep(stepRecord, time.Since(readAt))
+	v.observeStep(updates, stepRecord, time.Since(readAt))
 	if record.HeadSeq == 0 {
 		return nil, nil
 	}
@@ -705,9 +705,9 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 		built := time.Now()
 		pack, err = gitops.BuildPack(ctx, repo, tips, tmpDir)
 		if err == nil && preparing {
-			v.observeStep(stepWalk, pack.Walk)
+			v.observeStep(updates, stepWalk, pack.Walk)
 			if !pack.Empty() {
-				v.observeStep(stepPack, time.Since(built)-pack.Walk)
+				v.observeStep(updates, stepPack, time.Since(built)-pack.Walk)
 			}
 		}
 	} else {
@@ -739,7 +739,7 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 		return corestore.PackUpload{}, err
 	}
 	if preparing {
-		v.observeStep(stepUpload, time.Since(uploading))
+		v.observeStep(updates, stepUpload, time.Since(uploading))
 	}
 	v.metrics.packBytes.Add(float64(pack.Size))
 
@@ -762,14 +762,34 @@ const (
 	stepUpload = "upload"
 )
 
-// observeStep observes d in step of graft_storage_preparing_step_seconds. Only
-// authoritative mode observes the steps: the shadow mode builds its packs
-// another way (buildPackAgainst).
-func (v *Voter) observeStep(step string, d time.Duration) {
+// The kinds of transactions that graft_storage_preparing_step_seconds tells apart.
+const (
+	// kindCreate is a transaction that only creates references, such as a commit
+	// onto a new branch.
+	kindCreate = "create"
+	// kindUpdate is a transaction that changes or deletes an existing reference,
+	// such as a land onto its branch.
+	kindUpdate = "update"
+)
+
+// transactionKind returns the kind of the transaction of updates.
+func transactionKind(updates []inputUpdate) string {
+	for _, u := range updates {
+		if !u.oldZero {
+			return kindUpdate
+		}
+	}
+	return kindCreate
+}
+
+// observeStep observes d in step of graft_storage_preparing_step_seconds, for the
+// kind of the transaction of updates. Only authoritative mode observes the steps:
+// the shadow mode builds its packs another way (buildPackAgainst).
+func (v *Voter) observeStep(updates []inputUpdate, step string, d time.Duration) {
 	if !v.core.Authoritative() {
 		return
 	}
-	v.metrics.preparingSteps.WithLabelValues(step).Observe(d.Seconds())
+	v.metrics.preparingSteps.WithLabelValues(transactionKind(updates), step).Observe(d.Seconds())
 }
 
 // fault calls FaultHook and exits the process when CrashEnv selects the point.
@@ -1277,9 +1297,10 @@ func newMetrics() *metrics {
 			Name: "graft_storage_preparing_step_seconds",
 			Help: "Time of each step of the Preparing phase of authoritative writes: record (the read of the " +
 				"repository record), walk (the objects of the pack), pack (writing and hashing a non-empty pack) " +
-				"and upload (to the bucket).",
+				"and upload (to the bucket); kind is create for a transaction that only creates references, " +
+				"update otherwise.",
 			Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
-		}, []string{"step"}),
+		}, []string{"kind", "step"}),
 		prepared: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "graft_storage_prepared_seconds",
 			Help:    "Time spent in the Prepared phase of the storage core write path, while git holds the reference locks.",
