@@ -734,8 +734,8 @@ server together: an older server does not know `hold` and would verify a held pr
 
 What it was worth, measured on 487 held-out files of 13 open-source repositories (Luna and glm-5.3-flash, with the
 verify simulation of the bench in place of the operator's tests): 59.8% of the files landed, and 15.5% of those differed
-from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), against 43%
-on conflicts of merged agent PRs. These figures were measured by combining two separate single-model runs, which is what
+from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), and 17.5% from
+what a third one, from another vendor, accepts (upper bound 22.3%), against 43% to 52% on conflicts of merged agent PRs. These figures were measured by combining two separate single-model runs, which is what
 the gate decides; the gate in the code is covered by tests with fake providers, not re-measured through itself (PLAN10
 15.12). They are before the operator's own tests, which are the one signal that caught more errors where we could run
 them. Cost: two model calls per region.
@@ -887,7 +887,7 @@ differently there is one model call, whose request holds:
   closest to the answer.
 
 Two things more come with the strategy, with no option: both were measured against the alternatives
-(PLAN10 15.11) and the alternatives were removed.
+(PLAN10 15.10) and the alternatives were removed.
 
 - The regions of the file are those of git's own merge (`git merge-file --diff3`
   on the three versions), so that "no conflict" means what it means to git and

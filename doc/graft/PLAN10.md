@@ -941,7 +941,7 @@ end of this section.
 | writer | proposes a resolution per region | a model, configurable (15.13) | 15.10: the elements kept and removed, 15.12 |
 | checks and repair | refuse a broken answer, repair it once | deterministic checks | 15.10 |
 | report | tells the agent what the answer keeps or drops | deterministic | 15.6: it separates (43% against 60% right), it does not gate |
-| agree_with (optional) | holds a proposal back unless a second model from another vendor gives the same file and both reports are clean | code (`llmStrategy`), configured by the operator | 15.12: G1, 59.8% of the files landed with 15.5% wrong under two judges, before the operator's tests |
+| agree_with (optional) | holds a proposal back unless a second model from another vendor gives the same file and both reports are clean | code (`llmStrategy`), configured by the operator | 15.12: G1, 59.8% of the files landed with 15.5% wrong under two judges and 17.5% under a third, before the operator's tests |
 | verify | runs the operator's build and tests on the exact tree | the operator's command | 15.9, 14 |
 | decideLand | the one landing rule | code | 15.4 |
 
@@ -1670,10 +1670,15 @@ spring-boot capped at 30; python 13, go 100, ts-js 100, other java 1); `tune200`
 
 ### 15.12 The operating point
 
-**The goal and the answer.** Federico's goal: at least 20% of the conflict files resolved and landed automatically, with at
-most 5% wrong among them (Wilson 95% upper bound), on data the gates were not chosen on, under the strict judge and under
-judge A, OSS and agent PRs apart. **It is not met, by any gate, on either kind of data.** What follows is the operating
-point that the evidence supports, the gates that were tried, and the reading.
+**The goal and the answer.** Federico's goal was: at least 20% of the conflict files resolved and landed automatically, with
+at most 5% wrong among them (Wilson 95% upper bound), on data the gates were not chosen on, under the strict judge and
+under judge A, OSS and agent PRs apart. **That goal is not met, by any gate, on either kind of data.** After the first
+held-out numbers the bar on the wrong share was restated to 20% (below, "The threshold of 20% wrong"); that bar was set
+after the numbers were known, and is not a pre-registered confirmation. Against it, the best gate (G1, two models from
+different vendors in agreement, 59.8% of the OSS held-out files landed) has 15.5% wrong under the two first judges, 17.5%
+(upper bound 22.3%) under a third judge from another vendor, which is the number to quote, and on conflicts of agent PRs
+none comes close (43% to 52% wrong). What follows is the operating point that the evidence supports, the gates that were
+tried, and the reading.
 
 *The judges.* The strict judge calls an answer right when it equals the human's file after normalization (line endings,
 trailing whitespace): about a fifth of the answers it calls wrong are valid (whitespace, order, an equivalent
@@ -1684,7 +1689,12 @@ accepts fewer (187 against 205 of 270), so "judge A" below is one cheap judge an
 conservative reading. For the gates on the held-out sets a stronger second judge was added, `openai/gpt-6.1-sol` (effort
 low, the same rubric, no failed call), run on the answers that G0 lands: it accepts fewer than the first one (on the OSS
 held-out G0 files it finds 74 wrong against the first judge's 56), so the figures below are given for judge 1, judge 2
-and "both accept", the last being the one to quote. Neither judge runs tests.
+and "both accept". Neither judge runs tests. A third judge was added after the first numbers, from a vendor unrelated to the
+two writers and to the first two judges: `mistralai/mistral-large-4-0` (non-reasoning, the same rubric, Appendix B), on the
+answers that G1 lands (291 OSS, 130 agent-PR), a strict-equal answer being accepted without a call. It is the strictest
+of the three. Its cap ($0.25 per set) stopped it before the end: 11 OSS and 18 agent-PR answers that are not strict-equal
+have no verdict, and 15 and 16 of its calls failed; all of them are counted as wrong here, so its figures read high. **Judge
+3 alone is the number to quote**, with the majority of judges 1, 2 and 3 beside it.
 
 **What the writer's proposals are worth** (the prompt of record, Luna, effort low; "right" = the strict judge; the
 interval is Wilson 95%; accepted = the answer passed the rules and the syntax check):
@@ -1735,8 +1745,30 @@ ts-js 14.6% (22.6) / 19.2% (27.0), python 6.7% (29.8) / 14.3% (34.6), java 1.7% 
 confirmation; read against it, honestly: on the OSS held-out, G1 has 15.5% wrong under both judges (11.3% under judge 1, 15.1%
 under judge 2) with an upper bound of 20.1% under both judges (19.7% under judge 2, 15.5% under judge 1), at 59.8% of
 the files landed, so it meets the bar on the point estimates and misses the bound under the conservative reading by 0.1
-point; G0 (Luna alone) has 20.9% (upper 25.4%) and does not; without spring-boot G1 has 18.8% (upper 24.3%). On the agent-PR
-files no gate comes close: 43.1% wrong at best (upper 51.7%), at 45.8% landed.
+point; G0 (Luna alone) has 20.9% (upper 25.4%) and does not; without spring-boot G1 has 18.8% (upper 24.3%). Under the
+third judge, from another vendor and the strictest, G1 has 17.5% wrong (upper 22.3%): under the restated bar on the
+point estimate, over it on the bound, and 21.4% (upper 27.1%) without spring-boot, so the restated bar is met by neither
+reading of the bound and by the point estimates of the whole set only. On the agent-PR files no gate comes close: 43.1%
+wrong at best under two judges (upper 51.7%), 51.5% under judge 3 (upper 60.0%), at 45.8% landed.
+
+**G1 under a third judge.** Wrong share among the files G1 lands, judge 3 alone and the majority (at least two of the
+three judges accept), Wilson 95% upper bound in parentheses; the answers with no verdict or a failed one count as wrong:
+
+| G1 landed | files | judge 3 alone | 2 of 3 judges |
+|---|---:|---|---|
+| OSS held-out | 291 | **17.5% (up 22.3)** | 15.1% (up 19.7) |
+| OSS held-out without spring-boot | 234 | 21.4% (up 27.1) | 18.4% (up 23.8) |
+| go | 115 | 27.0% (up 35.7) | 24.3% (up 32.9) |
+| ts-js | 103 | 17.5% (up 25.9) | 13.6% (up 21.5) |
+| python | 15 | 6.7% (up 29.8) | 6.7% (up 29.8) |
+| rust-java (spring-boot but one file) | 58 | 1.7% (up 9.1) | 1.7% (up 9.1) |
+| agent-PR | 130 | **51.5% (up 60.0)** | 42.3% (up 50.9) |
+
+Judge 3 finds 51 of the 291 OSS answers wrong, against 33 for judge 1 and 44 for judge 2; the answers that its cap left
+unjudged (11) and the failed calls (15) are among them, so with every one of those accepted the figure would be 8.6%, and
+it is 17.5% with every one counted wrong. The conclusion does not depend on them: the point estimate is under the restated
+20% on the OSS held-out and the upper bound is over it, and without spring-boot, which is the easy part of the corpus,
+both are over.
 
 **Reading.**
 * The statistical bar is high: at most 5% with an upper bound needs about 75 landed files with none wrong, 130 with two,
@@ -1834,7 +1866,8 @@ judge's normalization, the composition reports of both are clean, and `verify.co
 a `hold` reason and the report says that the second model disagreed, and the server never lands a held file, nor
 runs the verification for it. A budget table must be given for both models or for neither. The bench runs the same
 code and prices both models. RESOLVE.md has the configuration. Measured on the OSS held-out files it lands 59.8% of
-the files with 15.5% of those wrong under two independent judges (upper bound 20.1%), before the operator's tests; on
+the files with 15.5% of those wrong under two independent judges (upper bound 20.1%) and 17.5% under a third judge from
+another vendor (upper bound 22.3%), before the operator's tests; on
 conflicts of agent PRs 45.8% of the files with 43.1% wrong. Those numbers were measured as two single-model runs
 combined offline (the gate decides the same thing on the same answers); the code is covered by tests with fake
 providers and was not run through the bench against the live models. The 20%-wrong bar it is compared with was set
@@ -1870,6 +1903,8 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | held-out runs of the prompt of record: Luna and glm-5.3-flash on 487 OSS files and on 284 agent-PR files | manifest-heldout-487, manifest-agent-284 | 7fd0ab2's tools tree (8812cee) | $0.300 + $0.302 + $0.227 + $0.237 |
 | 20 | judge 1 (glm-5.3-flash) on the held-out answers | the answers of Luna | scripts outside the repository | $0.025 + $0.021 |
 | 20 | judge 2 (openai/gpt-6.1-sol, effort low) on the answers landed by G0 | OSS held-out 359, agent-PR 210 | scripts outside the repository | $0.239 + $0.268 |
+| 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1; each set stopped at its cap of $0.25 (11 OSS and 18 agent-PR answers unjudged, 15 and 16 failed calls) | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.255 + $0.253 (the key: $0.497) |
+| 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
 rust and a ts file) that costs at most a few cents and stops a model whose calls end before an answer: more than
