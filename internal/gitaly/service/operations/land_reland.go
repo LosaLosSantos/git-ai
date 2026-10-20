@@ -15,6 +15,7 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
+	"github.com/feder-cr/git-ai/internal/gitaly/hook"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/log"
@@ -189,6 +190,15 @@ func (s *Server) landPrecheckResolution(ctx context.Context, in *gitalypb.UserLa
 	commitID, err := repo.ResolveRevision(ctx, git.Revision(in.GetCommitId()+"^{commit}"))
 	if err != nil {
 		return &landPrecheck{skipped: fmt.Sprintf("commit_id %q does not resolve to a commit", in.GetCommitId())}, nil
+	}
+
+	// An agent that may not update the branch gets nothing checked or verified: the check and the
+	// verification run the operator's code, and the policy decides on the actor and the reference
+	// alone, so it comes first, as in landResolveAt. Otherwise a denied agent could hold the
+	// repository's verify slot, and its tree would run in the operator's sandbox.
+	reference := git.NewReferenceNameFromBranchName(string(in.GetBranch()))
+	if err := hook.CheckAgentPolicy(ctx, s.graft, fmt.Sprintf("%s %s %s\n", tip, commitID, reference)); err != nil {
+		return nil, err
 	}
 
 	// A resolution for a tip the branch has left, or for a change that already landed, needs no
