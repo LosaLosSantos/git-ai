@@ -242,9 +242,14 @@ Request (server to resolver):
             "base":   {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
             "ours":   {"oid": "<oid>", "mode": "100644", "content": "<base64>"},
             "theirs": {"oid": "<oid>", "mode": "100644", "content": "<base64>"}}],
- "limits": {"max_file_bytes": 1048576}}
+ "limits": {"max_file_bytes": 1048576},
+ "capabilities": ["origin", "proposal", "hold", "verify"]}
 ```
 
+- `capabilities` says what the server does with the answers (an additive field of protocol v1): `origin` it reads the
+  origin of a file, `proposal` a file that is not a rule's is a proposal that lands only on a verified tree, `hold` it
+  never lands a file with a `hold`, `verify` it verifies the exact tree that lands. A request without it comes from an
+  older server, and `graft-resolve` gives it no model's resolution (see "Version skew" below).
 - `ours` is the current branch tip side. `theirs` is the change being landed.
 - `tip`, `merge_base` and `messages.tip` are always empty since this version;
   they stay in the protocol for compatibility. The server reuses a file's
@@ -716,7 +721,12 @@ only = ["z-ai/fp8"]
 Both models resolve each file at the same time with the same prompt of record. The first model's resolution is the
 one that is proposed. It lands only if all three hold:
 
-1. **the two results are the same file** after normalizing line endings, trailing whitespace and trailing blank lines;
+1. **the two results are the same file** after a normalization that erases exactly three things: a carriage return before a
+   line feed (CRLF and LF are the same), the spaces, tabs and carriage returns at the end of a line, and the blank lines at
+   the end of the file (so a final newline or its absence is not a difference). Nothing else is erased: indentation, blank
+   lines elsewhere, the order of lines and every other character must be equal. It is the normalization that the
+   measurements and the judges used, and it decides only whether the models agree: the bytes that land, and that the
+   verification runs on, are the first model's, exactly as it wrote them;
 2. **the composition report of both is clean** (no line saying that the answer drops or duplicates a change of a side);
 3. **`verify.command` passes** on the exact tree, as for every model resolution: `verify.enabled = true` is mandatory
    (the gate does not replace it, it chooses the proposals worth verifying).
@@ -734,18 +744,28 @@ server together: an older server does not know `hold` and would verify a held pr
 
 What it was worth, measured on 487 held-out files of 13 open-source repositories (Luna and glm-5.3-flash, with the
 verify simulation of the bench in place of the operator's tests): 59.8% of the files landed, and 15.5% of those differed
-from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), and at most 16.8% from
-what a third one, from another vendor, accepts (upper bound 21.6%; it is a ceiling, 24 of its 291 verdicts are missing and counted as wrong), against 43% to 52% on conflicts of merged agent PRs. These figures were measured by combining two separate single-model runs, which is what
+from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), and at most 15.5% from
+what a third one, from another vendor, accepts (upper bound 20.1%; it is a ceiling, 15 of its 291 verdicts are missing and counted as wrong), against 43% to 52% on conflicts of merged agent PRs. These figures were measured by combining two separate single-model runs, which is what
 the gate decides; the gate in the code is covered by tests with fake providers, not re-measured through itself (PLAN10
 15.12). They are before the operator's own tests, which are the one signal that caught more errors where we could run
 them. Cost: two model calls per region.
 
-**Upgrade `graft-resolve` together with the server.** A resolution is a rule's only if its file says so (`origin`
-`"rule"`, protocol v1); a file without an origin is a model's, which lands only through `verify.command`. A
-`graft-resolve` of an earlier release answers without an origin, so with a new server every file it resolves,
-`trivial` and `union` included, is a proposal, and lands only if `verify.command` passes on the exact tree (without
-one, it never lands). The other way round, an older server does not know `hold` (the `agree_with` gate) and would
-verify a held proposal like any other. Upgrade both in the same maintenance window.
+**Version skew between the server and `graft-resolve`.** A resolution is a rule's only if its file says so (`origin`
+`"rule"`, protocol v1); a file without an origin is a model's, which lands only through `verify.command`.
+
+* *An older `graft-resolve` with a new server.* It answers without an origin, so every file it resolves, `trivial` and
+  `union` included, is a proposal, and lands only if `verify.command` passes on the exact tree (without one, it never
+  lands). Safe, and the rules stop landing by themselves until `graft-resolve` is upgraded.
+* *A new `graft-resolve` with an older server.* An older server ignores the origin, the proposal mark and the hold, and
+  lands every answer it gets without verification, a held one included. The request therefore says what the server does
+  (`capabilities`, an additive field of protocol v1: `origin`, `proposal`, `hold`, `verify`; a server of this release
+  sends all four), and `graft-resolve` gives a model's resolution (the `llm` strategy, a `command` with `origin =
+  "model"`) only to a server that announces `proposal`, and with `agree_with` only to one that announces `hold` too. For
+  any other server the model is not called and the file stays unresolved, with the reason "the server cannot hold or
+  verify a model's resolution; upgrade the server". The rules are unaffected. A client of the protocol of your own that
+  sends no capabilities gets no model's resolution either.
+
+Upgrade both in the same maintenance window anyway.
 
 **The `rerere` store and the upgrade.** Entries are versioned and record their
 origin. The stores of v0.1.0 and v0.2.0 recorded the `llm` answers as well, with
