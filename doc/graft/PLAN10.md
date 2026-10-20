@@ -1295,14 +1295,23 @@ The resolution is bound to the files instead:
      the lane never asks again for the life of the process). The split follows what the resolution is, not how long it
      took: a model, a verification, a rule that does not end within `inline_timeout` (default 1 s) or one that cannot
      resolve a file go out of the lane, to the path below. With the rules in the lane the bench has no hand-back, no
-     ticket and one resolver call per resolution, and its numbers are v0.2.0's.
+     ticket and one resolver call per resolution, and its numbers are v0.2.0's. The lane is bounded: it never waits for
+     a slot (the calls have a pool of their own; with it taken the member goes out of the lane), and the time it may
+     lose to calls that fail is bounded once per batch attempt (`landInlineBudget`: `inline_timeout` in all, not per
+     member). A land that the rules cannot resolve (the resolver refuses, or a file may not be sent) is resolved out of
+     the lane for the proposals and ends there, without a ticket: without a verification a model's resolution never
+     lands, so a ticket would protect nothing. The request announces no capability but `origin`, so that a
+     graft-resolve that gates the models on the capabilities (any since they were added) refuses to call one even if it
+     ignored `rules_only`; v0.2.0 has no gating and may.
   2. **A queue for the lands that lose a round out of the lane.** A land that lost a round takes a ticket, first in
      first out, on its files (per file; per branch when `verify.enabled`, since the tree that is verified is the
      branch's), keeps it until it lands, its deadline ends or it fails, and is the only land of the branch that resolves
-     them again; the others wait without calling the resolver, and the lane hands back any other land with a verdict on a
-     ticketed file, so that the holder's verdict is the one that lands. Measured on the same bench with the rules out of
-     the lane: 92 resolver calls, 8 hand-backs, 250 of 250. A land that waits past its deadline ends with the package
-     ("the time ran out waiting for the other lands on the same files").
+     them again; the others wait without calling the resolver, and the lane hands back any land with a verdict made out
+     of the lane on a ticketed file, so that the holder's verdict is the one that lands. A ticket never stops the
+     rules in the lane: the inline attempt comes before the check of the tickets, and the land that waited for its turn
+     goes back to the lane, not to a new pre-resolution; a lane round does not count toward `resolve_rounds`. Measured
+     on the same bench with the rules out of the lane: 92 resolver calls, 8 hand-backs, 250 of 250. A land that waits
+     past its deadline ends with the package ("the time ran out waiting for the other lands on the same files").
   3. resolve_rounds (default 32) is only a safety cap: the rounds of a land are bounded by its deadline, and the queue
      makes it lose at most the rounds that a land which changes its files without a conflict makes it lose.
   The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
