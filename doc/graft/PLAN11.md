@@ -170,7 +170,26 @@ of a land as intents in the prepared phase, before git may commit:
   never committed stay; there is one line, about 200 bytes, per such update.
 * The cost is one write and one fsync per land update in the prepared phase, under the
   references' locks, serialized per repository by the intents' lock file, not shared
-  with the changelog's group commit; the bench measures it.
+  with the changelog's group commit.
+
+#### Measured cost (bench window, 50 agents, rebase, batching on)
+
+* Intents (`graft_land_intents_seconds`): one per batch update, mean 9.4 ms (the same
+  class as the changelog append's own fsync), 2.6% of the batch time (range 1.3–3.0%),
+  about 0.4 ms per landed change at a batch size of about 21.
+* The lookup (phase `identity` of `graft_land_batch_phase_seconds`), per diverged
+  request: file changelog mean 0.87 ms, authoritative mode mean 0.23 ms (p99 under 5 ms).
+  In the file changelog the first lookup of each batch catches the index up (its lock
+  file, one block, the batch's new entry and intents) and the others take the fast path
+  with no I/O; under the load of the window that first lookup costs 5–25 ms (4.6% of the
+  lookups, one per batch). A later step, if it ever shows in profiles: catch the index up
+  in the background after the committed append, so that the first lookup of a batch takes
+  the fast path too.
+* The database rows: one upsert per changeset, +0.1 ms on SQLite and +1.0 ms on Postgres
+  for 10 identities (`BenchmarkCommitChangesetLands`).
+* Fixed at the cause by the window: an unconditional cut of the intents file (a journal
+  commit under the locks), the rescan of up to 256 log entries per lookup (the scan now
+  starts at the mark's line), and one database round trip per identity.
 
 In the authoritative mode the database row and the reference change are one transaction,
 so there is no such window and no intents.
