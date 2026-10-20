@@ -382,3 +382,37 @@ func TestUserLand_aLaneRoundThatHandsBackTakesNoTicket(t *testing.T) {
 	}
 	require.Positive(t, inlineCalls(t, q.dir))
 }
+
+// TestUserLand_withNoInlineSlotAllTheLandsStillLand: every slot of the lane is taken (by calls in flight for other
+// branches), so no member can be resolved in the lane; they all go out of it, with the queue, and all of
+// them land with the default resolve_rounds: the lack of a slot costs time, not lands.
+func TestUserLand_withNoInlineSlotAllTheLandsStillLand(t *testing.T) {
+	t.Parallel()
+
+	const lands = 8
+	var s *Server
+	operationServerHooks.Store(t.Name(), func(served *Server) { s = served })
+	q := newQueueFixture(t, lands, inlineOn)
+	require.NotNil(t, s)
+
+	var own []interface{ Release() }
+	for {
+		slot, ok := s.conflictResolver.TryAcquireInlineSlot()
+		if !ok {
+			break
+		}
+		own = append(own, slot)
+	}
+	defer func() {
+		for _, slot := range own {
+			slot.Release()
+		}
+	}()
+
+	for i, err := range q.landAll(q.onA) {
+		require.NoError(t, err, "land %d of %d", i+1, lands)
+	}
+	require.Zero(t, inlineCalls(t, q.dir), "the lane never called")
+	require.Len(t, strings.Split(q.branchBlob(t, "a"), "\n"), lands+1)
+	require.Empty(t, landTickets.keysOf(q.scope))
+}
