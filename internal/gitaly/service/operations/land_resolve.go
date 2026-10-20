@@ -146,11 +146,23 @@ func (s *Server) landResolveAt(
 	var reusedNames []string
 	var sent []resolver.File
 	var mine []*landFileState
+	// A land that ran out of time waiting for its turn on its files (land_tickets.go) is ended with the
+	// package, and does not land past the lands that hold the tickets: its files are not attempted, and
+	// say why.
+	queuedBehind := false
+	if pre.unverifiable != "" {
+		paths := make([]string, 0, len(files))
+		for _, f := range files {
+			paths = append(paths, f.conflict.path)
+		}
+		scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
+		queuedBehind = landTickets.blocked(landTicketKeys(scope, paths, s.resolveCfg.Verify.Enabled), pre.ticket)
+	}
 	for _, f := range files {
 		if !f.sent() {
 			continue
 		}
-		if v, ok := pre.verdicts[landKeyOf(f.conflict)]; ok {
+		if v, ok := pre.verdicts[landKeyOf(f.conflict)]; ok && !queuedBehind {
 			mine = append(mine, f)
 			reused[f.conflict.path] = v.file
 			reusedNames = append(reusedNames, v.resolver)
@@ -501,8 +513,46 @@ func (s *Server) landApplyVerdicts(
 			Warn("graft: the merge at the lane's tip has conflicts without a conflicting file")
 		return landResolution{}, l.notAttempted(landNoConflictingFiles, nil)
 	}
+	// The rules are resolved here, in the lane, within a bound of time (land_inline.go): the member rides
+	// the batch, as it did before the resolution left the lane. What a rule cannot resolve goes out.
+	inline := landInlineNotTried
+	if len(missing) > 0 && pre != nil && s.conflictResolver != nil && l.bases <= 1 {
+		// A land that lost a round out of the lane holds the files with priority: resolving them here would
+		// change them under its verdict once more, so the lands that would give way and wait their turn.
+		if s.landInlineEnabled() && landTickets.priorityBlocked(s.landListingKeys(in, l), pre.ticket) {
+			return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: landListingPaths(l), queued: true}
+		}
+		inline = s.landResolveInline(ctx, in, tip, commitID, l, pre)
+		if inline == landInlineResolved {
+			missing = missing[:0]
+			for _, f := range l.files {
+				if _, ok := pre.verdicts[landKeyOf(f.conflict)]; !ok || !f.sent() {
+					missing = append(missing, f.conflict.path)
+				}
+			}
+		}
+	}
+	// What the rules cannot resolve, without a verification, is resolved out of the lane for the proposals
+	// and ends there: what a model resolves never lands, so no ticket protects anything.
+	rulesCannot := inline == landInlineRulesCannot && !s.resolveCfg.Verify.Enabled
+	// A land that lost a round holds the ticket of its files and is the one whose verdict lands: any other
+	// land on the same files, whose verdicts were made out of the lane, waits for its turn
+	// (land_tickets.go), instead of landing first and invalidating the holder's verdict once more. A land
+	// that the lane has just resolved inline needs no turn: the rules do not wait for the tickets.
+	// Without a verification, a land whose files have a model's verdict does not land either: it is not
+	// waited for.
+	if pre != nil && s.conflictResolver != nil && l.bases <= 1 && inline != landInlineResolved && !rulesCannot && !landHasModelVerdict(s, l, pre) {
+		paths := make([]string, 0, len(l.files))
+		for _, f := range l.files {
+			paths = append(paths, f.conflict.path)
+		}
+		scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
+		if landTickets.blocked(landTicketKeys(scope, paths, s.resolveCfg.Verify.Enabled), pre.ticket) {
+			return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: paths, queued: true}
+		}
+	}
 	if len(missing) > 0 {
-		return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: missing}
+		return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: missing, rulesCannot: rulesCannot}
 	}
 
 	reused := map[string]resolver.ResponseFile{}

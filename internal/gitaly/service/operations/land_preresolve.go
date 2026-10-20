@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,6 +71,9 @@ type landPreResolution struct {
 	// verifyAll says that a verification is configured: every resolution then needs a verified tree
 	// to land, a rule's as well as a model's (15.9).
 	verifyAll bool
+	// ticket is the land's place in the queue of its files, once it has lost a round (land_tickets.go).
+	// The lane lets the holder's verdicts land before those of any other land on the same files.
+	ticket *landTicket
 }
 
 func newLandPreResolution() *landPreResolution {
@@ -141,6 +145,13 @@ type landNeedsResolution struct {
 	// the batch ran out of attempts: the tree it was about to land is another one, and the land goes
 	// out again as it does for an unverified tree.
 	moved bool
+	// queued says that another land holds the ticket of one of the files (paths): this one waits for
+	// its turn before it resolves again.
+	queued bool
+	// rulesCannot says that the lane asked the rules to resolve the files and they cannot (or a file may
+	// not be sent): without a verification what a model resolves never lands, so the land is resolved out
+	// of the lane for the proposals and ends there, without a ticket.
+	rulesCannot bool
 }
 
 func (e *landNeedsResolution) Error() string {
@@ -262,8 +273,36 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 		return ctx.Err() == nil && errors.Is(resolveCtx.Err(), context.DeadlineExceeded)
 	}
 	rounds := s.resolveCfg.ResolveRoundsOrDefault()
-	for round := 1; round <= rounds; round++ {
-		if err := s.landPreResolve(resolveCtx, in, committer, pre); err != nil {
+	used := 0
+	// The land keeps its ticket until it ends, whatever the ending: it lands, the deadline stops it, or
+	// it fails.
+	defer func() {
+		pre.ticket.release()
+		landResolutionRounds.Observe(float64(used))
+	}()
+	// When the lane resolves the rules itself (land_inline.go), the first round enters it at once: a land
+	// without conflicts needs no pre-resolution at all, and one with conflicts that a rule resolves is
+	// resolved there, in its batch. What the rules cannot resolve is handed back, and resolved out of the
+	// lane in the next round.
+	//
+	// A round that enters the lane without a pre-resolution (a lane round) is not one of resolve_rounds: it
+	// resolves nothing out of the lane, so with resolve_rounds = 1 the land that needs a model still
+	// leaves the lane. A land that waited for its turn on a file goes back to the lane too, where the
+	// rules are resolved inline whoever holds the ticket. A lane round is bounded all the same.
+	lane := s.landInlineEnabled()
+	laneRoundsLeft := landMaxLaneRounds
+	for round := 1; round <= rounds; {
+		used++
+		laneRound := lane && laneRoundsLeft > 0
+		lane = false
+		var preErr error
+		if laneRound {
+			laneRoundsLeft--
+		} else {
+			round++
+			preErr = s.landPreResolve(resolveCtx, in, committer, pre)
+		}
+		if err := preErr; err != nil {
 			// The deadline ended a step of the round: the listing, the tree, the resolution or the
 			// verification. A refusal of the policy is not a deadline.
 			if deadline() && status.Code(err) != codes.PermissionDenied {
@@ -281,15 +320,107 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 			}
 			return nil, err
 		}
-		resp, err := s.landOnce(ctx, in, committer, nil, pre)
-		if !errors.As(err, &need) {
-			return resp, err
+		// Another land holds the ticket of one of these files: this one does not enter the lane, which would
+		// only hand it back (and which every land of the branch waits for), and waits for its turn.
+		if paths := pre.currentPaths(); s.landTicketsBlock(in, paths, pre) {
+			need = &landNeedsResolution{paths: paths, queued: true}
+		} else {
+			resp, err := s.landOnce(ctx, in, committer, nil, pre)
+			if !errors.As(err, &need) {
+				return resp, err
+			}
 		}
 		if deadline() {
+			pre.ticket.release()
 			return s.landFinalPass(ctx, in, committer, pre, landStoppedReason(need, timeout))
 		}
+		// The land lost the round, to a land that changed its files (or to the tree that moved, with a
+		// verification): it takes its turn on them. From now on it is the only land of the branch that
+		// resolves these files again, and the others wait without calling the resolver. A lane round that
+		// merely did not find the rules enough takes no turn: the lane has not lost anything, and without a
+		// verification what the model resolves next never lands, so a ticket would protect nothing. Only a
+		// lane round that was told to wait for its turn does.
+		if need.rulesCannot {
+			// The rules cannot resolve it: what is next is a model's call out of the lane, which never lands
+			// without a verification. It holds no ticket while it runs, even the one it took when it queued.
+			pre.ticket.release()
+			pre.ticket = nil
+			continue
+		}
+		if laneRound && !need.queued {
+			continue
+		}
+		if err := s.landTakeTicket(resolveCtx, in, pre, need); err != nil {
+			if deadline() {
+				pre.ticket.release()
+				return s.landFinalPass(ctx, in, committer, pre, landQueueReason(timeout))
+			}
+			switch {
+			case errors.Is(ctx.Err(), context.DeadlineExceeded):
+				return nil, structerr.NewDeadlineExceeded("waiting for the other lands on the same files: %w", err)
+			case ctx.Err() != nil:
+				return nil, structerr.NewCanceled("waiting for the other lands on the same files: %w", err)
+			}
+			return nil, err
+		}
+		if !laneRound {
+			// It lost a round out of the lane: its resolution is the one that must land, and the inline
+			// resolutions of the others give way to it until it is done.
+			pre.ticket.setPriority()
+		}
+		// Back to the lane at once with the ticket: the rules are resolved there, no pre-resolution first.
+		lane = laneRound && need.queued
 	}
+	pre.ticket.release()
 	return s.landFinalPass(ctx, in, committer, pre, landStoppedReason(need, timeout))
+}
+
+// landMaxLaneRounds bounds the rounds that enter the lane without a pre-resolution, which do not count
+// toward resolve_rounds: the first, and the ones after a wait for a turn.
+const landMaxLaneRounds = 4
+
+// currentPaths are the paths of the conflicting files the land has at the latest tip it looked at.
+func (p *landPreResolution) currentPaths() []string {
+	paths := make([]string, 0, len(p.current))
+	for k := range p.current {
+		paths = append(paths, k.path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// landTicketsBlock reports whether another land holds the ticket of one of paths.
+func (s *Server) landTicketsBlock(in *gitalypb.UserLandRequest, paths []string, pre *landPreResolution) bool {
+	if len(paths) == 0 || s.landWillNotLand(pre) {
+		return false
+	}
+	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
+	return landTickets.blocked(landTicketKeys(scope, paths, s.resolveCfg.Verify.Enabled), pre.ticket)
+}
+
+// landTakeTicket makes the land hold the tickets of the files it needs resolved, waiting for the lands
+// that lost a round before it (land_tickets.go). A land that holds tickets for all of them keeps them.
+// One that now needs more files gives its tickets back and takes the larger set at the tail: tickets
+// are taken in sorted order, so that no two lands wait for each other.
+func (s *Server) landTakeTicket(ctx context.Context, in *gitalypb.UserLandRequest, pre *landPreResolution, need *landNeedsResolution) error {
+	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
+	keys := landTicketKeys(scope, need.paths, s.resolveCfg.Verify.Enabled)
+	if pre.ticket.covers(keys) {
+		return nil
+	}
+	pre.ticket.release()
+	pre.ticket = nil
+	t, err := landTickets.acquire(ctx, keys)
+	if err != nil {
+		return err
+	}
+	pre.ticket = t
+	return nil
+}
+
+// landQueueReason is why a land that waited for its turn on its files could not go on.
+func landQueueReason(timeout time.Duration) string {
+	return fmt.Sprintf("the time ran out waiting for the other lands on the same files (deadline of %s)", timeout)
 }
 
 // landCallerGaveUp is the status of a land whose caller gave up, or whose own deadline passed, while

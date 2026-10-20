@@ -61,6 +61,8 @@ type landingAttempt struct {
 	observe landPhaseObserver
 	// mode is how the attempt makes its objects durable.
 	mode landPublishMode
+	// inline is the time the members of the attempt may lose to inline calls that fail (land_inline.go).
+	inline landInlineBudget
 }
 
 // batchRebaser replays the commits of the changes of an attempt. It is rebase.Engine.
@@ -239,7 +241,7 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		// UserLand to be resolved out of the lane. When the land fails otherwise, the request gets
 		// the merge conflict it would have got without resolution, with the conflict package as a
 		// second detail when the server listed the conflicts.
-		res, resolveErr := a.server.landApplyVerdicts(ctx, in, a.repo, tip, commitID, req.committer, req.preResolution)
+		res, resolveErr := a.server.landApplyVerdicts(withLandInlineBudget(ctx, &a.inline), in, a.repo, tip, commitID, req.committer, req.preResolution)
 		var need *landNeedsResolution
 		if errors.As(resolveErr, &need) {
 			return landStep{}, need

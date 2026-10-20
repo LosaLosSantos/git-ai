@@ -108,8 +108,11 @@ func validAnswer() resolver.Response {
 
 // enabledResolver is a resolver configuration with resolution on, the given command and every
 // default.
+//
+// The inline resolution of the rules in the lane (land_inline.go) is off here: most of these tests are about
+// what happens out of the lane, with rounds, and the tests of the inline resolution turn it on.
 func enabledResolver(argv []string) config.GraftResolver {
-	return config.GraftResolver{Enabled: true, Command: argv}
+	return config.GraftResolver{Enabled: true, Command: argv, InlineTimeout: "0s"}
 }
 
 // gitBinary returns the absolute path of the git executable Gitaly runs, for scripts that move

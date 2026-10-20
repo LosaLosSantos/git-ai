@@ -68,6 +68,11 @@ type Request struct {
 	// graft-resolve gives without verification: graft-resolve then gives no model's resolution
 	// (resolve.Resolver.resolveFile).
 	Capabilities []string `json:"capabilities,omitempty"`
+	// RulesOnly asks the resolver to run only its rules (the strategies whose answers are a rule's:
+	// trivial, union, rerere, a command with origin "rule") and never to call a model: the lane of
+	// the server asks it so when it resolves a member inline, within a bound of time. What the rules
+	// cannot resolve is left unresolved. A resolver that honours it says so in Response.RulesOnly.
+	RulesOnly bool `json:"rules_only,omitempty"`
 }
 
 // The capabilities of a server (Request.Capabilities).
@@ -178,6 +183,9 @@ type Response struct {
 	Resolver    string         `json:"resolver"`
 	Files       []ResolvedFile `json:"files"`
 	Explanation string         `json:"explanation,omitempty"`
+	// RulesOnly echoes a request's RulesOnly: the resolver ran only its rules. A server that asked for
+	// it and does not get it back is talking to an older resolver, and does not ask again.
+	RulesOnly bool `json:"rules_only,omitempty"`
 }
 
 // ResolvedFile is the answer for one conflicted path. Content is null for
