@@ -234,11 +234,16 @@ func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcm
 	// The compaction reads the changelog and rewrites the intents: it runs after the hook, not
 	// under the locks of the references, and its failure leaves the intents as they are.
 	if compact {
-		go func() {
+		run := func() {
 			if err := changelog.CompactLandIntents(repoPath); err != nil {
 				m.logger.WithError(err).WithField("repository", repoPath).Error("graft: compacting the land intents failed")
 			}
-		}()
+		}
+		if m.startLandIntentsCompaction != nil {
+			m.startLandIntentsCompaction(run)
+		} else {
+			go run()
+		}
 	}
 
 	return nil
