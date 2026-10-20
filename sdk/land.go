@@ -56,8 +56,16 @@ type LandOptions struct {
 	// configured conflict resolver (see doc/graft/RESOLVE.md). A resolved
 	// landing is a merge commit of the branch tip and the change. If the
 	// resolver is disabled, refuses a file or fails, the landing fails with a
-	// merge conflict as without this option.
+	// merge conflict as without this option, and the error carries the
+	// conflict package (see LandConflict).
 	ResolveConflicts bool
+	// Resolution lands Commit with the caller's resolution of the conflicts of
+	// a conflict package (see LandConflict and ResolutionFor), as a merge
+	// commit of the branch tip and the change. The server accepts it only when
+	// it was made against the current tip and resolves exactly the conflicting
+	// paths; otherwise Land fails with a fresh package. The request must fit in
+	// MaxLandRequestBytes.
+	Resolution *Resolution
 	// RetryUnavailable is how Land retries a call that the server answers
 	// with Unavailable (see UnavailableRetry). It is on by default.
 	RetryUnavailable UnavailableRetry
@@ -152,9 +160,13 @@ func (r UnavailableRetry) backoff(n int) time.Duration {
 }
 
 // maxRetries returns the retries of a land with the given strategy.
-func (r UnavailableRetry) maxRetries(strategy LandStrategy) int {
+//
+// A land with a Resolution is always a merge of the tip and the change, whatever its strategy: after a
+// lost response Commit is reachable from the tip, so the retry is reported as AlreadyLanded and nothing is
+// replayed. SkipRebaseLands, which protects against the replay of a rebase, does not apply to it.
+func (r UnavailableRetry) maxRetries(strategy LandStrategy, resolution bool) int {
 	switch {
-	case r.Disabled, strategy == LandRebase && r.SkipRebaseLands:
+	case r.Disabled, strategy == LandRebase && !resolution && r.SkipRebaseLands:
 		return 0
 	case r.MaxRetries > 0:
 		return r.MaxRetries
@@ -232,7 +244,8 @@ func oldTip(oid string) string {
 // the status of the last error.
 //
 // Failures carry structured details: use IsMergeConflict, IsNotAncestor,
-// IsReferenceUpdateConflict, IsRejectedByHook or LandError.
+// IsReferenceUpdateConflict, IsRejectedByHook or LandError, and LandConflict
+// for the conflict package of a land that asked for resolution.
 func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) {
 	switch {
 	case trimBranchPrefix(opts.Branch) == "":
@@ -259,6 +272,12 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 	if !opts.Timestamp.IsZero() {
 		req.Timestamp = timestamppb.New(opts.Timestamp)
 	}
+	if opts.Resolution != nil {
+		req.Resolution = opts.Resolution.toProto()
+		if err := checkLandRequestSize(req); err != nil {
+			return nil, err
+		}
+	}
 
 	var (
 		resp            *gitalypb.UserLandResponse
@@ -268,7 +287,7 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 	)
 	for {
 		resp, err = r.client.operations.UserLand(ctx, req)
-		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy) {
+		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy, opts.Resolution != nil) {
 			break
 		}
 		retries++

@@ -33,6 +33,11 @@ var (
 		Buckets: []float64{0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
 	})
 
+	landIntentsCompactionFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "graft_land_intents_compaction_failures_total",
+		Help: "Compactions of the land intents that a prepared reference transaction started and that failed; the intents stay as they were.",
+	})
+
 	changelogAppendSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "graft_changelog_append_seconds",
 		Help:    "Time of one write of the changeset log, with its fsync, for a group of reference transactions.",

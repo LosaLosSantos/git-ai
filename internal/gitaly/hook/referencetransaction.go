@@ -234,11 +234,15 @@ func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcm
 		return err
 	}
 
-	// The compaction reads the changelog and rewrites the intents: it runs after the hook, not
-	// under the locks of the references, and its failure leaves the intents as they are.
+	// The compaction reads the changelog and rewrites the intents. It starts in the prepared
+	// phase, in a goroutine that the hook does not wait for, so it runs while git still holds
+	// the references' locks and after: it takes none of them, only the intents' lock file, which
+	// the intents of other transactions of the repository wait for meanwhile. Its failure leaves
+	// the intents as they are; it is counted and logged.
 	if compact {
 		run := func() {
 			if err := changelog.CompactLandIntents(repoPath); err != nil {
+				landIntentsCompactionFailuresTotal.Inc()
 				m.logger.WithError(err).WithField("repository", repoPath).Error("graft: compacting the land intents failed")
 			}
 		}
@@ -476,12 +480,17 @@ func (m *GitLabHookManager) enforceGraftPolicy(ctx context.Context, env []string
 // denial of the transaction, or an empty message when the policy allows it or
 // does not apply to it.
 func (m *GitLabHookManager) graftPolicyDecision(env []string, changes []byte) (string, error) {
-	if !m.cfg.Graft.Standalone || len(m.cfg.Graft.Policy) == 0 {
+	if !m.cfg.Graft.Standalone {
 		return "", nil
 	}
 
 	meta, err := gitcmd.ChangelogMetaFromEnv(env)
 	if err != nil {
+		if len(m.cfg.Graft.Policy) == 0 {
+			// Without a policy the metadata decides nothing but the reservation of refs/graft/,
+			// which needs an agent the metadata names.
+			return "", nil
+		}
 		return "", fmt.Errorf("reading graft metadata: %w", err)
 	}
 
@@ -505,6 +514,14 @@ func (m *GitLabHookManager) graftPolicyDecision(env []string, changes []byte) (s
 		return "", nil
 	}
 
+	// refs/graft/ is the server's, whatever the policy says.
+	if message := graftReservedDenial(changes); message != "" {
+		return message, nil
+	}
+	if len(m.cfg.Graft.Policy) == 0 {
+		return "", nil
+	}
+
 	message, err := graftPolicyDenial(m.cfg.Graft.Policy, meta.Actor, changes)
 	if err != nil {
 		return "", fmt.Errorf("evaluating graft policy: %w", err)
@@ -524,12 +541,18 @@ func (m *GitLabHookManager) graftPolicyDecision(env []string, changes []byte) (s
 // a per-agent token, outside standalone mode or with an empty policy it does
 // nothing, and the decision is final: the hook still runs afterwards.
 func CheckAgentPolicy(ctx context.Context, graft config.Graft, changes string) error {
-	if !graft.Standalone || len(graft.Policy) == 0 {
+	if !graft.Standalone {
 		return nil
 	}
 
 	id, ok := identity.FromContext(ctx)
 	if !ok || id.Source != identity.SourceAgent {
+		return nil
+	}
+	if message := graftReservedDenial([]byte(changes)); message != "" {
+		return structerr.NewPermissionDenied("%s", message)
+	}
+	if len(graft.Policy) == 0 {
 		return nil
 	}
 
@@ -571,6 +594,23 @@ func graftPolicyDenial(policy []config.GraftPolicyRule, actor string, changes []
 	}
 
 	return message, nil
+}
+
+// GraftReservedRefPrefix is the namespace of the references that only the server writes: the
+// proposals of a land (refs/graft/proposals/) and graft-verify's green references, which it
+// writes with the shared token. An agent never creates, updates or deletes a reference under it,
+// whatever the policy says, by any RPC or a push: the reference-transaction hook refuses it.
+const GraftReservedRefPrefix = "refs/graft/"
+
+// graftReservedDenial returns the denial of changes that update a reference under
+// GraftReservedRefPrefix, or "".
+func graftReservedDenial(changes []byte) string {
+	for _, line := range strings.Split(string(changes), "\n") {
+		if _, _, reference, ok := changelog.ParseHookLine(line); ok && strings.HasPrefix(reference, GraftReservedRefPrefix) {
+			return fmt.Sprintf("%q is under %s, which is reserved for the server: agents may not update it", reference, GraftReservedRefPrefix)
+		}
+	}
+	return ""
 }
 
 // isGovernedReference reports whether the standalone access policy governs an

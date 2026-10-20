@@ -283,3 +283,75 @@ func TestValidate_Errors(t *testing.T) {
 		require.False(t, errors.Is(err, ErrInvalidResponse))
 	})
 }
+
+func TestValidateFile_specialFileSymlinks(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		".gitmodules", "sub/.gitattributes", ".gitignore", ".mailmap",
+		".GITMODULES", ".gitmodules ", ".gitmodules...", ".gitmodules::$DATA",
+		"GITMOD~1", "gi7eba~4", "GI7D29~1", "maba30~2", "gitign~1", "gitmod~4 .",
+		// The hashed 8.3 forms: fewer letters of the stem, more digits, eight characters in all.
+		"gi7eb~12", "gi7e~123", "GI7EBA~9", "mabA3~12.",
+		// HFS+ ignores zero-width code points.
+		".git\u200cmodules", "\ufeff.gitattributes",
+	} {
+		err := ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20)
+		require.ErrorContains(t, err, "is refused", "%q", name)
+		// As a regular file the name is fine.
+		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeRegular, Content: []byte("x")}, 1<<20), "%q", name)
+	}
+
+	for _, name := range []string{
+		".gitmodules-old", "gitmodules", "GITMOD~A", "gitmod~10", "x.gitignore", "link",
+		// git's short name takes ~1 to ~4; a hashed form is eight characters with its digits.
+		"gitmod~5", "gi7eba~0", "gi7eb~1x", "gi7eba~12x", "gi7ebx~1", "maba3~1.",
+	} {
+		require.NoError(t, ValidateFile(ResponseFile{Path: name, Action: ActionWrite, Mode: ModeSymlink, Content: []byte("target")}, 1<<20), "%q", name)
+	}
+}
+
+// TestValidateFile_pointerLine: a written file holding the pointer line of a binary side, as
+// graft land --conflicts-dir writes it, is refused, text or binary; the prefix elsewhere in a line
+// is content like any other.
+func TestValidateFile_pointerLine(t *testing.T) {
+	t.Parallel()
+
+	for name, content := range map[string]string{
+		"alone":            ConflictPointerPrefix + "the binary ours side is sides/ours/c.bin\n",
+		"after text":       "x\n" + ConflictPointerPrefix + "the binary theirs side is sides/theirs/c.bin",
+		"in binary":        "\x00bin\n" + ConflictPointerPrefix + "the binary ours side is sides/ours/c.bin\n",
+		"with a CR ending": "x\r\n" + ConflictPointerPrefix + "p\r\n",
+	} {
+		err := ValidateFile(ResponseFile{Path: "c.bin", Action: ActionWrite, Mode: ModeRegular, Content: []byte(content)}, 1<<20)
+		require.ErrorContains(t, err, "the pointer to a binary side", name)
+	}
+	require.NoError(t, ValidateFile(ResponseFile{Path: "c.txt", Action: ActionWrite, Mode: ModeRegular, Content: []byte("see " + ConflictPointerPrefix + "x\n")}, 1<<20))
+
+	// Validate applies it to a resolver's answer too.
+	req := &Request{Files: []File{{Path: "c.bin"}}, Limits: Limits{MaxFileBytes: 1 << 20}}
+	err := Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{{Path: "c.bin", Action: ActionWrite, Mode: ModeRegular, Content: []byte(ConflictPointerPrefix + "p\n")}}})
+	require.ErrorIs(t, err, ErrInvalidResponse)
+	require.ErrorContains(t, err, "the pointer to a binary side")
+}
+
+// TestValidateFile_pointerLineOfTheSides: a pointer line that a side of the conflict has of its own
+// is content, not a pointer left in place: Validate takes the sides from the request, and
+// ValidateFileWithSides from its caller. Without such a side the rule holds.
+func TestValidateFile_pointerLineOfTheSides(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("doc\n" + ConflictPointerPrefix + "an example of the line\n")
+	f := ResponseFile{Path: "c.md", Action: ActionWrite, Mode: ModeRegular, Content: content}
+
+	require.ErrorIs(t, ValidateFile(f, 1<<20), ErrConflictPointer)
+	require.NoError(t, ValidateFileWithSides(f, 1<<20, []byte("base\n"), content))
+	require.ErrorIs(t, ValidateFileWithSides(f, 1<<20, []byte("base\n"), []byte("ours\n")), ErrConflictPointer)
+
+	req := &Request{Files: []File{{Path: "c.md", Ours: &Side{Content: content}, Theirs: &Side{Content: []byte("t\n")}}}, Limits: Limits{MaxFileBytes: 1 << 20}}
+	require.NoError(t, Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{f}}))
+	req.Files[0].Ours.Content = []byte("o\n")
+	err := Validate(req, &Response{Version: ProtocolVersion, Files: []ResponseFile{f}})
+	require.ErrorIs(t, err, ErrInvalidResponse)
+	require.ErrorIs(t, err, ErrConflictPointer)
+}

@@ -405,7 +405,8 @@ func blobInfo(
 ) (git.ObjectID, error) {
 	// Since only blobs are allowed, only path-scoped revisions and blob IDs are accepted.
 	if bytes.Contains(revision, []byte(":")) {
-		if err := git.ValidateRevision(revision, git.AllowPathScopedRevision()); err != nil {
+		// git-cat-file reads the revisions NUL-delimited (-Z), so a line break in a path is data.
+		if err := git.ValidateRevision(revision, git.AllowPathScopedRevision(), git.AllowLineBreaksInPath()); err != nil {
 			return "", fmt.Errorf("validating path-scoped revision: %w", err)
 		}
 	} else {

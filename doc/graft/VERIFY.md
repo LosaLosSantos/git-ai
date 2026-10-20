@@ -7,6 +7,18 @@ built on the public SDK (`sdk/`). It does not run inside the server and has no
 special access to it: it is an ordinary gRPC client that uses the operator's
 shared token (see [Permissions](#permissions)).
 
+## Security note: the test command runs code from the tree
+
+The test command runs code that is in the tip, written by agents, and, where
+the server's AI lands a resolution because the land's own `verify.command`
+passed (see [RESOLVE](RESOLVE.md)), written by a model from repository content
+that agents control. Treat both commands as untrusted code: run them in a
+container with `--network=none`, the work directory read-only where the tests
+allow it, no credentials in the environment or on the file system, and resource
+limits. A command that needs the network or a secret to pass can be steered
+into leaking it (a prompt injection planted in the repository). See
+[AGENT-SECURITY](AGENT-SECURITY.md).
+
 ## Loop
 
 1. Read the changelog of the branch from the saved cursor with

@@ -388,14 +388,26 @@ func New(ctx context.Context, logger log.Logger, nameAndArgs []string, opts ...O
 	// If requested, we will set up the command such that `Write()` can be called on it directly. Otherwise,
 	// we simply pass as stdin whatever the user has asked us to set up. If no `stdin` was set up, the command
 	// will implicitly read from `/dev/null`.
-	if _, ok := cfg.stdin.(stdinSentinel); ok {
+	// startStdinCopy starts the copy of a filtered stdin, once the process started: until then
+	// nothing runs that could outlive a command that failed to start.
+	startStdinCopy := func() {}
+	switch _, ok := cfg.stdin.(stdinSentinel); {
+	case ok && cfg.stdinFilter != nil:
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("creating stdin pipe: %w", err)
+		}
+		command.writer, startStdinCopy = filteredStdin(pipe, cfg.stdinFilter)
+	case ok:
 		pipe, err := cmd.StdinPipe()
 		if err != nil {
 			return nil, fmt.Errorf("creating stdin pipe: %w", err)
 		}
 
 		command.writer = pipe
-	} else {
+	case cfg.stdin != nil && cfg.stdinFilter != nil:
+		cmd.Stdin = cfg.stdinFilter(cfg.stdin)
+	default:
 		cmd.Stdin = cfg.stdin
 	}
 
@@ -428,6 +440,7 @@ func New(ctx context.Context, logger log.Logger, nameAndArgs []string, opts ...O
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting process %v: %w", cmd.Args, err)
 	}
+	startStdinCopy()
 
 	go trackMaxRssAnon(ctx, cmd.Process.Pid, &command.maxRssAnon, command.processExitedCh)
 
@@ -822,6 +835,29 @@ func (c *Command) exitStatus() (int, syscall.Signal) {
 	}
 
 	return state.ExitCode(), 0
+}
+
+// filteredStdin returns the writer of a command's stdin that reaches pipe, the stdin of the
+// process, through filter, and the function that starts the copy, which the caller calls once the
+// process started. The copy is a goroutine that copies the filtered stream into pipe and closes
+// pipe when the writer is closed. When the process stops reading, the copy fails, and the writes
+// after that fail with its error, as writes to pipe itself would: a writer never blocks on a
+// process that is gone. A command that fails to start never calls the function, and so leaves no
+// goroutine behind.
+func filteredStdin(pipe io.WriteCloser, filter func(io.Reader) io.Reader) (io.WriteCloser, func()) {
+	r, w := io.Pipe()
+	return w, func() { go copyFilteredStdin(r, pipe, filter) }
+}
+
+func copyFilteredStdin(r *io.PipeReader, pipe io.WriteCloser, filter func(io.Reader) io.Reader) {
+	_, err := io.Copy(pipe, filter(r))
+	if closeErr := pipe.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	r.CloseWithError(err)
 }
 
 type stdinSentinel struct{}

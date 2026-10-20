@@ -152,3 +152,77 @@ func TestCreateBundleFromRefList_validations(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateBundleFromRefList_refusesPatternsThatAreMoreThanOneLine: the patterns reach git-bundle(1) one
+// per line on its stdin, so a pattern with a line feed, a carriage return or a NUL is another pattern, or
+// cut short: it names references the request never showed. Every pattern is checked, those of the first
+// request before anything starts, and those of a later one as it is read.
+func TestCreateBundleFromRefList_refusesPatternsThatAreMoreThanOneLine(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg, client := setupRepositoryService(t)
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("master"))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithReference("refs/graft/green/main"), gittest.WithMessage("hidden"))
+
+	for desc, pattern := range map[string]string{
+		"a line feed and a second pattern": "master\nrefs/graft/green/main",
+		"a carriage return":                "master\r",
+		"a NUL":                            "master\x00refs/graft/green/main",
+	} {
+		t.Run("first request, "+desc, func(t *testing.T) {
+			t.Parallel()
+
+			stream, err := client.CreateBundleFromRefList(ctx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Repository: repo, Patterns: [][]byte{[]byte(pattern)}}))
+			require.NoError(t, stream.CloseSend())
+			var data int
+			for resp, err := stream.Recv(); ; resp, err = stream.Recv() {
+				data += len(resp.GetData())
+				if err != nil {
+					require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
+					require.ErrorContains(t, err, "a revision can't contain a line break or NUL")
+					break
+				}
+			}
+			require.Zero(t, data, "no bundle was made")
+		})
+
+		t.Run("a later request, "+desc, func(t *testing.T) {
+			t.Parallel()
+
+			stream, err := client.CreateBundleFromRefList(ctx)
+			require.NoError(t, err)
+			require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Repository: repo, Patterns: [][]byte{[]byte("master")}}))
+			require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Patterns: [][]byte{[]byte(pattern)}}))
+			require.NoError(t, stream.CloseSend())
+			// The data of the patterns that were read before the invalid one may have been sent: the
+			// bundle is not finished, and the answer is the error. What must never be in it is a
+			// reference the invalid pattern would have named, which never reached git.
+			var data []byte
+			var resp *gitalypb.CreateBundleFromRefListResponse
+			for resp, err = stream.Recv(); err == nil; resp, err = stream.Recv() {
+				data = append(data, resp.GetData()...)
+			}
+			require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
+			require.ErrorContains(t, err, "a revision can't contain a line break or NUL")
+			require.NotContains(t, string(data), "refs/graft/green/main", "the invalid pattern reached git")
+		})
+	}
+
+	t.Run("an ordinary pattern still makes a bundle", func(t *testing.T) {
+		t.Parallel()
+
+		stream, err := client.CreateBundleFromRefList(ctx)
+		require.NoError(t, err)
+		require.NoError(t, stream.Send(&gitalypb.CreateBundleFromRefListRequest{Repository: repo, Patterns: [][]byte{[]byte("master")}}))
+		require.NoError(t, stream.CloseSend())
+		var data int
+		for resp, err := stream.Recv(); err == nil; resp, err = stream.Recv() {
+			data += len(resp.GetData())
+		}
+		require.Positive(t, data)
+	})
+}

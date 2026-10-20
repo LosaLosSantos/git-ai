@@ -22,6 +22,8 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -82,6 +84,13 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("openai: HTTP %d: %s", e.StatusCode, e.Message)
 }
 
+// HTTPStatus implements llm.StatusError.
+func (e *APIError) HTTPStatus() int { return e.StatusCode }
+
+// BeforeGeneration implements llm.StatusError: the provider does not stream, so an error status
+// is the status of the response, before anything was generated.
+func (e *APIError) BeforeGeneration() bool { return true }
+
 // Provider is an OpenAI-compatible Chat Completions client. It is safe for
 // concurrent use.
 type Provider struct {
@@ -89,6 +98,8 @@ type Provider struct {
 	apiKey           string
 	model            string
 	maxTokens        int
+	effort           string
+	routing          *providerPreference
 	timeout          time.Duration
 	client           *http.Client
 	maxResponseBytes int64
@@ -109,9 +120,37 @@ func New(cfg llm.Config) (*Provider, error) {
 	if cfg.MaxTokens < 0 {
 		return nil, errors.New("openai: max_tokens must not be negative")
 	}
+	// No setting is dropped silently: the provider runs no command and supports
+	// no options, and an effort it cannot send is an error.
+	if len(cfg.Command) > 0 {
+		return nil, errors.New("openai: command is for the command provider; this provider takes none")
+	}
+	if len(cfg.Options) > 0 {
+		keys := make([]string, 0, len(cfg.Options))
+		for k := range cfg.Options {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return nil, fmt.Errorf("openai: unsupported options %v: this provider takes none", keys)
+	}
+	effort := strings.ToLower(strings.TrimSpace(cfg.Effort))
+	if effort != "" && !efforts[effort] {
+		return nil, fmt.Errorf("openai: invalid effort %q (want minimal, low, medium, high or xhigh)", cfg.Effort)
+	}
 	timeout, err := cfg.TimeoutOrDefault()
 	if err != nil {
 		return nil, err
+	}
+	var routing *providerPreference
+	if cfg.Routing != nil {
+		if err := cfg.Routing.Validate(); err != nil {
+			return nil, fmt.Errorf("openai: %w", err)
+		}
+		routing = &providerPreference{
+			Only:           slices.Clone(cfg.Routing.Only),
+			Ignore:         slices.Clone(cfg.Routing.Ignore),
+			AllowFallbacks: false,
+		}
 	}
 
 	endpoint, err := chatEndpoint(cfg.BaseURL)
@@ -132,6 +171,8 @@ func New(cfg llm.Config) (*Provider, error) {
 		apiKey:           os.Getenv(keyEnv),
 		model:            model,
 		maxTokens:        cfg.MaxTokens,
+		effort:           effort,
+		routing:          routing,
 		timeout:          timeout,
 		client:           &http.Client{},
 		maxResponseBytes: defaultMaxResponseBytes,
@@ -272,11 +313,33 @@ func appendSchemaInstruction(system string, schemaJSON []byte) string {
 	return system + "\n\n" + instruction
 }
 
+// efforts are the reasoning efforts the provider sends.
+var efforts = map[string]bool{"minimal": true, "low": true, "medium": true, "high": true, "xhigh": true}
+
 type chatRequest struct {
-	Model          string    `json:"model"`
-	Messages       []message `json:"messages"`
-	MaxTokens      int       `json:"max_tokens,omitempty"`
-	ResponseFormat any       `json:"response_format,omitempty"`
+	Model          string     `json:"model"`
+	Messages       []message  `json:"messages"`
+	MaxTokens      int        `json:"max_tokens,omitempty"`
+	ResponseFormat any        `json:"response_format,omitempty"`
+	Reasoning      *reasoning `json:"reasoning,omitempty"`
+	// Provider is OpenRouter's provider-routing object, sent when routing is configured.
+	Provider *providerPreference `json:"provider,omitempty"`
+}
+
+// providerPreference is OpenRouter's provider-routing object (llm.Routing). allow_fallbacks is
+// always sent, and always false: a call that the allowed endpoints cannot serve fails rather than
+// going to another endpoint, whose price the budget may not have counted.
+type providerPreference struct {
+	Only           []string `json:"only,omitempty"`
+	Ignore         []string `json:"ignore,omitempty"`
+	AllowFallbacks bool     `json:"allow_fallbacks"`
+}
+
+// reasoning is OpenRouter's reasoning parameter, sent when an effort is
+// configured. An endpoint that does not know it may reject the request, so
+// configure an effort only for an endpoint that takes it.
+type reasoning struct {
+	Effort string `json:"effort"`
 }
 
 type message struct {
@@ -289,6 +352,10 @@ func (p *Provider) body(system, prompt string, maxTokens int, format any) []byte
 		Model:          p.model,
 		MaxTokens:      maxTokens,
 		ResponseFormat: format,
+		Provider:       p.routing,
+	}
+	if p.effort != "" {
+		req.Reasoning = &reasoning{Effort: p.effort}
 	}
 	if system != "" {
 		req.Messages = append(req.Messages, message{Role: "system", Content: system})
@@ -301,8 +368,10 @@ func (p *Provider) body(system, prompt string, maxTokens int, format any) []byte
 }
 
 type chatResponse struct {
-	Model   string `json:"model"`
-	Choices []struct {
+	Model string `json:"model"`
+	// Provider is the provider that served the call, as OpenRouter reports it.
+	Provider string `json:"provider"`
+	Choices  []struct {
 		Message struct {
 			Content *string `json:"content"`
 			Refusal *string `json:"refusal"`
@@ -310,8 +379,11 @@ type chatResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens            int `json:"prompt_tokens"`
+		CompletionTokens        int `json:"completion_tokens"`
+		CompletionTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -345,11 +417,13 @@ func (p *Provider) answer(chat *chatResponse, wantJSON bool) (*llm.Response, err
 		model = p.model
 	}
 	resp := &llm.Response{
-		Text:  text,
-		Model: model,
+		Text:     text,
+		Model:    model,
+		Provider: chat.Provider,
 		Usage: llm.Usage{
-			InputTokens:  chat.Usage.PromptTokens,
-			OutputTokens: chat.Usage.CompletionTokens,
+			InputTokens:     chat.Usage.PromptTokens,
+			OutputTokens:    chat.Usage.CompletionTokens,
+			ReasoningTokens: chat.Usage.CompletionTokensDetails.ReasoningTokens,
 		},
 	}
 	if wantJSON {

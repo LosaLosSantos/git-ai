@@ -10,6 +10,11 @@
 // object in prose or a Markdown code fence. A non-zero exit status is an
 // error; its stderr (bounded) is included in the error message.
 //
+// The program inherits graft-resolve's environment, plus GRAFT_LLM_MODEL,
+// GRAFT_LLM_EFFORT and GRAFT_LLM_MAX_TOKENS when model, effort and a token
+// limit are set (inherited variables of those names are removed). base_url, api_key_env and options are rejected: the program
+// reads its own endpoint and credentials.
+//
 // This backend is the escape hatch for any model or service that has a
 // command-line client: the operator decides what runs, Graft only speaks the
 // stdin/stdout contract.
@@ -21,8 +26,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,9 +66,22 @@ type Provider struct {
 	argv           []string
 	label          string
 	model          string
+	effort         string
+	maxTokens      int
 	timeout        time.Duration
 	maxOutputBytes int
 }
+
+// Environment variables the program receives, set only when the setting is:
+// the model name, the reasoning effort (verbatim), and the answer token limit
+// of the call (the request's, else the configured default). The program is
+// expected to honour them; the AI budget counts a call's output as at most
+// GRAFT_LLM_MAX_TOKENS.
+const (
+	EnvModel     = "GRAFT_LLM_MODEL"
+	EnvEffort    = "GRAFT_LLM_EFFORT"
+	EnvMaxTokens = "GRAFT_LLM_MAX_TOKENS"
+)
 
 // stdinPayload is the request written to the program's stdin.
 type stdinPayload struct {
@@ -85,6 +106,35 @@ func New(cfg llm.Config) (*Provider, error) {
 	if cfg.MaxTokens < 0 {
 		return nil, errors.New("command: max_tokens must not be negative")
 	}
+	// No setting is dropped silently. The program reads its own endpoint and
+	// credentials from its environment, so base_url, api_key_env and options
+	// are errors here.
+	var unsupported []string
+	if strings.TrimSpace(cfg.BaseURL) != "" {
+		unsupported = append(unsupported, "base_url")
+	}
+	if strings.TrimSpace(cfg.APIKeyEnv) != "" {
+		unsupported = append(unsupported, "api_key_env")
+	}
+	if len(cfg.Options) > 0 {
+		keys := make([]string, 0, len(cfg.Options))
+		for k := range cfg.Options {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		unsupported = append(unsupported, fmt.Sprintf("options %v", keys))
+	}
+	if cfg.Routing != nil {
+		unsupported = append(unsupported, "routing")
+	}
+	if len(unsupported) > 0 {
+		return nil, fmt.Errorf("command: unsupported settings %s: the program reads its endpoint and credentials from its own environment", strings.Join(unsupported, ", "))
+	}
+	for name, v := range map[string]string{"model": cfg.Model, "effort": cfg.Effort} {
+		if strings.ContainsRune(v, 0) {
+			return nil, fmt.Errorf("command: %s contains a NUL byte", name)
+		}
+	}
 	timeout, err := cfg.TimeoutOrDefault()
 	if err != nil {
 		return nil, err
@@ -94,7 +144,9 @@ func New(cfg llm.Config) (*Provider, error) {
 	return &Provider{
 		argv:           argv,
 		label:          "command:" + filepath.Base(argv[0]),
-		model:          cfg.Model,
+		model:          strings.TrimSpace(cfg.Model),
+		effort:         strings.TrimSpace(cfg.Effort),
+		maxTokens:      cfg.MaxTokens,
 		timeout:        timeout,
 		maxOutputBytes: DefaultMaxOutputBytes,
 	}, nil
@@ -133,6 +185,26 @@ func (p *Provider) Complete(ctx context.Context, req llm.Request) (*llm.Response
 	stderr := &limitedBuffer{limit: maxStderrBytes}
 
 	cmd := exec.CommandContext(ctx, p.argv[0], p.argv[1:]...)
+	// The GRAFT_LLM_ variables are the provider's settings only: inherited ones are removed.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); k == EnvModel || k == EnvEffort || k == EnvMaxTokens {
+			continue
+		}
+		cmd.Env = append(cmd.Env, kv)
+	}
+	if p.model != "" {
+		cmd.Env = append(cmd.Env, EnvModel+"="+p.model)
+	}
+	if p.effort != "" {
+		cmd.Env = append(cmd.Env, EnvEffort+"="+p.effort)
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = p.maxTokens
+	}
+	if maxTokens > 0 {
+		cmd.Env = append(cmd.Env, EnvMaxTokens+"="+strconv.Itoa(maxTokens))
+	}
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr

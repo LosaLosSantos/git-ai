@@ -1,0 +1,17 @@
+{
+  "repos": [
+    {"name": "microsoft/TypeScript", "url": "https://github.com/microsoft/TypeScript.git", "commit": "5237fd46890956e4bb8177a1a05dcd69e4166560", "license": "Apache-2.0"},
+    {"name": "microsoft/vscode", "url": "https://github.com/microsoft/vscode.git", "commit": "80aa091c84c6201a3b3cc648a6b12e388e1a2c39", "license": "MIT"},
+    {"name": "facebook/react", "url": "https://github.com/facebook/react.git", "commit": "098d2e87a1f7142947418d15f63f975b58c4685b", "license": "MIT"},
+    {"name": "django/django", "url": "https://github.com/django/django.git", "commit": "d430084791a61b31cecec132bce3dca19194f7f2", "license": "BSD-3-Clause"},
+    {"name": "pandas-dev/pandas", "url": "https://github.com/pandas-dev/pandas.git", "commit": "4f72cac84d11ea782685bfced9de9db9b492686c", "license": "BSD-3-Clause"},
+    {"name": "pallets/flask", "url": "https://github.com/pallets/flask.git", "commit": "d086db856be187255b8ec61ef409357393020f32", "license": "BSD-3-Clause"},
+    {"name": "kubernetes/kubernetes", "url": "https://github.com/kubernetes/kubernetes.git", "commit": "7f9d9d6a3d6e48be4d8d261c9474618d7f8d303d", "license": "Apache-2.0"},
+    {"name": "prometheus/prometheus", "url": "https://github.com/prometheus/prometheus.git", "commit": "c052a79dc7fd0f2df2219ffe336f510b0d149b72", "license": "Apache-2.0"},
+    {"name": "golang/go", "url": "https://github.com/golang/go.git", "commit": "dfc6f7db9bd75868ffb5cbc9501a2f4899122d2f", "license": "BSD-3-Clause"},
+    {"name": "rust-lang/rust-analyzer", "url": "https://github.com/rust-lang/rust-analyzer.git", "commit": "5ec20d044dbf04895877a55921ddc0ae6e73e127", "license": "MIT OR Apache-2.0"},
+    {"name": "tokio-rs/tokio", "url": "https://github.com/tokio-rs/tokio.git", "commit": "cdd9dae3aa5056e23dc4d5bc4f852ab8fbf27aff", "license": "MIT"},
+    {"name": "apache/kafka", "url": "https://github.com/apache/kafka.git", "commit": "f90822763913e10a02478c235b34a5ea9f36856e", "license": "Apache-2.0"},
+    {"name": "spring-projects/spring-boot", "url": "https://github.com/spring-projects/spring-boot.git", "commit": "57a1ca37c36f3cf355211aa8dea8c500b2dd3a09", "license": "Apache-2.0"}
+  ]
+}

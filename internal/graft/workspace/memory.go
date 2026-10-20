@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -291,7 +292,23 @@ func (m *MemoryBackend) Land(_ context.Context, opts LandOptions) (LandResult, e
 	if commit.parent != "" {
 		base = m.commits[commit.parent].files
 	}
-	// Three-way merge of the commit's changes (relative to its parent) onto the tip.
+	// Three-way merge of the commit's changes (relative to its parent) onto the tip. With a
+	// resolution, the conflicting names take the resolved files, as the server's merge commit
+	// does; the resolution must be made against this tip and resolve exactly those names.
+	// As on the server, a resolution for another commit is refused, whatever its files.
+	if opts.Resolution != nil && opts.Resolution.Commit != id {
+		return LandResult{}, fmt.Errorf("the resolution is for commit %q, not commit %q", opts.Resolution.Commit, id)
+	}
+	if opts.Resolution != nil && opts.Resolution.Tip != tip {
+		return LandResult{}, fmt.Errorf("the resolution was made against tip %s, the branch is at %s: %w", opts.Resolution.Tip, tip, ErrMergeConflict)
+	}
+	resolved := map[string]ResolvedFile{}
+	if opts.Resolution != nil {
+		for _, f := range opts.Resolution.Files {
+			resolved[f.Path] = f
+		}
+	}
+	conflicting := map[string]bool{}
 	files := cloneFiles(m.commits[tip].files)
 	names := map[string]bool{}
 	for name := range commit.files {
@@ -308,12 +325,34 @@ func (m *MemoryBackend) Land(_ context.Context, opts LandOptions) (LandResult, e
 		}
 		tipFile, tipHas := files[name]
 		if !sameFile(tipFile, tipHas, baseFile, baseHas) && !sameFile(tipFile, tipHas, commitFile, commitHasFile) {
-			return LandResult{}, fmt.Errorf("%s: %w", name, ErrMergeConflict)
+			if opts.Resolution == nil {
+				return LandResult{}, fmt.Errorf("%s: %w", name, ErrMergeConflict)
+			}
+			r, ok := resolved[name]
+			if !ok {
+				return LandResult{}, fmt.Errorf("%s is not resolved: %w", name, ErrMergeConflict)
+			}
+			conflicting[name] = true
+			if r.Delete {
+				delete(files, name)
+				continue
+			}
+			mode, err := strconv.ParseUint(r.Mode, 8, 32)
+			if err != nil {
+				return LandResult{}, fmt.Errorf("the resolution of %s has the mode %q: %w", name, r.Mode, err)
+			}
+			files[name] = memFile{content: r.Content, mode: uint32(mode)}
+			continue
 		}
 		if commitHasFile {
 			files[name] = commitFile
 		} else {
 			delete(files, name)
+		}
+	}
+	for name := range resolved {
+		if !conflicting[name] {
+			return LandResult{}, fmt.Errorf("the resolution names %s, which does not conflict: %w", name, ErrMergeConflict)
 		}
 	}
 	newID := m.newCommit(tip, files, commit.author, commit.subject)

@@ -3,12 +3,14 @@ package git
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 type validateRevisionConfig struct {
 	allowEmpty              bool
 	allowPathScopedRevision bool
 	allowPseudoRevisions    bool
+	allowLineBreaksInPath   bool
 }
 
 // ValidateRevisionOption is an option that can be passed to ValidateRevision.
@@ -23,11 +25,22 @@ func AllowEmptyRevision() ValidateRevisionOption {
 }
 
 // AllowPathScopedRevision changes ValidateRevision to allow path-scoped revisions like
-// `HEAD:README.md`. Note that path-scoped revisions may contain any character except for NUL bytes.
-// Most importantly, a path-scoped revision may contain newlines.
+// `HEAD:README.md`. The path of a path-scoped revision may contain any character except for NUL
+// bytes and, unless AllowLineBreaksInPath is given, line breaks: revisions travel to git one per
+// line on its standard input (git-rev-list(1) --stdin), so a line break in a revision would be
+// another revision, and NUL ends the line for git.
 func AllowPathScopedRevision() ValidateRevisionOption {
 	return func(cfg *validateRevisionConfig) {
 		cfg.allowPathScopedRevision = true
+	}
+}
+
+// AllowLineBreaksInPath changes ValidateRevision to allow a line feed or a carriage return in the
+// path of a path-scoped revision. Only a caller whose revisions git reads NUL-delimited may give
+// it (git-cat-file(1) -Z): for any other, a line break ends the revision.
+func AllowLineBreaksInPath() ValidateRevisionOption {
+	return func(cfg *validateRevisionConfig) {
+		cfg.allowLineBreaksInPath = true
 	}
 }
 
@@ -47,25 +60,13 @@ func ValidateRevision(revision []byte, opts ...ValidateRevisionOption) error {
 		opt(&cfg)
 	}
 
-	if cfg.allowPseudoRevisions {
-		switch {
-		case bytes.Equal(revision, []byte("--all")):
-			return nil
-		case bytes.Equal(revision, []byte("--not")):
-			return nil
-		case bytes.Equal(revision, []byte("--branches")):
-			return nil
-		case bytes.Equal(revision, []byte("--tags")):
-			return nil
-		case bytes.Equal(revision, []byte("--alternate-refs")):
-			return nil
-		case bytes.HasPrefix(revision, []byte("--branches=")):
-			return nil
-		case bytes.HasPrefix(revision, []byte("--tags=")):
-			return nil
-		case bytes.HasPrefix(revision, []byte("--glob=")):
-			return nil
+	if cfg.allowPseudoRevisions && isPseudoRevision(revision) {
+		// The pattern after "=" is a reference pattern: it has no control character, and above all
+		// no line break or NUL, which would make the rest of it another revision on git's stdin.
+		if hasControlCharacter(revision) {
+			return fmt.Errorf("revision can't contain control characters")
 		}
+		return nil
 	}
 
 	if bytes.HasPrefix(revision, []byte("-")) {
@@ -76,9 +77,13 @@ func ValidateRevision(revision []byte, opts ...ValidateRevisionOption) error {
 	}
 
 	if cfg.allowPathScopedRevision {
-		// We don't need to validate the path component, if any, given that it may contain
-		// all bytes except for the NUL byte which we already checked for above.
-		revision, _, _ = bytes.Cut(revision, []byte(":"))
+		// The path component, if any, may contain all bytes except for the NUL byte which we
+		// already checked for above, and line breaks, which separate revisions on git's stdin.
+		var path []byte
+		revision, path, _ = bytes.Cut(revision, []byte(":"))
+		if !cfg.allowLineBreaksInPath && bytes.ContainsAny(path, "\n\r") {
+			return fmt.Errorf("path of a revision can't contain a line break")
+		}
 	}
 
 	if !cfg.allowEmpty && len(revision) == 0 {
@@ -87,6 +92,9 @@ func ValidateRevision(revision []byte, opts ...ValidateRevisionOption) error {
 	if bytes.ContainsAny(revision, " \t\n\r") {
 		return fmt.Errorf("revision can't contain whitespace")
 	}
+	if hasControlCharacter(revision) {
+		return fmt.Errorf("revision can't contain control characters")
+	}
 	if bytes.Contains(revision, []byte(":")) {
 		return fmt.Errorf("revision can't contain ':'")
 	}
@@ -94,5 +102,45 @@ func ValidateRevision(revision []byte, opts ...ValidateRevisionOption) error {
 		return fmt.Errorf("revision can't contain '\\'")
 	}
 
+	return nil
+}
+
+// isPseudoRevision reports whether revision is a pseudo-revision understood by git-rev-list(1) that
+// AllowPseudoRevision allows.
+func isPseudoRevision(revision []byte) bool {
+	switch {
+	case bytes.Equal(revision, []byte("--all")),
+		bytes.Equal(revision, []byte("--not")),
+		bytes.Equal(revision, []byte("--branches")),
+		bytes.Equal(revision, []byte("--tags")),
+		bytes.Equal(revision, []byte("--alternate-refs")),
+		bytes.HasPrefix(revision, []byte("--branches=")),
+		bytes.HasPrefix(revision, []byte("--tags=")),
+		bytes.HasPrefix(revision, []byte("--glob=")):
+		return true
+	}
+	return false
+}
+
+// hasControlCharacter reports whether b holds an ASCII control character: below space, or DEL.
+// References cannot contain one (git check-ref-format), so no revision of a reference does.
+func hasControlCharacter(b []byte) bool {
+	for _, c := range b {
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateStdinRevision checks a revision that is about to be written to the standard input of a
+// git command that reads revisions one per line (git-rev-list(1) --stdin): whatever its caller
+// validated, a revision with a line feed or a carriage return is more than one revision, and one
+// with a NUL is read only up to it. Every writer of such a stdin calls it for each revision, and a
+// test lists the writers (stdin_writers_test.go).
+func ValidateStdinRevision(revision string) error {
+	if strings.ContainsAny(revision, "\n\r\x00") {
+		return fmt.Errorf("revision %q: a revision can't contain a line break or NUL", revision)
+	}
 	return nil
 }

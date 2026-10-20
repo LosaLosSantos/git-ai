@@ -1,3 +1,5 @@
+//go:build cgo
+
 package resolve
 
 import (
@@ -19,7 +21,7 @@ func TestResolveLLMDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 		"add-add invalid": {Path: "x", Ours: []byte("\xff\n"), Theirs: []byte("t\n")},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := llmFixed("x\n", "high")
+			p := llmFixed("x\n")
 			if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); !errors.Is(err, ErrLLMNotApplicable) {
 				t.Fatalf("err = %v, want ErrLLMNotApplicable", err)
 			}
@@ -32,7 +34,7 @@ func TestResolveLLMDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 
 func TestResolveLLMAcceptsValidMultibyteUTF8(t *testing.T) {
 	// Valid multi-byte text ("é" as C3 A9) is still sent to the model.
-	p := llmFixed("café\nB\nC\n", "high")
+	p := llmFixed("café\nB\nC\n")
 	f := LLMFile{Path: "x", Base: []byte("café\nA\n"), Ours: []byte("café\nB\n"), Theirs: []byte("café\nC\n")}
 	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
 		t.Fatal(err)
@@ -46,7 +48,7 @@ func TestLLMStrategyDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 	// Through the strategy chain: a Latin-1 side must not reach the provider,
 	// and no strategy may write the altered bytes.
 	fake := wp19SetAnswer(func(context.Context, llm.Request) (*llm.Response, error) {
-		return wp19Answer("caf\xe9\nB\nC\n", "high"), nil
+		return wp19Answer("caf\xe9\nB\nC\n"), nil
 	})
 	r := wp19Build(t, wp19LLMConfig)
 
@@ -64,67 +66,100 @@ func TestLLMStrategyDeclinesInvalidUTF8WithoutCall(t *testing.T) {
 	}
 }
 
-func TestLLMEnsureNewlineFollowsLineEndings(t *testing.T) {
-	crlfBase := []string{"a\r\n", "b\r\n", "c\r\n"}
-	lfBase := []string{"a\n", "b\n", "c\n"}
-
-	// A CRLF neighbourhood gets CRLF, an LF file gets LF.
-	crlf := &llmRegion{start: 1, end: 2, base: "b\r\n", ours: "B\r\n", theirs: "b2\r\n"}
-	if got := llmEnsureNewline("X", crlfBase, crlf); got != "X\r\n" {
-		t.Fatalf("CRLF answer = %q, want %q", got, "X\r\n")
-	}
-	lf := &llmRegion{start: 1, end: 2, base: "b\n", ours: "B\n", theirs: "b2\n"}
-	if got := llmEnsureNewline("X", lfBase, lf); got != "X\n" {
-		t.Fatalf("LF answer = %q, want %q", got, "X\n")
-	}
-
-	// An answer that already ends in a newline is left alone.
-	if got := llmEnsureNewline("X\r\n", crlfBase, crlf); got != "X\r\n" {
-		t.Fatalf("terminated answer = %q", got)
-	}
-
-	// The last line without a terminator gets none.
-	last := &llmRegion{start: 2, end: 3, base: "c", ours: "C", theirs: "c2"}
-	if got := llmEnsureNewline("X", []string{"a\r\n", "b\r\n", "c"}, last); got != "X" {
-		t.Fatalf("unterminated last line = %q, want %q", got, "X")
-	}
-}
-
-func TestResolveLLMHunkModeKeepsCRLFLineEndings(t *testing.T) {
-	base := strings.ReplaceAll(numbered("line", 100), "\n", "\r\n")
+// TestResolveLLMKeepsCRLFLineEndings: a file whose sides are all CRLF reaches the model as LF, a
+// model that answers with LF, as models do, gets its answer accepted, and the result is CRLF
+// again; an answer that echoes CRLF is read as LF and accepted too; the newline rule still holds.
+func TestResolveLLMKeepsCRLFLineEndings(t *testing.T) {
+	base := strings.ReplaceAll(numbered("line", 30), "\n", "\r\n")
 	ours := strings.Replace(base, "line 15\r\n", "o\r\n", 1)
 	theirs := strings.Replace(base, "line 15\r\n", "t\r\n", 1)
 	f := LLMFile{Path: "crlf.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
+	want := strings.Replace(base, "line 15\r\n", "merged\r\n", 1)
 
-	// The answer has no line terminator; the region is not the last line.
-	p := llmFixed("merged", "high")
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
+	// A realistic model: whatever it reads, it answers with LF line breaks.
+	p := &llmFake{answer: func(_ int, req llm.Request) (*llm.Response, error) {
+		return llmRawAnswer(strings.ReplaceAll(patchWrap(t, req, "merged\n"), "\r", "")), nil
+	}}
+	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Hunks != 1 {
-		t.Fatalf("hunks = %d, want 1", res.Hunks)
+	if string(res.Content) != want {
+		t.Fatalf("content = %q", res.Content)
 	}
-	content := string(res.Content)
-	if !strings.Contains(content, "merged\r\n") {
-		t.Fatalf("answer not CRLF-terminated: %q", content)
+	if strings.Contains(p.reqs[0].System+p.reqs[0].Prompt, "\r") {
+		t.Fatal("a CRLF file reached the model with CR")
 	}
-	if lf, crlf := strings.Count(content, "\n"), strings.Count(content, "\r\n"); lf != crlf {
-		t.Fatalf("mixed line endings: %d LF, %d CRLF", lf, crlf)
+
+	// A model that echoes CRLF in the code: its answer is read as LF.
+	echo := &llmFake{answer: func(_ int, req llm.Request) (*llm.Response, error) {
+		n := patchNonceRE.FindStringSubmatch(req.Prompt)[1]
+		body := "line 12\r\nline 13\r\nline 14\r\nmerged\r\nline 16\r\nline 17\r\nline 18\r\n"
+		return llmRawAnswer("===== BEGIN PATCHED CODE " + n + " =====\n" + body + "===== END PATCHED CODE " + n + " =====\n"), nil
+	}}
+	res, err = ResolveLLM(context.Background(), echo, f, LLMOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Content) != want {
+		t.Fatalf("content of a CRLF echo = %q", res.Content)
+	}
+
+	if _, err := ResolveLLM(context.Background(), llmFixed("merged"), f, LLMOptions{}); !errors.Is(err, ErrLLMRejected) {
+		t.Fatalf("err = %v, want the newline rule", err)
 	}
 }
 
-func TestLLMHunkPromptMarksAbsentBase(t *testing.T) {
-	base := []string{"x\n"}
-	r := &llmRegion{start: 0, end: 0, base: "", ours: "o\n", theirs: "t\n"}
-
-	absent := llmHunkPrompt("f.txt", base, r, 1, 1, 8, true, "nonce1")
-	if !strings.Contains(absent, "BEGIN BASE REGION nonce1 (absent) =====") {
-		t.Fatalf("absent base not marked:\n%s", absent)
+// TestResolveLLMLineEndingsBySidesPresent: an add/add conflict (no base) whose sides are CRLF is a
+// CRLF file; a file with mixed line endings is sent as it is.
+func TestResolveLLMLineEndingsBySidesPresent(t *testing.T) {
+	ours := strings.ReplaceAll(numbered("line", 20), "\n", "\r\n")
+	theirs := strings.Replace(ours, "line 10\r\n", "t\r\n", 1)
+	ours = strings.Replace(ours, "line 10\r\n", "o\r\n", 1)
+	p := llmFixed("merged\n")
+	res, err := ResolveLLM(context.Background(), p, LLMFile{Path: "a.txt", Ours: []byte(ours), Theirs: []byte(theirs)}, LLMOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(p.reqs[0].Prompt, "\r") || !strings.Contains(string(res.Content), "merged\r\n") {
+		t.Fatalf("add/add CRLF: prompt has CR %v, content %q", strings.Contains(p.reqs[0].Prompt, "\r"), res.Content)
 	}
 
-	present := llmHunkPrompt("f.txt", base, r, 1, 1, 8, false, "nonce1")
-	if strings.Contains(present, "(absent)") {
-		t.Fatalf("present base marked absent:\n%s", present)
+	mixed := strings.Replace(ours, "line 3\r\n", "line 3\n", 1)
+	p = llmFixed("merged\n")
+	_, _ = ResolveLLM(context.Background(), p, LLMFile{Path: "a.txt", Ours: []byte(mixed), Theirs: []byte(theirs)}, LLMOptions{})
+	if len(p.reqs) == 0 || !strings.Contains(p.reqs[0].Prompt, "\r") {
+		t.Fatal("a file with mixed line endings was not sent as it is")
+	}
+
+	for _, tc := range []struct {
+		sides [][]byte
+		want  string
+	}{
+		{[][]byte{[]byte("a\nb\n"), nil, []byte("c\n")}, LineEndingsLF},
+		{[][]byte{[]byte("a\r\nb\r\n"), nil, []byte("c\r\nd")}, LineEndingsCRLF},
+		{[][]byte{[]byte("a\r\nb\n"), []byte("c\r\n")}, LineEndingsMixed},
+		{[][]byte{[]byte("a\r\n"), []byte("c\n")}, LineEndingsMixed},
+		{[][]byte{[]byte("no break"), nil}, LineEndingsLF},
+	} {
+		if got := LLMLineEndings(tc.sides...); got != tc.want {
+			t.Fatalf("%q: %s, want %s", tc.sides, got, tc.want)
+		}
+	}
+}
+
+// TestResolveLLMRecordsRejectedAnswers: the raw text of a rejected answer reaches the
+// LLMRegionStats of the context, with why it was rejected.
+func TestResolveLLMRecordsRejectedAnswers(t *testing.T) {
+	stats := &LLMRegionStats{}
+	f := LLMFile{Path: "a.txt", Base: []byte("base\n"), Ours: []byte("ours\n"), Theirs: []byte("theirs\n")}
+	raw := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return llmRawAnswer("no block at all"), nil }}
+	_, err := ResolveLLM(WithLLMRegionStats(context.Background(), stats), raw, f, LLMOptions{})
+	if !errors.Is(err, ErrLLMRejected) {
+		t.Fatalf("err = %v", err)
+	}
+	got := stats.Rejected()
+	if len(got) != 1 || !strings.Contains(got[0], "no block at all") || !strings.Contains(got[0], "has no patched code") {
+		t.Fatalf("rejected = %q", got)
 	}
 }

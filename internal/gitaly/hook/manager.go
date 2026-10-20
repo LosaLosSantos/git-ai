@@ -87,8 +87,9 @@ type GitLabHookManager struct {
 	observer *eager.Observer
 	// storageVoter commits reference transactions to the Graft storage core, nil when it is off.
 	storageVoter StorageVoter
-	// startLandIntentsCompaction runs a compaction of land intents that a prepared transaction
-	// asked for, after the hook. Nil runs it in a goroutine; tests set it.
+	// startLandIntentsCompaction starts a compaction of land intents that a prepared
+	// transaction asked for, without the hook waiting for it. Nil runs it in a goroutine;
+	// tests set it.
 	startLandIntentsCompaction func(compact func())
 }
 

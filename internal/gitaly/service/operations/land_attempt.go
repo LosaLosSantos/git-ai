@@ -207,6 +207,26 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 		return landStep{commit: commitID, tip: tip, alreadyLanded: true, earlier: earlier}, nil
 	}
 
+	// A resolution from the caller lands as a merge commit of the tip and the change, when it was
+	// made against this tip; it replaces the server's attempt to merge or rebase.
+	if in.GetResolution() != nil {
+		res, err := a.server.landWithResolution(ctx, in, a.repo, tip, commitID, req.committer, req.precheck)
+		if err != nil {
+			var unresolved *landUnresolvedError
+			if errors.As(err, &unresolved) {
+				// The paths of UserLandError are bounded like the files of the package.
+				files := unresolved.listing.files[:min(len(unresolved.listing.files), landMaxPackageFiles)]
+				paths := make([][]byte, 0, len(files))
+				for _, f := range files {
+					paths = append(paths, []byte(f.conflict.path))
+				}
+				return landStep{}, landWithPackage(ctx, landMergeConflictError(tip, commitID, paths, err), err)
+			}
+			return landStep{}, err
+		}
+		return landStep{commit: commitID, tip: res.commit, rewritten: true, resolution: &res}, nil
+	}
+
 	newTip, err := a.computeTip(ctx, in, plan, tip, commitID, req.committer)
 	var resolution *landResolution
 	if err != nil {
@@ -214,13 +234,20 @@ func (a *landingAttempt) decide(ctx context.Context, tip git.ObjectID, req *land
 			return landStep{}, err
 		}
 
-		// The conflict is resolved into a merge commit. When that fails, the request gets the
-		// merge conflict it would have got without resolution.
-		res, resolveErr := a.server.resolveLandConflicts(ctx, in, a.repo, tip, commitID, req.committer)
+		// The conflict is resolved into a merge commit from the verdicts made before the lane
+		// (PLAN10 15.8); the resolver is never called here. Files without a verdict go back to
+		// UserLand to be resolved out of the lane. When the land fails otherwise, the request gets
+		// the merge conflict it would have got without resolution, with the conflict package as a
+		// second detail when the server listed the conflicts.
+		res, resolveErr := a.server.landApplyVerdicts(ctx, in, a.repo, tip, commitID, req.committer, req.preResolution)
+		var need *landNeedsResolution
+		if errors.As(resolveErr, &need) {
+			return landStep{}, need
+		}
 		if resolveErr != nil {
 			a.server.logger.WithError(resolveErr).WithField("branch", string(in.GetBranch())).
 				Info("graft: conflict resolution of land failed")
-			return landStep{}, err
+			return landStep{}, landWithPackage(ctx, err, resolveErr)
 		}
 
 		resolution = &res

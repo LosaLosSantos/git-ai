@@ -104,3 +104,46 @@ func TestLandResolvingPassesOptionThrough(t *testing.T) {
 	require.Len(t, b.lands, 1)
 	require.True(t, b.lands[0].ResolveConflicts)
 }
+
+// TestLandResolutionLandsTheResolvedFiles drives LandResolution over the memory backend: the
+// pending commit conflicts with the tip on a.txt, and a resolution of a.txt made against that tip
+// lands it; a resolution against another tip, or one that names a path without a conflict, fails
+// as a merge conflict and keeps the commit pending.
+func TestLandResolutionLandsTheResolvedFiles(t *testing.T) {
+	t.Parallel()
+
+	b := seedBackend(t, []string{"a.txt", "b.txt"}, []string{"base", "b"})
+	ws := cloneTestWorkspace(t, b)
+	require.NoError(t, os.WriteFile(filepath.Join(ws.Root(), "a.txt"), []byte("local"), 0o644))
+	_, err := ws.Commit(context.Background(), CommitRequest{Message: "local a", Author: Signature{Name: "Ada", Email: "ada@example.com"}})
+	require.NoError(t, err)
+	pending := ws.state.Pending.Commit
+
+	// Another writer changes a.txt on main.
+	tip := b.Put("main", "a.txt", []byte("remote"))
+	committer := Signature{Name: "Ada", Email: "ada@example.com"}
+
+	_, err = ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: "stale", Commit: pending,
+		Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}}})
+	require.ErrorIs(t, err, ErrMergeConflict, "a resolution against another tip")
+
+	_, err = ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: tip, Commit: pending,
+		Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}, {Path: "b.txt", Mode: "100644", Content: []byte("x")}}})
+	require.ErrorIs(t, err, ErrMergeConflict, "a resolution of a path without a conflict")
+	require.NotNil(t, ws.state.Pending, "a failed land keeps the commit pending")
+
+	_, err = ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: tip, Commit: "other", Files: nil})
+	require.ErrorContains(t, err, "not the pending commit")
+	// The backend refuses it too, as the server does, for a caller that goes around the workspace.
+	_, err = b.Land(context.Background(), LandOptions{Branch: "main", Commit: pending, Strategy: StrategyMerge, Committer: committer,
+		Resolution: &Resolution{Tip: tip, Commit: "other", Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}}}})
+	require.ErrorContains(t, err, `the resolution is for commit "other"`)
+
+	res, err := ws.LandResolution(context.Background(), "", committer, &Resolution{Tip: tip, Commit: pending,
+		Files: []ResolvedFile{{Path: "a.txt", Mode: "100644", Content: []byte("both")}}})
+	require.NoError(t, err)
+	require.True(t, res.Rewritten)
+	require.Equal(t, "both", readRemote(t, b, "main", "a.txt"))
+	require.Equal(t, "b", readRemote(t, b, "main", "b.txt"))
+	require.Nil(t, ws.state.Pending)
+}

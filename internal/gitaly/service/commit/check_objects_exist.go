@@ -48,7 +48,8 @@ func (s *server) CheckObjectsExist(
 		// Note: we have already fetched the first request containing revisions further up,
 		// so we only fetch the next request at the end of this loop.
 		for _, revision := range request.GetRevisions() {
-			if err := git.ValidateRevision(revision, git.AllowPathScopedRevision()); err != nil {
+			// git-cat-file reads the revisions NUL-delimited (-Z), so a line break in a path is data.
+			if err := git.ValidateRevision(revision, git.AllowPathScopedRevision(), git.AllowLineBreaksInPath()); err != nil {
 				return structerr.NewInvalidArgument("invalid revision: %w", err).
 					WithMetadata("revision", string(revision))
 			}

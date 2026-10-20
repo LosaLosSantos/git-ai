@@ -165,8 +165,10 @@ of a land as intents in the prepared phase, before git may commit:
   64 KiB on, when at least half of its intents may go: the rest is written to a new file,
   fsync'd and renamed over the old one, with the directory fsync'd. The lookups compact,
   and so does the append: once the file doubled since the last compaction, the hook
-  starts one after the update, outside the references' locks, so that the intents of
-  lands that never look up (fast-forwards only) go too. The intents of updates that were
+  starts one in the prepared phase, in a goroutine it does not wait for, which takes none
+  of the references' locks, only the intents' lock file, so that the intents of lands
+  that never look up (fast-forwards only) go too. A failed compaction is counted
+  (`graft_land_intents_compaction_failures_total`) and logged. The intents of updates that were
   never committed stay; there is one line, about 200 bytes, per such update.
 * The cost is one write and one fsync per land update in the prepared phase, under the
   references' locks, serialized per repository by the intents' lock file, not shared

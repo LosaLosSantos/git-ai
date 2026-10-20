@@ -296,6 +296,15 @@ func Revlist(
 	go func() {
 		defer close(resultChan)
 
+		// The revisions go to git-rev-list(1) one per line on its stdin: the guard is here, at the
+		// sink, so that it holds for every caller.
+		for _, revision := range revisions {
+			if err := git.ValidateStdinRevision(revision); err != nil {
+				sendRevisionResult(ctx, resultChan, RevisionResult{err: err})
+				return
+			}
+		}
+
 		if cfg.trailers && cfg.objects {
 			sendRevisionResult(ctx, resultChan, RevisionResult{
 				err: fmt.Errorf("WithTrailers is incompatible with WithObjects"),

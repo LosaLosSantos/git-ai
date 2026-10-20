@@ -1052,3 +1052,40 @@ func TestRevisionResult_IsBlob(t *testing.T) {
 		})
 	}
 }
+
+// TestRevlist_refusesRevisionsThatAreMoreThanOneLine: revisions go to git-rev-list(1) one per line
+// on its stdin, so a revision with a line feed, a carriage return or a NUL is refused at the sink,
+// whatever the caller validated: it would be another revision, or cut short.
+func TestRevlist_refusesRevisionsThatAreMoreThanOneLine(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	cfg := testcfg.Build(t)
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg, gittest.CreateRepositoryConfig{SkipCreationViaService: true})
+	repo := localrepo.NewTestRepo(t, cfg, repoProto)
+	commit := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch("main"))
+	hidden := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(commit), gittest.WithReference("refs/graft/green/main"))
+
+	for desc, revisions := range map[string][]string{
+		"a line feed":        {"--glob=x\nrefs/graft/green/main"},
+		"a carriage return":  {"main\rrefs/graft/green/main"},
+		"a NUL":              {"--all\x00"},
+		"after a good one":   {"main", "main:path\nrefs/graft/green/main"},
+		"a pattern and a NL": {"--branches=x\n" + hidden.String()},
+	} {
+		it := Revlist(ctx, repo, revisions)
+		for it.Next() {
+			require.FailNow(t, "a revision was listed", "%s: %v", desc, it.Result())
+		}
+		require.ErrorContains(t, it.Err(), "a revision can't contain a line break or NUL", desc)
+	}
+
+	// Control: ordinary revisions are listed.
+	it := Revlist(ctx, repo, []string{"main"})
+	var listed []string
+	for it.Next() {
+		listed = append(listed, it.Result().OID.String())
+	}
+	require.NoError(t, it.Err())
+	require.Equal(t, []string{commit.String()}, listed)
+}

@@ -66,6 +66,10 @@ func (s *server) ObjectsSize(server gitalypb.RepositoryService_ObjectsSizeServer
 				return structerr.NewInvalidArgument("validating revision: %w", err).WithMetadata("revision", revision)
 			}
 
+			if err := git.ValidateStdinRevision(string(revision)); err != nil {
+				return structerr.NewInvalidArgument("validating revision: %w", err).WithMetadata("revision", revision)
+			}
+
 			// Each revision must be separated by a newline when the `--stdin` option is used, as Git
 			// parses these differently to command-line arguments.
 			if _, err := cmd.Write([]byte(fmt.Sprintf("%s\n", revision))); err != nil {

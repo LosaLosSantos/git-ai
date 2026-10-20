@@ -47,7 +47,9 @@ const (
 // Ours is the current branch tip side, Theirs the change being landed. Any
 // side may be nil (absent).
 type Request struct {
-	Version    int        `json:"version"`
+	Version int `json:"version"`
+	// Operation is OperationResolve (also when absent) or OperationCheck.
+	Operation  string     `json:"operation,omitempty"`
 	Repository Repository `json:"repository"`
 	Branch     string     `json:"branch"`
 	Tip        string     `json:"tip"`
@@ -56,7 +58,99 @@ type Request struct {
 	Messages   Messages   `json:"messages"`
 	Actor      string     `json:"actor"`
 	Files      []File     `json:"files"`
-	Limits     Limits     `json:"limits"`
+	// Resolution is, for OperationCheck only, the agent's resolution of Files to check.
+	Resolution []ResponseFile `json:"resolution,omitempty"`
+	Limits     Limits         `json:"limits"`
+	// Capabilities are what the server that sends the request does with a resolver's answers (the
+	// Capability constants). A server that sets none is an older one, which lands every answer that
+	// graft-resolve gives without verification: graft-resolve then gives no model's resolution
+	// (resolve.Resolver.resolveFile).
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// The capabilities of a server (Request.Capabilities).
+const (
+	// CapabilityOrigin: the server reads the origin of a resolved file and lands only the files of a rule
+	// without verification.
+	CapabilityOrigin = "origin"
+	// CapabilityProposal: a file the server does not know to be a rule's is a model's, a proposal that
+	// lands only on a tree that verify.command passed on.
+	CapabilityProposal = "proposal"
+	// CapabilityHold: the server never lands a file with a hold (ResponseFile.Hold).
+	CapabilityHold = "hold"
+	// CapabilityVerify: the server verifies the exact tree that lands (verify.command) and lands a model's
+	// resolution on no other.
+	CapabilityVerify = "verify"
+)
+
+// ServerCapabilities returns the capabilities of this server, sent with every resolve request. Every
+// call returns a new slice, which nothing can change for the next request.
+func ServerCapabilities() []string {
+	return []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+}
+
+// Operations of a request.
+const (
+	// OperationResolve asks the resolver to resolve Files; an absent operation means it.
+	OperationResolve = "resolve"
+	// OperationCheck asks the resolver to check an agent's Resolution of Files with the checks of
+	// its own answers, and to answer a CheckResponse.
+	OperationCheck = "check"
+)
+
+// CheckResponse is the answer to an OperationCheck request: one verdict per file of the
+// resolution, in its order.
+type CheckResponse struct {
+	Version   int    `json:"version"`
+	Operation string `json:"operation"`
+	// Resolver names the checker, for the Graft-Checked-By trailer.
+	Resolver string      `json:"resolver"`
+	Files    []CheckFile `json:"files"`
+}
+
+// Syntax verdicts of a CheckFile.
+const (
+	// SyntaxChecked: both sides parse, and so does the resolution.
+	SyntaxChecked = "checked"
+	// SyntaxUnchecked: a side does not parse with the grammar, so the resolution got no syntax
+	// verdict.
+	SyntaxUnchecked = "unchecked"
+	// SyntaxNone: the path has no grammar, or the file is deleted.
+	SyntaxNone = "none"
+)
+
+// CheckFile is the verdict on one file of a resolution.
+type CheckFile struct {
+	Path   string `json:"path"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+	Syntax string `json:"syntax"`
+}
+
+// ErrorResponse is the body of a refusal: the HTTP 422 answer, or the stdout of
+// a command that exits non-zero. Files is optional.
+type ErrorResponse struct {
+	Error string        `json:"error"`
+	Files []FileOutcome `json:"files,omitempty"`
+}
+
+// Outcomes of a file in a refusal.
+const (
+	// OutcomeResolved: the resolver resolved the file, but not every file of
+	// the request.
+	OutcomeResolved = "resolved"
+	// OutcomeRejected: the resolver's result for the file failed a check.
+	OutcomeRejected = "rejected"
+	// OutcomeFailed: the resolver failed on the file (a model error, a spent
+	// budget, no strategy applying).
+	OutcomeFailed = "failed"
+)
+
+// FileOutcome is what the resolver did with one file of a refused request.
+type FileOutcome struct {
+	Path    string `json:"path"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // Repository identifies the repository the conflict belongs to.
@@ -136,11 +230,44 @@ type Response struct {
 	Explanation string         `json:"explanation"`
 }
 
+// The origins of a resolved file: what made the resolution.
+const (
+	// OriginRule: an operator's rule (trivial, union, rerere, command) made it. Only a file marked
+	// as a rule lands without the operator's verification of the tree.
+	OriginRule = "rule"
+	// OriginModel: a model made it. It lands only if verify.command passed on the tree that lands
+	// (PLAN10 14, 15.9), and is otherwise proposed to the agent.
+	OriginModel = "model"
+)
+
 // ResponseFile is the resolution of one conflicting path. Content is base64
 // on the wire and is only meaningful for ActionWrite.
+//
+// Origin says what made the resolution: OriginRule or OriginModel. It is fail-safe: a file is a
+// rule's only when it says so, and a file without an origin, or with one that is none of the two,
+// is a model's, which lands only through the operator's verification. Proposal is the older mark of
+// a model's resolution, still read: it means OriginModel, whatever Origin says. The name of the
+// resolver decides nothing.
 type ResponseFile struct {
-	Path    string `json:"path"`
-	Action  string `json:"action"`
-	Mode    string `json:"mode,omitempty"`
-	Content []byte `json:"content,omitempty"`
+	Path     string `json:"path"`
+	Action   string `json:"action"`
+	Mode     string `json:"mode,omitempty"`
+	Content  []byte `json:"content,omitempty"`
+	Origin   string `json:"origin,omitempty"`
+	Proposal bool   `json:"proposal,omitempty"`
+	// Hold is the reason the resolver holds a model's resolution back (the second model of the llm
+	// strategy's agree_with did not agree): the file is a proposal for the agent and never lands by
+	// itself, whatever verify.command says (decideLand). A held file is a model's, whatever its
+	// origin says.
+	Hold string `json:"hold,omitempty"`
+	// Report is the composition report of a model's resolution (PLAN10 15.3): in exact words what it
+	// keeps, drops and repeats of the two sides' changes. A report, never a gate: nothing in it
+	// decides whether the resolution lands. It goes to the agent with the proposal.
+	Report []string `json:"report,omitempty"`
+}
+
+// FromModel reports whether the file is a model's resolution: anything that is not marked as a
+// rule's, anything marked as a proposal, and anything held back.
+func (f ResponseFile) FromModel() bool {
+	return f.Proposal || f.Hold != "" || f.Origin != OriginRule
 }

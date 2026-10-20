@@ -1270,6 +1270,214 @@ message UserLandRequest {
   // fails with merge_conflict as usual) when no resolver is configured or the
   // server policy does not allow it for the caller.
   bool resolve_conflicts = 10;
+  // resolution lands commit_id with the caller's resolution of the conflicts that a
+  // LandConflict described, instead of asking the server's resolver. The server
+  // accepts it only when resolution.tip equals the current branch tip,
+  // resolution.commit equals commit_id, and resolution.files resolve exactly the
+  // paths that conflict at that tip, each once; otherwise the land fails with a
+  // fresh LandConflict. It is validated like a resolver answer (no conflict
+  // markers; modes 100644, 100755 or 120000; sizes; the syntax check when a
+  // resolver is configured) and lands as a merge commit with a
+  // Graft-Resolved-By: agent/<actor> trailer. The whole request is bounded by
+  // the 4 MiB gRPC message limit.
+  LandResolution resolution = 11;
+}
+
+// LandConflict describes the conflicts of a land that the server did not resolve, so
+// that the caller can resolve them and land again with UserLandRequest.resolution. It
+// is sent as an additional detail of the error, next to UserLandError, when the
+// request set resolve_conflicts or resolution.
+message LandConflict {
+  // tip is the branch tip that the change was merged with.
+  string tip = 1;
+  // commit is the landed commit.
+  string commit = 2;
+  // merge_base is the merge base of tip and commit, empty for unrelated histories.
+  string merge_base = 3;
+  // tip_message is the message of the tip, cut to 4 KiB.
+  bytes tip_message = 4;
+  // commit_message is the message of the landed commit, cut to 4 KiB.
+  bytes commit_message = 5;
+  // messages_truncated is set when a message was cut.
+  bool messages_truncated = 6;
+  // files are all the conflicting files. A merge with more than 1000 conflicting
+  // files gets no package files: reason says so, and it cannot be resolved through a
+  // land.
+  repeated LandConflictFile files = 7;
+  // reason is set when the server did not try to resolve the request at all, for
+  // example because it has too many files or the actor may not resolve; it is cut to
+  // 512 bytes.
+  string reason = 8;
+  // messages are the messages of the merge about its conflicts, at most 1000.
+  repeated LandConflictMessage messages = 9;
+  // proposal_ref is the hidden reference that keeps the proposals of the package
+  // (refs/graft/proposals/...), empty when no file has a proposal. Its blobs are
+  // read by the oids of LandConflictProposal.
+  string proposal_ref = 10;
+}
+
+// LandConflictFile is one conflicting file of a LandConflict.
+message LandConflictFile {
+  // Kind is the kind of the conflict.
+  enum Kind {
+    // KIND_UNSPECIFIED is never sent.
+    KIND_UNSPECIFIED = 0;
+    // KIND_CONTENT: both sides changed the content.
+    KIND_CONTENT = 1;
+    // KIND_MODIFY_DELETE: one side changed the file, the other deleted it.
+    KIND_MODIFY_DELETE = 2;
+    // KIND_ADD_ADD: both sides added the file.
+    KIND_ADD_ADD = 3;
+    // KIND_MODE: the sides differ in mode only.
+    KIND_MODE = 4;
+  }
+  // Outcome is what the server did with the file.
+  enum Outcome {
+    // OUTCOME_UNSPECIFIED is never sent.
+    OUTCOME_UNSPECIFIED = 0;
+    // OUTCOME_NOT_SENT: the file was not sent to the resolver (reason: lockfile,
+    // binary, large, generated, minified, denied path, invalid UTF-8 path).
+    OUTCOME_NOT_SENT = 1;
+    // OUTCOME_REJECTED: the resolver's result failed a check (reason: the check).
+    OUTCOME_REJECTED = 2;
+    // OUTCOME_FAILED: the resolver failed on the file (reason: the error, such as a
+    // model error or "AI budget exhausted").
+    OUTCOME_FAILED = 3;
+    // OUTCOME_RESOLVED: the file was resolved, but the land failed because another
+    // file was not.
+    OUTCOME_RESOLVED = 4;
+    // OUTCOME_NOT_ATTEMPTED: the request was not resolved at all (see
+    // LandConflict.reason).
+    OUTCOME_NOT_ATTEMPTED = 5;
+    // OUTCOME_PROPOSED: a model resolved the file; the server lands a
+    // model's resolution only after verify.command passed on the merged tree,
+    // otherwise it proposes it (see proposal).
+    OUTCOME_PROPOSED = 6;
+  }
+  // path is the path of the conflict in the merged tree.
+  bytes path = 1;
+  // kind is the kind of the conflict.
+  Kind kind = 2;
+  // base, ours and theirs are the sides; an absent side is unset. ours is the tip's
+  // side, theirs the landed commit's.
+  LandConflictSide base = 3;
+  // ours is the tip's side.
+  LandConflictSide ours = 4;
+  // theirs is the landed commit's side.
+  LandConflictSide theirs = 5;
+  // hunks are the conflicting regions, in order.
+  repeated LandConflictHunk hunks = 6;
+  // outcome is what the server did with the file.
+  Outcome outcome = 7;
+  // reason explains the outcome, cut to 512 bytes.
+  string reason = 8;
+  // syntax_unchecked is set when a resolution of the file was accepted without a
+  // syntax verdict, because a side does not parse with the grammar of its language.
+  bool syntax_unchecked = 9;
+  // hunks_omitted says why hunks is empty or incomplete for a content or add/add
+  // conflict: a side too large to read, a diff over its cost bound, more regions
+  // than a file lists, or a package over its size bound. It is empty when hunks is
+  // complete, and for the kinds of conflict that have no hunks.
+  string hunks_omitted = 10;
+  // proposal is the resolution the resolver made of the file, for a file that a
+  // model proposed (OUTCOME_PROPOSED) or that the rules resolved in a land that
+  // failed for another file (OUTCOME_RESOLVED), so that the agent can land it as
+  // it is or edit it.
+  LandConflictProposal proposal = 11;
+}
+
+// LandConflictProposal is the resolver's resolution of one conflicting file.
+message LandConflictProposal {
+  // action is "write" or "delete".
+  string action = 1;
+  // oid is the blob of the resolved content, for a write; it is kept in the
+  // repository by LandConflict.proposal_ref.
+  string oid = 2;
+  // mode is the file mode of a write.
+  string mode = 3;
+  // resolver names what made it: the resolver and its strategies.
+  string resolver = 4;
+  // explanation is the resolver's explanation, cut to 512 bytes.
+  string explanation = 5;
+}
+
+// LandConflictSide is one side of a conflicting file; its content is read by oid.
+message LandConflictSide {
+  // oid is the object ID of the blob. It is set only for a blob in the tree of the
+  // merge base, the tip or the landed commit, which the repository keeps. A side
+  // that the merge wrote for this conflict alone (such as the content merge of a
+  // rename) is not kept after the land fails, so it has no oid and unavailable says
+  // why.
+  string oid = 1;
+  // mode is the file mode.
+  string mode = 2;
+  // unavailable is set instead of oid when the side's blob is not kept in the
+  // repository: its content cannot be read.
+  string unavailable = 3;
+}
+
+// LandConflictMessage is a message of the merge about a conflict, as git
+// merge-tree reports it. A conflict without a conflicting file (a directory rename
+// split, say) is described by its message alone.
+message LandConflictMessage {
+  // paths are the paths the message is about.
+  repeated bytes paths = 1;
+  // type is the kind of the conflict, such as "CONFLICT (rename/delete)".
+  string type = 2;
+  // message is the message, cut to 512 bytes.
+  string message = 3;
+}
+
+// LandConflictHunk is a conflicting region as line ranges of each side. Each range
+// counts the lines of the side it names (base of the base side's file, ours of the
+// tip's, theirs of the landed commit's), 1-based and half-open ([start, end)); an
+// empty range (start == end) is an insertion point before line start.
+message LandConflictHunk {
+  // base is the range in the base side.
+  LineRange base = 1;
+  // ours is the range in the tip's side.
+  LineRange ours = 2;
+  // theirs is the range in the landed commit's side.
+  LineRange theirs = 3;
+}
+
+// LineRange is a half-open range of 1-based lines.
+message LineRange {
+  // start is the first line of the range.
+  uint32 start = 1;
+  // end is the line after the last line of the range.
+  uint32 end = 2;
+}
+
+// LandResolution is the caller's resolution of the conflicts of a LandConflict.
+message LandResolution {
+  // tip is the tip that the resolution was made against, from LandConflict.tip.
+  string tip = 1;
+  // commit is the landed commit, LandConflict.commit; it must equal commit_id.
+  string commit = 2;
+  // files resolve every conflicting path exactly once.
+  repeated LandResolvedFile files = 3;
+}
+
+// LandResolvedFile resolves one conflicting path.
+message LandResolvedFile {
+  // Action is what becomes of the path.
+  enum Action {
+    // ACTION_UNSPECIFIED is rejected.
+    ACTION_UNSPECIFIED = 0;
+    // ACTION_WRITE writes content with mode.
+    ACTION_WRITE = 1;
+    // ACTION_DELETE deletes the path.
+    ACTION_DELETE = 2;
+  }
+  // path is the path of the conflict.
+  bytes path = 1;
+  // action is what becomes of the path.
+  Action action = 2;
+  // mode is 100644, 100755 or 120000 for ACTION_WRITE.
+  string mode = 3;
+  // content is the file's content for ACTION_WRITE.
+  bytes content = 4;
 }
 
 // UserLandResponse is a response for the UserLand RPC.

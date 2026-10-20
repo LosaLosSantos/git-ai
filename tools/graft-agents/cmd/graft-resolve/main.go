@@ -5,6 +5,7 @@
 //
 //	graft-resolve [--config FILE] [--max-request-bytes N] < request.json > response.json
 //	graft-resolve serve --listen ADDR [--config FILE] [--token-file FILE] [--max-request-bytes N]
+//	graft-resolve bench mine|run [flags]   (see bench.go and doc/graft/PLAN10.md)
 //
 // In command mode the request is read from stdin and the response written to
 // stdout. An unresolvable request exits 1 with the reason on stderr. In serve
@@ -44,6 +45,9 @@ func main() {
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "serve" {
 		return runServe(args[1:], stderr)
+	}
+	if len(args) > 0 && args[0] == "bench" {
+		return runBench(args[1:], stdout, stderr)
 	}
 	return runCommand(args, stdin, stdout, stderr)
 }
@@ -123,12 +127,32 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), res.Timeout)
 	defer cancel()
+	if req.Operation == protocol.OperationCheck {
+		verdicts, err := res.Check(ctx, req)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return writeOut(stdout, stderr, verdicts)
+	}
 	resp, err := res.Resolve(ctx, req)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
+		// A refusal also goes to stdout as an ErrorResponse, with the outcome of every file.
+		var unresolved *resolve.UnresolvedError
+		if errors.As(err, &unresolved) {
+			if out, jerr := json.Marshal(unresolved.Response()); jerr == nil {
+				_, _ = stdout.Write(append(out, '\n'))
+			}
+		}
 		return 1
 	}
-	out, err := json.Marshal(resp)
+	return writeOut(stdout, stderr, resp)
+}
+
+// writeOut writes the answer of command mode on stdout.
+func writeOut(stdout, stderr io.Writer, answer any) int {
+	out, err := json.Marshal(answer)
 	if err != nil {
 		fmt.Fprintf(stderr, "graft-resolve: encoding response: %v\n", err)
 		return 1

@@ -72,14 +72,41 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 		return nil, structerr.NewInvalidArgument("%w", err)
 	}
 
-	if s.landBatchable(ctx, in) {
-		return s.userLandBatched(ctx, in, committer)
+	// The check of an agent's resolution runs an external process: it runs here, before the land
+	// enters its lane, so that no branch is held while it runs (landPrecheckResolution).
+	var precheck *landPrecheck
+	if in.GetResolution() != nil && (s.conflictResolver != nil || s.resolveCfg.Verify.Enabled) {
+		if precheck, err = s.landPrecheckInQuarantine(ctx, in); err != nil {
+			return nil, err
+		}
 	}
 
-	resp, err := s.landWithRetries(ctx, in, committer)
+	// A land that asks the server to resolve its conflicts is resolved out of the lane (PLAN10
+	// 15.8).
+	if in.GetResolveConflicts() && in.GetResolution() == nil {
+		return s.landResolving(ctx, in, committer)
+	}
+	return s.landOnce(ctx, in, committer, precheck, nil)
+}
+
+// landOnce lands the request once through its lane, in a batch or alone, with the precheck of an
+// agent's resolution or the pre-resolution of the server's, if any, and prunes the branch's
+// proposals once it landed.
+func (s *Server) landOnce(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
+	if s.landBatchable(ctx, in) {
+		resp, err := s.userLandBatched(ctx, in, committer, precheck, pre)
+		if err != nil {
+			return nil, err
+		}
+		s.landPruneAfterLand(ctx, in)
+		return resp, nil
+	}
+
+	resp, err := s.landWithRetries(ctx, in, committer, precheck, pre)
 	if err != nil {
 		return nil, err
 	}
+	s.landPruneAfterLand(ctx, in)
 
 	// A request that lands alone is a batch of one.
 	resp.BatchSize = 1
@@ -88,14 +115,26 @@ func (s *Server) UserLand(ctx context.Context, in *gitalypb.UserLandRequest) (*g
 	return resp, nil
 }
 
+// landPrecheckInQuarantine runs the precheck in a quarantine that it discards, even on a panic:
+// the precheck merges the tip and the change, which writes objects, and it leaves nothing in the
+// repository, whatever the storage mode.
+func (s *Server) landPrecheckInQuarantine(ctx context.Context, in *gitalypb.UserLandRequest) (*landPrecheck, error) {
+	_, quarantineRepo, cleanup, err := s.quarantinedRepo(ctx, in.GetRepository())
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	return s.landPrecheckResolution(ctx, in, quarantineRepo)
+}
+
 // landWithRetries lands the request alone, retrying the compare-and-swap while the branch moves. It
 // makes at most max_attempts attempts.
 //
 // On MVCC repositories, the attempt runs against a snapshot that is pinned for the whole RPC.
 // Retrying within the RPC would read the same tip again, so the conflict is reported to the
 // client instead and the client has to retry the landing.
-func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
-	snapshotPinned := mvcc.CacheFromContext(ctx) != nil
+func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
+	snapshotPinned := landSnapshotPinned(ctx)
 
 	maxAttempts := int(in.GetMaxAttempts())
 	if maxAttempts == 0 {
@@ -103,7 +142,7 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 	}
 
 	for attempt := 1; ; attempt++ {
-		resp, err := s.landAttempt(ctx, in, committer)
+		resp, err := s.landAttempt(ctx, in, committer, precheck, pre)
 		if err == nil {
 			resp.Attempts = int32(attempt)
 			return resp, nil
@@ -114,8 +153,8 @@ func (s *Server) landWithRetries(ctx context.Context, in *gitalypb.UserLandReque
 			return nil, err
 		}
 
-		if attempt >= maxAttempts || snapshotPinned {
-			return nil, landKeptMovingError(in, conflict, attempt)
+		if err := landLostRace(in, pre, conflict, attempt, maxAttempts, snapshotPinned); err != nil {
+			return nil, err
 		}
 
 		if err := waitLandBackoff(ctx, attempt); err != nil {
@@ -167,7 +206,7 @@ func (s *Server) landAncestry(ctx context.Context, quarantineRepo *localrepo.Rep
 
 // landAttempt performs a single compare-and-swap attempt of UserLand. It returns a landConflict
 // if the branch was moved by a concurrent writer, in which case the caller retries.
-func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
+func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature, precheck *landPrecheck, pre *landPreResolution) (*gitalypb.UserLandResponse, error) {
 	attempt, cleanup, err := s.newLandingAttempt(ctx, in.GetRepository(), landPublishLoose, ignoreLandPhase)
 	if err != nil {
 		return nil, err
@@ -182,7 +221,7 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 
 	// The request is decided as a member of a batch is (landingAttempt.decide). The policy is not
 	// evaluated here: the update runs with the identity of the request, so the hooks judge it.
-	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in)}
+	req := &landBatchRequest{ctx: ctx, in: in, committer: committer, actor: landBatchActor(ctx, in), precheck: precheck, preResolution: pre}
 	step, err := attempt.decide(ctx, tip, req)
 	if err != nil {
 		return nil, err
@@ -216,6 +255,7 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 	if step.resolution != nil {
 		resp.ResolvedPaths = step.resolution.resolvedPaths
 		resp.Resolver = step.resolution.resolver
+		step.resolution.landed()
 	}
 	return resp, nil
 }
@@ -374,6 +414,39 @@ func landMergeConflictError(tip, commitID git.ObjectID, conflictingFiles [][]byt
 	})
 }
 
+// landSnapshotPinned reports whether the RPC reads a snapshot that is pinned for all of it (MVCC).
+func landSnapshotPinned(ctx context.Context) bool {
+	return mvcc.CacheFromContext(ctx) != nil
+}
+
+// landLostRace decides what a landing attempt that lost the compare-and-swap does next: nil to
+// attempt again, or the error that ends the land. On a pinned snapshot a new attempt in the RPC
+// would read the same tip and build the same tree, so the land ends with the retryable
+// FailedPrecondition for the client to retry, whatever the land holds: not even a model's
+// resolution is handed back to be verified again, as that would verify the same tree once more.
+// Otherwise the attempts run out at max_attempts and the land ends as landKeptMoving says.
+func landLostRace(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempt, maxAttempts int, pinned bool) error {
+	switch {
+	case pinned:
+		return landKeptMovingError(in, conflict, attempt)
+	case attempt >= maxAttempts:
+		return landKeptMoving(in, pre, conflict, attempt)
+	}
+	return nil
+}
+
+// landKeptMoving is the error of a landing that gave up because the branch kept moving. A model's
+// resolution is handed back instead, as a land that needs its new tree verified (it is the same
+// cause: the branch moved on): UserLand goes out again, and at its deadline the agent gets the
+// proposals, not an error about a branch it has nothing to do with. The others get
+// landKeptMovingError.
+func landKeptMoving(in *gitalypb.UserLandRequest, pre *landPreResolution, conflict landConflict, attempts int) error {
+	if pre.mustVerify() {
+		return &landNeedsResolution{tip: conflict.newOID, commit: git.ObjectID(in.GetCommitId()), moved: true}
+	}
+	return landKeptMovingError(in, conflict, attempts)
+}
+
 // landKeptMovingError returns the FailedPrecondition error for a landing that lost the
 // compare-and-swap on every attempt, or that cannot be retried inside the RPC.
 func landKeptMovingError(in *gitalypb.UserLandRequest, conflict landConflict, attempts int) error {
@@ -479,6 +552,12 @@ func validateUserLandRequest(ctx context.Context, locator storage.Locator, in *g
 
 	if _, ok := gitalypb.UserLandRequest_Strategy_name[int32(in.GetStrategy())]; !ok {
 		return fmt.Errorf("unknown strategy: %d", in.GetStrategy())
+	}
+
+	// A resolution lands as a merge commit of the tip and the change, which fast-forward only
+	// forbids: the request contradicts itself.
+	if in.GetResolution() != nil && in.GetStrategy() == gitalypb.UserLandRequest_STRATEGY_FF_ONLY {
+		return errors.New("a resolution lands as a merge commit, which STRATEGY_FF_ONLY does not allow")
 	}
 
 	if in.GetMaxAttempts() < 0 {

@@ -415,7 +415,9 @@ The batch executor (`internal/gitaly/service/operations`) defines:
 The hooks (`internal/gitaly/hook`) define `graft_land_intents_seconds`
 (histogram): the land intents of one prepared reference transaction in the file
 changelog, the wait for their lock file, one write and one fsync, under the
-references' locks ([PLAN11](PLAN11.md), 4.2).
+references' locks ([PLAN11](PLAN11.md), 4.2), and
+`graft_land_intents_compaction_failures_total` (counter): compactions of the
+land intents that failed, which leave the intents as they were.
 
 The server registers the lanes of the process (`landlane.Shared`) and these
 metrics with the Prometheus registry, so they are exported on `/metrics`. The
@@ -505,6 +507,8 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
   This holds also when a later commit reverted the change in between (for
   example graft-verify reverting the culprit): the change is not landed again,
   and `reverted_by_commit_id` names the revert.
+  A land with a `resolution` (the re-land of a conflict package) is always a merge of the tip and the change, so
+  `SkipRebaseLands` does not apply to it: the retry finds the change on the branch and reports `already_landed`.
 - A land that arrives alone waits up to `window` before its batch runs. Set
   `window = "0s"` to remove the wait, or `disabled = true` to remove batching.
 - Requests that do not qualify (see *When a land is batched*) run unbatched and

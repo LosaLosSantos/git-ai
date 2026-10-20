@@ -2,6 +2,7 @@ package operations
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	gitalyauth "github.com/feder-cr/git-ai/auth"
@@ -14,6 +15,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/service/repository"
 	"github.com/feder-cr/git-ai/internal/gitaly/service/ssh"
 	"github.com/feder-cr/git-ai/internal/gitlab"
+	"github.com/feder-cr/git-ai/internal/graft/landlane"
 	"github.com/feder-cr/git-ai/internal/grpc/client"
 	"github.com/feder-cr/git-ai/internal/structerr"
 	"github.com/feder-cr/git-ai/internal/testhelper"
@@ -78,8 +80,24 @@ func setupOperationsService(
 func runOperationServiceServer(tb testing.TB, cfg config.Cfg, options ...testserver.GitalyServerOpt) string {
 	tb.Helper()
 
+	return runOperationServiceServerWithLanes(tb, cfg, nil, options...)
+}
+
+// runOperationServiceServerWithLanes is runOperationServiceServer with the land lanes of the test, which
+// the test can then observe (their queue depth is a metric of the lanes). Nil means lanes of the server's
+// own, as in every other test.
+func runOperationServiceServerWithLanes(tb testing.TB, cfg config.Cfg, lanes *landlane.Shared, options ...testserver.GitalyServerOpt) string {
+	tb.Helper()
+
 	return testserver.RunGitalyServer(tb, cfg, func(srv *grpc.Server, deps *service.Dependencies) {
-		gitalypb.RegisterOperationServiceServer(srv, NewServer(deps))
+		if lanes != nil {
+			deps.GraftLandLanes = lanes
+		}
+		operationServer := NewServer(deps)
+		if hook, ok := operationServerHooks.Load(tb.Name()); ok {
+			hook.(func(*Server))(operationServer)
+		}
+		gitalypb.RegisterOperationServiceServer(srv, operationServer)
 		gitalypb.RegisterHookServiceServer(srv, hook.NewServer(deps))
 		gitalypb.RegisterRepositoryServiceServer(srv, repository.NewServer(deps))
 		gitalypb.RegisterRefServiceServer(srv, ref.NewServer(deps))
@@ -88,6 +106,12 @@ func runOperationServiceServer(tb testing.TB, cfg config.Cfg, options ...testser
 		gitalypb.RegisterSSHServiceServer(srv, ssh.NewServer(deps))
 	}, options...)
 }
+
+// operationServerHooks hands the operation Server that a test's service runs to the test, by the
+// name of the test: a func(*Server) stored under t.Name() before the service starts is called with the
+// Server before it serves. The Server is the real one, with every dependency, which a Server built by
+// hand in a test is not.
+var operationServerHooks sync.Map
 
 func newOperationClient(tb testing.TB, serverSocketPath string) (gitalypb.OperationServiceClient, *grpc.ClientConn) {
 	conn, err := client.New(testhelper.Context(tb), serverSocketPath)

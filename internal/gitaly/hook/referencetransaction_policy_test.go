@@ -209,3 +209,29 @@ func TestEnforceGraftPolicy_Concurrent(t *testing.T) {
 		require.NoError(t, err)
 	}
 }
+
+// TestEnforceGraftPolicy_refsGraftIsReserved: an agent may never update a reference under
+// refs/graft/, whatever the policy says, even with no policy at all; the server and callers that
+// are not agents may.
+func TestEnforceGraftPolicy_refsGraftIsReserved(t *testing.T) {
+	t.Parallel()
+
+	ctx := testhelper.Context(t)
+	allowAll := []config.GraftPolicyRule{{Actor: "agent-a", Refs: []string{"**"}, Allow: true}}
+	for name, policy := range map[string][]config.GraftPolicyRule{"a policy that allows all": allowAll, "no policy": nil} {
+		m := graftPolicyManager(t, config.Graft{Standalone: true, Policy: policy})
+		for _, ref := range []string{"refs/graft/proposals/0123456789abcdef/1", "refs/graft/green/main"} {
+			err := m.enforceGraftPolicy(ctx, policyEnv(t, "agent-a", true), policyChanges("refs/heads/main", ref))
+			require.Equal(t, codes.PermissionDenied, status.Code(err), "%s: %s", name, ref)
+			require.ErrorContains(t, err, "reserved for the server", "%s: %s", name, ref)
+		}
+		// Not an agent (the server, the shared token): allowed.
+		require.NoError(t, m.enforceGraftPolicy(ctx, policyEnv(t, "", false), policyChanges("refs/graft/proposals/0123456789abcdef/1")), name)
+		// Other references of an agent follow the policy as before.
+		require.NoError(t, m.enforceGraftPolicy(ctx, policyEnv(t, "agent-a", true), policyChanges("refs/heads/main")), name)
+	}
+
+	// Outside standalone mode nothing is decided here.
+	m := graftPolicyManager(t, config.Graft{})
+	require.NoError(t, m.enforceGraftPolicy(ctx, policyEnv(t, "agent-a", true), policyChanges("refs/graft/green/main")))
+}

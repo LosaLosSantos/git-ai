@@ -157,3 +157,18 @@ jobs:
 
       - name: Test (graft-agents module)
         run: go -C tools/graft-agents test ./...
+
+  graft-agents-nocgo:
+    # The llm strategy needs the tree-sitter grammars (cgo): without them the module still has to
+    # build and its tests run, and graft-resolve refuses an llm strategy at startup.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/graft-agents/go.mod
+
+      - name: Test (graft-agents module, CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go -C tools/graft-agents test ./...

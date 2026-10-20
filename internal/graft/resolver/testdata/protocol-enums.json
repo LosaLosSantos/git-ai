@@ -1,0 +1,12 @@
+{
+  "comment": "The values of the enumerations of protocol v1. Both copies of the protocol (internal/graft/resolver and tools/graft-agents/protocol) are tested against this file, so a value cannot change or drift between the server and graft-resolve without a failing test. A change of a value is a new protocol version.",
+  "version": 1,
+  "kind": ["content", "modify-delete", "add-add", "mode"],
+  "action": ["write", "delete"],
+  "mode": ["100644", "100755", "120000"],
+  "operation": ["resolve", "check"],
+  "syntax": ["checked", "unchecked", "none"],
+  "origin": ["rule", "model"],
+  "outcome": ["resolved", "rejected", "failed"],
+  "capability": ["origin", "proposal", "hold", "verify"]
+}

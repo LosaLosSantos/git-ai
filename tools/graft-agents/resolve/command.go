@@ -36,10 +36,15 @@ type command struct {
 	timeout time.Duration
 	env     []string
 	stdout  bool
+	// model: the command asks a model, or reads what one wrote; its answers are a model's.
+	model bool
 }
 
+// IsRule: a command is a rule unless it is configured with origin = "model" (RuleStrategy).
+func (c command) IsRule() bool { return !c.model }
+
 func newCommand(spec StrategySpec) (Strategy, error) {
-	if err := allowOnly(spec, "command", "timeout", "output", "env"); err != nil {
+	if err := allowOnly(spec, "command", "timeout", "output", "env", "origin"); err != nil {
 		return nil, err
 	}
 	argv, err := optStringList(spec, "command")
@@ -72,7 +77,19 @@ func newCommand(spec StrategySpec) (Strategy, error) {
 	if err := validateEnvNames(env); err != nil {
 		return nil, fmt.Errorf("strategy %q: %w", spec.Name, err)
 	}
-	return command{argv: argv, timeout: timeout, env: env, stdout: stdout}, nil
+	origin, err := optString(spec, "origin")
+	if err != nil {
+		return nil, err
+	}
+	var model bool
+	switch origin {
+	case "", protocol.OriginRule:
+	case protocol.OriginModel:
+		model = true
+	default:
+		return nil, fmt.Errorf("strategy %q: origin must be %q or %q, got %q", spec.Name, protocol.OriginRule, protocol.OriginModel, origin)
+	}
+	return command{argv: argv, timeout: timeout, env: env, stdout: stdout, model: model}, nil
 }
 
 func (c command) Resolve(ctx context.Context, f File, _ protocol.Request) (Resolution, bool, error) {

@@ -101,10 +101,10 @@ func TestRerereRejectsCorruptEntries(t *testing.T) {
 
 	cases := map[string]string{
 		"not json":     `{not json`,
-		"bad action":   `{"action":"explode","content":null}`,
-		"bad mode":     `{"action":"write","mode":"777","content":"eA=="}`,
-		"missing mode": `{"action":"write","content":"eA=="}`,
-		"bad base64":   `{"action":"write","mode":"100644","content":"%%%"}`,
+		"bad action":   `{"version":2,"origin":"rule","action":"explode","content":null}`,
+		"bad mode":     `{"version":2,"origin":"rule","action":"write","mode":"777","content":"eA=="}`,
+		"missing mode": `{"version":2,"origin":"rule","action":"write","content":"eA=="}`,
+		"bad base64":   `{"version":2,"origin":"rule","action":"write","mode":"100644","content":"%%%"}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -179,5 +179,67 @@ func TestRerereFactoryValidation(t *testing.T) {
 	}
 	if _, err := newRerere(StrategySpec{Name: "rr", Type: "rerere", Options: map[string]any{"dir": "x", "other": 1}}); err == nil {
 		t.Fatal("unknown option accepted")
+	}
+}
+
+// TestRerereEntryWithoutOriginIsNotARule: the v0.1.0 and v0.2.0 stores recorded the llm answers as well,
+// with no origin and no version. Such an entry is never replayed as a rule's answer (the conflict goes on
+// to the next strategy), whether it is a rule's or a model's, and the first one says so once. An entry of
+// a version this code does not know, and an entry of the current version that is not a rule's, are the same.
+func TestRerereEntryWithoutOriginIsNotARule(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestRerere(t, dir)
+	f := conflict("a.go")
+	ctx := context.Background()
+	path := s.entryPath(rerereKey(f))
+
+	var notices []string
+	oldNotice := rerereLegacy
+	rerereLegacy = func(d string) { notices = append(notices, d) }
+	rerereLegacyOnce = sync.Once{}
+	t.Cleanup(func() { rerereLegacy = oldNotice; rerereLegacyOnce = sync.Once{} })
+
+	bodies := map[string]string{
+		"written before the version": `{"action":"write","mode":"100644","content":"bW9kZWwK"}`,
+		"a later version":            `{"version":3,"origin":"rule","action":"write","mode":"100644","content":"eA=="}`,
+		"current version, a model":   `{"version":2,"origin":"model","action":"write","mode":"100644","content":"eA=="}`,
+		"current version, no origin": `{"version":2,"action":"write","mode":"100644","content":"eA=="}`,
+	}
+	for name, body := range bodies {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := s.Resolve(ctx, f, protocol.Request{}); err != nil || ok {
+			t.Fatalf("%s: replayed: ok=%v err=%v", name, ok, err)
+		}
+	}
+	if len(notices) != 1 || notices[0] != dir {
+		t.Fatalf("notices %v, want one for %s", notices, dir)
+	}
+
+	// Through a resolver the conflict goes on: the next strategy answers, and as a rule or a model by its own origin.
+	if err := os.WriteFile(path, []byte(bodies["written before the version"]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newTestResolver(t, nil, Binding{Name: "rr", Strategy: s}, Binding{Name: "next", Strategy: &proposingStrategy{fakeStrategy{fn: answer(protocol.ModeFile, "fresh\n")}}})
+	resp, err := r.Resolve(ctx, request(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Files) != 1 || string(resp.Files[0].Content) == "model\n" || resp.Files[0].Origin != protocol.OriginModel {
+		t.Fatalf("response %+v", resp.Files)
+	}
+
+	// What this code records is replayed: version 2, origin rule.
+	want := Resolution{Action: protocol.ActionWrite, Mode: protocol.ModeFile, Content: []byte("rule\n")}
+	if err := s.Record(ctx, f, want); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(raw), `"version":2`) || !strings.Contains(string(raw), `"origin":"rule"`) {
+		t.Fatalf("entry %s (%v)", raw, err)
+	}
+	if got, ok, err := s.Resolve(ctx, f, protocol.Request{}); err != nil || !ok || string(got.Content) != "rule\n" {
+		t.Fatalf("replay: %+v ok=%v err=%v", got, ok, err)
 	}
 }

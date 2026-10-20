@@ -32,6 +32,46 @@ var ErrInvalidResponse = errors.New("invalid resolver response")
 // stderr or the 422 error message).
 type UnresolvableError struct {
 	Reason string
+	// Files are the resolver's outcomes per requested file, when it gave them
+	// (the "files" member of the refusal). Resolve keeps them only when there is
+	// exactly one per requested path, each with a known outcome; otherwise Files
+	// is nil and every file shares Reason.
+	Files []FileOutcome
+}
+
+// validOutcomes returns files when it has exactly one entry per requested path
+// with a known outcome, and nil otherwise: a malformed list is not trusted in
+// part. A refusal whose every file is resolved contradicts itself and is
+// malformed too.
+func validOutcomes(req Request, files []FileOutcome) []FileOutcome {
+	if len(files) != len(req.Files) {
+		return nil
+	}
+	unresolved := false
+	for _, f := range files {
+		if f.Outcome != OutcomeResolved {
+			unresolved = true
+		}
+	}
+	if !unresolved {
+		return nil
+	}
+	want := make(map[string]bool, len(req.Files))
+	for _, f := range req.Files {
+		want[f.Path] = true
+	}
+	for _, f := range files {
+		switch f.Outcome {
+		case OutcomeResolved, OutcomeRejected, OutcomeFailed:
+		default:
+			return nil
+		}
+		if !want[f.Path] {
+			return nil
+		}
+		delete(want, f.Path)
+	}
+	return files
 }
 
 // Error implements error.
@@ -57,6 +97,18 @@ type Client struct {
 	pathsDeny    []string
 	actors       []string
 	httpClient   *http.Client
+	// checkSlots bounds the checks of agents' resolutions that run at once (CheckSlot), and
+	// resolveSlots the resolutions (ResolveSlot): two pools, so that long resolutions never delay
+	// the short checks (PLAN10 15.8).
+	checkSlots   chan struct{}
+	resolveSlots chan struct{}
+	// sendRules decide the files that are never sent (SendRules).
+	sendRules *SendRules
+}
+
+// SendRules returns the rules of the files that are never sent to this resolver.
+func (c *Client) SendRules() *SendRules {
+	return c.sendRules
 }
 
 // New builds the resolver client from the configuration. It returns a nil
@@ -79,11 +131,23 @@ func New(cfg config.GraftResolver) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 {
-		return nil, errors.New("graft land resolver: max_files and max_file_bytes must not be negative")
+	if _, err := cfg.ProposalTTLOrDefault(); err != nil {
+		return nil, err
 	}
 
+	if cfg.MaxFiles < 0 || cfg.MaxFileBytes < 0 || cfg.CheckConcurrency < 0 || cfg.ResolveConcurrency < 0 || cfg.VerifyConcurrency < 0 || cfg.VerifyPerRepository < 0 || cfg.ResolveRounds < 0 {
+		return nil, errors.New("graft land resolver: max_files, max_file_bytes, check_concurrency, resolve_concurrency, verify_concurrency, verify_per_repository and resolve_rounds must not be negative")
+	}
+	// The check of an agent's resolution sends a file's three sides and its resolution in one
+	// request, which must fit its bound.
+	if mfb := cfg.MaxFileBytesOrDefault(); mfb > MaxCheckFileBytes {
+		return nil, fmt.Errorf("graft land resolver: max_file_bytes %d is too large: the check of a resolution sends a file's three sides and its resolution in one request of at most %d bytes, so max_file_bytes can be at most %d", mfb, MaxCheckRequestBytes, MaxCheckFileBytes)
+	}
+
+	rules, err := NewSendRules(cfg)
+	if err != nil {
+		return nil, err
+	}
 	c := &Client{
 		command:      slices.Clone(cfg.Command),
 		timeout:      timeout,
@@ -92,6 +156,9 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		pathsAllow:   slices.Clone(cfg.PathsAllow),
 		pathsDeny:    slices.Clone(cfg.PathsDeny),
 		actors:       slices.Clone(cfg.Actors),
+		sendRules:    rules,
+		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
+		resolveSlots: make(chan struct{}, cfg.ResolveConcurrencyOrDefault()),
 	}
 
 	if cfg.URL != "" {
@@ -125,13 +192,13 @@ func New(cfg config.GraftResolver) (*Client, error) {
 	return c, nil
 }
 
-// Resolve sends req to the resolver and returns its validated answer. The
-// request's Version and Limits are set by the client. A refusal is an error
-// matching ErrUnresolvable; any other failure (timeout, bound exceeded, invalid
-// answer, transport error) is a distinct error. Resolve returns an error
-// without calling the resolver when the request breaks the client's limits or
-// policy.
-func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
+// resolve sends req to the resolver and returns its validated answer; callers
+// send it with a resolve slot (ResolveSlot.Resolve). The request's Version and
+// Limits are set by the client. A refusal is an error matching
+// ErrUnresolvable; any other failure (timeout, bound exceeded, invalid answer,
+// transport error) is a distinct error. It returns an error without calling
+// the resolver when the request breaks the client's limits or policy.
+func (c *Client) resolve(ctx context.Context, req Request) (*Response, error) {
 	if c == nil {
 		return nil, ErrDisabled
 	}
@@ -139,7 +206,10 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 	req.Version = ProtocolVersion
 	req.Limits = Limits{MaxFileBytes: c.maxFileBytes}
 
-	if err := c.checkRequest(req); err != nil {
+	if err := c.checkResolvePolicy(req); err != nil {
+		return nil, err
+	}
+	if err := c.checkFiles(req); err != nil {
 		return nil, err
 	}
 
@@ -165,6 +235,10 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 			return nil, fmt.Errorf("resolver timed out after %s: %w", c.timeout, ctx.Err())
 		}
 
+		var refusal *UnresolvableError
+		if errors.As(err, &refusal) {
+			refusal.Files = validOutcomes(req, refusal.Files)
+		}
 		return nil, err
 	}
 
@@ -180,10 +254,11 @@ func (c *Client) Resolve(ctx context.Context, req Request) (*Response, error) {
 	return &resp, nil
 }
 
-// checkRequest enforces the client's limits and policy on an outgoing request:
-// file count, per-side size, clean unique UTF-8 paths, known kinds, the path
-// policy and the actor policy.
-func (c *Client) checkRequest(req Request) error {
+// checkResolvePolicy enforces what bounds a request for an AI resolution only:
+// max_files and the actor policy. The check of an agent's resolution is not
+// such a request: it runs for every actor that may land, on every file the
+// agent resolved (PLAN10 12).
+func (c *Client) checkResolvePolicy(req Request) error {
 	if len(req.Files) > c.maxFiles {
 		return fmt.Errorf("resolve request has %d conflicted files, limit is %d", len(req.Files), c.maxFiles)
 	}
@@ -191,7 +266,13 @@ func (c *Client) checkRequest(req Request) error {
 	if !c.ActorAllowed(req.Actor) {
 		return fmt.Errorf("actor %q may not request conflict resolution", req.Actor)
 	}
+	return nil
+}
 
+// checkFiles enforces the client's rules on the files of an outgoing request,
+// a resolve or a check: per-side size, clean unique UTF-8 paths, known kinds
+// and the path policy.
+func (c *Client) checkFiles(req Request) error {
 	seen := make(map[string]struct{}, len(req.Files))
 	for _, f := range req.Files {
 		if !cleanRelPath(f.Path) {
@@ -239,4 +320,4 @@ func (c *Client) outputLimit(n int) int64 {
 }
 
 // maxEnvelopeBytes is the fixed allowance on top of the per-file output bound.
-const maxEnvelopeBytes = 64 << 10
+const maxEnvelopeBytes = config.GraftResolverCheckEnvelopeBytes

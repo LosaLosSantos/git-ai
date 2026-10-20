@@ -1,0 +1,224 @@
+package resolve
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
+)
+
+// The llm strategy's budget is the [strategy.llm.budget] table:
+//
+//	[strategy.llm.budget]
+//	monthly_usd = 50                 # the cap; 0 or absent: none (the spend is still tracked)
+//	input_usd_per_million = 2.0      # the model's prices, kept current by the operator
+//	output_usd_per_million = 10.0    # output tokens, reasoning included
+//	request_usd = 0                  # optional: a fixed price per call
+//	state = "/var/lib/graft/resolve-budget.json"
+//
+// The table needs max_tokens in [strategy.llm], which bounds the worst case of a call. When the
+// month's spend plus the worst case of a call would exceed the cap, the call is not made and the
+// file fails with "AI budget exhausted", which the server puts into the conflict package.
+//
+// With an agree_with model the cap must cover both: the same table goes into
+// [strategy.llm.agree_with.budget], with the second model's prices and its own state file.
+
+// llmBudgetConfig decodes the optional budget table of the [strategy.llm] table.
+func llmBudgetConfig(spec StrategySpec, tbl map[string]any) (*Budget, error) {
+	raw, ok := tbl["budget"]
+	if !ok {
+		return nil, nil
+	}
+	bt, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("strategy %q: llm: budget must be a table", spec.Name)
+	}
+	var unknown []string
+	for k := range bt {
+		switch k {
+		case "monthly_usd", "input_usd_per_million", "output_usd_per_million", "request_usd", "state":
+		default:
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		return nil, fmt.Errorf("strategy %q: llm.budget: unknown keys %v", spec.Name, unknown)
+	}
+
+	number := func(key string) (float64, error) {
+		switch v := bt[key].(type) {
+		case nil:
+			return 0, nil
+		case int64:
+			if v >= 0 {
+				return float64(v), nil
+			}
+		case float64:
+			if v >= 0 {
+				return v, nil
+			}
+		}
+		return 0, fmt.Errorf("strategy %q: llm.budget: %s must be a non-negative number", spec.Name, key)
+	}
+	var prices Prices
+	var monthly float64
+	var err error
+	for _, f := range []struct {
+		key string
+		dst *float64
+	}{
+		{"monthly_usd", &monthly},
+		{"input_usd_per_million", &prices.InputPerMillion},
+		{"output_usd_per_million", &prices.OutputPerMillion},
+		{"request_usd", &prices.PerRequest},
+	} {
+		if *f.dst, err = number(f.key); err != nil {
+			return nil, err
+		}
+	}
+	state, err := stringField(bt, "state")
+	if err != nil {
+		return nil, fmt.Errorf("strategy %q: llm.budget: %w", spec.Name, err)
+	}
+	if state == "" {
+		return nil, fmt.Errorf("strategy %q: llm.budget: state is required: the spend must survive restarts", spec.Name)
+	}
+	b, err := NewBudget(monthly, prices, state)
+	if err != nil {
+		return nil, fmt.Errorf("strategy %q: llm.%w", spec.Name, err)
+	}
+	return b, nil
+}
+
+// UseBudget makes every llm strategy of r go through b, in place of a configured budget, and
+// returns how many there are. It must be called before the first Resolve. Each llm strategy
+// needs max_tokens. A strategy with an agree_with model has two prices: UseBudgets.
+func (r *Resolver) UseBudget(b *Budget) (int, error) {
+	return r.UseBudgets(b, nil)
+}
+
+// UseBudgets makes the first model of every llm strategy of r go through first and the second
+// model of the strategies that have an agree_with go through second, in place of the configured
+// budgets, and returns how many strategies there are. A strategy with an agree_with needs second:
+// a cap that covers one of two models would not be a cap.
+func (r *Resolver) UseBudgets(first, second *Budget) (int, error) {
+	if first == nil {
+		return 0, errors.New("resolve: nil budget")
+	}
+	n := 0
+	for _, bd := range r.bindings {
+		s, ok := bd.Strategy.(*llmStrategy)
+		if !ok {
+			continue
+		}
+		if s.opt.MaxTokens <= 0 {
+			return 0, fmt.Errorf("strategy %q: a budget needs max_tokens in [strategy.llm]", bd.Name)
+		}
+		if s.agree != nil && s.agree.opt.MaxTokens <= 0 {
+			return 0, fmt.Errorf("strategy %q: a budget needs max_tokens in [strategy.llm.agree_with]", bd.Name)
+		}
+		if s.agree != nil && second == nil {
+			return 0, fmt.Errorf("strategy %q: it has an agree_with model, which has its own price: give a budget for each model", bd.Name)
+		}
+		s.budget = first
+		s.provider = budgetProvider{p: s.base, b: first}
+		if s.agree != nil {
+			s.agree.budget = second
+			s.agree.provider = budgetProvider{p: s.agree.base, b: second}
+		}
+		n++
+	}
+	return n, nil
+}
+
+// LLMModels returns the configured model of each llm strategy of r, by strategy name.
+func (r *Resolver) LLMModels() map[string]string {
+	out := map[string]string{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			out[bd.Name] = s.model
+		}
+	}
+	return out
+}
+
+// LLMAgreeModels returns the configured agree_with model of each llm strategy of r that has one,
+// by strategy name.
+func (r *Resolver) LLMAgreeModels() map[string]string {
+	out := map[string]string{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok && s.agree != nil {
+			out[bd.Name] = s.agree.model
+		}
+	}
+	return out
+}
+
+// LLMRoutings returns the OpenRouter routing of each llm strategy of r, by strategy name; nil for
+// a strategy without one.
+func (r *Resolver) LLMRoutings() map[string]*llm.Routing {
+	out := map[string]*llm.Routing{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			out[bd.Name] = s.routing
+		}
+	}
+	return out
+}
+
+// LLMAgreeRoutings is LLMRoutings for the agree_with model of the strategies that have one.
+func (r *Resolver) LLMAgreeRoutings() map[string]*llm.Routing {
+	out := map[string]*llm.Routing{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok && s.agree != nil {
+			out[bd.Name] = s.agree.routing
+		}
+	}
+	return out
+}
+
+// LLMMaxRegions returns the largest max_regions of r's llm strategies, or 0 when r has none.
+func (r *Resolver) LLMMaxRegions() int {
+	n := 0
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			n = max(n, s.opt.MaxRegions)
+		}
+	}
+	return n
+}
+
+// LLMMaxPromptTokens returns an upper bound of the input tokens of one model call of r's llm
+// strategies, counted like the budget's worst case: one token per byte. A prompt holds file data
+// within max_prompt_bytes (whole file or one region), the two commit messages, the system prompt,
+// the schema and the framing; 64 KiB covers all but the file data.
+func (r *Resolver) LLMMaxPromptTokens() int {
+	n := 0
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok {
+			n = max(n, s.opt.MaxPromptBytes+2*llmMaxMessageBytes+64<<10)
+		}
+	}
+	return n
+}
+
+// Budgets returns the budgets of r's strategies, by strategy name; the budget of the agree_with
+// model of a strategy is under its name followed by "/agree_with".
+func (r *Resolver) Budgets() map[string]*Budget {
+	out := map[string]*Budget{}
+	for _, bd := range r.bindings {
+		s, ok := bd.Strategy.(*llmStrategy)
+		if !ok {
+			continue
+		}
+		if s.budget != nil {
+			out[bd.Name] = s.budget
+		}
+		if s.agree != nil && s.agree.budget != nil {
+			out[bd.Name+agreeSuffix] = s.agree.budget
+		}
+	}
+	return out
+}

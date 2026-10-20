@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/graft/agentrefs"
+	"github.com/feder-cr/git-ai/internal/graft/identity"
 	"github.com/feder-cr/git-ai/internal/structerr"
 )
 
@@ -16,6 +18,10 @@ const (
 	scNoRefUpdates = 1 << iota
 	// scNoEndOfOptions denotes a command which doesn't know --end-of-options
 	scNoEndOfOptions
+	// scWalksRefs denotes a command whose revisions take git's pseudo references --all and
+	// --glob, which an agent's command never resolves to references agents do not see
+	// (agentRefWalk).
+	scWalksRefs
 )
 
 type commandDescription struct {
@@ -39,7 +45,7 @@ var commandDescriptions = map[string]commandDescription{
 		flags: scNoRefUpdates | scNoEndOfOptions,
 	},
 	"bundle": {
-		flags: scNoRefUpdates,
+		flags: scNoRefUpdates | scWalksRefs,
 		opts:  packConfiguration,
 	},
 	"cat-file": {
@@ -94,7 +100,7 @@ var commandDescriptions = map[string]commandDescription{
 		flags: scNoRefUpdates,
 	},
 	"fast-export": {
-		flags: scNoRefUpdates,
+		flags: scNoRefUpdates | scWalksRefs,
 	},
 	"fetch": {
 		flags: 0,
@@ -144,7 +150,7 @@ var commandDescriptions = map[string]commandDescription{
 		flags: scNoRefUpdates,
 	},
 	"format-patch": {
-		flags: scNoRefUpdates,
+		flags: scNoRefUpdates | scWalksRefs,
 	},
 	"fsck": {
 		flags: scNoRefUpdates,
@@ -195,7 +201,7 @@ var commandDescriptions = map[string]commandDescription{
 		},
 	},
 	"log": {
-		flags: scNoRefUpdates,
+		flags: scNoRefUpdates | scWalksRefs,
 	},
 	"last-modified": {
 		flags: scNoRefUpdates,
@@ -317,7 +323,7 @@ var commandDescriptions = map[string]commandDescription{
 	"rev-list": {
 		// We cannot use --end-of-options here because pseudo revisions like `--all`
 		// and `--not` count as options.
-		flags: scNoRefUpdates | scNoEndOfOptions,
+		flags: scNoRefUpdates | scNoEndOfOptions | scWalksRefs,
 		validatePositionalArgs: func(args []string) error {
 			for _, arg := range args {
 				// git-rev-list(1) supports pseudo-revision arguments which can be
@@ -326,6 +332,10 @@ var commandDescriptions = map[string]commandDescription{
 				// refuse them as positional arguments. We thus override validation
 				// for two of these which we are using in our codebase.
 				if strings.HasPrefix(arg, "-") {
+					// The flag an agent's walk gets before each --all and --glob (agent_walk.go).
+					if arg == excludeHiddenFlag {
+						continue
+					}
 					if err := git.ValidateRevision([]byte(arg), git.AllowPseudoRevision()); err != nil {
 						return structerr.NewInvalidArgument(
 							"validating positional argument: %w", err,
@@ -342,10 +352,10 @@ var commandDescriptions = map[string]commandDescription{
 	"rev-parse": {
 		// --end-of-options is echoed by git-rev-parse(1) if used without
 		// `--verify`.
-		flags: scNoRefUpdates | scNoEndOfOptions,
+		flags: scNoRefUpdates | scNoEndOfOptions | scWalksRefs,
 	},
 	"show": {
-		flags: scNoRefUpdates,
+		flags: scNoRefUpdates | scWalksRefs,
 	},
 	"show-index": {
 		flags: scNoRefUpdates,
@@ -451,7 +461,11 @@ func validatePositionalArg(arg string) error {
 }
 
 func hiddenReceivePackRefPrefixes(ctx context.Context) []GlobalOption {
-	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes))
+	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes)+1)
+	// An agent does not see refs/graft/ at all (agentrefs); others see what the prefixes allow.
+	if id, ok := identity.FromContext(ctx); ok && id.Source == identity.SourceAgent {
+		config = append(config, ConfigPair{Key: "receive.hideRefs", Value: agentrefs.HiddenPrefix})
+	}
 
 	for refPrefix, refType := range git.InternalRefPrefixes {
 		switch refType {
@@ -467,8 +481,13 @@ func hiddenReceivePackRefPrefixes(ctx context.Context) []GlobalOption {
 	return config
 }
 
-func hiddenUploadPackRefPrefixes(context.Context) []GlobalOption {
-	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes))
+func hiddenUploadPackRefPrefixes(ctx context.Context) []GlobalOption {
+	config := make([]GlobalOption, 0, len(git.InternalRefPrefixes)+1)
+	// An agent does not see refs/graft/ at all (agentrefs), graft-verify's green references
+	// included, which other clients may fetch.
+	if id, ok := identity.FromContext(ctx); ok && id.Source == identity.SourceAgent {
+		config = append(config, ConfigPair{Key: "uploadpack.hideRefs", Value: agentrefs.HiddenPrefix})
+	}
 
 	for refPrefix, refType := range git.InternalRefPrefixes {
 		switch refType {

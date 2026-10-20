@@ -84,7 +84,7 @@ func TestResolve_HTTPSuccess(t *testing.T) {
 
 	client := newClient(t, httpConfig(srv.URL, writeToken(t, "s3cret")))
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.NoError(t, err)
 	require.Equal(t, []byte("merged\n"), resp.Files[0].Content)
 	require.Equal(t, "graft-resolve/test", resp.Resolver)
@@ -100,7 +100,7 @@ func TestResolve_HTTPWithoutTokenSendsNoAuthorization(t *testing.T) {
 
 	client := newClient(t, httpConfig(srv.URL, ""))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.NoError(t, err)
 }
 
@@ -117,7 +117,7 @@ func TestResolve_HTTPTokenIsReadOnce(t *testing.T) {
 	// Rotating the file afterwards does not change what the client sends.
 	require.NoError(t, os.WriteFile(tokenFile, []byte("second\n"), 0o600))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.NoError(t, err)
 }
 
@@ -146,7 +146,7 @@ func TestResolve_HTTPRefusal(t *testing.T) {
 
 			client := newClient(t, httpConfig(srv.URL, ""))
 
-			resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+			resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 			require.Nil(t, resp)
 			require.ErrorIs(t, err, ErrUnresolvable)
 			require.False(t, errors.Is(err, ErrInvalidResponse))
@@ -173,7 +173,7 @@ func TestResolve_HTTPOtherStatusIsFailure(t *testing.T) {
 
 			client := newClient(t, httpConfig(srv.URL, ""))
 
-			resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+			resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 			require.Nil(t, resp)
 			require.Error(t, err)
 			require.False(t, errors.Is(err, ErrUnresolvable), "only HTTP 422 is a refusal")
@@ -198,7 +198,7 @@ func TestResolve_HTTPRedirectIsNotFollowed(t *testing.T) {
 
 	client := newClient(t, httpConfig(redirect.URL, writeToken(t, "s3cret")))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Error(t, err)
 	require.False(t, errors.Is(err, ErrUnresolvable))
 	require.Equal(t, int32(0), target.Load(), "the bearer token must not follow a redirect")
@@ -228,7 +228,7 @@ func TestResolve_HTTPInvalidAnswers(t *testing.T) {
 
 			client := newClient(t, httpConfig(srv.URL, ""))
 
-			resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+			resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 			require.Nil(t, resp)
 			require.ErrorIs(t, err, ErrInvalidResponse)
 			require.False(t, errors.Is(err, ErrUnresolvable))
@@ -249,7 +249,7 @@ func TestResolve_HTTPOversizedAnswer(t *testing.T) {
 	cfg.MaxFileBytes = 1024
 	client := newClient(t, cfg)
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, ErrInvalidResponse)
 	require.ErrorContains(t, err, "exceeds")
@@ -271,7 +271,7 @@ func TestResolve_HTTPTimeout(t *testing.T) {
 	client := newClient(t, cfg)
 
 	start := time.Now()
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.False(t, errors.Is(err, ErrUnresolvable))
@@ -287,7 +287,7 @@ func TestResolve_HTTPUnreachable(t *testing.T) {
 
 	client := newClient(t, httpConfig(url, ""))
 
-	resp, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	resp, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Nil(t, resp)
 	require.Error(t, err)
 	require.False(t, errors.Is(err, ErrUnresolvable))
@@ -303,7 +303,7 @@ func TestResolve_HTTPErrorDoesNotLeakToken(t *testing.T) {
 
 	client := newClient(t, httpConfig(srv.URL, writeToken(t, "s3cret-token-value")))
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "s3cret-token-value")
 }
@@ -321,7 +321,7 @@ func TestResolve_HTTPRejectedRequestNeverSent(t *testing.T) {
 	cfg.PathsDeny = []string{"a.*"}
 	client := newClient(t, cfg)
 
-	_, err := client.Resolve(testhelper.Context(t), sampleRequest())
+	_, err := client.resolve(testhelper.Context(t), sampleRequest())
 	require.ErrorContains(t, err, "is not allowed to be resolved")
 	require.Equal(t, int32(0), hits.Load())
 }
@@ -342,7 +342,7 @@ func TestResolve_HTTPCallerCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(testhelper.Context(t))
 	time.AfterFunc(100*time.Millisecond, cancel)
 
-	_, err := client.Resolve(ctx, sampleRequest())
+	_, err := client.resolve(ctx, sampleRequest())
 	require.ErrorIs(t, err, context.Canceled)
 }
 
@@ -363,7 +363,7 @@ func TestResolve_HTTPConcurrentCalls(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			_, err := client.Resolve(context.Background(), sampleRequest())
+			_, err := client.resolve(context.Background(), sampleRequest())
 			errs <- err
 		}()
 	}

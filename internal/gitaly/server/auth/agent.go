@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -13,6 +14,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	gitalycfgauth "github.com/feder-cr/git-ai/internal/gitaly/config/auth"
 	"github.com/feder-cr/git-ai/internal/gitaly/storage"
+	"github.com/feder-cr/git-ai/internal/graft/agentrefs"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
 	grpcmwauth "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/auth"
 	"google.golang.org/grpc"
@@ -105,7 +107,14 @@ func InterceptorsWithAgentRPCs(conf gitalycfgauth.Config, agents []config.GraftA
 			if err := checkAgentRequest(ctx, req); err != nil {
 				return nil, err
 			}
-			return handler(ctx, req)
+			if err := checkAgentRefs(ctx, req); err != nil {
+				return nil, err
+			}
+			resp, err := handler(ctx, req)
+			if err == nil {
+				filterAgentRefs(ctx, resp)
+			}
+			return resp, err
 		})
 	}
 
@@ -176,7 +185,8 @@ func checkAgentRequest(ctx context.Context, req any) error {
 	return nil
 }
 
-// agentRequestGuardStream checks every message an agent sends on a stream.
+// agentRequestGuardStream checks every message an agent sends on a stream, and
+// removes from every message it receives the references it may not see.
 type agentRequestGuardStream struct {
 	grpc.ServerStream
 }
@@ -188,7 +198,16 @@ func (s *agentRequestGuardStream) RecvMsg(m any) error {
 		return err
 	}
 
-	return checkAgentRequest(s.Context(), m)
+	if err := checkAgentRequest(s.Context(), m); err != nil {
+		return err
+	}
+	return checkAgentRefs(s.Context(), m)
+}
+
+// SendMsg sends m without the references under refs/graft/ it lists.
+func (s *agentRequestGuardStream) SendMsg(m any) error {
+	filterAgentRefs(s.Context(), m)
+	return s.ServerStream.SendMsg(m)
 }
 
 // loadAgentCredentials validates the agent configuration and resolves every
@@ -205,6 +224,12 @@ func loadAgentCredentials(sharedToken string, agents []config.GraftAgent) ([]age
 		}
 		if agent.Name == sharedTokenIdentityName {
 			return nil, fmt.Errorf("graft agent %d: name %q is reserved", i, agent.Name)
+		}
+		// The workspace's temporary branches of an agent are graft/<name>/..., and an agent may not
+		// name graft/<namespace>/... for a namespace of the server (agentrefs): an agent named after
+		// one could not use its own branches.
+		if slices.Contains(agentrefs.ServerNamespaces, agent.Name) {
+			return nil, fmt.Errorf("graft agent %d: name %q is reserved for the server's references under %s", i, agent.Name, agentrefs.HiddenPrefix)
 		}
 		if _, ok := names[agent.Name]; ok {
 			return nil, fmt.Errorf("graft agent %q: duplicate name", agent.Name)

@@ -2,7 +2,6 @@ package resolve
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,7 +10,9 @@ import (
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 )
 
-// llmFake is a llm.Provider that records requests and answers with answer.
+// llmFake is a llm.Provider that records requests and answers with answer. The text of an answer
+// is the replacement of the region, which Complete wraps as a well-behaved model would (patchWrap);
+// an llmRawAnswer is sent as it is.
 type llmFake struct {
 	reqs   []llm.Request
 	answer func(i int, req llm.Request) (*llm.Response, error)
@@ -21,17 +22,28 @@ func (f *llmFake) Name() string { return "fake:test" }
 
 func (f *llmFake) Complete(_ context.Context, req llm.Request) (*llm.Response, error) {
 	f.reqs = append(f.reqs, req)
-	return f.answer(len(f.reqs)-1, req)
+	resp, err := f.answer(len(f.reqs)-1, req)
+	return patchWrapResponse(req, resp, err)
 }
 
-func llmFakeAnswer(content, confidence string) *llm.Response {
-	b, _ := json.Marshal(map[string]string{"content": content, "confidence": confidence, "explanation": "fake"})
-	return &llm.Response{Text: string(b), JSON: b, Model: "fake-model"}
+// patchWrapResponse wraps the text of resp with patchWrap, unless it is raw or an error.
+func patchWrapResponse(req llm.Request, resp *llm.Response, err error) (*llm.Response, error) {
+	if err != nil || resp == nil || resp.Model == llmRawModel {
+		return resp, err
+	}
+	out := *resp
+	out.Text = patchWrap(nil, req, resp.Text)
+	return &out, nil
 }
 
-func llmFixed(content, confidence string) *llmFake {
+// llmFakeAnswer is an answer that replaces the region with content.
+func llmFakeAnswer(content string) *llm.Response {
+	return &llm.Response{Text: content, Model: "fake-model"}
+}
+
+func llmFixed(content string) *llmFake {
 	return &llmFake{answer: func(int, llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer(content, confidence), nil
+		return llmFakeAnswer(content), nil
 	}}
 }
 
@@ -96,7 +108,7 @@ func TestResolveLLMNotApplicable(t *testing.T) {
 		"binary":        {Path: "x", Base: []byte("a\x00"), Ours: []byte("b\n"), Theirs: []byte("c\n")},
 	} {
 		t.Run(name, func(t *testing.T) {
-			p := llmFixed("x", "high")
+			p := llmFixed("x")
 			if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); !errors.Is(err, ErrLLMNotApplicable) {
 				t.Fatalf("err = %v", err)
 			}
@@ -107,50 +119,45 @@ func TestResolveLLMNotApplicable(t *testing.T) {
 	}
 }
 
-func TestResolveLLMWholeFile(t *testing.T) {
-	p := llmFixed("merged\n", "high")
+// TestResolveLLMSmallFile: a file whose only line conflicts is one region with no context.
+func TestResolveLLMSmallFile(t *testing.T) {
+	p := llmFixed("merged\n")
 	f := LLMFile{Path: "a/b.go", Base: []byte("base\n"), Ours: []byte("ours\n"), Theirs: []byte("theirs\n")}
 
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(res.Content) != "merged\n" || res.Confidence != LLMConfidenceHigh || res.Model != "fake-model" || res.Hunks != 0 {
-		t.Fatalf("result = %+v", res)
-	}
-	if res.Explanation != "fake" {
-		t.Fatalf("explanation = %q", res.Explanation)
-	}
-
-	if len(p.reqs) != 1 {
-		t.Fatalf("calls = %d", len(p.reqs))
+	if string(res.Content) != "merged\n" || res.Model != "fake-model" || res.Hunks != 1 || len(p.reqs) != 1 {
+		t.Fatalf("result = %+v, calls %d", res, len(p.reqs))
 	}
 	req := p.reqs[0]
-	for _, want := range []string{"a/b.go", "BEGIN BASE", "base\n", "BEGIN OURS", "ours\n", "BEGIN THEIRS", "theirs\n"} {
-		if !strings.Contains(req.Prompt, want) {
-			t.Errorf("prompt misses %q", want)
-		}
+	nonce := patchNonceRE.FindStringSubmatch(req.Prompt)[1]
+	if got := patchSection(t, req.Prompt, "CODE", nonce); got != "ours\n" {
+		t.Fatalf("CODE = %q", got)
 	}
-	if !strings.Contains(req.System, "complete merged file") {
-		t.Error("system prompt does not ask for the complete file")
+	if got := patchSection(t, req.Prompt, "PATCH", nonce); got != "@@ -1 +1 @@\n-base\n+theirs\n" {
+		t.Fatalf("PATCH = %q", got)
 	}
-	if req.SchemaName == "" || req.JSONSchema == nil {
-		t.Fatal("schema not requested")
-	}
-	required, _ := json.Marshal(req.JSONSchema["required"])
-	if string(required) != `["content","confidence","explanation"]` {
-		t.Fatalf("schema required = %s", required)
+	if strings.Contains(req.System, "starts with the first") || strings.Contains(req.System, "ends with the last") {
+		t.Fatal("no context lines, so no anchor directive")
 	}
 }
 
+// TestResolveLLMAddAddBaseAbsent: without a base the PATCH adds THEIRS' lines.
 func TestResolveLLMAddAddBaseAbsent(t *testing.T) {
-	p := llmFixed("new\n", "medium")
+	p := llmFixed("new\n")
 	f := LLMFile{Path: "new.txt", Ours: []byte("o\n"), Theirs: []byte("t\n")}
-	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{}); err != nil {
+	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(p.reqs[0].Prompt, "(absent)") {
-		t.Fatal("absent base not marked in prompt")
+	if string(res.Content) != "new\n" {
+		t.Fatalf("content = %q", res.Content)
+	}
+	nonce := patchNonceRE.FindStringSubmatch(p.reqs[0].Prompt)[1]
+	if got := patchSection(t, p.reqs[0].Prompt, "PATCH", nonce); got != "@@ -0,0 +1 @@\n+t\n" {
+		t.Fatalf("PATCH = %q", got)
 	}
 }
 
@@ -161,14 +168,10 @@ func TestResolveLLMRejections(t *testing.T) {
 		resp *llm.Response
 		opt  LLMOptions
 	}{
-		"low confidence by default":          {resp: llmFakeAnswer("x\n", "low")},
-		"medium rejected when high required": {resp: llmFakeAnswer("x\n", "medium"), opt: LLMOptions{MinConfidence: "high"}},
-		"unknown confidence":                 {resp: llmFakeAnswer("x\n", "certain")},
-		"conflict marker":                    {resp: llmFakeAnswer("<<<<<<< ours\nx\n", "high")},
-		"separator marker":                   {resp: llmFakeAnswer("x\n=======\ny\n", "high")},
-		"answer too large":                   {resp: llmFakeAnswer(strings.Repeat("x", 100), "high"), opt: LLMOptions{MaxAnswerBytes: 10}},
-		"invalid JSON":                       {resp: &llm.Response{Text: "no json here"}},
-		"wrong JSON type":                    {resp: &llm.Response{JSON: json.RawMessage(`{"content": 3}`)}},
+		"conflict marker":  {resp: llmFakeAnswer("<<<<<<< ours\nx\n")},
+		"separator marker": {resp: llmFakeAnswer("x\n=======\ny\n")},
+		"answer too large": {resp: llmFakeAnswer(strings.Repeat("x", 100) + "\n"), opt: LLMOptions{MaxAnswerBytes: 10}},
+		"no patched code":  {resp: llmRawAnswer("no block here")},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) { return tc.resp, nil }}
@@ -184,15 +187,14 @@ func TestResolveLLMAcceptsSetextUnderline(t *testing.T) {
 	// "==========" is a title underline, not the "=======" separator, and the
 	// server accepts it; the answer check must not reject it.
 	f := LLMFile{Path: "README.md", Base: []byte("Title\n==========\nbody\n"), Ours: []byte("Title\n==========\nours\n"), Theirs: []byte("Title\n==========\ntheirs\n")}
-	want := "Title\n==========\nmerged\n"
-	res, err := ResolveLLM(context.Background(), llmFixed(want, "high"), f, LLMOptions{})
+	res, err := ResolveLLM(context.Background(), llmFixed("merged\n"), f, LLMOptions{})
 	if err != nil {
 		t.Fatalf("ResolveLLM: %v", err)
 	}
-	if string(res.Content) != want {
+	if want := "Title\n==========\nmerged\n"; string(res.Content) != want {
 		t.Fatalf("content = %q, want %q", res.Content, want)
 	}
-	if llmHasConflictMarkers(want) {
+	if llmHasConflictMarkers("Title\n==========\n") {
 		t.Fatal("setext underline treated as a conflict marker")
 	}
 }
@@ -213,69 +215,49 @@ func TestResolveLLMProviderError(t *testing.T) {
 
 func TestResolveLLMInvalidOptions(t *testing.T) {
 	f := LLMFile{Path: "x", Base: []byte("a\n"), Ours: []byte("b\n"), Theirs: []byte("c\n")}
-	if _, err := ResolveLLM(context.Background(), llmFixed("x", "high"), f, LLMOptions{MinConfidence: "sure"}); err == nil {
-		t.Fatal("invalid min confidence accepted")
+	if _, err := ResolveLLM(context.Background(), llmFixed("x\n"), f, LLMOptions{MaxTokens: -1}); err == nil {
+		t.Fatal("negative max tokens accepted")
 	}
 	if _, err := ResolveLLM(context.Background(), nil, f, LLMOptions{}); err == nil {
 		t.Fatal("nil provider accepted")
 	}
 }
 
-func TestResolveLLMHunkModeReassemblesRegions(t *testing.T) {
+// TestResolveLLMMergesCleanRegionsLocally: the changes of one side only are merged without the
+// model; the model answers the one conflicting region, and its request holds no other region.
+func TestResolveLLMMergesCleanRegionsLocally(t *testing.T) {
 	base := numbered("line", 100)
-	// Ours changes line 50 only. Theirs changes line 10 only. Both change line 80
-	// differently, which is the conflict.
-	ours := strings.Replace(base, "line 50\n", "ours 50\n", 1)
-	ours = strings.Replace(ours, "line 80\n", "ours 80\n", 1)
-	theirs := strings.Replace(base, "line 10\n", "theirs 10\n", 1)
-	theirs = strings.Replace(theirs, "line 80\n", "theirs 80\n", 1)
-
-	p := &llmFake{answer: func(int, llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer("merged 80\n", "high"), nil
-	}}
+	ours := strings.NewReplacer("line 50\n", "ours 50\n", "line 80\n", "ours 80\n").Replace(base)
+	theirs := strings.NewReplacer("line 10\n", "theirs 10\n", "line 80\n", "theirs 80\n").Replace(base)
+	p := llmFixed("merged 80\n")
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500, ContextLines: 2})
+	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Hunks != 1 || len(p.reqs) != 1 {
 		t.Fatalf("hunks = %d, calls = %d; want one conflict answered once", res.Hunks, len(p.reqs))
 	}
-
-	want := strings.NewReplacer(
-		"line 50\n", "ours 50\n",
-		"line 10\n", "theirs 10\n",
-		"line 80\n", "merged 80\n",
-	).Replace(base)
+	want := strings.NewReplacer("line 50\n", "ours 50\n", "line 10\n", "theirs 10\n", "line 80\n", "merged 80\n").Replace(base)
 	if string(res.Content) != want {
-		t.Fatalf("content mismatch:\n%s", string(res.Content))
+		t.Fatalf("content mismatch:\n%s", res.Content)
 	}
-
-	prompt := p.reqs[0].Prompt
-	if !strings.Contains(prompt, "ours 80") || !strings.Contains(prompt, "theirs 80") {
-		t.Error("prompt misses the conflicting sides")
-	}
-	if strings.Contains(prompt, "line 10\n") || strings.Contains(prompt, "line 50\n") {
-		t.Error("prompt contains unrelated regions")
-	}
-	if !strings.Contains(prompt, "line 78\n") {
-		t.Error("prompt misses the context before the region")
-	}
-	if strings.Contains(p.reqs[0].System, "complete merged file") {
-		t.Error("hunk mode must not ask for the whole file")
+	req := p.reqs[0]
+	if strings.Contains(req.Prompt, "line 10\n") || strings.Contains(req.Prompt, "line 50\n") || strings.Contains(req.System, "OTHER CODE") {
+		t.Error("request holds unrelated regions")
 	}
 }
 
-func TestResolveLLMHunkModeNoConflictSkipsModel(t *testing.T) {
+func TestResolveLLMNoConflictSkipsModel(t *testing.T) {
 	base := numbered("line", 100)
 	ours := strings.Replace(base, "line 3\n", "ours 3\n", 1)
 	theirs := strings.Replace(base, "line 40\n", "theirs 40\n", 1)
 
-	p := llmFixed("unused\n", "high")
+	p := llmFixed("unused\n")
 	f := LLMFile{Path: "big.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
 
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
+	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,66 +267,6 @@ func TestResolveLLMHunkModeNoConflictSkipsModel(t *testing.T) {
 	want := strings.NewReplacer("line 3\n", "ours 3\n", "line 40\n", "theirs 40\n").Replace(base)
 	if string(res.Content) != want {
 		t.Fatal("non-overlapping changes not merged")
-	}
-}
-
-func TestResolveLLMHunkModeTwoConflicts(t *testing.T) {
-	base := numbered("line", 100)
-	ours := strings.NewReplacer("line 5\n", "o5\n", "line 50\n", "o50\n").Replace(base)
-	theirs := strings.NewReplacer("line 5\n", "t5\n", "line 50\n", "t50\n").Replace(base)
-
-	p := &llmFake{answer: func(i int, _ llm.Request) (*llm.Response, error) {
-		return llmFakeAnswer(fmt.Sprintf("resolved %d", i), map[int]string{0: "high", 1: "medium"}[i]), nil
-	}}
-	f := LLMFile{Path: "two.txt", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
-
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500, ContextLines: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(p.reqs) != 2 || res.Hunks != 2 {
-		t.Fatalf("calls = %d, hunks = %d", len(p.reqs), res.Hunks)
-	}
-	if res.Confidence != LLMConfidenceMedium {
-		t.Fatalf("confidence = %s, want the lowest of the answers", res.Confidence)
-	}
-	want := strings.NewReplacer(
-		"line 5\n", "resolved 0\n",
-		"line 50\n", "resolved 1\n",
-	).Replace(base)
-	if string(res.Content) != want {
-		t.Fatalf("content mismatch:\n%s", string(res.Content))
-	}
-	if !strings.Contains(p.reqs[0].Prompt, "region 1 of 2") {
-		t.Fatal("prompt does not number the region")
-	}
-}
-
-func TestResolveLLMHunkModeRejectsBadRegionAnswer(t *testing.T) {
-	base := numbered("line", 100)
-	ours := strings.Replace(base, "line 15\n", "o\n", 1)
-	theirs := strings.Replace(base, "line 15\n", "t\n", 1)
-
-	p := llmFixed("<<<<<<< ours\n", "high")
-	f := LLMFile{Path: "x", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
-	if _, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500}); !errors.Is(err, ErrLLMRejected) {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestResolveLLMHunkModeAddsMissingNewline(t *testing.T) {
-	base := numbered("line", 100)
-	ours := strings.Replace(base, "line 15\n", "o\n", 1)
-	theirs := strings.Replace(base, "line 15\n", "t\n", 1)
-
-	p := llmFixed("resolved", "high")
-	f := LLMFile{Path: "x", Base: []byte(base), Ours: []byte(ours), Theirs: []byte(theirs)}
-	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{MaxPromptBytes: 1500})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(res.Content), "resolved\nline 16\n") {
-		t.Fatalf("answer not newline-terminated:\n%s", res.Content)
 	}
 }
 
@@ -359,19 +281,20 @@ func TestLLMRegionsCleanWhenSidesAgree(t *testing.T) {
 	if len(regions) != 1 || !regions[0].clean {
 		t.Fatalf("regions = %+v, want one clean region", regions)
 	}
-	if got := llmAssemble(base, regions); got != "a\nX\nc\n" {
+	if got := llmJoin(regions); got != "X\n" {
 		t.Fatalf("assembled = %q", got)
 	}
 }
 
 func TestLLMEmptyFileSides(t *testing.T) {
-	p := llmFixed("", "high")
+	// Both sides emptied the file the same way: a clean region, no call.
+	p := llmFixed("")
 	f := LLMFile{Path: "empty.txt", Base: []byte("x\n"), Ours: []byte{}, Theirs: []byte{}}
 	res, err := ResolveLLM(context.Background(), p, f, LLMOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Content) != 0 {
-		t.Fatalf("content = %q", res.Content)
+	if len(res.Content) != 0 || len(p.reqs) != 0 {
+		t.Fatalf("content = %q, calls %d", res.Content, len(p.reqs))
 	}
 }

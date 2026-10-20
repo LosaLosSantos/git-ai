@@ -112,7 +112,7 @@ The policy is read at startup. A change needs a restart.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | required | Identity of the agent. It is the identity the token maps to, the actor the policy decides on for the token's requests, the actor that the changeset log records for the token's updates and, in standalone mode, the user ID (`gl_id`, `gl_username`) of every request made with the token, whatever the client sent. The name `shared` is reserved for the shared token. |
+| `name` | string | required | Identity of the agent. It is the identity the token maps to, the actor the policy decides on for the token's requests, the actor that the changeset log records for the token's updates and, in standalone mode, the user ID (`gl_id`, `gl_username`) of every request made with the token, whatever the client sent. The name `shared` is reserved for the shared token, and `proposals` and `green` for the server's references under `refs/graft/`: the workspace's temporary branches of an agent are `graft/<name>/...`, which for those names an agent may not use. |
 | `token` | string | — | The secret. Set either `token` or `token_file`. |
 | `token_file` | string | — | Path to a file that holds the secret, surrounding whitespace removed. Read at startup. |
 
@@ -179,22 +179,52 @@ never calls a language model: it calls the program or HTTP endpoint configured
 here. The protocol, the validation rules and `graft-resolve` are described in
 [RESOLVE.md](RESOLVE.md).
 
+A resolver configuration the server could not use is a startup error: an empty
+`command`, a `url` that is not an `http` or `https` URL with a host, a
+`token_file` that cannot be read or is empty, a bad `timeout`, a negative
+bound, or a `max_file_bytes` over the bound of a check request. A configured
+resolver is never treated as no resolver: if it cannot be built later (its
+token file removed, say), every land that needs it fails closed, with the
+cause.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch. When false, `resolve_conflicts` in a land request is ignored. |
 | `command` | array of strings | empty | Program and arguments. It reads one request on stdin and writes the answer on stdout. |
 | `url` | string | empty | `http://` or `https://` endpoint that receives the request as a JSON POST. Exactly one of `command` and `url` must be set when `enabled` is true. |
 | `token_file` | string | empty | For `url`: file with the bearer token, read at startup. |
-| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration). |
+| `timeout` | string | `"120s"` | Bound on one resolver call (Go duration), and on the whole land that the server resolves for `resolve_conflicts`: its rounds (the resolutions, the verifications of a model's resolution, the waits for slots, and the passes through the branch's lane) end at this deadline, which is `timeout` plus `verify.timeout` when `verify.enabled`. A land that is still unresolved at this deadline does not fail with a deadline: it ends with the merge conflict and its package, the proposals of what is known and the files that changed under it as not attempted, with the reason. |
 | `max_files` | int | `20` | Conflicted files per land. A land with more is not sent to the resolver. |
-| `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. |
+| `max_file_bytes` | int | `1048576` (1 MiB) | Bound on every side of every file sent and on every resolved file accepted. At most 12566528 (about 12 MiB): one file, its three sides and its resolution, must fit one check request. |
+| `proposal_ttl` | string | `"168h"` | How long the proposals of a failed land are kept under `refs/graft/proposals/` (Go duration, by the server's clock); at most 20 are kept per branch. Lands with a resolution and the housekeeping pass prune them. |
+| `check_concurrency` | int | `2` | Checks of agents' resolutions that run at once in the Gitaly process, across all its listeners (one resolver client is shared by them); each holds a request of up to 64 MiB. A check waits for a free slot within its deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_check_slot_wait_seconds`. |
+| `verify_per_repository` | int | `1` | Verifications that run at once for one repository (of any resolution: a rule's, an agent's, a model's), inside `verify_concurrency`: every land of a busy branch builds a tree of its own to verify, and one repository must not take the whole pool. A land waits for its repository's turn first, holding nothing of the pool, within the land's deadline. **The cost, stated:** a resolution lands only on the tree that was verified, so a land whose branch moved after its tree was verified is verified again, and on a busy branch the lands take their turns one repository at a time; at the deadline a land ends with the package (a rule's files `NOT_ATTEMPTED` with the reason, a model's `PROPOSED`) and the agent lands again. Lands of rules are batched only when `verify.enabled` is not set. |
+| `verify_concurrency` | int | `2` | Verifications that run at once in the Gitaly process (of any resolution: a rule's, an agent's, a model's), all out of the lane, in a pool of their own that exists whenever `verify.enabled` is set, with or without an AI resolver, as `verify.command` takes minutes. A verification waits for a free slot within the land's deadline. The wait is in `graft_resolver_verify_slot_wait_seconds`. |
+| `resolve_concurrency` | int | `2` | Resolutions that run at once in the Gitaly process, in a pool apart from the checks', so that long resolutions never delay a check. A resolution waits for a free slot within the land's deadline (`timeout`), and fails closed when it expires. The wait is in `graft_resolver_resolve_slot_wait_seconds`. |
+| `resolve_rounds` | int | `32` | Safety cap on the rounds of a land whose conflicting files keep changing while it is resolved out of the lane. The rounds are bounded by `timeout`; the cap is set well above realistic contention and is no contract. |
 | `paths_allow` | array of strings | empty (every path) | Globs of paths that may be sent to the resolver, with the syntax of policy refs. |
 | `paths_deny` | array of strings | empty | Globs of paths that are never sent. Deny wins over allow. |
 | `actors` | array of strings | empty (every caller that may land) | Globs of the identities that may request resolution: agent names, or `shared` for the shared token. Without `[[graft.agent]]` no caller has an identity, so a non-empty list admits nobody (the server warns at startup). |
+| `lockfiles` | array of strings | empty | Base names of lockfiles, besides the built-in `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `Cargo.lock` and `go.sum`. A conflicting lockfile is never sent to the resolver: it goes to the agent. |
+| `generated_markers` | array of strings | empty | Go regular expressions, besides the built-in `Code generated .* DO NOT EDIT\.`, `@generated`, `DO NOT EDIT` and `(?i)auto-generated`, searched in the first 10 lines of every side. A match marks the file generated, and it is never sent. A path that the tip's `.gitattributes` marks `linguist-generated` is generated as well. |
+| `minified.globs` | array of strings | empty | Base-name globs of minified files, besides the built-in `*.min.js`, `*.min.mjs`, `*.min.css` and `*.bundle.js`. Such files are never sent. |
+| `minified.average_line_bytes` | int | `300` | A side larger than 2 KiB whose average line is longer is minified. |
+| `minified.longest_line_bytes` | int | `5000` | A side larger than 2 KiB with a longer line is minified. |
+| `verify.enabled` | bool | `false` | Run `verify.command` on the merged tree of every resolution (a resolver's or an agent's) before it lands; it applies even when `enabled` is false. It is also what lets a model's resolution land: only a tree it passed on lands, and without it a model's resolution is only ever a proposal. |
+| `verify.command` | array of strings | empty | Program and arguments, run in a temporary checkout of the merged tree with `PATH`, `HOME` and `TMPDIR` only. A non-zero exit rejects the resolution. |
+| `verify.timeout` | string | `"5m"` | Bound on one verification, the checkout of the tree and the command together (Go duration); one that does not finish rejects the resolution. When `verify.enabled`, it is added to `timeout` for the deadline of a resolved land. |
+| `verify.max_tree_entries` | int | `200000` | Files, links and submodules in the tree that is checked out for the command, plus the directories made for them; a bigger tree is not verified, and the package says why. |
+| `verify.max_tree_bytes` | int | `2147483648` | Bytes of the files of that tree and of the targets of its links, checked per entry from the listing, before that entry's content is read. |
+| `verify.max_tree_depth` | int | `64` | Components of a path of that tree. A tree can name one deep subtree many times; the expansion is what this and the entry count bound. |
+
+A file that is never sent goes to the agent with its reason in the conflict
+package: large (a side over `max_file_bytes`), binary (a NUL byte), lockfile,
+generated or minified, checked in that order (see [RESOLVE.md](RESOLVE.md)).
 
 Startup fails when both or neither of `command` and `url` are set, the URL has
-another scheme, `timeout` is not a duration, a bound is negative, or a glob is
-empty or invalid.
+another scheme, `timeout` is not a duration, a bound or a threshold is
+negative, a glob is empty or invalid, a lockfile is not a base name, or a
+generated marker is not a valid regular expression.
 
 ### `[graft.storage]`
 
@@ -210,7 +240,7 @@ are in [STORAGE.md](STORAGE.md).
 | `database` | string | required when on | `sqlite:///absolute/path.db`, or `postgres://user@host:port/db?sslmode=...` (`postgresql://` too). All nodes use the same database. Credentials are not written here: Postgres reads the `PG*` environment variables and `.pgpass`. The schema is created at startup. |
 | `bucket` | string | required when on | gocloud URL of the object storage: `file:///absolute/dir`, `s3://bucket?region=...`, `gs://bucket` or `azblob://container`. All nodes use the same bucket. Credentials come from the cloud SDK's environment (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_*`). |
 | `node_id` | string | the host name | Name of this node in the database (changesets record it, and `graft storage state` shows it). Must not contain spaces or slashes. Give every node its own. |
-| `sync_timeout` | string (Go duration) | `"10s"` | Budget of one sync round before a request in authoritative mode. A round that cannot reach the head in time keeps what it did: the local repository stays at the changeset it reached, the request fails with `Unavailable`, and the next request's round goes on from there. A round that cannot finish at all (for example because the database is unreachable or a local writer holds a reference lock) fails the request with `Unavailable` too. Concurrent requests share a round; a request that arrives during a round that read the head before it then runs one of its own, so it waits at most two rounds (and stops waiting with `Unavailable` after twice `sync_timeout` plus a second per round, should a round not end within its budget). Clients retry `Unavailable`: the SDK does it for merge and fast-forward lands (`LandOptions.RetryUnavailable`, see [LAND-BATCHING](LAND-BATCHING.md#limits)); rebase lands are not retried by default, because the server cannot yet tell that a rebased change already landed. A client without the SDK must follow the same rules. Must be positive. |
+| `sync_timeout` | string (Go duration) | `"10s"` | Budget of one sync round before a request in authoritative mode. A round that cannot reach the head in time keeps what it did: the local repository stays at the changeset it reached, the request fails with `Unavailable`, and the next request's round goes on from there. A round that cannot finish at all (for example because the database is unreachable or a local writer holds a reference lock) fails the request with `Unavailable` too. Concurrent requests share a round; a request that arrives during a round that read the head before it then runs one of its own, so it waits at most two rounds (and stops waiting with `Unavailable` after twice `sync_timeout` plus a second per round, should a round not end within its budget). Clients retry `Unavailable`: the SDK does it for every land (`LandOptions.RetryUnavailable`, see [LAND-BATCHING](LAND-BATCHING.md#limits)): the retry of a land whose response was lost answers `already_landed` from the server's record of the first land, rebase lands included (that record needs a server released after v0.2.0 with its changeset log on, `[graft.changelog]` not disabled; against another server the retry of a lost rebase land replays the change, and `SkipRebaseLands` turns the retry of rebase lands off). A client without the SDK must follow the same rules. Must be positive. |
 | `shadow_timeout` | string (Go duration) | `"5s"` | Budget of the shadow-mode work of one reference transaction, for its Preparing phase (pack build and upload, before git locks the references) and its Prepared phase together. When it runs out, the work is abandoned, logged and counted, and the git write proceeds. Must be positive. |
 | `gc_grace` | string (Go duration) | `"1h"` | How long garbage collection waits before it deletes a pack it observed unreferenced, and how old a checkpoint must be before the packs it covers are deleted. Must be greater than `sync_timeout + gc_margin`. |
 | `gc_margin` | string (Go duration) | `"5m"` | Safety margin of the writers' deadline: a write uploads its pack and commits its changeset within `gc_grace - gc_margin`, else it fails. It also covers the difference between a node's clock and the database's. Must be positive. |

@@ -487,9 +487,21 @@ func (cf *ExecCommandFactory) newCommand(ctx context.Context, repo storage.Repos
 		sc.Flags = append(sc.Flags, Flag{Name: fmt.Sprintf("--ref-format=%s", backend.Name)})
 	}
 
+	// An agent's walk of git's pseudo references leaves out the references agents do not see.
+	walk := agentRefWalk(ctx, sc)
+	if walk {
+		sc = excludeHiddenRefs(sc)
+	}
+
 	config, err := cf.combineOpts(ctx, sc, opts)
 	if err != nil {
 		return nil, err
+	}
+	if walk {
+		config.globals = append(config.globals, agentWalkConfig()...)
+		if readsRevisionsFromStdin(sc) {
+			config.commandOpts = append(config.commandOpts, command.WithStdinFilter(excludeHiddenRefsOnStdin))
+		}
 	}
 
 	cmdGitVersion, err := cf.GitVersion(ctx)

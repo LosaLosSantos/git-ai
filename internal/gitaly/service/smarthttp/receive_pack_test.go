@@ -204,6 +204,8 @@ func TestPostReceivePack_hiddenRefs(t *testing.T) {
 		"refs/merge-requests/1/head",
 		"refs/merge-requests/1/merge",
 		"refs/pipelines/1",
+		// The proposals of a land (PLAN10 14) are written by the server only.
+		"refs/graft/proposals/0123456789abcdef/1",
 	} {
 		t.Run(ref, func(t *testing.T) {
 			t.Parallel()

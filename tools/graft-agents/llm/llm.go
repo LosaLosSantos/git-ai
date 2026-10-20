@@ -46,6 +46,9 @@ type Request struct {
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
+	// ReasoningTokens are the output tokens the model spent reasoning (part of OutputTokens),
+	// when the provider reports them.
+	ReasoningTokens int
 }
 
 // Response is one completion.
@@ -59,6 +62,9 @@ type Response struct {
 	Model string
 	// Usage is the token usage, if known.
 	Usage Usage
+	// Provider is the provider that served the call, when the endpoint says (OpenRouter's "provider"
+	// field of the answer): with routing pinned to a provider it is the proof that the call stayed there.
+	Provider string
 }
 
 // Provider is a language-model backend.
@@ -73,6 +79,9 @@ type Provider interface {
 
 // Config selects and configures a provider. It is embedded in the TOML
 // configuration of the Graft agents.
+//
+// A provider honours every field it is given or fails at construction: no
+// setting is dropped silently.
 type Config struct {
 	// Type is "anthropic", "openai", "command" or "none".
 	Type string `toml:"type" json:"type"`
@@ -92,11 +101,13 @@ type Config struct {
 	Timeout string `toml:"timeout" json:"timeout"`
 	// MaxTokens is the default Request.MaxTokens.
 	MaxTokens int `toml:"max_tokens" json:"max_tokens"`
-	// Effort is a provider-specific reasoning-effort hint ("low", "medium",
-	// "high", ...); providers that do not support it ignore it.
+	// Effort is a provider-specific reasoning effort ("low", "medium",
+	// "high", ...); a provider that cannot send it rejects it.
 	Effort string `toml:"effort" json:"effort"`
 	// Options holds extra provider-specific settings.
 	Options map[string]string `toml:"options" json:"options"`
+	// Routing pins the OpenRouter endpoints a call may use (openai provider only).
+	Routing *Routing `toml:"routing" json:"routing"`
 }
 
 // DefaultTimeout is the default completion timeout.

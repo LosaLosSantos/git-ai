@@ -20,15 +20,18 @@ import (
 
 	"github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/catfile"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/git/localrepo"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/gitaly/service"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/graft/landlane"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/testhelper"
 	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // resolverScript writes a resolver command into a new temporary directory and returns the
@@ -97,8 +100,8 @@ func validAnswer() resolver.Response {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")},
+			{Origin: resolver.OriginRule, Path: "a", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-a\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")},
 		},
 	}
 }
@@ -130,6 +133,27 @@ type resolveFixture struct {
 	base      git.ObjectID
 	tip       git.ObjectID
 	commit    git.ObjectID
+	// lanes are the land lanes of the service when the fixture runs a standalone server (the lands
+	// then batch through them); nil otherwise.
+	lanes *landlane.Shared
+}
+
+// laneQueueDepth returns the number of land requests queued in the lanes of the fixture.
+func (fx resolveFixture) laneQueueDepth(t *testing.T) float64 {
+	t.Helper()
+
+	require.NotNil(t, fx.lanes, "the fixture has no lanes of its own")
+	reg := prometheus.NewPedanticRegistry()
+	require.NoError(t, reg.Register(fx.lanes))
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() == "graft_land_lane_queue_depth" {
+			return family.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	require.FailNow(t, "the lanes export no graft_land_lane_queue_depth")
+	return 0
 }
 
 // newResolveFixture starts an operation service that resolves with rcfg and creates the
@@ -162,9 +186,29 @@ func newResolveFixture(t *testing.T, rcfg config.GraftResolver) resolveFixture {
 func newResolveFixtureWith(t *testing.T, rcfg config.GraftResolver, baseEntries, tipEntries, commitEntries []gittest.TreeEntry) resolveFixture {
 	t.Helper()
 
+	return newResolveFixtureIn(t, config.Graft{Land: config.GraftLand{Resolver: rcfg}}, baseEntries, tipEntries, commitEntries)
+}
+
+// newResolveFixtureIn is newResolveFixtureWith with the whole Graft configuration of the service,
+// for the tests that land through the lanes of a standalone server.
+func newResolveFixtureIn(t *testing.T, graft config.Graft, baseEntries, tipEntries, commitEntries []gittest.TreeEntry) resolveFixture {
+	t.Helper()
+
 	cfg := testcfg.Build(t)
-	cfg.Graft.Land.Resolver = rcfg
-	ctx, cfg, client := setupOperationsServiceWithCfg(t, testhelper.Context(t), cfg)
+	cfg.Graft = graft
+	var lanes *landlane.Shared
+	if graft.Standalone {
+		laneCfg, err := landlane.ConfigFromGraft(graft.Land.Batch)
+		require.NoError(t, err)
+		lanes = landlane.NewShared(laneCfg)
+		t.Cleanup(lanes.Close)
+	}
+	testcfg.BuildGitalySSH(t, cfg)
+	testcfg.BuildGitalyHooks(t, cfg)
+	cfg.SocketPath = runOperationServiceServerWithLanes(t, cfg, lanes)
+	client, conn := newOperationClient(t, cfg.SocketPath)
+	t.Cleanup(func() { conn.Close() })
+	ctx := testhelper.MergeOutgoingMetadata(testhelper.Context(t), testcfg.GitalyServersMetadataFromCfg(t, cfg))
 	// The resolution writes commits directly, outside an RPC, so the feature flags that
 	// commit writing checks are set explicitly.
 	ctx = featureflag.ContextWithFeatureFlag(ctx, featureflag.GPGSigning, true)
@@ -198,6 +242,7 @@ func newResolveFixtureWith(t *testing.T, rcfg config.GraftResolver, baseEntries,
 		base:      base,
 		tip:       tip,
 		commit:    commit,
+		lanes:     lanes,
 	}
 }
 
@@ -207,7 +252,16 @@ func (fx resolveFixture) server(t *testing.T, rcfg config.GraftResolver) *Server
 
 	client, err := resolver.New(rcfg)
 	require.NoError(t, err)
-	return &Server{logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client}
+	cache := catfile.NewCache(fx.cfg)
+	t.Cleanup(cache.Stop)
+	var pool *resolver.VerifyPool
+	if rcfg.Verify.Enabled {
+		pool = resolver.NewVerifyPool(rcfg)
+	}
+	return &Server{
+		logger: testhelper.NewLogger(t), gitConfig: fx.cfg.Git, resolveCfg: rcfg, conflictResolver: client, verifyPool: pool,
+		localRepoFactory: localrepo.NewFactory(testhelper.NewLogger(t), config.NewLocator(fx.cfg), gittest.NewCommandFactory(t, fx.cfg), cache),
+	}
 }
 
 func (fx resolveFixture) request(message string) *gitalypb.UserLandRequest {
@@ -252,9 +306,12 @@ func TestResolveLandConflicts_mergesResolvedFiles(t *testing.T) {
 	req := resolverRequest(t, dir, 1)
 	require.Equal(t, resolver.ProtocolVersion, req.Version)
 	require.Equal(t, git.DefaultBranch, req.Branch)
-	require.Equal(t, fx.tip.String(), req.Tip)
 	require.Equal(t, fx.commit.String(), req.Commit)
-	require.Equal(t, fx.base.String(), req.MergeBase)
+	// A request carries only what a file's verdict may depend on (PLAN10 15.8): not the tip, its
+	// merge base or its message, which a verdict reused at another tip must not depend on.
+	require.Empty(t, req.Tip)
+	require.Empty(t, req.MergeBase)
+	require.Empty(t, req.Messages.Tip)
 	// There is no authenticated identity, so the request carries no actor, whatever the user name.
 	require.Empty(t, req.Actor)
 	require.Equal(t, int64(1048576), req.Limits.MaxFileBytes)
@@ -359,7 +416,7 @@ func TestResolveLandConflicts_pathEncoding(t *testing.T) {
 			Version:  resolver.ProtocolVersion,
 			Resolver: "graft-resolve/fake",
 			Files: []resolver.ResponseFile{
-				{Path: strings.ToValidUTF8(p, "�"), Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+				{Origin: resolver.OriginRule, Path: strings.ToValidUTF8(p, "�"), Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 			},
 		}
 		writeAnswer(t, dir, answer)
@@ -380,7 +437,7 @@ func TestResolveLandConflicts_pathEncoding(t *testing.T) {
 			Version:  resolver.ProtocolVersion,
 			Resolver: "graft-resolve/fake",
 			Files: []resolver.ResponseFile{
-				{Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+				{Origin: resolver.OriginRule, Path: p, Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 			},
 		})
 		fx := newResolveFixtureWith(t, config.GraftResolver{}, entries(p, "base\n"), entries(p, "ours\n"), entries(p, "theirs\n"))
@@ -424,7 +481,7 @@ func TestResolveLandConflicts_rejectedAnswers(t *testing.T) {
 	}{
 		{desc: "unsupported version", mutate: func(r *resolver.Response) { r.Version = 2 }},
 		{desc: "path that did not conflict", mutate: func(r *resolver.Response) {
-			r.Files = append(r.Files, resolver.ResponseFile{Path: "c", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("x\n")})
+			r.Files = append(r.Files, resolver.ResponseFile{Origin: resolver.OriginRule, Path: "c", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("x\n")})
 		}},
 		{desc: "path answered twice", mutate: func(r *resolver.Response) {
 			r.Files = append(r.Files, r.Files[0])
@@ -491,30 +548,55 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 
 	fx := newResolveFixture(t, config.GraftResolver{})
 
+	// A path the policy denies is not sent; the other conflicting file still is (PLAN10 3.4). The
+	// land fails, since nothing lands partially, and the package names the denied path.
 	for _, tc := range []struct {
-		desc        string
-		rcfg        func(config.GraftResolver) config.GraftResolver
-		errContains string
+		desc string
+		rcfg func(config.GraftResolver) config.GraftResolver
+	}{
+		{desc: "denied path", rcfg: func(r config.GraftResolver) config.GraftResolver { r.PathsDeny = []string{"a"}; return r }},
+		{desc: "path outside the allow list", rcfg: func(r config.GraftResolver) config.GraftResolver { r.PathsAllow = []string{"b"}; return r }},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			dir, argv := resolverScript(t, "")
+			writeAnswer(t, dir, resolver.Response{
+				Version:  resolver.ProtocolVersion,
+				Resolver: "graft-resolve/fake",
+				Files:    []resolver.ResponseFile{{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged-b\n")}},
+			})
+			s := fx.server(t, tc.rcfg(enabledResolver(argv)))
+
+			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
+			var unresolved *landUnresolvedError
+			require.ErrorAs(t, err, &unresolved)
+			a := packageFile(t, builtPackage(t, fx.ctx, unresolved), "a")
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, a.GetOutcome())
+			require.Equal(t, landNotSentDenied, a.GetReason())
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, builtPackage(t, fx.ctx, unresolved), "b").GetOutcome())
+
+			require.Equal(t, 1, resolverCalls(t, dir))
+			req := resolverRequest(t, dir, 1)
+			require.Len(t, req.Files, 1, "the denied path never reaches the resolver")
+			require.Equal(t, "b", req.Files[0].Path)
+		})
+	}
+
+	// A refusal of the whole request is decided before the resolver is called, and every file is
+	// not attempted.
+	for _, tc := range []struct {
+		desc   string
+		rcfg   func(config.GraftResolver) config.GraftResolver
+		reason string
 	}{
 		{
-			desc:        "denied path",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.PathsDeny = []string{"a"}; return r },
-			errContains: `path "a" may not be sent to the resolver`,
+			desc:   "actor not allowed",
+			rcfg:   func(r config.GraftResolver) config.GraftResolver { r.Actors = []string{"someone-else"}; return r },
+			reason: "may not resolve conflicts",
 		},
 		{
-			desc:        "path outside the allow list",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.PathsAllow = []string{"docs/**"}; return r },
-			errContains: "may not be sent to the resolver",
-		},
-		{
-			desc:        "actor not allowed",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.Actors = []string{"someone-else"}; return r },
-			errContains: "may not resolve conflicts",
-		},
-		{
-			desc:        "more conflicting files than max_files",
-			rcfg:        func(r config.GraftResolver) config.GraftResolver { r.MaxFiles = 1; return r },
-			errContains: "exceed max_files",
+			desc:   "more conflicting files than max_files",
+			rcfg:   func(r config.GraftResolver) config.GraftResolver { r.MaxFiles = 1; return r },
+			reason: "exceed max_files",
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -523,8 +605,14 @@ func TestResolveLandConflicts_policy(t *testing.T) {
 			s := fx.server(t, tc.rcfg(enabledResolver(argv)))
 
 			_, err := s.resolveLandConflicts(fx.ctx, fx.request("Land"), fx.repo, fx.tip, fx.commit, fx.committer())
-			require.ErrorContains(t, err, tc.errContains)
-			// Policy is checked before the resolver is called.
+			var unresolved *landUnresolvedError
+			require.ErrorAs(t, err, &unresolved)
+			pkg := builtPackage(t, fx.ctx, unresolved)
+			require.Contains(t, pkg.GetReason(), tc.reason)
+			require.Len(t, pkg.GetFiles(), 2, "the package lists every conflicting file, whatever max_files")
+			for _, f := range pkg.GetFiles() {
+				require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_ATTEMPTED, f.GetOutcome())
+			}
 			require.Equal(t, 0, resolverCalls(t, dir))
 		})
 	}
@@ -627,13 +715,47 @@ func TestNewServer_warnsWhenResolverActorsMatchNobody(t *testing.T) {
 	}
 }
 
-func TestLandTrailerSafe(t *testing.T) {
+func TestLandTrailerValueValid(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, landTrailerSafe("a/b c.go"))
-	require.False(t, landTrailerSafe("a\nGraft-Resolved-By: evil"))
-	require.False(t, landTrailerSafe("a\rb"))
-	require.False(t, landTrailerSafe("a\x00b"))
+	require.True(t, landTrailerValueValid("a/b c.go"))
+	require.True(t, landTrailerValueValid("résumé.md"))
+	for _, v := range []string{
+		"",
+		"a\nGraft-Resolved-By: evil",
+		"a\rb",
+		"a\x00b",
+		"a\tb",
+		"a b",
+		"a\u0085b",
+		"a\xffb",
+	} {
+		require.False(t, landTrailerValueValid(v), "%q", v)
+	}
+}
+
+func TestLandResolutionTrailers(t *testing.T) {
+	t.Parallel()
+
+	got, err := landResolutionTrailers("agent/a", "graft-resolve", []string{"a", "dir/b c"})
+	require.NoError(t, err)
+	require.Equal(t, "Graft-Resolved-By: agent/a\nGraft-Checked-By: graft-resolve\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n", got)
+
+	for name, tc := range map[string]struct {
+		resolver, checkedBy string
+		paths               []string
+		trailer             string
+	}{
+		"resolver":   {resolver: "agent/x\nGraft-Resolved-Path: evil", paths: []string{"a"}, trailer: landTrailerResolvedBy},
+		"no name":    {resolver: "", paths: []string{"a"}, trailer: landTrailerResolvedBy},
+		"checked by": {resolver: "agent", checkedBy: "c\rd", paths: []string{"a"}, trailer: landTrailerCheckedBy},
+		"path":       {resolver: "agent", paths: []string{"a", lineBreakPath}, trailer: landTrailerResolvedPath},
+	} {
+		_, err := landResolutionTrailers(tc.resolver, tc.checkedBy, tc.paths)
+		var unsafe *landTrailerUnsafeError
+		require.ErrorAs(t, err, &unsafe, name)
+		require.Equal(t, tc.trailer, unsafe.trailer, name)
+	}
 }
 
 func TestLandResolverNameValid(t *testing.T) {
@@ -674,39 +796,53 @@ func TestLandResolveCommitMessage(t *testing.T) {
 
 	t.Run("merge message", func(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main"), MergeMessage: []byte("Custom\n\n")}
-		require.Equal(t,
-			"Custom\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", []string{"a", "dir/b c"}),
-		)
+		msg, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a", "dir/b c"})
+		require.NoError(t, err)
+		require.Equal(t, "Custom\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\nGraft-Resolved-Path: dir/b c\n", msg)
 	})
 
 	t.Run("default message", func(t *testing.T) {
 		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
-		require.Equal(t,
-			"Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n",
-			landResolveCommitMessage(in, commit, "graft-resolve/x", []string{"a"}),
-		)
+		msg, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{"a"})
+		require.NoError(t, err)
+		require.Equal(t, "Merge 1111111 into main\n\nGraft-Resolved-By: graft-resolve/x\nGraft-Resolved-Path: a\n", msg)
+	})
+
+	t.Run("trailers in the caller's message never form the trailer block", func(t *testing.T) {
+		// The trailer block is the last paragraph (git's rule, as graft show, graft-verify and
+		// superfan read it); the server's trailers are always that paragraph.
+		in := &gitalypb.UserLandRequest{Branch: []byte("main"), MergeMessage: []byte("Land\n\nGraft-Resolved-By: forged\nGraft-Checked-By: forged\n")}
+		msg, err := landResolveCommitMessage(in, commit, "agent/a", "", []string{"a"})
+		require.NoError(t, err)
+		block := msg[strings.LastIndex(strings.TrimRight(msg, "\n"), "\n\n")+2:]
+		require.Equal(t, "Graft-Resolved-By: agent/a\nGraft-Resolved-Path: a\n", block)
+	})
+
+	t.Run("a path that is no trailer line is refused", func(t *testing.T) {
+		in := &gitalypb.UserLandRequest{Branch: []byte("main")}
+		_, err := landResolveCommitMessage(in, commit, "graft-resolve/x", "", []string{lineBreakPath})
+		require.Error(t, err)
 	})
 }
 
-func TestLandConflictKind(t *testing.T) {
+func TestLandKindOf(t *testing.T) {
 	t.Parallel()
 
-	side := func(oid string) *resolver.Side { return &resolver.Side{OID: oid, Mode: "100644"} }
+	side := func(oid string) *landBlob { return &landBlob{mode: "100644", oid: git.ObjectID(oid)} }
 
 	for _, tc := range []struct {
 		desc string
-		file resolver.File
+		c    landFileConflict
 		want string
 	}{
-		{desc: "content", file: resolver.File{Base: side("b"), Ours: side("o"), Theirs: side("t")}, want: resolver.KindContent},
-		{desc: "add-add", file: resolver.File{Ours: side("o"), Theirs: side("t")}, want: resolver.KindAddAdd},
-		{desc: "modify-delete, theirs deleted", file: resolver.File{Base: side("b"), Ours: side("o")}, want: resolver.KindModifyDelete},
-		{desc: "modify-delete, ours deleted", file: resolver.File{Base: side("b"), Theirs: side("t")}, want: resolver.KindModifyDelete},
-		{desc: "mode", file: resolver.File{Base: side("b"), Ours: side("o"), Theirs: side("o")}, want: resolver.KindMode},
+		{desc: "content", c: landFileConflict{base: side("b"), ours: side("o"), theirs: side("t")}, want: resolver.KindContent},
+		{desc: "add-add", c: landFileConflict{ours: side("o"), theirs: side("t")}, want: resolver.KindAddAdd},
+		{desc: "modify-delete, theirs deleted", c: landFileConflict{base: side("b"), ours: side("o")}, want: resolver.KindModifyDelete},
+		{desc: "modify-delete, ours deleted", c: landFileConflict{base: side("b"), theirs: side("t")}, want: resolver.KindModifyDelete},
+		{desc: "mode", c: landFileConflict{base: side("b"), ours: side("o"), theirs: side("o")}, want: resolver.KindMode},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			require.Equal(t, tc.want, landConflictKind(tc.file))
+			require.Equal(t, tc.want, landKindOf(tc.c))
 		})
 	}
 }
@@ -838,13 +974,14 @@ func TestUserLand_resolveConflicts(t *testing.T) {
 		requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
 	})
 
-	t.Run("retries against the new tip after a concurrent writer", func(t *testing.T) {
+	t.Run("a writer that moves the tip on another file costs no second resolution", func(t *testing.T) {
 		t.Parallel()
 
-		// The script moves the branch to the writer commit while the first attempt is being
-		// resolved. The first compare-and-swap then fails, and the second attempt resolves
-		// against the writer. The paths of the repository and the commits are read from files
-		// the test writes, because the repository exists only once the service runs.
+		// The script moves the branch to the writer commit while the land is being resolved, out
+		// of the lane. The writer adds e and leaves a and b as they were: their verdicts hold at
+		// the writer (PLAN10 15.8), so the lane lands them on the writer without calling the
+		// resolver again. The paths of the repository and the commits are read from files the test
+		// writes, because the repository exists only once the service runs.
 		dir, argv := resolverScript(t, fmt.Sprintf(`if [ "$N" = 1 ]; then
   "$(cat "$DIR/git")" -C "$(cat "$DIR/repo")" update-ref refs/heads/%s "$(cat "$DIR/writer")" "$(cat "$DIR/tip")"
 fi`, git.DefaultBranch))
@@ -872,9 +1009,8 @@ fi`, git.DefaultBranch))
 
 		resp, err := fx.client.UserLand(fx.ctx, fx.request("Land agent work"))
 		require.NoError(t, err)
-		require.Equal(t, int32(2), resp.GetAttempts())
-		require.Equal(t, 2, resolverCalls(t, dir))
-		require.Equal(t, writer.String(), resolverRequest(t, dir, 2).Tip)
+		require.Equal(t, int32(1), resp.GetAttempts())
+		require.Equal(t, 1, resolverCalls(t, dir), "the verdicts on a and b are reused at the writer")
 		// The old tip reported is the tip of the attempt that landed, the writer commit.
 		require.Equal(t, writer.String(), resp.GetOldTip())
 

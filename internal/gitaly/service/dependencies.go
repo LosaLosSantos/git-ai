@@ -22,6 +22,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/gitlab"
 	"github.com/feder-cr/git-ai/internal/graft/corestore"
 	"github.com/feder-cr/git-ai/internal/graft/landlane"
+	"github.com/feder-cr/git-ai/internal/graft/resolver"
 	"github.com/feder-cr/git-ai/internal/grpc/backchannel"
 	"github.com/feder-cr/git-ai/internal/grpc/client"
 	"github.com/feder-cr/git-ai/internal/grpc/middleware/limithandler"
@@ -64,6 +65,10 @@ type Dependencies struct {
 	// listener, and every operations server takes its lanes from here, so that the requests for
 	// one branch are batched in one lane whichever listener they arrive on.
 	GraftLandLanes *landlane.Shared
+	// GraftResolver is the conflict resolver of the process, built once: every operations server
+	// takes it from here, so that its check slots bound the whole process. Nil makes each server
+	// build its own (setups that register one server).
+	GraftResolver *resolver.Shared
 	// GraftStorage is the storage core (doc/graft/STORAGE.md), nil when it is off.
 	GraftStorage *corestore.Core
 	// GraftStorageSyncer catches up the local repositories in authoritative mode. It is nil when
@@ -226,6 +231,12 @@ func (dc *Dependencies) GetPoolMetadataStore() relational.PoolStore {
 // were built without them.
 func (dc *Dependencies) GetGraftLandLanes() *landlane.Shared {
 	return dc.GraftLandLanes
+}
+
+// GetGraftResolver returns the conflict resolver of the process, nil when the dependencies were
+// built without it.
+func (dc *Dependencies) GetGraftResolver() *resolver.Shared {
+	return dc.GraftResolver
 }
 
 // GetGraftStorage returns the storage core, nil when it is off.

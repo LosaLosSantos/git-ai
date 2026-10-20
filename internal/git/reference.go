@@ -76,6 +76,10 @@ var InternalRefPrefixes = map[string]InternalReferenceType{
 	// Temporary references are used internally by Rails for various operations and should not
 	// be exposed to the user.
 	"refs/tmp/": InternalReferenceTypeHidden,
+
+	// The proposals of a land that the server did not resolve (PLAN10 14): written by the server
+	// only, read by object ID, never advertised nor writable by a push.
+	"refs/graft/proposals/": InternalReferenceTypeHidden,
 }
 
 // ObjectPoolRefNamespace is the namespace used for the references of the primary pool member part

@@ -81,11 +81,45 @@ func TestCommandModeUnresolvableExitsOne(t *testing.T) {
 	if code := run(nil, stdin, &stdout, &stderr); code != 1 {
 		t.Fatalf("exit %d, want 1", code)
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout must be empty on failure: %q", stdout.String())
+	// The refusal is on stdout as an ErrorResponse with the outcome of every file (the server reads
+	// it), and its reason on stderr (for a server that predates the outcomes).
+	var refusal protocol.ErrorResponse
+	if err := json.Unmarshal(stdout.Bytes(), &refusal); err != nil {
+		t.Fatalf("stdout is not an ErrorResponse: %v\n%s", err, stdout.String())
+	}
+	if !strings.Contains(refusal.Error, "hard.go") || len(refusal.Files) != 1 ||
+		refusal.Files[0] != (protocol.FileOutcome{Path: "hard.go", Outcome: protocol.OutcomeFailed, Reason: "no strategy resolved this conflict"}) {
+		t.Fatalf("refusal = %+v", refusal)
 	}
 	if !strings.Contains(stderr.String(), "hard.go") || !strings.Contains(stderr.String(), "unresolved") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestCommandModeCheck(t *testing.T) {
+	req := protocol.Request{
+		Version: protocol.Version, Operation: protocol.OperationCheck,
+		Files: []protocol.FileConflict{fileConflict("a.txt", "base\n", "ours\n", "theirs\n")},
+		Resolution: []protocol.ResolvedFile{
+			{Path: "a.txt", Action: protocol.ActionWrite, Mode: protocol.ModeFile, Content: []byte("merged\n")},
+		},
+		Limits: protocol.Limits{MaxFileBytes: 1 << 20},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(nil, bytes.NewReader(raw), &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	var resp protocol.CheckResponse
+	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
+		t.Fatalf("stdout is not a CheckResponse: %v\n%s", err, stdout.String())
+	}
+	if resp.Operation != protocol.OperationCheck || resp.Resolver != "graft-resolve" || len(resp.Files) != 1 ||
+		resp.Files[0] != (protocol.CheckFile{Path: "a.txt", OK: true, Syntax: protocol.SyntaxNone}) {
+		t.Fatalf("check response %+v", resp)
 	}
 }
 

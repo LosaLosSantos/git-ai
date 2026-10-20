@@ -11,6 +11,7 @@ import (
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/resolver"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // renameFileContent returns a 12-line file whose line 6 is line6. A rename and an edit of the same
@@ -42,7 +43,7 @@ func TestResolveLandConflicts_renameOnCommitSide(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 
@@ -89,7 +90,7 @@ func TestResolveLandConflicts_renameOnTipSide(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "b", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 
@@ -170,7 +171,7 @@ func TestUserLand_renameFromDeniedPathIsNotResolved(t *testing.T) {
 				Version:  resolver.ProtocolVersion,
 				Resolver: "graft-resolve/fake",
 				Files: []resolver.ResponseFile{
-					{Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+					{Origin: resolver.OriginRule, Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 				},
 			})
 			rcfg := enabledResolver(argv)
@@ -181,9 +182,13 @@ func TestUserLand_renameFromDeniedPathIsNotResolved(t *testing.T) {
 				tc.tip, tc.commit,
 			)
 
-			// Directly, the reason is the source path of the side.
+			// Directly, the file is not sent, and the package names the source path of the side.
 			_, err := fx.server(t, rcfg).resolveLandConflicts(fx.ctx, fx.request("Land rename"), fx.repo, fx.tip, fx.commit, fx.committer())
-			require.ErrorContains(t, err, `conflicting path "pub/k" comes from path "secrets/k"`)
+			var unresolved *landUnresolvedError
+			require.ErrorAs(t, err, &unresolved)
+			k := packageFile(t, builtPackage(t, fx.ctx, unresolved), "pub/k")
+			require.Equal(t, gitalypb.LandConflictFile_OUTCOME_NOT_SENT, k.GetOutcome())
+			require.Equal(t, `a side comes from path "secrets/k", which may not be sent to the resolver`, k.GetReason())
 			require.Equal(t, 0, resolverCalls(t, dir))
 
 			// Through the RPC, the landing keeps the merge conflict.
@@ -209,7 +214,7 @@ func TestUserLand_renameBetweenAllowedPathsIsResolved(t *testing.T) {
 		Version:  resolver.ProtocolVersion,
 		Resolver: "graft-resolve/fake",
 		Files: []resolver.ResponseFile{
-			{Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
+			{Origin: resolver.OriginRule, Path: "pub/k", Action: resolver.ActionWrite, Mode: resolver.ModeRegular, Content: []byte("merged\n")},
 		},
 	})
 	rcfg := enabledResolver(argv)
@@ -271,37 +276,34 @@ func TestLandSourcePaths(t *testing.T) {
 	require.Equal(t, []string{"u"}, got)
 	require.Len(t, listings, 1)
 
-	_, err = landSourcePaths(fx.ctx, fx.repo, listings, fx.base, absent, "a")
-	require.ErrorContains(t, err, "is in no path of")
+	// A blob in no path of the tree has no source: the classification does not send the file.
+	got, err = landSourcePaths(fx.ctx, fx.repo, listings, fx.base, absent, "a")
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 // TestLandCheckSides covers the shapes of the sides that are not resolved.
-func TestLandCheckSides(t *testing.T) {
+func TestLandShapeReason(t *testing.T) {
 	t.Parallel()
 
-	side := &resolver.Side{OID: "o", Mode: resolver.ModeRegular, Content: []byte("x")}
+	side := &landBlob{mode: resolver.ModeRegular, oid: "o"}
 
 	for _, tc := range []struct {
-		name    string
-		file    resolver.File
-		wantErr string
+		name string
+		c    landFileConflict
+		want string
 	}{
-		{name: "content", file: resolver.File{Path: "a", Base: side, Ours: side, Theirs: side}},
-		{name: "add-add", file: resolver.File{Path: "a", Ours: side, Theirs: side}},
-		{name: "modify-delete with base", file: resolver.File{Path: "a", Base: side, Ours: side}},
-		{name: "modify-delete with base on theirs", file: resolver.File{Path: "a", Base: side, Theirs: side}},
-		{name: "neither side", file: resolver.File{Path: "a", Base: side}, wantErr: "neither side"},
-		{name: "no sides", file: resolver.File{Path: "a"}, wantErr: "neither side"},
-		{name: "no base, ours missing", file: resolver.File{Path: "a", Theirs: side}, wantErr: "no base and a missing side"},
-		{name: "no base, theirs missing", file: resolver.File{Path: "a", Ours: side}, wantErr: "no base and a missing side"},
+		{name: "content", c: landFileConflict{path: "a", base: side, ours: side, theirs: side}},
+		{name: "add-add", c: landFileConflict{path: "a", ours: side, theirs: side}},
+		{name: "modify-delete with base", c: landFileConflict{path: "a", base: side, ours: side}},
+		{name: "modify-delete with base on theirs", c: landFileConflict{path: "a", base: side, theirs: side}},
+		{name: "neither side", c: landFileConflict{path: "a", base: side}, want: landNotSentNoSide},
+		{name: "no sides", c: landFileConflict{path: "a"}, want: landNotSentNoSide},
+		{name: "no base, ours missing", c: landFileConflict{path: "a", theirs: side}, want: landNotSentNoBaseOneSide},
+		{name: "no base, theirs missing", c: landFileConflict{path: "a", ours: side}, want: landNotSentNoBaseOneSide},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := landCheckSides(tc.file)
-			if tc.wantErr == "" {
-				require.NoError(t, err)
-				return
-			}
-			require.ErrorContains(t, err, tc.wantErr)
+			require.Equal(t, tc.want, landShapeReason(tc.c))
 		})
 	}
 }

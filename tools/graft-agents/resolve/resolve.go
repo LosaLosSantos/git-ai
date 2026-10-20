@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve/syntax"
 )
 
 // DefaultCheckTimeout bounds one check command when the check sets no timeout.
@@ -54,6 +55,12 @@ type Resolution struct {
 	Action  string
 	Mode    string
 	Content []byte
+	// Report is the composition report that goes with a model's resolution (ResolvedFile.Report).
+	Report []string
+	// Hold is why the resolution is held back as a proposal even if it would pass the server's
+	// verification (ResolvedFile.Hold): the second model of the llm strategy's agree_with did not
+	// agree with the first. Empty for a resolution that is not held.
+	Hold string
 }
 
 // Strategy resolves conflicts. Implementations must be safe for concurrent
@@ -62,6 +69,38 @@ type Strategy interface {
 	// Resolve returns (answer, true, nil) when it resolved f, (_, false, nil)
 	// when it does not apply, and an error when it failed.
 	Resolve(ctx context.Context, f File, req protocol.Request) (Resolution, bool, error)
+}
+
+// syntaxChecked is implemented by the strategies whose answers always get the syntax check
+// (syntax.CheckMerge): the llm strategy. The check runs before the configured checks, and
+// rejects an answer that does not parse when both sides it merges parse.
+type syntaxChecked interface {
+	syntaxChecked()
+}
+
+// RuleStrategy is implemented by the strategies whose answers are a rule's: deterministic code
+// that the operator trusts (trivial, union, rerere, and command unless it is configured as a
+// model). Their resolutions land on the server without the operator's verify.command.
+//
+// The default is the other way round, fail-safe at this layer: a strategy that does not
+// implement RuleStrategy, or whose IsRule says false, is a MODEL. That is the llm strategy and
+// every strategy that another package registers with RegisterStrategy. Its answers are marked
+// origin "model", and the server lands them only if verify.command passed on the exact merged
+// tree (PLAN10 14, 15.9). A strategy that implements RuleStrategy claims that its answers are
+// a rule's, and that claim is the operator's trust: do not write it for anything that asks a
+// model, or reads what a model wrote.
+type RuleStrategy interface {
+	Strategy
+	// IsRule reports whether the answers of this strategy are a rule's.
+	IsRule() bool
+}
+
+// originOf is the origin of the answers of s: a rule's only when s says so.
+func originOf(s Strategy) string {
+	if r, ok := s.(RuleStrategy); ok && r.IsRule() {
+		return protocol.OriginRule
+	}
+	return protocol.OriginModel
 }
 
 // Recorder is implemented by strategies that want to learn accepted answers.
@@ -203,11 +242,71 @@ func NewResolver(bindings []Binding, checks []Check, timeout time.Duration) (*Re
 type Failure struct {
 	Path    string
 	Reasons []string
+	// Attempts are the strategies that applied to the file and did not resolve
+	// it, in chain order, with what happened. Reasons holds the same in text.
+	Attempts []Attempt
 }
+
+// AttemptKind says why a strategy that applied to a file did not resolve it.
+type AttemptKind string
+
+const (
+	// AttemptFailed: the strategy returned an error (for a model, the call or
+	// its answer failed; errors.Is(Err, ErrBudgetExhausted) when the AI budget
+	// is spent).
+	AttemptFailed AttemptKind = "failed"
+	// AttemptRejected: the result broke a rule that every result must keep
+	// (conflict markers, mode, size, or its syntax), or a model answer broke
+	// the rules of an answer (ErrLLMRejected).
+	AttemptRejected AttemptKind = "rejected"
+	// AttemptCheckFailed: a configured check rejected the result.
+	AttemptCheckFailed AttemptKind = "check_failed"
+)
+
+// Attempt is one strategy that applied to a file without resolving it.
+type Attempt struct {
+	Strategy string
+	Kind     AttemptKind
+	Err      error
+}
+
+// ErrBudgetExhausted is returned by a strategy that does not call its model
+// because the AI budget is spent.
+var ErrBudgetExhausted = errors.New("AI budget exhausted")
 
 // UnresolvedError reports files that stayed unresolved.
 type UnresolvedError struct {
 	Failures []Failure
+	// Resolved are the paths of the request that were resolved; nothing lands, since the request
+	// is answered as a whole.
+	Resolved []string
+}
+
+// maxOutcomeReasonBytes bounds the reason of one file in an ErrorResponse, as the server's
+// conflict package does.
+const maxOutcomeReasonBytes = 512
+
+// Response returns the refusal as the protocol's ErrorResponse, with the outcome of every file of
+// the request: resolved, rejected (a strategy's answer failed a rule or a check) or failed.
+func (e *UnresolvedError) Response() protocol.ErrorResponse {
+	out := protocol.ErrorResponse{Error: e.Error()}
+	for _, p := range e.Resolved {
+		out.Files = append(out.Files, protocol.FileOutcome{Path: p, Outcome: protocol.OutcomeResolved})
+	}
+	for _, f := range e.Failures {
+		outcome := protocol.OutcomeFailed
+		for _, a := range f.Attempts {
+			if a.Kind == AttemptRejected || a.Kind == AttemptCheckFailed {
+				outcome = protocol.OutcomeRejected
+			}
+		}
+		reason := strings.Join(f.Reasons, "; ")
+		if len(reason) > maxOutcomeReasonBytes {
+			reason = strings.ToValidUTF8(reason[:maxOutcomeReasonBytes], "")
+		}
+		out.Files = append(out.Files, protocol.FileOutcome{Path: f.Path, Outcome: outcome, Reason: reason})
+	}
+	return out
 }
 
 func (e *UnresolvedError) Error() string {
@@ -222,6 +321,12 @@ func (e *UnresolvedError) Error() string {
 // file stays unresolved, and an error wrapping ErrInvalidRequest for a
 // malformed request. Nothing is returned partially.
 func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.Response, error) {
+	if req.Operation != "" && req.Operation != protocol.OperationResolve {
+		return protocol.Response{}, fmt.Errorf("%w: operation %q is not %q", ErrInvalidRequest, req.Operation, protocol.OperationResolve)
+	}
+	if len(req.Resolution) > 0 {
+		return protocol.Response{}, fmt.Errorf("%w: a resolve request carries no resolution", ErrInvalidRequest)
+	}
 	if err := validateRequest(req); err != nil {
 		return protocol.Response{}, err
 	}
@@ -240,12 +345,12 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 	var failures []Failure
 
 	for _, f := range req.Files {
-		out, name, reasons, err := r.resolveFile(ctx, req, f, maxBytes)
+		out, name, attempts, err := r.resolveFile(ctx, req, f, maxBytes)
 		if err != nil {
 			return protocol.Response{}, err
 		}
 		if name == "" {
-			failures = append(failures, Failure{Path: f.Path, Reasons: reasons})
+			failures = append(failures, Failure{Path: f.Path, Reasons: attemptReasons(attempts), Attempts: attempts})
 			continue
 		}
 		if !seen[name] {
@@ -256,12 +361,27 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 		resp.Files = append(resp.Files, out)
 	}
 	if len(failures) > 0 {
-		return protocol.Response{}, &UnresolvedError{Failures: failures}
+		resolved := make([]string, 0, len(resp.Files))
+		for _, f := range resp.Files {
+			resolved = append(resolved, f.Path)
+		}
+		return protocol.Response{}, &UnresolvedError{Failures: failures, Resolved: resolved}
 	}
 
 	resp.Resolver = resolverName(used)
 	if len(notes) > 0 {
 		resp.Explanation = "resolved " + strings.Join(notes, ", ")
+	}
+	// The month's AI spend of the strategies that answered, so that command mode reports it too.
+	budgets := r.Budgets()
+	for _, name := range used {
+		for _, key := range []string{name, name + agreeSuffix} {
+			if b := budgets[key]; b != nil {
+				if snap, err := b.Snapshot(); err == nil {
+					resp.Explanation += "; " + key + ": " + snap.String()
+				}
+			}
+		}
 	}
 	return resp, nil
 }
@@ -294,11 +414,31 @@ func resolverName(used []string) string {
 	return fmt.Sprintf("%s+%d", resolverNamePrefix, len(used))
 }
 
+// attemptReasons returns the text form of the attempts, the reasons of a
+// Failure.
+func attemptReasons(attempts []Attempt) []string {
+	if len(attempts) == 0 {
+		return []string{"no strategy resolved this conflict"}
+	}
+	reasons := make([]string, 0, len(attempts))
+	for _, a := range attempts {
+		switch a.Kind {
+		case AttemptRejected:
+			reasons = append(reasons, fmt.Sprintf("%s: rejected: %v", a.Strategy, a.Err))
+		case AttemptCheckFailed:
+			reasons = append(reasons, fmt.Sprintf("%s: check failed: %v", a.Strategy, a.Err))
+		default:
+			reasons = append(reasons, fmt.Sprintf("%s: %v", a.Strategy, a.Err))
+		}
+	}
+	return reasons
+}
+
 // resolveFile runs the chain for one file. It returns the strategy name that
-// accepted the answer, or an empty name and the collected reasons. err is set
-// only when ctx ended.
-func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File, maxBytes int64) (protocol.ResolvedFile, string, []string, error) {
-	var reasons []string
+// accepted the answer, or an empty name and the attempts of the strategies
+// that applied. err is set only when ctx ended.
+func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File, maxBytes int64) (protocol.ResolvedFile, string, []Attempt, error) {
+	var attempts []Attempt
 	for _, b := range r.bindings {
 		if err := ctx.Err(); err != nil {
 			return protocol.ResolvedFile{}, "", nil, err
@@ -306,40 +446,99 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 		if !matchPaths(b.Paths, f.Path) {
 			continue
 		}
+		// A model's resolution is given only to a server that says it holds and verifies it. An older
+		// server ignores the origin, the proposal and the hold, and lands every answer it gets: the model
+		// is not even called (it would be paid for), and the file stays unresolved with the reason.
+		if why := unsupportedBy(b.Strategy, req); why != "" {
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: errors.New(why)})
+			continue
+		}
 		res, ok, err := b.Strategy.Resolve(ctx, f, req)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return protocol.ResolvedFile{}, "", nil, ctxErr
 			}
-			reasons = append(reasons, fmt.Sprintf("%s: %v", b.Name, err))
+			// A model answer that breaks the rules of an answer (ErrLLMRejected) is a rejected
+			// result, not a failed call.
+			kind := AttemptFailed
+			if errors.Is(err, ErrLLMRejected) {
+				kind = AttemptRejected
+			}
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: kind, Err: err})
 			continue
 		}
 		if !ok {
 			continue
 		}
 		if err := checkResolution(res, maxBytes); err != nil {
-			reasons = append(reasons, fmt.Sprintf("%s: rejected: %v", b.Name, err))
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: err})
 			continue
+		}
+		// Resolution.Hold is exported, so a strategy of another package may set it without implementing
+		// holder: a hold is never sent to a server that cannot honour it, which would land the file.
+		if res.Hold != "" && !req.Has(protocol.CapabilityHold) {
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: errors.New("the server cannot hold a model's resolution; upgrade the server")})
+			continue
+		}
+		if _, ok := b.Strategy.(syntaxChecked); ok && res.Action == protocol.ActionWrite && res.Mode != protocol.ModeSymlink {
+			if _, err := syntax.CheckMerge(ctx, f.Path, res.Content, sideContent(f.Ours), sideContent(f.Theirs)); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return protocol.ResolvedFile{}, "", nil, ctxErr
+				}
+				attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
+				continue
+			}
 		}
 		if err := r.runChecks(ctx, f.Path, res); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return protocol.ResolvedFile{}, "", nil, ctxErr
 			}
-			reasons = append(reasons, fmt.Sprintf("%s: check failed: %v", b.Name, err))
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptCheckFailed, Err: err})
 			continue
 		}
-		r.record(ctx, f, res)
+		// A model resolution is a proposal: the server lands it only after verify.command passed on
+		// the tree that lands (PLAN10 14, 15.9). It is not recorded either: a strategy that learns
+		// accepted answers (Recorder) would otherwise replay a model's resolution later as a
+		// rule's. What is not a rule (originOf) is a model.
+		origin := originOf(b.Strategy)
+		proposal := origin == protocol.OriginModel
+		if !proposal {
+			r.record(ctx, f, res)
+		}
 		return protocol.ResolvedFile{
-			Path:    f.Path,
-			Action:  res.Action,
-			Mode:    modeOf(res),
-			Content: contentOf(res),
+			Path:     f.Path,
+			Action:   res.Action,
+			Mode:     modeOf(res),
+			Content:  contentOf(res),
+			Origin:   origin,
+			Proposal: proposal,
+			Hold:     res.Hold,
+			Report:   res.Report,
 		}, b.Name, nil, nil
 	}
-	if len(reasons) == 0 {
-		reasons = []string{"no strategy resolved this conflict"}
+	return protocol.ResolvedFile{}, "", attempts, nil
+}
+
+// holder is implemented by the strategies whose answers may carry a hold (the llm strategy with an
+// agree_with): the server must never land a held file, which only a server with CapabilityHold knows.
+type holder interface {
+	holds() bool
+}
+
+// unsupportedBy returns why the server that sent req cannot take the answers of s, or "" when it can. The
+// answers of a rule need nothing; those of a model need CapabilityProposal, and CapabilityHold when they
+// may be held.
+func unsupportedBy(s Strategy, req protocol.Request) string {
+	if originOf(s) != protocol.OriginModel {
+		return ""
 	}
-	return protocol.ResolvedFile{}, "", reasons, nil
+	if !req.Has(protocol.CapabilityProposal) {
+		return "the server cannot hold or verify a model's resolution; upgrade the server"
+	}
+	if h, ok := s.(holder); ok && h.holds() && !req.Has(protocol.CapabilityHold) {
+		return "the server cannot hold a model's resolution (agree_with); upgrade the server"
+	}
+	return ""
 }
 
 func modeOf(res Resolution) string {
@@ -439,18 +638,19 @@ func checkResolution(res Resolution, maxBytes int64) error {
 	if int64(len(res.Content)) > maxBytes {
 		return fmt.Errorf("content of %d bytes exceeds the %d byte limit", len(res.Content), maxBytes)
 	}
-	if !isBinary(res.Content) && hasConflictMarkers(res.Content) {
+	if !isBinary(res.Content) && HasConflictMarkers(res.Content) {
 		return errors.New("content contains conflict markers")
 	}
 	return nil
 }
 
-// hasConflictMarkers mirrors the server's acceptance rule
+// HasConflictMarkers reports whether content has a conflict marker line. It mirrors the
+// server's acceptance rule
 // (internal/graft/resolver/validate.go): a line is a conflict marker if it
 // starts with "<<<<<<< " or ">>>>>>> ", or if it is "=======" followed by
 // whitespace only. A trailing carriage return is ignored. A longer run of '='
 // such as a Markdown setext or RST title underline is not a marker.
-func hasConflictMarkers(content []byte) bool {
+func HasConflictMarkers(content []byte) bool {
 	for _, line := range bytes.Split(content, []byte("\n")) {
 		line = bytes.TrimSuffix(line, []byte{'\r'})
 		switch {

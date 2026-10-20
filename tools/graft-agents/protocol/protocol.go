@@ -49,7 +49,9 @@ const MaxResolverNameBytes = 128
 
 // Request is the server-to-resolver message.
 type Request struct {
-	Version    int            `json:"version"`
+	Version int `json:"version"`
+	// Operation is OperationResolve (also when absent) or OperationCheck.
+	Operation  string         `json:"operation,omitempty"`
 	Repository Repository     `json:"repository"`
 	Branch     string         `json:"branch"`
 	Tip        string         `json:"tip"`
@@ -58,7 +60,82 @@ type Request struct {
 	Messages   Messages       `json:"messages"`
 	Actor      string         `json:"actor"`
 	Files      []FileConflict `json:"files"`
+	// Resolution is, for OperationCheck only, the agent's resolution of Files to check.
+	Resolution []ResolvedFile `json:"resolution,omitempty"`
 	Limits     Limits         `json:"limits"`
+	// Capabilities are what the server that sends the request does with a resolver's answers (the
+	// Capability constants). A server that sets none is an older one, which lands every answer that
+	// graft-resolve gives without verification: graft-resolve then gives no model's resolution
+	// (resolve.Resolver.resolveFile).
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// The capabilities of a server (Request.Capabilities).
+const (
+	// CapabilityOrigin: the server reads ResolvedFile.Origin and lands only the files of a rule
+	// without verification.
+	CapabilityOrigin = "origin"
+	// CapabilityProposal: a file the server does not know to be a rule's is a model's, a proposal that
+	// lands only on a tree that verify.command passed on.
+	CapabilityProposal = "proposal"
+	// CapabilityHold: the server never lands a file with a hold (ResolvedFile.Hold).
+	CapabilityHold = "hold"
+	// CapabilityVerify: the server verifies the exact tree that lands and lands a model's resolution
+	// on no other.
+	CapabilityVerify = "verify"
+)
+
+// Has reports whether the request says that its server has the capability.
+func (r Request) Has(capability string) bool {
+	for _, c := range r.Capabilities {
+		if c == capability {
+			return true
+		}
+	}
+	return false
+}
+
+// ServerCapabilities returns the capabilities of a server of this release, for a client that stands in
+// for one (the bench). Every call returns a new slice.
+func ServerCapabilities() []string {
+	return []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+}
+
+// Operations of a request.
+const (
+	// OperationResolve asks for a resolution of Files; an absent operation means it.
+	OperationResolve = "resolve"
+	// OperationCheck asks to check an agent's Resolution of Files with the checks of the resolver's
+	// own answers, answered with a CheckResponse.
+	OperationCheck = "check"
+)
+
+// CheckResponse is the answer to an OperationCheck request: one verdict per file of the
+// resolution, in its order.
+type CheckResponse struct {
+	Version   int    `json:"version"`
+	Operation string `json:"operation"`
+	// Resolver names the checker, for the Graft-Checked-By trailer of the server.
+	Resolver string      `json:"resolver"`
+	Files    []CheckFile `json:"files"`
+}
+
+// Syntax verdicts of a CheckFile.
+const (
+	// SyntaxChecked: both sides parse, and so does the resolution.
+	SyntaxChecked = "checked"
+	// SyntaxUnchecked: a side does not parse with the grammar, so there is no syntax verdict.
+	SyntaxUnchecked = "unchecked"
+	// SyntaxNone: the path has no grammar, or the file is deleted.
+	SyntaxNone = "none"
+)
+
+// CheckFile is the verdict on one file of a resolution.
+type CheckFile struct {
+	Path   string `json:"path"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+	Syntax string `json:"syntax"`
 }
 
 // Repository identifies the repository the conflict belongs to.
@@ -110,11 +187,55 @@ type ResolvedFile struct {
 	Action  string `json:"action"`
 	Mode    string `json:"mode,omitempty"`
 	Content []byte `json:"content"`
+	// Origin says what made the resolution: OriginRule for an operator's rule (trivial, union,
+	// rerere, command), OriginModel for a model (the llm strategy). The server lands a resolution
+	// without the operator's verification only if it is marked as a rule's: a file without an origin
+	// is a model's (PLAN10 14, 15.9).
+	Origin string `json:"origin,omitempty"`
+	// Proposal is the older mark of a model's resolution, still sent with OriginModel.
+	Proposal bool `json:"proposal,omitempty"`
+	// Hold is the reason the resolver holds a model's resolution back: the file is a proposal for
+	// the agent and does not land by itself, even when verify.command passes on the tree that
+	// would land. It is set when the llm strategy's agree_with gate is on and the second model did
+	// not agree with the first (resolve.Resolution.Hold). A resolver that does not know the field
+	// is an older one: upgrade graft-resolve together with the server.
+	Hold string `json:"hold,omitempty"`
+	// Report is the composition report of a model's resolution (PLAN10 15.3): in exact words what it
+	// keeps, drops and repeats of the two sides' changes. A report and not a gate: nothing in it
+	// decides whether the resolution lands. It goes to the agent with the proposal.
+	Report []string `json:"report,omitempty"`
 }
+
+// The origins of a resolved file (see ResolvedFile.Origin).
+const (
+	OriginRule  = "rule"
+	OriginModel = "model"
+)
 
 // ErrorResponse is the body of an HTTP 422 (unresolvable) or other error.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	// Files is the outcome of every file of a refused request (optional). The server uses it only
+	// when it has exactly one entry per requested path, each with a known outcome.
+	Files []FileOutcome `json:"files,omitempty"`
+}
+
+// Outcomes of a file in a refusal.
+const (
+	// OutcomeResolved: the file was resolved, but not every file of the request.
+	OutcomeResolved = "resolved"
+	// OutcomeRejected: a strategy's result for the file failed a rule or a check.
+	OutcomeRejected = "rejected"
+	// OutcomeFailed: the file could not be resolved (no strategy applied, a model error, a spent
+	// AI budget).
+	OutcomeFailed = "failed"
+)
+
+// FileOutcome is what the resolver did with one file of a refused request.
+type FileOutcome struct {
+	Path    string `json:"path"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // ValidMode reports whether mode is one of the modes the server accepts.
