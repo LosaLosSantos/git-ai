@@ -21,13 +21,14 @@ func TestProtocolEnumValuesMatchTheGolden(t *testing.T) {
 
 	require.EqualValues(t, ProtocolVersion, golden["version"])
 	got := map[string][]string{
-		"kind":      {KindContent, KindModifyDelete, KindAddAdd, KindMode},
-		"action":    {ActionWrite, ActionDelete},
-		"mode":      {ModeRegular, ModeExecutable, ModeSymlink},
-		"operation": {OperationResolve, OperationCheck},
-		"syntax":    {SyntaxChecked, SyntaxUnchecked, SyntaxNone},
-		"origin":    {OriginRule, OriginModel},
-		"outcome":   {OutcomeResolved, OutcomeRejected, OutcomeFailed},
+		"kind":       {KindContent, KindModifyDelete, KindAddAdd, KindMode},
+		"action":     {ActionWrite, ActionDelete},
+		"mode":       {ModeRegular, ModeExecutable, ModeSymlink},
+		"operation":  {OperationResolve, OperationCheck},
+		"syntax":     {SyntaxChecked, SyntaxUnchecked, SyntaxNone},
+		"origin":     {OriginRule, OriginModel},
+		"outcome":    {OutcomeResolved, OutcomeRejected, OutcomeFailed},
+		"capability": {CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify},
 	}
 	for name, want := range got {
 		raw, ok := golden[name].([]any)

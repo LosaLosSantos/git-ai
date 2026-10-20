@@ -7,5 +7,6 @@
   "operation": ["resolve", "check"],
   "syntax": ["checked", "unchecked", "none"],
   "origin": ["rule", "model"],
-  "outcome": ["resolved", "rejected", "failed"]
+  "outcome": ["resolved", "rejected", "failed"],
+  "capability": ["origin", "proposal", "hold", "verify"]
 }

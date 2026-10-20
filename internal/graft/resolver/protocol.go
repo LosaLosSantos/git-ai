@@ -61,7 +61,30 @@ type Request struct {
 	// Resolution is, for OperationCheck only, the agent's resolution of Files to check.
 	Resolution []ResponseFile `json:"resolution,omitempty"`
 	Limits     Limits         `json:"limits"`
+	// Capabilities are what the server that sends the request does with a resolver's answers (the
+	// Capability constants). A server that sets none is an older one, which lands every answer that
+	// graft-resolve gives without verification: graft-resolve then gives no model's resolution
+	// (resolve.Resolver.resolveFile).
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// The capabilities of a server (Request.Capabilities).
+const (
+	// CapabilityOrigin: the server reads the origin of a resolved file and lands only the files of a rule
+	// without verification.
+	CapabilityOrigin = "origin"
+	// CapabilityProposal: a file the server does not know to be a rule's is a model's, a proposal that
+	// lands only on a tree that verify.command passed on.
+	CapabilityProposal = "proposal"
+	// CapabilityHold: the server never lands a file with a hold (ResponseFile.Hold).
+	CapabilityHold = "hold"
+	// CapabilityVerify: the server verifies the exact tree that lands (verify.command) and lands a model's
+	// resolution on no other.
+	CapabilityVerify = "verify"
+)
+
+// ServerCapabilities are the capabilities of this server, sent with every resolve request.
+var ServerCapabilities = []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
 
 // Operations of a request.
 const (

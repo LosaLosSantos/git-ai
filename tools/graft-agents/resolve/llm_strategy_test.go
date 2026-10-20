@@ -128,6 +128,8 @@ func wp19Request(files ...protocol.FileConflict) protocol.Request {
 		Actor:      "agent-1",
 		Files:      files,
 		Limits:     protocol.Limits{MaxFileBytes: 1 << 20},
+		// The server of the tests holds and verifies a model's resolution.
+		Capabilities: protocol.ServerCapabilities,
 	}
 }
 

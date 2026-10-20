@@ -76,11 +76,14 @@ func conflict(path string) protocol.FileConflict {
 	}
 }
 
+// request is the request of a server of this release: it says that it holds and verifies a model's
+// resolution (protocol.ServerCapabilities).
 func request(files ...protocol.FileConflict) protocol.Request {
 	return protocol.Request{
-		Version: protocol.Version,
-		Limits:  protocol.Limits{MaxFileBytes: 1 << 20},
-		Files:   files,
+		Version:      protocol.Version,
+		Limits:       protocol.Limits{MaxFileBytes: 1 << 20},
+		Files:        files,
+		Capabilities: protocol.ServerCapabilities,
 	}
 }
 
@@ -674,5 +677,54 @@ func TestProposalsAreMarkedAndNotRecorded(t *testing.T) {
 	// The server lands a file without the operator's verification only if it says it is a rule's.
 	if resp.Files[0].Origin != protocol.OriginRule {
 		t.Fatalf("rule answer: origin %q, want %q", resp.Files[0].Origin, protocol.OriginRule)
+	}
+}
+
+// TestAModelsResolutionIsGivenOnlyToAServerThatHoldsAndVerifiesIt: an older server ignores the origin, the
+// proposal and the hold of a file, and lands every answer it gets without verification, so graft-resolve
+// does not call a model for it: the file stays unresolved, with the reason. The answers of a rule are
+// unaffected. A server of this release says what it does in the request (Capabilities).
+func TestAModelsResolutionIsGivenOnlyToAServerThatHoldsAndVerifiesIt(t *testing.T) {
+	model := &proposingStrategy{fakeStrategy{fn: answer(protocol.ModeFile, "from the model\n")}}
+	rule := &fakeStrategy{fn: answer(protocol.ModeFile, "from the rule\n")}
+
+	// An old server: no capabilities.
+	old := request(conflict("a.go"))
+	old.Capabilities = nil
+	r := newTestResolver(t, nil, Binding{Name: "model", Strategy: model})
+	_, err := r.Resolve(context.Background(), old)
+	var unresolved *UnresolvedError
+	if !errors.As(err, &unresolved) || len(unresolved.Failures) != 1 {
+		t.Fatalf("an old server got a model's resolution: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the server cannot hold or verify a model's resolution; upgrade the server") {
+		t.Fatalf("the reason is missing: %v", err)
+	}
+	if model.calls.Load() != 0 {
+		t.Fatalf("the model was called %d times for a server that cannot take its answer", model.calls.Load())
+	}
+
+	// The rules of the same chain are unaffected.
+	r = newTestResolver(t, nil, Binding{Name: "model", Strategy: model}, Binding{Name: "rule", Strategy: rule})
+	resp, err := r.Resolve(context.Background(), old)
+	if err != nil || len(resp.Files) != 1 || string(resp.Files[0].Content) != "from the rule\n" || resp.Files[0].Origin != protocol.OriginRule {
+		t.Fatalf("an old server must get the rule's resolution: %v %+v", err, resp.Files)
+	}
+
+	// A server that proposes but does not hold, or any capability list without "proposal": no model.
+	for _, caps := range [][]string{{protocol.CapabilityOrigin}, {protocol.CapabilityHold, protocol.CapabilityVerify}} {
+		partial := request(conflict("a.go"))
+		partial.Capabilities = caps
+		r = newTestResolver(t, nil, Binding{Name: "model", Strategy: model})
+		if _, err := r.Resolve(context.Background(), partial); err == nil {
+			t.Fatalf("capabilities %v without proposal got a model's resolution", caps)
+		}
+	}
+
+	// A server of this release: the model's resolution is given, as a proposal.
+	r = newTestResolver(t, nil, Binding{Name: "model", Strategy: model})
+	resp, err = r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil || len(resp.Files) != 1 || resp.Files[0].Origin != protocol.OriginModel || !resp.Files[0].Proposal {
+		t.Fatalf("a server of this release must get the model's proposal: %v %+v", err, resp.Files)
 	}
 }

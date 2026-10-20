@@ -446,6 +446,13 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 		if !matchPaths(b.Paths, f.Path) {
 			continue
 		}
+		// A model's resolution is given only to a server that says it holds and verifies it. An older
+		// server ignores the origin, the proposal and the hold, and lands every answer it gets: the model
+		// is not even called (it would be paid for), and the file stays unresolved with the reason.
+		if why := unsupportedBy(b.Strategy, req); why != "" {
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: errors.New(why)})
+			continue
+		}
 		res, ok, err := b.Strategy.Resolve(ctx, f, req)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -504,6 +511,28 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 		}, b.Name, nil, nil
 	}
 	return protocol.ResolvedFile{}, "", attempts, nil
+}
+
+// holder is implemented by the strategies whose answers may carry a hold (the llm strategy with an
+// agree_with): the server must never land a held file, which only a server with CapabilityHold knows.
+type holder interface {
+	holds() bool
+}
+
+// unsupportedBy returns why the server that sent req cannot take the answers of s, or "" when it can. The
+// answers of a rule need nothing; those of a model need CapabilityProposal, and CapabilityHold when they
+// may be held.
+func unsupportedBy(s Strategy, req protocol.Request) string {
+	if originOf(s) != protocol.OriginModel {
+		return ""
+	}
+	if !req.Has(protocol.CapabilityProposal) {
+		return "the server cannot hold or verify a model's resolution; upgrade the server"
+	}
+	if h, ok := s.(holder); ok && h.holds() && !req.Has(protocol.CapabilityHold) {
+		return "the server cannot hold a model's resolution (agree_with); upgrade the server"
+	}
+	return ""
 }
 
 func modeOf(res Resolution) string {

@@ -1,6 +1,6 @@
 {
   "comment": "The JSON fields of every message of the resolver protocol v1, by message. Both copies of the protocol (internal/graft/resolver and tools/graft-agents/protocol) are tested against this file, so they cannot drift: a field added to one copy fails the other's test until it is added there and here.",
-  "request": ["actor", "branch", "commit", "files", "limits", "merge_base", "messages", "operation", "repository", "resolution", "tip", "version"],
+  "request": ["actor", "branch", "capabilities", "commit", "files", "limits", "merge_base", "messages", "operation", "repository", "resolution", "tip", "version"],
   "repository": ["relative_path", "storage"],
   "messages": ["commit", "tip"],
   "file": ["base", "kind", "ours", "path", "theirs"],
