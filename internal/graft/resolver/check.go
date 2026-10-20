@@ -93,6 +93,23 @@ var resolveSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 type ResolveSlot struct {
 	c        *Client
 	released bool
+	// inline says that the slot is one of the pool of the lane's own calls.
+	inline bool
+}
+
+// TryAcquireInlineSlot takes a slot of the pool of the calls with which the lane resolves the rules, without
+// waiting: it reports false when all are taken, and the lane goes on without the call. Release it when the
+// request is done.
+func (c *Client) TryAcquireInlineSlot() (*ResolveSlot, bool) {
+	if c == nil {
+		return nil, false
+	}
+	select {
+	case c.inlineSlots <- struct{}{}:
+		return &ResolveSlot{c: c, inline: true}, true
+	default:
+		return nil, false
+	}
 }
 
 // AcquireResolveSlot waits for a resolve slot. The wait counts against the deadline of ctx: when
@@ -118,6 +135,10 @@ func (s *ResolveSlot) Release() {
 		return
 	}
 	s.released = true
+	if s.inline {
+		<-s.c.inlineSlots
+		return
+	}
 	<-s.c.resolveSlots
 }
 

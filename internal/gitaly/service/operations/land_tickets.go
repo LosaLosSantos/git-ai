@@ -190,13 +190,16 @@ func (t *landTicket) release() {
 	}
 }
 
-// covers reports whether t holds a ticket for every one of keys.
+// covers reports whether t holds a ticket for every one of keys: a released ticket holds none.
 func (t *landTicket) covers(keys []string) bool {
 	if t == nil {
 		return false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.released {
+		return false
+	}
 	held := make(map[string]bool, len(t.acquired))
 	for _, k := range t.acquired {
 		held[k] = true

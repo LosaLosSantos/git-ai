@@ -148,6 +148,10 @@ type landNeedsResolution struct {
 	// queued says that another land holds the ticket of one of the files (paths): this one waits for
 	// its turn before it resolves again.
 	queued bool
+	// rulesCannot says that the lane asked the rules to resolve the files and they cannot (or a file may
+	// not be sent): without a verification what a model resolves never lands, so the land is resolved out
+	// of the lane for the proposals and ends there, without a ticket.
+	rulesCannot bool
 }
 
 func (e *landNeedsResolution) Error() string {
@@ -280,11 +284,22 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 	// without conflicts needs no pre-resolution at all, and one with conflicts that a rule resolves is
 	// resolved there, in its batch. What the rules cannot resolve is handed back, and resolved out of the
 	// lane in the next round.
-	laneFirst := s.landInlineEnabled()
-	for round := 1; round <= rounds; round++ {
-		used = round
+	//
+	// A round that enters the lane without a pre-resolution (a lane round) is not one of resolve_rounds: it
+	// resolves nothing out of the lane, so with resolve_rounds = 1 the land that needs a model still
+	// leaves the lane. A land that waited for its turn on a file goes back to the lane too, where the
+	// rules are resolved inline whoever holds the ticket. A lane round is bounded all the same.
+	lane := s.landInlineEnabled()
+	laneRoundsLeft := landMaxLaneRounds
+	for round := 1; round <= rounds; {
+		used++
+		laneRound := lane && laneRoundsLeft > 0
+		lane = false
 		var preErr error
-		if !(round == 1 && laneFirst) {
+		if laneRound {
+			laneRoundsLeft--
+		} else {
+			round++
 			preErr = s.landPreResolve(resolveCtx, in, committer, pre)
 		}
 		if err := preErr; err != nil {
@@ -321,7 +336,13 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 		}
 		// The land lost the round, to a land that changed its files (or to the tree that moved, with a
 		// verification): it takes its turn on them. From now on it is the only land of the branch that
-		// resolves these files again, and the others wait without calling the resolver.
+		// resolves these files again, and the others wait without calling the resolver. A lane round that
+		// merely did not find the rules enough takes no turn: the lane has not lost anything, and without a
+		// verification what the model resolves next never lands, so a ticket would protect nothing. Only a
+		// lane round that was told to wait for its turn does.
+		if laneRound && !need.queued || need.rulesCannot {
+			continue
+		}
 		if err := s.landTakeTicket(resolveCtx, in, pre, need); err != nil {
 			if deadline() {
 				pre.ticket.release()
@@ -335,10 +356,16 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 			}
 			return nil, err
 		}
+		// Back to the lane at once with the ticket: the rules are resolved there, no pre-resolution first.
+		lane = laneRound && need.queued
 	}
 	pre.ticket.release()
 	return s.landFinalPass(ctx, in, committer, pre, landStoppedReason(need, timeout))
 }
+
+// landMaxLaneRounds bounds the rounds that enter the lane without a pre-resolution, which do not count
+// toward resolve_rounds: the first, and the ones after a wait for a turn.
+const landMaxLaneRounds = 4
 
 // currentPaths are the paths of the conflicting files the land has at the latest tip it looked at.
 func (p *landPreResolution) currentPaths() []string {

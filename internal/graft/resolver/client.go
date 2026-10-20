@@ -86,6 +86,11 @@ func (e *UnresolvableError) Is(target error) bool {
 
 // Client calls the configured resolver. It is safe for concurrent use. A nil
 // *Client is the disabled resolver.
+// minInlineSlots is the least size of the pool of the lane's own calls: they are rules, which take
+// milliseconds, and each lane (one per branch) needs one at a time, so that the pool of one server is
+// not the bottleneck of its branches.
+const minInlineSlots = 8
+
 type Client struct {
 	command      []string
 	url          string
@@ -102,6 +107,9 @@ type Client struct {
 	// the short checks (PLAN10 15.8).
 	checkSlots   chan struct{}
 	resolveSlots chan struct{}
+	// inlineSlots bounds the calls with which the lane resolves the rules itself (TryAcquireInlineSlot): a pool
+	// of its own, which is never waited for, so that a model that holds the resolve slots does not stop the rules.
+	inlineSlots chan struct{}
 	// sendRules decide the files that are never sent (SendRules).
 	sendRules *SendRules
 }
@@ -159,6 +167,7 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		sendRules:    rules,
 		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
 		resolveSlots: make(chan struct{}, cfg.ResolveConcurrencyOrDefault()),
+		inlineSlots:  make(chan struct{}, max(minInlineSlots, cfg.ResolveConcurrencyOrDefault())),
 	}
 
 	if cfg.URL != "" {

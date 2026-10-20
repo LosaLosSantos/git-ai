@@ -30,9 +30,16 @@ func unionResolver(t *testing.T) (string, []string) {
 	return unionResolverMode(t, "")
 }
 
-// unionResolverMode is unionResolver with a mode: "slow" takes 3 s to answer a request for the rules only
-// (a rule that does not end in time), "noecho" does not say that it honoured the request (an older
-// graft-resolve).
+// unionResolverMode is unionResolver with a mode:
+//   - "slow": takes 3 s to answer a request for the rules only (a rule that does not end in time);
+//   - "slowonce": only the first request for the rules only takes 3 s (one hiccup);
+//   - "noecho": does not say that it honoured the request (an older graft-resolve);
+//   - "echo-model", "echo-noorigin", "echo-hold": echoes the request for the rules only, but answers with a
+//     model's file, one without an origin, or one with a hold;
+//   - "refuse": refuses every request for the rules only (the rules cannot resolve it);
+//   - "model": refuses the requests for the rules only on a file whose theirs side says "model", and
+//     answers the others with a model's resolution once dir/release exists (a model that takes a while);
+//   - "barrier": answers a request that is not for the rules only once two requests have come.
 func unionResolverMode(t *testing.T, mode string) (string, []string) {
 	t.Helper()
 
@@ -41,23 +48,58 @@ func unionResolverMode(t *testing.T, mode string) (string, []string) {
 DIR='%s'
 echo x >> "$DIR/calls.log"
 cat > "$DIR/req-$$.json"
-python3 - "$DIR/req-$$.json" "$DIR" '%s' <<'PY'
-import base64, json, sys, time
+exec python3 - "$DIR/req-$$.json" "$DIR" '%s' <<'PY'
+import base64, json, os, sys, time
 req = json.load(open(sys.argv[1]))
+dir, mode = sys.argv[2], sys.argv[3]
 rules = bool(req.get("rules_only"))
 if rules:
-    open(sys.argv[2] + "/inline.log", "a").write("x\n")
-    if sys.argv[3] == "slow":
+    open(dir + "/inline.log", "a").write("x\n")
+    if mode == "slow":
         time.sleep(3)
+    if mode == "slowonce":
+        try:
+            os.close(os.open(dir + "/slowed", os.O_CREAT | os.O_EXCL))
+            time.sleep(3)
+        except FileExistsError:
+            pass
+    if mode == "refuse":
+        sys.stderr.write("the rules cannot resolve it")
+        sys.exit(1)
+elif mode == "barrier":
+    for _ in range(200):
+        if len(open(dir + "/calls.log").read().split()) >= 2:
+            break
+        time.sleep(0.05)
 files = []
 for f in req["files"]:
     ours = base64.b64decode(f["ours"]["content"]).decode().splitlines()
     theirs = base64.b64decode(f["theirs"]["content"]).decode().splitlines()
-    merged = ours + [l for l in theirs if l not in ours]
-    files.append({"path": f["path"], "action": "write", "mode": "100644", "origin": "rule",
-                  "content": base64.b64encode(("\n".join(merged) + "\n").encode()).decode()})
+    model = any("model" in l for l in theirs)
+    if mode == "model" and model:
+        if rules:
+            sys.stderr.write("needs a model")
+            sys.exit(1)
+        for _ in range(400):
+            if os.path.exists(dir + "/release"):
+                break
+            time.sleep(0.05)
+        merged = theirs
+        origin = "model"
+    else:
+        merged = ours + [l for l in theirs if l not in ours]
+        origin = "rule"
+    entry = {"path": f["path"], "action": "write", "mode": "100644", "origin": origin,
+             "content": base64.b64encode(("\n".join(merged) + "\n").encode()).decode()}
+    if mode == "echo-model":
+        entry["origin"] = "model"
+    if mode == "echo-noorigin":
+        del entry["origin"]
+    if mode == "echo-hold":
+        entry["hold"] = "held by the second model"
+    files.append(entry)
 resp = {"version": 1, "resolver": "graft-resolve/union", "files": files}
-if sys.argv[3] != "noecho":
+if mode != "noecho":
     resp["rules_only"] = rules
 json.dump(resp, sys.stdout)
 PY

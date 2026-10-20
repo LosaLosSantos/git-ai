@@ -5,7 +5,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -64,30 +63,33 @@ func TestUserLand_theRulesAreResolvedInTheLane(t *testing.T) {
 	require.Len(t, strings.Split(on.branchBlob(t, "a"), "\n"), lands+1, "every land is in the file")
 	require.Positive(t, inlineCalls(t, on.dir), "the lane asked for the rules only")
 
-	off := newQueueFixture(t, lands, tune(false))
+	// The control does not depend on who is faster: the resolver answers the two lands only once both have
+	// asked, so both resolved against the same tip, and the one that lands second has a stale verdict and,
+	// with one round, no other.
+	off := newQueueFixtureMode(t, 2, "barrier", tune(false))
 	failed := 0
 	for _, err := range off.landAll(off.onA) {
 		if err != nil {
 			failed++
 		}
 	}
-	require.Positive(t, failed, "the control: without the inline resolution the cap of 1 round ends lands")
+	require.Equal(t, 1, failed, "the control: without the inline resolution the cap of 1 round ends the land that lost it")
 	require.Zero(t, inlineCalls(t, off.dir))
 }
 
 // TestUserLand_aRuleThatDoesNotEndInTimeIsHandedBack: the rule takes 3 s and the lane gives it 300 ms: the
-// member goes out of the lane, and is resolved there (the resolver answers the ordinary request at once).
+// members go out of the lane, and are resolved there (the resolver answers the ordinary request at once).
+// How long the lane stalls is measured by TestLandResolveInline_aBatchLosesAtMostItsBudget.
 func TestUserLand_aRuleThatDoesNotEndInTimeIsHandedBack(t *testing.T) {
 	t.Parallel()
 
 	q := newQueueFixtureMode(t, 3, "slow", func(c *config.GraftResolver) { c.InlineTimeout = "300ms" })
-	start := time.Now()
 	for i, err := range q.landAll(q.onA) {
 		require.NoError(t, err, "land %d", i+1)
 	}
-	require.Less(t, time.Since(start), 60*time.Second)
 	require.Positive(t, inlineCalls(t, q.dir), "the lane tried")
 	require.Len(t, strings.Split(q.branchBlob(t, "a"), "\n"), 4)
+	require.Empty(t, landTickets.keysOf(q.scope), "no ticket is kept")
 }
 
 // TestUserLand_anOlderResolverIsNeverAskedAgain: a resolver that does not say that it honoured the request
@@ -173,12 +175,12 @@ func TestLandResolveInline_neverForAnAgentThePolicyDenies(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.landClassify(ctx, fx.repo, l.files, l.base, fx.tip, fx.commit, newLandClassifyCache(l.files, fx.tip)))
 	pre := newLandPreResolution()
-	require.False(t, s.landResolveInline(ctx, fx.request("Land"), fx.tip, fx.commit, l, pre), "denied by the policy")
+	require.Equal(t, landInlineNotTried, s.landResolveInline(ctx, fx.request("Land"), fx.tip, fx.commit, l, pre), "denied by the policy")
 	require.Zero(t, unionCalls(t, dir), "nothing was resolved")
 
 	// The same agent where the policy lets it update the branch.
 	s.graft.Policy = []config.GraftPolicyRule{{Actor: "agent-7", Refs: []string{"refs/heads/**"}, Allow: true}}
-	require.True(t, s.landResolveInline(ctx, fx.request("Land"), fx.tip, fx.commit, l, pre))
+	require.Equal(t, landInlineResolved, s.landResolveInline(ctx, fx.request("Land"), fx.tip, fx.commit, l, pre))
 	require.Equal(t, 1, unionCalls(t, dir))
 }
 

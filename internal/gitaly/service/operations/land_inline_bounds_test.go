@@ -1,0 +1,384 @@
+package operations
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/feder-cr/git-ai/internal/git/gittest"
+	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
+)
+
+// The tests of the bounds of the inline resolution (land_inline.go): what the lane gives away to a call
+// that fails, what it takes from a reply, and what it never waits for.
+
+// inlineProbe is a listing of the fixture's conflicts, classified at its tip, with a server that resolves
+// inline, for the tests that call landResolveInline directly.
+type inlineProbe struct {
+	fx  resolveFixture
+	s   *Server
+	dir string
+	l   landListing
+}
+
+func newInlineProbe(t *testing.T, mode string, tune func(*config.GraftResolver)) inlineProbe {
+	t.Helper()
+
+	dir, argv := unionResolverMode(t, mode)
+	rcfg := enabledResolver(argv)
+	rcfg.InlineTimeout = ""
+	if tune != nil {
+		tune(&rcfg)
+	}
+	fx := newResolveFixture(t, rcfg)
+	s := fx.server(t, rcfg)
+	l, err := landListConflicts(fx.ctx, fx.repo, fx.tip, fx.commit, 1<<20)
+	require.NoError(t, err)
+	require.NoError(t, s.landClassify(fx.ctx, fx.repo, l.files, l.base, fx.tip, fx.commit, newLandClassifyCache(l.files, fx.tip)))
+	return inlineProbe{fx: fx, s: s, dir: dir, l: l}
+}
+
+func (p inlineProbe) resolve(ctx context.Context, t *testing.T, pre *landPreResolution) landInlineResult {
+	t.Helper()
+	return p.s.landResolveInline(ctx, p.fx.request("Land"), p.fx.tip, p.fx.commit, p.l, pre)
+}
+
+// TestLandResolveInline_aReplyThatIsNotTheRulesIsRejected: a resolver that echoes rules_only but answers with
+// a model's file, a file that says nothing of its origin, or a file it holds, is not taken: the member goes out
+// of the lane as one the rules cannot resolve, and nothing of the reply is kept. The guard is the lane's own;
+// decideLand would refuse such a land too, but only after the lane had taken the verdict.
+func TestLandResolveInline_aReplyThatIsNotTheRulesIsRejected(t *testing.T) {
+	t.Parallel()
+
+	for _, mode := range []string{"echo-model", "echo-noorigin", "echo-hold"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+
+			p := newInlineProbe(t, mode, nil)
+			pre := newLandPreResolution()
+			require.Equal(t, landInlineRulesCannot, p.resolve(p.fx.ctx, t, pre))
+			require.Empty(t, pre.verdicts, "nothing of the reply is kept")
+			require.False(t, p.s.landInlineOff.Load(), "the resolver did honour the request")
+			require.Equal(t, 1, inlineCalls(t, p.dir))
+		})
+	}
+}
+
+// TestLandResolveInline_announcesOnlyTheOrigin: the request asks for the rules only and announces no
+// capability but the origin, so that a graft-resolve that gates the models on the capabilities refuses to
+// call one even if it were to ignore rules_only.
+func TestLandResolveInline_announcesOnlyTheOrigin(t *testing.T) {
+	t.Parallel()
+
+	p := newInlineProbe(t, "", nil)
+	require.Equal(t, landInlineResolved, p.resolve(p.fx.ctx, t, newLandPreResolution()))
+
+	reqs, err := filepath.Glob(filepath.Join(p.dir, "req-*.json"))
+	require.NoError(t, err)
+	require.Len(t, reqs, 1)
+	raw, err := os.ReadFile(reqs[0])
+	require.NoError(t, err)
+	var req struct {
+		RulesOnly    bool     `json:"rules_only"`
+		Capabilities []string `json:"capabilities"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &req))
+	require.True(t, req.RulesOnly)
+	require.Equal(t, []string{"origin"}, req.Capabilities)
+}
+
+// TestLandResolveInline_aResolverThatRefusesIsRulesCannot: the refusal of the rules is not a slow call: the
+// member is one that only a model can resolve, and the lane charges the batch nothing but the call.
+func TestLandResolveInline_aResolverThatRefusesIsRulesCannot(t *testing.T) {
+	t.Parallel()
+
+	p := newInlineProbe(t, "refuse", nil)
+	pre := newLandPreResolution()
+	require.Equal(t, landInlineRulesCannot, p.resolve(p.fx.ctx, t, pre))
+	require.Empty(t, pre.verdicts)
+	require.False(t, p.s.landInlineOff.Load())
+}
+
+// TestLandResolveInline_aBatchLosesAtMostItsBudget: the rule takes 3 s and the lane gives it 300 ms. Six
+// members of one batch attempt (one budget) lose that once: the first call is cancelled, the other five are
+// handed back without a call. Measured on the time the lane spends in the calls, which is what stalls the
+// batch: six members at 300 ms each would be 1.8 s.
+func TestLandResolveInline_aBatchLosesAtMostItsBudget(t *testing.T) {
+	t.Parallel()
+
+	const members = 6
+	p := newInlineProbe(t, "slow", func(c *config.GraftResolver) { c.InlineTimeout = "300ms" })
+	budget := &landInlineBudget{}
+	ctx := withLandInlineBudget(p.fx.ctx, budget)
+
+	start := time.Now()
+	for i := 0; i < members; i++ {
+		require.Equal(t, landInlineSlow, p.resolve(ctx, t, newLandPreResolution()), "member %d", i+1)
+	}
+	stalled := time.Since(start)
+
+	require.Equal(t, 1, inlineCalls(t, p.dir), "only the first member called: the others found the budget spent")
+	require.GreaterOrEqual(t, budget.lost, 250*time.Millisecond)
+	require.Less(t, stalled, 1500*time.Millisecond, "the lane stalled once for the call, not once per member")
+
+	// The next batch attempt has a budget of its own.
+	require.Equal(t, landInlineSlow, p.resolve(withLandInlineBudget(p.fx.ctx, &landInlineBudget{}), t, newLandPreResolution()))
+	require.Equal(t, 2, inlineCalls(t, p.dir))
+}
+
+// TestLandResolveInline_aCallThatSucceedsCostsTheBudgetNothing: a batch of members that the rules resolve
+// quickly is not cut short by the time those calls take.
+func TestLandResolveInline_aCallThatSucceedsCostsTheBudgetNothing(t *testing.T) {
+	t.Parallel()
+
+	p := newInlineProbe(t, "", nil)
+	budget := &landInlineBudget{}
+	ctx := withLandInlineBudget(p.fx.ctx, budget)
+	for i := 0; i < 4; i++ {
+		require.Equal(t, landInlineResolved, p.resolve(ctx, t, newLandPreResolution()), "member %d", i+1)
+	}
+	require.Zero(t, budget.lost)
+}
+
+// TestLandResolveInline_neverWaitsForASlot: the lane takes a slot of its own pool without waiting. With the
+// pool taken the member goes out of the lane at once, without a call; and a model that holds every resolve
+// slot of the resolver does not stop the rules.
+func TestLandResolveInline_neverWaitsForASlot(t *testing.T) {
+	t.Parallel()
+
+	p := newInlineProbe(t, "", nil)
+
+	// Every resolve slot is held by models: the rules go on.
+	var held []interface{ Release() }
+	for i := 0; i < p.s.resolveCfg.ResolveConcurrencyOrDefault(); i++ {
+		slot, err := p.s.conflictResolver.AcquireResolveSlot(p.fx.ctx)
+		require.NoError(t, err)
+		held = append(held, slot)
+	}
+	require.Equal(t, landInlineResolved, p.resolve(p.fx.ctx, t, newLandPreResolution()), "the resolve pool is not the lane's")
+	for _, slot := range held {
+		slot.Release()
+	}
+	calls := inlineCalls(t, p.dir)
+
+	// The lane's own pool is taken (by the other members in flight): no wait, no call.
+	var own []interface{ Release() }
+	for {
+		slot, ok := p.s.conflictResolver.TryAcquireInlineSlot()
+		if !ok {
+			break
+		}
+		own = append(own, slot)
+	}
+	require.NotEmpty(t, own)
+	done := make(chan landInlineResult, 1)
+	go func() { done <- p.resolve(p.fx.ctx, t, newLandPreResolution()) }()
+	select {
+	case res := <-done:
+		require.Equal(t, landInlineSlow, res)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lane waited for a slot")
+	}
+	require.Equal(t, calls, inlineCalls(t, p.dir), "no call without a slot")
+	for _, slot := range own {
+		slot.Release()
+	}
+	require.Equal(t, landInlineResolved, p.resolve(p.fx.ctx, t, newLandPreResolution()), "the slots were given back")
+}
+
+// TestUserLand_aLandNeedingAModelDoesNotHoldBackTheUnionLands: one land on a hot file needs a model (the
+// rules cannot resolve it, and the model takes as long as it takes: here, until the test says so), and
+// six others on the same file are resolved by a rule. Without a verification what the model resolves never
+// lands, so the land that needs it takes no ticket and the others are not made to wait for it: all six
+// land while the model is still working, and no ticket is held.
+func TestUserLand_aLandNeedingAModelDoesNotHoldBackTheUnionLands(t *testing.T) {
+	t.Parallel()
+
+	q := newQueueFixtureMode(t, 6, "model", func(c *config.GraftResolver) { c.InlineTimeout = "" })
+	model := gittest.WriteCommit(t, q.cfg, q.repoPath, gittest.WithParents(q.base),
+		gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "model-1\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+
+	modelDone := make(chan error, 1)
+	go func() {
+		_, err := q.land(model)
+		modelDone <- err
+	}()
+	// The model land is at the resolver, out of the lane: its request is the one that is not for the rules.
+	require.Eventually(t, func() bool { return unionCalls(t, q.dir)-inlineCalls(t, q.dir) >= 1 }, 30*time.Second, 10*time.Millisecond)
+
+	landed := make(chan []error, 1)
+	go func() { landed <- q.landAll(q.onA) }()
+	select {
+	case errs := <-landed:
+		for i, err := range errs {
+			require.NoError(t, err, "union land %d", i+1)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the union lands waited for the land that needs a model")
+	}
+	require.Empty(t, landTickets.keysOf(q.scope), "the land that needs a model holds no ticket")
+	select {
+	case err := <-modelDone:
+		t.Fatalf("the model land ended before the model answered: %v", err)
+	default:
+	}
+	require.Len(t, strings.Split(q.branchBlob(t, "a"), "\n"), 7)
+
+	// The model answers: its resolution is a proposal, as without a verification it always was.
+	require.NoError(t, os.WriteFile(filepath.Join(q.dir, "release"), nil, 0o644))
+	select {
+	case err := <-modelDone:
+		requireMergeConflict(t, err)
+		require.NotNil(t, landConflictDetail(err), "the package with the proposal")
+	case <-time.After(60 * time.Second):
+		t.Fatal("the model land did not end")
+	}
+	require.Empty(t, landTickets.keysOf(q.scope))
+}
+
+// TestUserLand_aTicketOnTheFileDoesNotStopTheRulesInTheLane: another land holds the ticket of the file,
+// and the lane resolves the rules of this one inline all the same: the ticket serves the out-of-lane
+// resolution, and a rule does not wait for it. The block in the lane comes after the inline attempt; it
+// hands back only what the lane could not resolve.
+func TestUserLand_aTicketOnTheFileDoesNotStopTheRulesInTheLane(t *testing.T) {
+	t.Parallel()
+
+	q := newQueueFixture(t, 2, inlineOn)
+	holder, err := landTickets.acquire(q.ctx, []string{q.keyOfA})
+	require.NoError(t, err)
+	defer holder.release()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.land(q.onA[0])
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the land waited for the holder of the ticket")
+	}
+	require.Equal(t, 1, inlineCalls(t, q.dir), "resolved in the lane")
+	require.Equal(t, 0, landTickets.waiting(q.keyOfA), "it never queued")
+	require.True(t, landTickets.blocked([]string{q.keyOfA}, nil), "the holder is still the holder")
+}
+
+// TestUserLand_aSlowRuleWaitsForTheTicketHolder: when the lane could not resolve inline (the rule did not end in
+// time), the land goes out of the lane and, with another land holding the ticket of the file, waits for its
+// turn there as before.
+func TestUserLand_aSlowRuleWaitsForTheTicketHolder(t *testing.T) {
+	t.Parallel()
+
+	q := newQueueFixtureMode(t, 1, "slow", func(c *config.GraftResolver) { c.InlineTimeout = "300ms" })
+	holder, err := landTickets.acquire(q.ctx, []string{q.keyOfA})
+	require.NoError(t, err)
+	defer holder.release()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.land(q.onA[0])
+		done <- err
+	}()
+	require.Eventually(t, func() bool { return landTickets.waiting(q.keyOfA) == 1 }, 30*time.Second, 5*time.Millisecond, "the land never queued")
+	select {
+	case err := <-done:
+		t.Fatalf("the land went past the holder of its file: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	holder.release()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("the land did not land when the holder was done")
+	}
+}
+
+// TestUserLand_oneFailedInlineCallDoesNotStartAConvoy: one rule call hiccups (3 s, cut at 300 ms) in the middle
+// of a hot file's lands. The members the lane handed back are resolved out of the lane and come back, but no
+// file stays ticketed: the next wave is resolved in the lane, at once, without one request out of it.
+func TestUserLand_oneFailedInlineCallDoesNotStartAConvoy(t *testing.T) {
+	t.Parallel()
+
+	const lands = 8
+	q := newQueueFixtureMode(t, 2*lands, "slowonce", func(c *config.GraftResolver) { c.InlineTimeout = "300ms" })
+
+	for i, err := range q.landAll(q.onA[:lands]) {
+		require.NoError(t, err, "land %d of the first wave", i+1)
+	}
+	require.Empty(t, landTickets.keysOf(q.scope), "no ticket is kept after the hiccup")
+	outOfLane := unionCalls(t, q.dir) - inlineCalls(t, q.dir)
+	inline := inlineCalls(t, q.dir)
+
+	for i, err := range q.landAll(q.onA[lands:]) {
+		require.NoError(t, err, "land %d of the second wave", i+1)
+	}
+	require.Equal(t, outOfLane, unionCalls(t, q.dir)-inlineCalls(t, q.dir), "the second wave never left the lane")
+	require.Greater(t, inlineCalls(t, q.dir), inline)
+	require.Len(t, strings.Split(q.branchBlob(t, "a"), "\n"), 2*lands+1)
+	require.Empty(t, landTickets.keysOf(q.scope))
+}
+
+// TestUserLand_theLaneRoundDoesNotCountTowardTheRounds: with resolve_rounds of 1 a land that only a model can
+// resolve still leaves the lane for the pre-resolution: it ends with the proposal, not with the file
+// NOT_ATTEMPTED and nothing proposed.
+func TestUserLand_theLaneRoundDoesNotCountTowardTheRounds(t *testing.T) {
+	t.Parallel()
+
+	q := newQueueFixtureMode(t, 1, "model", func(c *config.GraftResolver) {
+		c.InlineTimeout = ""
+		c.ResolveRounds = 1
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(q.dir, "release"), nil, 0o644))
+	model := gittest.WriteCommit(t, q.cfg, q.repoPath, gittest.WithParents(q.base),
+		gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "model-1\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+
+	_, err := q.land(model)
+	requireMergeConflict(t, err)
+	pkg := landConflictDetail(err)
+	require.NotNil(t, pkg)
+	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, packageFile(t, pkg, "a").GetOutcome(), "the model was asked")
+}
+
+// TestUserLand_aLaneRoundThatHandsBackTakesNoTicket: the rule does not end in time, so the lane hands the land
+// back; it is resolved out of the lane and comes back, and at no round does it hold a ticket (a ticket would
+// make the lands on its file wait for it, for a hiccup of the lane).
+func TestUserLand_aLaneRoundThatHandsBackTakesNoTicket(t *testing.T) {
+	t.Parallel()
+
+	var s *Server
+	operationServerHooks.Store(t.Name(), func(served *Server) { s = served })
+	q := newQueueFixtureMode(t, 1, "slow", func(c *config.GraftResolver) { c.InlineTimeout = "300ms" })
+	require.NotNil(t, s)
+
+	var mu sync.Mutex
+	var held [][]string
+	s.landLaneHook = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		held = append(held, landTickets.keysOf(q.scope))
+	}
+	_, err := q.land(q.onA[0])
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(held), 2, "the land went through the lane, out of it, and back")
+	for round, keys := range held {
+		require.Empty(t, keys, "ticket held at the lane round %d", round+1)
+	}
+	require.Positive(t, inlineCalls(t, q.dir))
+}

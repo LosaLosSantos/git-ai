@@ -146,5 +146,6 @@ func TestLandTickets_keys(t *testing.T) {
 	require.True(t, r.blocked(landTicketKeys("r", []string{"c", "b"}, false), nil))
 	tk.release()
 	tk.release() // a second release does nothing
+	require.False(t, tk.covers(landTicketKeys("r", []string{"a"}, false)), "a released ticket covers nothing")
 	require.False(t, (*landTicket)(nil).covers(nil))
 }
