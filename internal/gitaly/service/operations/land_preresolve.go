@@ -340,7 +340,14 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 		// merely did not find the rules enough takes no turn: the lane has not lost anything, and without a
 		// verification what the model resolves next never lands, so a ticket would protect nothing. Only a
 		// lane round that was told to wait for its turn does.
-		if laneRound && !need.queued || need.rulesCannot {
+		if need.rulesCannot {
+			// The rules cannot resolve it: what is next is a model's call out of the lane, which never lands
+			// without a verification. It holds no ticket while it runs, even the one it took when it queued.
+			pre.ticket.release()
+			pre.ticket = nil
+			continue
+		}
+		if laneRound && !need.queued {
 			continue
 		}
 		if err := s.landTakeTicket(resolveCtx, in, pre, need); err != nil {
@@ -355,6 +362,11 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 				return nil, structerr.NewCanceled("waiting for the other lands on the same files: %w", err)
 			}
 			return nil, err
+		}
+		if !laneRound {
+			// It lost a round out of the lane: its resolution is the one that must land, and the inline
+			// resolutions of the others give way to it until it is done.
+			pre.ticket.setPriority()
 		}
 		// Back to the lane at once with the ticket: the rules are resolved there, no pre-resolution first.
 		lane = laneRound && need.queued
@@ -379,7 +391,7 @@ func (p *landPreResolution) currentPaths() []string {
 
 // landTicketsBlock reports whether another land holds the ticket of one of paths.
 func (s *Server) landTicketsBlock(in *gitalypb.UserLandRequest, paths []string, pre *landPreResolution) bool {
-	if len(paths) == 0 {
+	if len(paths) == 0 || s.landWillNotLand(pre) {
 		return false
 	}
 	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())

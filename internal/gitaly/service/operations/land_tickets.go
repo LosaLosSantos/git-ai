@@ -67,6 +67,10 @@ type landTicket struct {
 	mu       sync.Mutex
 	acquired []string // the keys held, in the order taken
 	released bool
+	// priority says that the holder resolves its files out of the lane after losing a round: until it ends, the
+	// lane hands back the inline resolutions of the other lands on them, which would change the files again and
+	// make its verdict stale at every round (priorityBlocked).
+	priority bool
 }
 
 // landTickets are the tickets of the process, shared by all the servers of it.
@@ -210,6 +214,32 @@ func (t *landTicket) covers(keys []string) bool {
 		}
 	}
 	return true
+}
+
+// setPriority makes the ticket one that the inline resolutions of the other lands give way to.
+func (t *landTicket) setPriority() {
+	t.mu.Lock()
+	t.priority = true
+	t.mu.Unlock()
+}
+
+func (t *landTicket) hasPriority() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.priority && !t.released
+}
+
+// priorityBlocked reports whether another land holds, with priority, a ticket for one of keys: the land that
+// asks must not change those files in the lane until the holder is done.
+func (r *landTicketRegistry) priorityBlocked(keys []string, me *landTicket) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, key := range keys {
+		if k := r.keys[key]; k != nil && k.holder != nil && k.holder != me && k.holder.hasPriority() {
+			return true
+		}
+	}
+	return false
 }
 
 // blocked reports whether another land holds a ticket for one of keys: the land that asks, which is me

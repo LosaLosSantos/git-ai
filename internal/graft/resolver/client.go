@@ -84,13 +84,13 @@ func (e *UnresolvableError) Is(target error) bool {
 	return target == ErrUnresolvable
 }
 
-// Client calls the configured resolver. It is safe for concurrent use. A nil
-// *Client is the disabled resolver.
 // minInlineSlots is the least size of the pool of the lane's own calls: they are rules, which take
 // milliseconds, and each lane (one per branch) needs one at a time, so that the pool of one server is
 // not the bottleneck of its branches.
 const minInlineSlots = 8
 
+// Client calls the configured resolver. It is safe for concurrent use. A nil
+// *Client is the disabled resolver.
 type Client struct {
 	command      []string
 	url          string

@@ -30,19 +30,24 @@ import (
 //     refuses to call one even if it were to ignore RulesOnly; v0.2.0 has no gating and may call one;
 //   - the lane never waits: the call takes a slot of a pool of its own (a model that holds all the
 //     resolve slots does not stop the rules), and if there is none the member goes out of the lane;
-//   - the time the lane may lose to calls that fail is bounded once per batch (landInlineBudget): a call
-//     is given inline_timeout (default 1s) or what is left of the budget, and a call that fails, in time or
-//     not, is charged to it; once it is spent the other members of the batch go out of the lane without a
-//     call. A call that succeeds costs the batch nothing but its own time;
-//   - a member that the rules cannot resolve (the resolver says so) goes out of the lane without a ticket:
-//     without a verification what a model resolves never lands, so a ticket would protect nothing;
+//   - the time the lane spends in inline calls is bounded once per batch attempt (landInlineBudget): a call
+//     is given inline_timeout (default 1s) or what is left of the budget, and all the time of every call,
+//     one that succeeds as well as one that fails, is charged to it; once it is spent the other members of
+//     the batch go out of the lane without a call, where the queue guarantees their progress. Fast rules
+//     (milliseconds) do not notice it;
+//   - a member that the rules cannot resolve (the resolver says so) goes out of the lane without a ticket,
+//     and releases the one it took: without a verification what a model resolves never lands, so a ticket
+//     would protect nothing and the lands on its file would wait for the model;
+//   - a land that lost a round out of the lane holds its files with priority until it is done: the lane hands
+//     back the inline resolutions of the others on them, which would change the files under its verdict at
+//     every round (a rule slower than inline_timeout would never land on a hot file);
 //   - a resolver that does not echo RulesOnly is an older graft-resolve, which may have called a model:
 //     the answer is dropped, and the lane never resolves inline again for the life of the process;
 //   - with a verification (verify.enabled) the lane never resolves: every tree is verified out of the lane;
 //   - the answer is validated like any other (the client's acceptance rules, the modes, the origin), and
 //     decideLand is the same: an answer that is not a rule's is never taken here.
 
-// landInlineBudget is the time a batch attempt may lose to inline calls that fail (land_inline.go). The
+// landInlineBudget is the time a batch attempt may spend in inline calls (land_inline.go). The
 // lane applies the members of an attempt one after the other, so it needs no lock.
 type landInlineBudget struct {
 	lost time.Duration
@@ -148,8 +153,10 @@ func (s *Server) landResolveInline(ctx context.Context, in *gitalypb.UserLandReq
 	defer cancel()
 	start := time.Now()
 	resp, err := slot.Resolve(callCtx, req)
+	// All the time of the lane in the call is the batch's, whether the call succeeds or not: a rule that takes
+	// 0.9 s and succeeds stalls a batch of N members for N * 0.9 s as much as one that fails.
+	budget.lost += time.Since(start)
 	if err != nil {
-		budget.lost += time.Since(start)
 		var refusal *resolver.UnresolvableError
 		if errors.As(err, &refusal) || errors.Is(err, resolver.ErrUnresolvable) {
 			// The rules cannot resolve a file of the member.
@@ -158,10 +165,7 @@ func (s *Server) landResolveInline(ctx context.Context, in *gitalypb.UserLandReq
 		s.logger.WithError(err).WithField("branch", string(in.GetBranch())).Debug("graft: inline resolution handed back")
 		return landInlineSlow
 	}
-	fail := func(result landInlineResult) landInlineResult {
-		budget.lost += time.Since(start)
-		return result
-	}
+	fail := func(result landInlineResult) landInlineResult { return result }
 	if !resp.RulesOnly {
 		if s.landInlineOff.CompareAndSwap(false, true) {
 			s.logger.WithField("resolver", resp.Resolver).Warn("graft: the resolver did not honour a request for its rules only (an older graft-resolve): the lane resolves out of the lane from now on")
@@ -190,6 +194,34 @@ func (s *Server) landResolveInline(ctx context.Context, in *gitalypb.UserLandReq
 		pre.verdicts[landKeyOf(f.conflict)] = landVerdict{file: byPath[f.conflict.path], resolver: resp.Resolver}
 	}
 	return landInlineResolved
+}
+
+// landListingKeys are the tickets of the files of a listing.
+func (s *Server) landListingKeys(in *gitalypb.UserLandRequest, l landListing) []string {
+	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
+	return landTicketKeys(scope, landListingPaths(l), s.resolveCfg.Verify.Enabled)
+}
+
+func landListingPaths(l landListing) []string {
+	paths := make([]string, 0, len(l.files))
+	for _, f := range l.files {
+		paths = append(paths, f.conflict.path)
+	}
+	return paths
+}
+
+// landWillNotLand reports whether the files the land has now carry a model's verdict (or a held one) and no
+// verification is configured: such a land ends with the package, so no other land gives way to it.
+func (s *Server) landWillNotLand(pre *landPreResolution) bool {
+	if s.resolveCfg.Verify.Enabled {
+		return false
+	}
+	for k := range pre.current {
+		if v, ok := pre.verdicts[k]; ok && (v.file.FromModel() || v.file.Hold != "") {
+			return true
+		}
+	}
+	return false
 }
 
 // landHasModelVerdict reports whether a file of the listing has a model's (or a held) verdict. Without a

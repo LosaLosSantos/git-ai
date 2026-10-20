@@ -517,6 +517,11 @@ func (s *Server) landApplyVerdicts(
 	// the batch, as it did before the resolution left the lane. What a rule cannot resolve goes out.
 	inline := landInlineNotTried
 	if len(missing) > 0 && pre != nil && s.conflictResolver != nil && l.bases <= 1 {
+		// A land that lost a round out of the lane holds the files with priority: resolving them here would
+		// change them under its verdict once more, so the lands that would give way and wait their turn.
+		if s.landInlineEnabled() && landTickets.priorityBlocked(s.landListingKeys(in, l), pre.ticket) {
+			return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: landListingPaths(l), queued: true}
+		}
 		inline = s.landResolveInline(ctx, in, tip, commitID, l, pre)
 		if inline == landInlineResolved {
 			missing = missing[:0]
