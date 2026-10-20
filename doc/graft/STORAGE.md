@@ -710,6 +710,7 @@ without a single divergence.
 |---|---|
 | `graft_storage_changesets_total{mode,result}` | Reference transactions handled by the write path; results `committed`, `noop`, `conflict`, `error`, `skipped`. |
 | `graft_storage_preparing_seconds` | Time of the write path in the Preparing phase, before git locks the references (pack build and upload). |
+| `graft_storage_preparing_step_seconds{kind,step}` | The steps of the Preparing phase in authoritative mode: `record` (the read of the repository record), `walk` (the objects reachable from the new tips and not from a local reference, until their list ends; observed for every transaction with new tips), `pack` (writing and hashing a non-empty pack) and `upload` (to the bucket). `kind` is `create` for a transaction that only creates references (a commit onto a new branch), `update` otherwise (a land). |
 | `graft_storage_prepared_seconds` | Time of the write path in the Prepared phase, while git holds the reference locks (expected values and database commit; also the pack when the Preparing phase did not prepare it). |
 | `graft_storage_pack_bytes_total` | Bytes of packs uploaded. |
 | `graft_storage_shadow_divergences_total` | Shadow mode changesets recorded despite a mismatch. |
@@ -821,6 +822,49 @@ show:
   The earlier, less loaded run is the better measure of the per-land overhead:
   about 140 ms (SQLite) and 240 ms (Postgres) on a land of about 300 ms. A
   catch-up check that finds the copy fresh costs well under 2 ms.
+
+### Where the Preparing phase spends its time
+
+Measured on 2026-10-20 with `graft_storage_preparing_step_seconds`, to decide
+whether a land should upload the pack it already wrote instead of building a
+second one.
+
+Setup:
+- the same machine;
+- 1-minute load below 2 at the start of every run, a fresh server per run;
+- authoritative mode, file bucket, gitai land mode, conflict rate 0, seed 1;
+- 1 writer × 20 changes and 10 writers × 5 changes, two runs per backend.
+
+The land transactions are `kind="update"`: 20 per run with 1 writer, 14 to 16
+with 10 writers, since a batch lands about 3.3 changes in one transaction. The
+commits onto the changes' own branches are `kind="create"`.
+
+Mean per land transaction, run by run:
+
+| step | SQLite (ms) | Postgres (ms) |
+|---|---:|---:|
+| record | 0.2 | 1.1–2.2 |
+| walk | 3.3–6.9 | 4.3–5.9 |
+| pack | 3.6–6.2 | 3.7–6.8 |
+| upload | 7.5–59.0 | 14.6–44.1 |
+
+The creates are in the same size class, for walk and pack alike, with larger
+uploads: 9–37 ms on SQLite and 18–130 ms on Postgres.
+
+What this shows:
+- **The upload dominates, in the mean and in the tail.** The p99 of a land's
+  upload reached 462 ms on SQLite. A commit's upload reached the top bucket,
+  about 2.2 s, in both single-writer Postgres runs.
+- **The upload is fsync latency.** The file bucket fsyncs every pack file and
+  its directories before `Put` returns. On this machine the WSL disk is shared
+  with the Postgres container, whose own fsyncs compete with the bucket's. This
+  is why the Postgres runs have the worst upload tails. An object-store bucket
+  behaves differently, and was not measured.
+- **Reusing the land's pack is not worth it.** Reuse could only remove the
+  `pack` step: 3.6–6.8 ms per land transaction, about 1–2 ms per land with
+  batching. That is before the cost of checking that the land's pack holds
+  every object the upload needs. The design required a 10 ms drop of the
+  Preparing mean on both backends, so the reuse was not built.
 
 ## Limits
 

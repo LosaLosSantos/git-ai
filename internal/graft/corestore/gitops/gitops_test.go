@@ -131,6 +131,7 @@ func TestBuildPackOnlyNewObjects(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, pack.Empty())
 			require.Equal(t, 3, pack.Objects, "commit, tree and blob of c2 only")
+			require.Positive(t, pack.Walk, "the walk of the objects is timed")
 			require.Equal(t, 1, countEntries(t, tmpDir))
 			require.True(t, strings.HasPrefix(filepath.Base(pack.Path), "graft-pack-"))
 			readPack(t, pack)
@@ -201,10 +202,12 @@ func TestBuildPackEmpty(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, pack.Empty())
 			require.Equal(t, 0, pack.Objects)
+			require.Positive(t, pack.Walk, "an empty walk is timed too")
 
 			pack, err = gitops.BuildPack(f.ctx, f.repo, nil, tmpDir)
 			require.NoError(t, err)
 			require.True(t, pack.Empty())
+			require.Zero(t, pack.Walk, "without a tip there is no walk")
 
 			pack, err = gitops.BuildPack(f.ctx, f.repo, []git.ObjectID{f.hash.ZeroOID}, tmpDir)
 			require.NoError(t, err)

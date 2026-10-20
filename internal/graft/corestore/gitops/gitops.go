@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/command"
 	"github.com/feder-cr/git-ai/internal/git"
@@ -51,6 +53,10 @@ type Pack struct {
 	Size   int64
 	// Objects is the number of objects in the pack.
 	Objects int
+	// Walk is the time from the start of the walk until its object list ended:
+	// until pack-objects read the end of the list, or, for an empty list, until
+	// rev-list exited. The rest of the build is the packing of the objects.
+	Walk time.Duration
 }
 
 // Empty reports whether the pack has no objects (and no file).
@@ -239,6 +245,8 @@ func buildPack(ctx context.Context, repo *localrepo.Repo, revList gitcmd.Command
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	start := time.Now()
+
 	var revStderr bytes.Buffer
 	revOpts := []gitcmd.CmdOpt{gitcmd.WithSetupStdout(), gitcmd.WithStderr(&revStderr)}
 	if stdin != nil {
@@ -261,8 +269,9 @@ func buildPack(ctx context.Context, repo *localrepo.Repo, revList gitcmd.Command
 		if err := revCmd.Wait(); err != nil {
 			return Pack{}, structerr.New("rev-list: %w", err).WithMetadata("stderr", revStderr.String())
 		}
-		return Pack{}, nil
+		return Pack{Walk: time.Since(start)}, nil
 	}
+	listEnd := &endReader{r: objectList}
 
 	file, err := os.CreateTemp(tmpDir, "graft-pack-*")
 	if err != nil {
@@ -288,7 +297,7 @@ func buildPack(ctx context.Context, repo *localrepo.Repo, revList gitcmd.Command
 				gitcmd.Flag{Name: "--stdout"},
 			},
 		},
-		gitcmd.WithStdin(objectList),
+		gitcmd.WithStdin(listEnd),
 		gitcmd.WithStdout(io.MultiWriter(file, hasher)),
 		gitcmd.WithStderr(&packStderr),
 	)
@@ -337,7 +346,36 @@ func buildPack(ctx context.Context, repo *localrepo.Repo, revList gitcmd.Command
 		SHA256:  sum,
 		Size:    info.Size(),
 		Objects: int(binary.BigEndian.Uint32(header[8:12])),
+		Walk:    listEnd.endedAfter(start),
 	}, nil
+}
+
+// endReader is a reader that records when the reader it wraps ended. It is read
+// by the goroutine that feeds the standard input of a command, and asked once the
+// command has exited.
+type endReader struct {
+	r io.Reader
+	// end is the time the reader ended, in Unix nanoseconds; 0 until then.
+	end atomic.Int64
+}
+
+func (e *endReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		e.end.CompareAndSwap(0, time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// endedAfter returns the time from start until the reader ended. A command that
+// exited without reading its input to the end (pack-objects reads all of it
+// before it writes) has no end, and then the whole time since start counts.
+func (e *endReader) endedAfter(start time.Time) time.Duration {
+	end := e.end.Load()
+	if end == 0 {
+		return time.Since(start)
+	}
+	return time.Unix(0, end).Sub(start)
 }
 
 // IndexPack adds the pack read from r to the repository with
