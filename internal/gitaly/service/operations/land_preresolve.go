@@ -371,8 +371,10 @@ func (s *Server) landFinalPass(
 func landFinalPassGaveUp(in *gitalypb.UserLandRequest, needs *landNeedsResolution, passes int) error {
 	return landKeptMovingError(in, landConflict{
 		reference: git.NewReferenceNameFromBranchName(string(in.GetBranch())),
-		oldOID:    needs.tip,
-		newOID:    needs.tip,
-		cause:     errors.New("the branch kept moving while the land was being ended"),
+		// The tip the last pass resolved at is the one the branch moved away from; where it moved to is
+		// not known here (the lane handed the land back without a compare-and-swap), so newOID is empty.
+		oldOID: needs.tip,
+		newOID: "",
+		cause:  errors.New("the branch kept moving while the land was being ended"),
 	}, passes)
 }

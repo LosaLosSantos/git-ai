@@ -186,9 +186,9 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			fmt.Fprintln(stderr, "graft-resolve bench run: a chain with an agree_with model has two prices: use --pricing openrouter")
 			return 2
 		}
-		cap := *maxUSD
+		perModel := *maxUSD
 		if len(agreeModels) > 0 {
-			cap /= 2
+			perModel /= 2
 		}
 		var prices, agreePrices resolve.Prices
 		switch *pricingSource {
@@ -208,12 +208,12 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			fmt.Fprintf(stderr, "graft-resolve bench run: unknown --pricing %q, want openrouter or fixed\n", *pricingSource)
 			return 2
 		}
-		if budget, err = resolve.NewBudget(cap, prices, ""); err != nil {
+		if budget, err = resolve.NewBudget(perModel, prices, ""); err != nil {
 			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 			return 1
 		}
 		if len(agreeModels) > 0 {
-			if agreeBudget, err = resolve.NewBudget(cap, agreePrices, ""); err != nil {
+			if agreeBudget, err = resolve.NewBudget(perModel, agreePrices, ""); err != nil {
 				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 				return 1
 			}
@@ -223,10 +223,10 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			return 1
 		}
 		fmt.Fprintf(stderr, "cap $%.2f; $%g per million input tokens, $%g per million output tokens, $%g per request\n",
-			cap, prices.InputPerMillion, prices.OutputPerMillion, prices.PerRequest)
+			perModel, prices.InputPerMillion, prices.OutputPerMillion, prices.PerRequest)
 		if agreeBudget != nil {
 			fmt.Fprintf(stderr, "cap $%.2f for the agree_with model; $%g per million input tokens, $%g per million output tokens, $%g per request\n",
-				cap, agreePrices.InputPerMillion, agreePrices.OutputPerMillion, agreePrices.PerRequest)
+				perModel, agreePrices.InputPerMillion, agreePrices.OutputPerMillion, agreePrices.PerRequest)
 		}
 	}
 

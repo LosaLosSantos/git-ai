@@ -26,8 +26,9 @@ sys.stdout.write("===== BEGIN PATCHED CODE %s =====\n%s===== END PATCHED CODE %s
 
 // agreeResolverConfig writes a resolve.toml with the llm strategy of fakeModel and an agree_with model
 // (second, the source of a model), and returns the graft configuration that uses the real
-// graft-resolve with it and a verification that always passes.
-func agreeResolverConfig(t *testing.T, second string) exampleConfig {
+// graft-resolve with it and a verification that always passes, and the file in which each run of that
+// verification leaves a line.
+func agreeResolverConfig(t *testing.T, second string) (exampleConfig, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -52,13 +53,28 @@ command = ["python3", "-I", "`+other+`"]
 model = "fake-b"
 `), 0o600))
 
+	runs := filepath.Join(dir, "verify-runs")
+	verify := filepath.Join(dir, "verify.sh")
+	require.NoError(t, os.WriteFile(verify, []byte("#!/bin/sh\necho x >> '"+runs+"'\nexit 0\n"), 0o755))
+
 	ex := loadExample(t)
 	ex.graft.Land.Resolver = config.GraftResolver{
 		Enabled: true,
 		Command: []string{buildAgentsTool(t, "./cmd/graft-resolve"), "--config", resolveConfig},
-		Verify:  config.GraftResolverVerify{Enabled: true, Command: []string{"/bin/true"}},
+		Verify:  config.GraftResolverVerify{Enabled: true, Command: []string{verify}},
 	}
-	return ex
+	return ex, runs
+}
+
+// verifyRunsOf counts the lines that the runs of the verification left in runs.
+func verifyRunsOf(t *testing.T, runs string) int {
+	t.Helper()
+	raw, err := os.ReadFile(runs)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	require.NoError(t, err)
+	return len(raw) / 2
 }
 
 // TestAgreeWithTheModelsThatAgreeLandThroughVerify and ...ThatDisagreeAreHeld are the agreement gate
@@ -69,7 +85,7 @@ model = "fake-b"
 func TestAgreeWithTheModelsThatAgreeLandThroughVerify(t *testing.T) {
 	t.Parallel()
 
-	ex := agreeResolverConfig(t, fakeModel)
+	ex, runs := agreeResolverConfig(t, fakeModel)
 	s := startGitaly(t, ex.graft, ex.sharedToken)
 	repo := s.repoAs(t, exampleTokens["planner"])
 	ctx := s.ctx
@@ -88,13 +104,14 @@ func TestAgreeWithTheModelsThatAgreeLandThroughVerify(t *testing.T) {
 	require.NoError(t, err, "two models that agree, and a verification that passes: the resolution lands")
 	msg := s.git(t, "log", "-1", "--format=%B", res.LandedCommitID)
 	require.Contains(t, msg, "Graft-Resolved-By: graft-resolve/model")
-	require.Contains(t, msg, "Graft-Checked-By: verify:true")
+	require.Contains(t, msg, "Graft-Checked-By: verify:verify.sh")
+	require.Equal(t, 1, verifyRunsOf(t, runs), "the tree that lands was verified once")
 }
 
 func TestAgreeWithTheModelsThatDisagreeAreHeld(t *testing.T) {
 	t.Parallel()
 
-	ex := agreeResolverConfig(t, otherModel)
+	ex, runs := agreeResolverConfig(t, otherModel)
 	s := startGitaly(t, ex.graft, ex.sharedToken)
 	repo := s.repoAs(t, exampleTokens["planner"])
 	ctx := s.ctx
@@ -123,6 +140,7 @@ func TestAgreeWithTheModelsThatDisagreeAreHeld(t *testing.T) {
 	require.Contains(t, f.GetReason(), "fake-b")
 	require.NotNil(t, f.GetProposal(), "the first model's proposal is kept for the agent")
 	require.Contains(t, f.GetProposal().GetExplanation(), "held: the second model (fake-b) disagreed")
+	require.Equal(t, 0, verifyRunsOf(t, runs), "a held resolution is not even verified: verify.command never ran")
 }
 
 // TestStorageProposalsInAuthoritativeMode: the references of the proposals are written and pruned
