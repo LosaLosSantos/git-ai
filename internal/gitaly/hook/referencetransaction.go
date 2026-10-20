@@ -234,11 +234,15 @@ func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcm
 		return err
 	}
 
-	// The compaction reads the changelog and rewrites the intents: it runs after the hook, not
-	// under the locks of the references, and its failure leaves the intents as they are.
+	// The compaction reads the changelog and rewrites the intents. It starts in the prepared
+	// phase, in a goroutine that the hook does not wait for, so it runs while git still holds
+	// the references' locks and after: it takes none of them, only the intents' lock file, which
+	// the intents of other transactions of the repository wait for meanwhile. Its failure leaves
+	// the intents as they are; it is counted and logged.
 	if compact {
 		run := func() {
 			if err := changelog.CompactLandIntents(repoPath); err != nil {
+				landIntentsCompactionFailuresTotal.Inc()
 				m.logger.WithError(err).WithField("repository", repoPath).Error("graft: compacting the land intents failed")
 			}
 		}

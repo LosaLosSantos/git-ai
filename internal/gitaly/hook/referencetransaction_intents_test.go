@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -116,6 +117,30 @@ func TestReferenceTransactionHook_recordsLandIntents(t *testing.T) {
 		records2, err := changelog.LookupLand(repoPath, "refs/heads/main", land.Original)
 		require.NoError(t, err)
 		require.Equal(t, []changelog.LandRecord{{Landed: land.Landed}}, records2, "the intent of the update stays")
+	})
+
+	t.Run("a failed compaction is counted", func(t *testing.T) {
+		t.Parallel()
+
+		// The intents file asks for a compaction, which fails: the land index cannot be opened, a
+		// directory is in its place.
+		var lines strings.Builder
+		for i := 0; i < 600; i++ {
+			line, err := json.Marshal(map[string]any{"ref": []byte("refs/heads/main"), "original": fmt.Sprintf("%040x", i+1), "landed": fmt.Sprintf("%040x", i+1), "invocation": fmt.Sprint("inv-", i)})
+			require.NoError(t, err)
+			lines.Write(line)
+			lines.WriteByte('\n')
+		}
+
+		failures := testutil.ToFloat64(landIntentsCompactionFailuresTotal)
+		_, err := prepare(t, testcfg.Build(t), "refs/heads/main", func(repoPath string) {
+			require.NoError(t, os.MkdirAll(filepath.Join(repoPath, "graft", "changelog.lands"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(repoPath, "graft", "changelog.intents"), []byte(lines.String()), 0o644))
+			_, err := changelog.Append(repoPath, changelog.Meta{Operation: "push"}, []changelog.Update{{Reference: "refs/heads/other", OldOID: gittest.DefaultObjectHash.ZeroOID.String(), NewOID: strings.Repeat("c", 40)}})
+			require.NoError(t, err)
+		}, func(compact func()) { compact() })
+		require.NoError(t, err, "the update does not wait for its compaction, nor fail with it")
+		require.GreaterOrEqual(t, testutil.ToFloat64(landIntentsCompactionFailuresTotal), failures+1)
 	})
 
 	t.Run("a failure to record the intents aborts the update", func(t *testing.T) {

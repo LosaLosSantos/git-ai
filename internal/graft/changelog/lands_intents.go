@@ -61,8 +61,8 @@ var (
 	// durable, see RecordLandIntents. A file created again at the same path, as with a
 	// repository created again, is another file.
 	intentDirsSynced sync.Map
-	// intentsCompactionSize holds, by path, the size of the intents file when RecordLandIntents
-	// last asked for a compaction, see compactionDue.
+	// intentsCompactionSize holds, by path, the size of the intents file that the last
+	// CompactLandIntents of this process left, see compactionDue.
 	intentsCompactionSize sync.Map
 )
 
@@ -147,20 +147,17 @@ func RecordLandIntents(repoPath, reference, invocation string, lands []Land) (co
 }
 
 // compactionDue reports whether an intents file of the given size is due for a compaction: from
-// compactIntentsMinSize on, each time it doubled since the last time it was due, or since the last
-// CompactLandIntents left it, in this process.
+// compactIntentsMinSize on, once it doubled since the last CompactLandIntents of this process left
+// it. Only a compaction that runs moves that size: a request that found one running does not, so
+// the next append asks again.
 func compactionDue(path string, size int64) bool {
 	if size < compactIntentsMinSize {
 		return false
 	}
 
 	last, _ := intentsCompactionSize.Load(path)
-	if lastSize, ok := last.(int64); ok && size < 2*lastSize {
-		return false
-	}
-
-	intentsCompactionSize.Store(path, size)
-	return true
+	lastSize, ok := last.(int64)
+	return !ok || size >= 2*lastSize
 }
 
 // compactionsRunning holds the repositories whose intents CompactLandIntents compacts right now.
