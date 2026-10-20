@@ -408,6 +408,8 @@ endif
 .PHONY: prepare-tests
 prepare-tests: ${GOTESTSUM} ${GITALY_PACKED_EXECUTABLES} ${GIT_FILTER_REPO} ${GIT_PACKED_EXECUTABLES}
 	${Q}mkdir -p "$(dir ${TEST_JUNIT_REPORT})"
+# The end-to-end tests build the tools of graft-agents with GOPROXY=off; that module has its own go.mod.
+	${Q}go -C ${SOURCE_DIR}/tools/graft-agents mod download
 
 .PHONY: prepare-debug
 prepare-debug: ${DELVE}

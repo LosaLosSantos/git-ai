@@ -71,6 +71,9 @@ type Store struct {
 	// writers queues the write transactions on SQLite (nil on Postgres, whose
 	// row locks queue their waiters themselves); see writeQueue.
 	writers *writeQueue
+	// snapshotWritten, when set by a test, is called by CreateCheckpoint once
+	// the reference snapshot is written, before created_at is stamped.
+	snapshotWritten func()
 }
 
 var _ corestore.MetaStore = (*Store)(nil)

@@ -38,7 +38,7 @@ func TestLandBatch_retryAfterALostResponse(t *testing.T) {
 func testLandBatchRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(nil))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(2, nil))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
@@ -51,7 +51,7 @@ func testLandBatchRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 	}
 	a, b := change("a"), change("b")
 
-	first, errs := landInOrder(ctx, client, repoProto,
+	first, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "agent-a", commit: a},
 		agentLanding{agent: "agent-b", commit: b},
 	)
@@ -62,10 +62,10 @@ func testLandBatchRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 	}
 	landedA, landedB := git.ObjectID(first[0].GetLandedCommitId()), git.ObjectID(first[1].GetLandedCommitId())
 
-	// The batch lands its members in the order they reached the lane, which the test does not
-	// fix: the tip is the commit of the last of them.
+	// The batch lands its members in the order they reached the lane: the tip is the commit of
+	// agent-b, the last of them.
 	tip := gittest.ResolveRevision(t, cfg, repoPath, git.DefaultRef.String())
-	require.Contains(t, []git.ObjectID{landedA, landedB}, tip)
+	require.Equal(t, landedB, tip)
 
 	entry := landEntry(t, repoPath, tip)
 	require.Equal(t, changelog.OperationLandBatch, entry.Operation)
@@ -75,7 +75,7 @@ func testLandBatchRetryAfterALostResponse(t *testing.T, ctx context.Context) {
 	}, entry.Lands)
 	require.Equal(t, tip.String(), entry.Lands[len(entry.Lands)-1].Landed, "the lands are in the order of the batch")
 
-	second, errs := landInOrder(ctx, client, repoProto,
+	second, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "agent-a", commit: a},
 		agentLanding{agent: "agent-b", commit: b},
 	)
@@ -224,7 +224,7 @@ func testUserLandConcurrentRetries(t *testing.T, ctx context.Context) {
 		graft config.Graft
 	}{
 		{desc: "unbatched", graft: config.Graft{}},
-		{desc: "batched", graft: agentBatchingGraft(nil)},
+		{desc: "batched", graft: agentBatchingGraft(2, nil)},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
@@ -234,7 +234,7 @@ func testUserLandConcurrentRetries(t *testing.T, ctx context.Context) {
 				fx := newRetryFixture(t, ctx, cfg)
 				before := gittest.Exec(t, cfg, "-C", fx.repoPath, "rev-list", "--count", git.DefaultBranch)
 
-				responses, errs := landInOrder(ctx, client, fx.repoProto,
+				responses, errs := landInOrder(t, ctx, client, fx.repoProto,
 					agentLanding{commit: fx.change},
 					agentLanding{commit: fx.change},
 				)
@@ -295,7 +295,7 @@ func TestLandBatch_intentAnswersWhatTheChangelogMisses(t *testing.T) {
 func testLandBatchIntentAnswersWhatTheChangelogMisses(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(nil))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(2, nil))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
@@ -308,7 +308,7 @@ func testLandBatchIntentAnswersWhatTheChangelogMisses(t *testing.T, ctx context.
 	}
 	a, b := change("a"), change("b")
 
-	first, errs := landInOrder(ctx, client, repoProto,
+	first, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "agent-a", commit: a},
 		agentLanding{agent: "agent-b", commit: b},
 	)
@@ -321,7 +321,7 @@ func testLandBatchIntentAnswersWhatTheChangelogMisses(t *testing.T, ctx context.
 	// The changelog lost the entry of the batch's update, its only entry.
 	require.NoError(t, os.Remove(changelog.Path(repoPath)))
 
-	second, errs := landInOrder(ctx, client, repoProto,
+	second, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "agent-a", commit: a},
 		agentLanding{agent: "agent-b", commit: b},
 	)

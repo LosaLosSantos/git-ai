@@ -126,6 +126,9 @@ func (s *Store) CreateCheckpoint(ctx context.Context, repoID int64, in corestore
 				return fmt.Errorf("insert checkpoint references: %w", err)
 			}
 		}
+		if s.snapshotWritten != nil {
+			s.snapshotWritten()
+		}
 
 		// The last statements (integrated review, final minor 1): the age of a
 		// checkpoint (C_gc, C_sync) counts from created_at, and the pack's

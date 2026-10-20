@@ -300,13 +300,13 @@ func TestLandBatch_batchOfOneRecordsLandWithActor(t *testing.T) {
 func testLandBatchOfOneRecordsLandWithActor(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(nil))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(1, nil))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch))
 	change := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base))
 
-	responses, errs := landInOrder(ctx, client, repoProto, agentLanding{agent: "agent-a", commit: change})
+	responses, errs := landInOrder(t, ctx, client, repoProto, agentLanding{agent: "agent-a", commit: change})
 	require.NoError(t, errs[0])
 	require.Equal(t, int32(1), responses[0].GetBatchSize())
 	require.Equal(t, change.String(), responses[0].GetLandedCommitId())

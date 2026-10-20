@@ -14,6 +14,12 @@ func OpenV010(ctx context.Context, dsn string) (*Store, error) {
 	return open(ctx, dsn, 1)
 }
 
+// SetSnapshotWrittenHook installs fn as the hook that CreateCheckpoint of s
+// calls once the reference snapshot is written, before created_at is stamped.
+func (s *Store) SetSnapshotWrittenHook(fn func()) {
+	s.snapshotWritten = fn
+}
+
 // SetRetryHook installs fn as the hook called for every retried transaction and
 // returns the function that removes it.
 func SetRetryHook(fn func(err error)) (restore func()) {
