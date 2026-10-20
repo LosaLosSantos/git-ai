@@ -28,10 +28,10 @@ const intentsFileName = "changelog.intents"
 // committed answers nothing.
 //
 // The file is JSON lines, appended under the lock file of the intents and fsync'd before the
-// prepared phase ends. Unlike the index it is not derived data. An intent is dropped by a
-// compaction once the changelog confirms it (a record of its land with its landed commit) or
-// supersedes it (a later record of the same original commit on the branch); the intent of an
-// update that was never committed and never landed again stays.
+// prepared phase ends. Unlike the index it is not derived data. An intent carries the invocation
+// of its update, and so does the changelog entry that the update writes once it is committed
+// (Entry.LandInvocation): a compaction drops an intent once the entry of its own update is
+// durable, and only then. The intent of an update that was never committed stays.
 
 // landIntent is one line of the intents file.
 type landIntent struct {
@@ -40,10 +40,8 @@ type landIntent struct {
 	Reference []byte `json:"ref"`
 	Original  string `json:"original"`
 	Landed    string `json:"landed"`
-	// Head is the sequence of the last durable changelog entry when the intent was recorded. The
-	// entry of the land, if any, comes after it, so a record of the same commit at a later
-	// sequence confirms or supersedes the intent.
-	Head uint64 `json:"head"`
+	// Invocation identifies the update that recorded the intent, see Entry.LandInvocation.
+	Invocation string `json:"invocation"`
 }
 
 // intentsPath returns the path of the intents file of the repository whose git directory is
@@ -52,74 +50,144 @@ func intentsPath(repoPath string) string {
 	return filepath.Join(repoPath, dirName, intentsFileName)
 }
 
-// intentDirsSynced holds the intents files of this process whose directory entries are durable,
-// see RecordLandIntents.
-var intentDirsSynced sync.Map
+// intentsFileKey identifies an intents file: its path, and the file at that path.
+type intentsFileKey struct {
+	path          string
+	device, inode uint64
+}
+
+var (
+	// intentDirsSynced holds the intents files of this process whose directory entries are
+	// durable, see RecordLandIntents. A file created again at the same path, as with a
+	// repository created again, is another file.
+	intentDirsSynced sync.Map
+	// intentsCompactionSize holds, by path, the size of the intents file when RecordLandIntents
+	// last asked for a compaction, see compactionDue.
+	intentsCompactionSize sync.Map
+)
 
 // RecordLandIntents records durably, in the repository whose git directory is repoPath, that the
-// update of reference about to be committed lands lands (see the comment above landIntent). It
-// returns once the intents are fsync'd; an error must abort the update, which would otherwise be
-// committed without its identity.
-func RecordLandIntents(repoPath, reference string, lands []Land) error {
-	head, err := readLogHead(repoPath)
-	if err != nil {
-		return err
-	}
-
+// update of reference about to be committed lands lands, as the update identified by invocation
+// (see the comment above landIntent). It returns once the intents are fsync'd; an error must abort
+// the update, which would otherwise be committed without its identity. compact reports that the
+// file grew so that its compaction is due: the caller runs CompactLandIntents, outside the locks
+// of the update.
+func RecordLandIntents(repoPath, reference, invocation string, lands []Land) (compact bool, err error) {
 	path := intentsPath(repoPath)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("creating changelog directory: %w", err)
+		return false, fmt.Errorf("creating changelog directory: %w", err)
 	}
 
 	unlock, err := lockFile(path + lockSuffix)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer unlock()
 
+	_, statErr := os.Stat(path)
+	created := errors.Is(statErr, fs.ErrNotExist)
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return fmt.Errorf("opening land intents: %w", err)
+		return false, fmt.Errorf("opening land intents: %w", err)
 	}
 	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return false, fmt.Errorf("stat land intents: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("stat land intents: no file identity in %T", info.Sys())
+	}
 
 	// The bytes after the last newline are a torn line of a writer that crashed before its fsync,
 	// whose update was therefore never committed. They are cut off, or the next line would be
 	// joined to them.
 	end, err := endOfLastLine(f)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	var buf bytes.Buffer
 	for _, land := range lands {
-		line, err := json.Marshal(landIntent{Reference: []byte(reference), Original: land.Original, Landed: land.Landed, Head: head.sequence})
+		line, err := json.Marshal(landIntent{Reference: []byte(reference), Original: land.Original, Landed: land.Landed, Invocation: invocation})
 		if err != nil {
-			return fmt.Errorf("encoding land intent: %w", err)
+			return false, fmt.Errorf("encoding land intent: %w", err)
 		}
 		buf.Write(line)
 		buf.WriteByte('\n')
 	}
 
 	if err := truncateFile(f, end); err != nil {
-		return fmt.Errorf("truncating land intents: %w", err)
+		return false, fmt.Errorf("truncating land intents: %w", err)
 	}
 	if _, err := f.WriteAt(buf.Bytes(), end); err != nil {
-		return fmt.Errorf("writing land intents: %w", err)
+		return false, fmt.Errorf("writing land intents: %w", err)
 	}
 	if err := syncFile(f); err != nil {
-		return fmt.Errorf("syncing land intents: %w", err)
+		return false, fmt.Errorf("syncing land intents: %w", err)
 	}
 
-	// The intents are durable only once the directory entries of their file are, which a writer
-	// that created the file may have crashed before syncing: the first write of this process
-	// syncs them.
-	if _, synced := intentDirsSynced.Load(path); !synced {
+	// The intents are durable only once the directory entries of their file are: when this write
+	// created the file, and on the first write of this process to the file, which a writer that
+	// created it may have crashed before syncing.
+	key := intentsFileKey{path: path, device: uint64(stat.Dev), inode: stat.Ino}
+	if _, synced := intentDirsSynced.Load(key); created || !synced {
 		if err := syncLogDirs(repoPath, path); err != nil {
-			return err
+			return false, err
 		}
-		intentDirsSynced.Store(path, struct{}{})
+		intentDirsSynced.Store(key, struct{}{})
 	}
+
+	return compactionDue(path, end+int64(buf.Len())), nil
+}
+
+// compactionDue reports whether an intents file of the given size is due for a compaction: from
+// compactIntentsMinSize on, each time it doubled since the last time it was due, or since the last
+// CompactLandIntents left it, in this process.
+func compactionDue(path string, size int64) bool {
+	if size < compactIntentsMinSize {
+		return false
+	}
+
+	last, _ := intentsCompactionSize.Load(path)
+	if lastSize, ok := last.(int64); ok && size < 2*lastSize {
+		return false
+	}
+
+	intentsCompactionSize.Store(path, size)
+	return true
+}
+
+// compactionsRunning holds the repositories whose intents CompactLandIntents compacts right now.
+var compactionsRunning sync.Map
+
+// CompactLandIntents brings the land index of the repository whose git directory is repoPath up to
+// its changelog and intents, which compacts the intents file when enough of its intents are
+// confirmed (see landsIndex.catchUpIntents). RecordLandIntents asks for it, so that the intents of
+// a repository whose lands never look up an earlier land (fast-forwards only) are compacted too. A
+// call while another one runs for the repository returns at once.
+func CompactLandIntents(repoPath string) error {
+	if _, running := compactionsRunning.LoadOrStore(repoPath, struct{}{}); running {
+		return nil
+	}
+	defer compactionsRunning.Delete(repoPath)
+
+	index, release := acquireLandsIndex(landsPath(repoPath))
+	defer release()
+
+	index.mu.Lock()
+	defer index.mu.Unlock()
+
+	if err := index.catchUp(repoPath); err != nil {
+		index.forget()
+		return err
+	}
+
+	// The next compaction is due once the file doubled from what this one left.
+	intentsCompactionSize.Store(intentsPath(repoPath), index.intentsFile.offset)
 
 	return nil
 }
@@ -148,10 +216,11 @@ type intentsFile struct {
 }
 
 // readIntents reads the complete lines of the intents file at path after known, calling add for
-// each intent. It returns what the reader knows of the file after the read. When the file is not
-// the one known (it was replaced) or is shorter (it was replaced or cut), it is read from the
-// start and reset is true: the intents read before do not describe it any more. A missing file has
-// no intents.
+// each intent, and returns what the reader knows of the file after the read. A reader that knows
+// nothing of the file (the zero known) reads it from its start. When the file is not the one known
+// (it was replaced) or is shorter (it was replaced or cut), nothing is read and reset is true: the
+// intents read before do not describe it, and the caller drops them and reads it again knowing
+// nothing. A missing file has no intents.
 func readIntents(path string, known intentsFile, add func(landIntent)) (intentsFile, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -172,9 +241,8 @@ func readIntents(path string, known intentsFile, add func(landIntent)) (intentsF
 	}
 
 	current := intentsFile{device: uint64(stat.Dev), inode: stat.Ino, offset: known.offset}
-	reset := current.device != known.device || current.inode != known.inode || info.Size() < known.offset
-	if reset {
-		current.offset = 0
+	if known != (intentsFile{}) && (current.device != known.device || current.inode != known.inode || info.Size() < known.offset) {
+		return intentsFile{}, true, nil
 	}
 
 	r := bufio.NewReader(io.NewSectionReader(f, current.offset, info.Size()-current.offset))
@@ -199,7 +267,7 @@ func readIntents(path string, known intentsFile, add func(landIntent)) (intentsF
 		add(intent)
 	}
 
-	return current, reset, nil
+	return current, false, nil
 }
 
 // compactIntents rewrites the intents file at path without the intents that drop says may go,

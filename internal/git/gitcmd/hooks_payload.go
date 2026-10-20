@@ -264,7 +264,13 @@ func NewHooksPayload(
 	id, hasIdentity := identity.FromContext(ctx)
 
 	members, membersTruncated := capChangelogMembers(changelog.BatchFromContext(ctx))
-	landReference, lands := changelog.LandsFromContext(ctx)
+	// The payload holds no branch for an update that lands nothing: an empty slice would not
+	// survive the encoding (omitempty), and the decoded payload would differ.
+	var landReference []byte
+	reference, lands := changelog.LandsFromContext(ctx)
+	if reference != "" {
+		landReference = []byte(reference)
+	}
 
 	return HooksPayload{
 		Repo: &gitalypb.Repository{
@@ -293,7 +299,7 @@ func NewHooksPayload(
 			Rewritten:        changelog.IsRewritten(ctx),
 			Members:          members,
 			MembersTruncated: membersTruncated,
-			LandReference:    []byte(landReference),
+			LandReference:    landReference,
 			Lands:            lands,
 			MVCCCommit:       mvccCommitHandle(ctx, cfg),
 		},

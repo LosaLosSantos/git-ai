@@ -97,6 +97,11 @@ type Entry struct {
 	// recorded on every land path and are never cut (see Land, WithLands and doc/graft/PLAN11.md).
 	// They are empty for updates that are not lands.
 	Lands []Land `json:"lands,omitempty"`
+	// LandInvocation identifies the update that landed Lands: the invocation of its reference
+	// transaction (see gitcmd.ChangelogMeta.Invocation), which its land intents carry too. A land
+	// intent is confirmed, and may go, once the entry of its own update is durable. It is empty
+	// without Lands.
+	LandInvocation string `json:"land_invocation,omitempty"`
 }
 
 // entryFields is Entry without its JSON methods.
@@ -175,6 +180,9 @@ type Meta struct {
 	// LandReference is the branch that Lands landed on. Only the entry of the update of that
 	// branch carries them (see LandsOf).
 	LandReference string
+	// LandInvocation identifies the update that recorded Lands, as its land intents do (see
+	// Entry.LandInvocation).
+	LandInvocation string
 	// Lands are the identities of the changes that the updates landed, see Entry.Lands.
 	Lands []Land
 }
@@ -482,6 +490,7 @@ func (s *logState) appendLocked(repoPath, path string, records []Record, entries
 				Members:          normalizeMembers(meta.Members),
 				MembersTruncated: meta.MembersTruncated,
 				Lands:            LandsOf(meta, update.Reference),
+				LandInvocation:   LandInvocationOf(meta, update.Reference),
 			}
 
 			line, err := json.Marshal(entry)

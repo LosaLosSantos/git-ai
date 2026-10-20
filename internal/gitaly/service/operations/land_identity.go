@@ -85,14 +85,16 @@ func (a *landingAttempt) landedEarlier(ctx context.Context, reference git.Refere
 
 		onBranch, err := a.repo.IsAncestor(ctx, landed.Revision(), tip.Revision())
 		if err != nil {
-			// The commit does not exist: an intent of an update that was not committed, whose
-			// objects were never migrated, or a land whose branch was reset past it and whose
-			// commit was pruned since. Either way the change is not on the branch through it.
+			// The commit does not exist: it was pruned since, after the branch was reset past it,
+			// or its update was aborted and its objects pruned. The change is not on the branch
+			// through it.
 			if errors.As(err, new(localrepo.InvalidCommitError)) {
 				continue
 			}
 			return nil, structerr.NewInternal("checking the earlier land of %s: %w", commitID, err)
 		}
+		// An update migrates its objects before it is prepared, so the commit of an intent whose
+		// update was aborted exists, off the branch, and does not answer.
 		if !onBranch {
 			continue
 		}

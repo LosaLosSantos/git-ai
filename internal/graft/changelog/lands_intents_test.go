@@ -12,10 +12,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// recordIntent records the intent of a land of original on reference as landed.
+// invocationOf returns the invocation that the tests give the update of the land of original.
+func invocationOf(original string) string { return "inv-" + original }
+
+// recordIntent records the intent of a land of original on reference as landed, by the update
+// invocationOf(original).
 func recordIntent(t *testing.T, repoPath, reference, original, landed string) {
 	t.Helper()
-	require.NoError(t, RecordLandIntents(repoPath, reference, []Land{{Original: original, Landed: landed}}))
+	_, err := RecordLandIntents(repoPath, reference, invocationOf(original), []Land{{Original: original, Landed: landed}})
+	require.NoError(t, err)
+}
+
+// confirmLand records the changelog entry of the update invocation, which landed original as
+// landed on reference.
+func confirmLand(t *testing.T, repoPath, reference, original, landed, invocation string) uint64 {
+	t.Helper()
+
+	entries, err := Append(repoPath, Meta{Operation: "land", LandReference: reference, LandInvocation: invocation, Lands: []Land{{Original: original, Landed: landed}}},
+		[]Update{{Reference: reference, OldOID: landOID(0), NewOID: landed}})
+	require.NoError(t, err)
+	return entries[0].Sequence
 }
 
 // intentsOf returns the intents in the intents file of the repository.
@@ -43,26 +59,28 @@ func TestLookupLandAnswersFromIntents(t *testing.T) {
 		require.Empty(t, lookupAll(t, repoPath, "refs/heads/other", landOID(1)))
 	})
 
-	t.Run("an intent that the changelog confirms", func(t *testing.T) {
+	t.Run("an intent of the recorded commit", func(t *testing.T) {
 		repoPath := t.TempDir()
 		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
-		seq := appendLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
+		seq := confirmLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2), invocationOf(landOID(1)))
 
 		require.Equal(t, []LandRecord{{Sequence: seq, Landed: landOID(2)}}, lookupAll(t, repoPath, "refs/heads/main", landOID(1)))
 	})
 
-	t.Run("an intent that a later land supersedes", func(t *testing.T) {
-		// The update of the intent was not committed, and the change was landed again.
+	t.Run("an intent of another commit than the recorded one", func(t *testing.T) {
+		// Review m1: land A of X is committed and its entry is pending; the branch is reset; land
+		// B of X is committed with its intent; A's entry is written, and B's is lost. The intent
+		// of B is not left out because a record came after it: it proves B by itself, when its
+		// commit is on the branch.
 		repoPath := t.TempDir()
-		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
-		seq := appendLand(t, repoPath, "refs/heads/main", landOID(1), landOID(3))
+		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(3))
+		seq := confirmLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2), "inv-a")
 
-		require.Equal(t, []LandRecord{{Sequence: seq, Landed: landOID(3)}}, lookupAll(t, repoPath, "refs/heads/main", landOID(1)))
+		require.Equal(t, []LandRecord{{Sequence: seq, Landed: landOID(2)}, {Landed: landOID(3)}},
+			lookupAll(t, repoPath, "refs/heads/main", landOID(1)))
 	})
 
 	t.Run("an intent after the recorded land", func(t *testing.T) {
-		// The change landed, the branch was reset past it, and its new land was committed
-		// without the changelog recording it: both are known, the record first.
 		repoPath := t.TempDir()
 		seq := appendLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
 		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(3))
@@ -86,6 +104,17 @@ func TestLookupLandAnswersFromIntents(t *testing.T) {
 
 		recordIntent(t, repoPath, "refs/heads/main", landOID(3), landOID(4))
 		require.Equal(t, []LandRecord{{Landed: landOID(4)}}, lookupAll(t, repoPath, "refs/heads/main", landOID(3)))
+	})
+
+	t.Run("the entry carries the invocation of its update", func(t *testing.T) {
+		repoPath := t.TempDir()
+		confirmLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2), "inv-x")
+		appendPlain(t, repoPath, "refs/heads/main", landOID(9))
+
+		entries, err := List(repoPath, 0, 10)
+		require.NoError(t, err)
+		require.Equal(t, "inv-x", entries[0].LandInvocation)
+		require.Empty(t, entries[1].LandInvocation, "an entry without lands has no invocation")
 	})
 }
 
@@ -117,18 +146,30 @@ func TestLandIntentsFile(t *testing.T) {
 		require.Equal(t, []LandRecord{{Landed: landOID(2)}}, lookupAll(t, repoPath, "refs/heads/main", landOID(1)))
 	})
 
-	t.Run("an intent records the head of the log", func(t *testing.T) {
+	t.Run("an intent carries the invocation of its update", func(t *testing.T) {
 		repoPath := t.TempDir()
-		seq := appendPlain(t, repoPath, "refs/heads/main", landOID(9))
 		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
 
 		intents := intentsOf(t, repoPath)
 		require.Len(t, intents, 1)
-		require.Equal(t, seq, intents[0].Head)
+		require.Equal(t, invocationOf(landOID(1)), intents[0].Invocation)
+	})
+
+	t.Run("a reader that knows nothing reads the file once", func(t *testing.T) {
+		repoPath := t.TempDir()
+		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
+		recordIntent(t, repoPath, "refs/heads/main", landOID(3), landOID(4))
+
+		read := 0
+		known, reset, err := readIntents(intentsPath(repoPath), intentsFile{}, func(landIntent) { read++ })
+		require.NoError(t, err)
+		require.False(t, reset)
+		require.Equal(t, 2, read)
+		require.Equal(t, fileSize(t, intentsPath(repoPath)), known.offset)
 	})
 }
 
-// TestLandIntentsAreDurable replaces syncFile, so it does not run in parallel.
+// TestLandIntentsAreDurable replaces syncFile and syncDir, so it does not run in parallel.
 func TestLandIntentsAreDurable(t *testing.T) {
 	t.Run("the intents are fsync'd before they return", func(t *testing.T) {
 		repoPath := t.TempDir()
@@ -151,77 +192,137 @@ func TestLandIntentsAreDurable(t *testing.T) {
 			return f.Sync()
 		})
 
-		require.ErrorContains(t, RecordLandIntents(repoPath, "refs/heads/main", []Land{{Original: landOID(1), Landed: landOID(2)}}), "injected")
+		_, err := RecordLandIntents(repoPath, "refs/heads/main", "inv", []Land{{Original: landOID(1), Landed: landOID(2)}})
+		require.ErrorContains(t, err, "injected")
+	})
+
+	t.Run("the directories are synced for a file created again", func(t *testing.T) {
+		// Review m3: the repository is removed and created again at the same path. The intents
+		// file of the new repository is another file, whose directory entries are synced.
+		repoPath := t.TempDir()
+		dirSyncs := 0
+		original := syncDir
+		syncDir = func(dir string) error {
+			dirSyncs++
+			return original(dir)
+		}
+		t.Cleanup(func() { syncDir = original })
+
+		recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
+		require.Positive(t, dirSyncs, "the write that created the file syncs the directories")
+
+		dirSyncs = 0
+		recordIntent(t, repoPath, "refs/heads/main", landOID(3), landOID(4))
+		require.Zero(t, dirSyncs, "a later write to the same file does not")
+
+		require.NoError(t, os.RemoveAll(filepath.Join(repoPath, dirName)))
+		recordIntent(t, repoPath, "refs/heads/main", landOID(5), landOID(6))
+		require.Positive(t, dirSyncs, "the write that created the file again syncs the directories")
 	})
 }
 
 func TestLandIntentsCompaction(t *testing.T) {
 	t.Parallel()
 
-	repoPath := t.TempDir()
-
-	// Enough intents to compact the file: half of them confirmed by the changelog, a quarter
-	// superseded by a later land, a quarter never committed and never landed again.
-	const n = 2000
-	lands := make([]Land, n)
-	for i := range lands {
-		lands[i] = Land{Original: landOID(10000 + i), Landed: landOID(20000 + i)}
-	}
-	require.NoError(t, RecordLandIntents(repoPath, "refs/heads/main", lands))
-	require.Greater(t, fileSize(t, intentsPath(repoPath)), int64(compactIntentsMinSize))
-
-	var confirmed []Land
-	for i := 0; i < n/2; i++ {
-		confirmed = append(confirmed, lands[i])
-	}
-	for i := n / 2; i < 3*n/4; i++ {
-		confirmed = append(confirmed, Land{Original: lands[i].Original, Landed: landOID(30000 + i)})
-	}
-	updates := make([]Update, 0, len(confirmed))
-	for i := range confirmed {
-		updates = append(updates, Update{Reference: "refs/heads/main", OldOID: landOID(0), NewOID: landOID(40000 + i)})
-	}
-	// One entry per land, each carrying its own land.
-	records := make([]Record, len(confirmed))
-	for i, land := range confirmed {
-		records[i] = Record{Meta: Meta{Operation: "land", LandReference: "refs/heads/main", Lands: []Land{land}}, Updates: updates[i : i+1]}
-	}
-	_, err := AppendGroup(repoPath, records)
-	require.NoError(t, err)
-
-	lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
-
-	kept := intentsOf(t, repoPath)
-	require.Len(t, kept, n/4, "only the intents that the changelog neither confirms nor supersedes are kept")
-	for _, intent := range kept {
-		require.True(t, strings.Compare(intent.Original, landOID(10000+3*n/4)) >= 0)
-	}
-
-	// The kept intents, more than the size from which a file is compacted, are not rewritten by
-	// every lookup.
-	require.Greater(t, fileSize(t, intentsPath(repoPath)), int64(compactIntentsMinSize))
-	compacted, err := os.Stat(intentsPath(repoPath))
-	require.NoError(t, err)
-	lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
-	again, err := os.Stat(intentsPath(repoPath))
-	require.NoError(t, err)
-	require.True(t, os.SameFile(compacted, again))
-
-	// Every land is still answered as before the compaction, also by a new process.
-	forgetLandsIndex(t, repoPath)
-	for i, land := range lands {
-		records := lookupAll(t, repoPath, "refs/heads/main", land.Original)
-		require.Len(t, records, 1)
-		switch {
-		case i < n/2:
-			require.Equal(t, land.Landed, records[0].Landed)
-			require.NotZero(t, records[0].Sequence)
-		case i < 3*n/4:
-			require.Equal(t, landOID(30000+i), records[0].Landed)
-		default:
-			require.Equal(t, LandRecord{Landed: land.Landed}, records[0])
+	// recordAndConfirm records n intents in one update each, and the changelog entries of the
+	// updates of the first confirmed of them. The entries of the next superseded intents' commits
+	// are written by other updates, with other landed commits: they do not confirm the intents.
+	recordAndConfirm := func(t *testing.T, repoPath string, n, confirmed, superseded int) []Land {
+		lands := make([]Land, n)
+		for i := range lands {
+			lands[i] = Land{Original: landOID(10000 + i), Landed: landOID(20000 + i)}
+			_, err := RecordLandIntents(repoPath, "refs/heads/main", invocationOf(lands[i].Original), lands[i:i+1])
+			require.NoError(t, err)
 		}
+
+		var records []Record
+		for i := 0; i < confirmed+superseded; i++ {
+			land, invocation := lands[i], invocationOf(lands[i].Original)
+			if i >= confirmed {
+				land, invocation = Land{Original: lands[i].Original, Landed: landOID(30000 + i)}, "inv-other"
+			}
+			records = append(records, Record{
+				Meta:    Meta{Operation: "land", LandReference: "refs/heads/main", LandInvocation: invocation, Lands: []Land{land}},
+				Updates: []Update{{Reference: "refs/heads/main", OldOID: landOID(0), NewOID: landOID(40000 + i)}},
+			})
+		}
+		_, err := AppendGroup(repoPath, records)
+		require.NoError(t, err)
+
+		return lands
 	}
+
+	t.Run("an intent goes once the entry of its own update is durable", func(t *testing.T) {
+		repoPath := t.TempDir()
+		const n = 2000
+		lands := recordAndConfirm(t, repoPath, n, 3*n/4, n/8)
+		require.Greater(t, fileSize(t, intentsPath(repoPath)), int64(compactIntentsMinSize))
+
+		lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
+
+		kept := intentsOf(t, repoPath)
+		require.Len(t, kept, n/4, "the intents whose own update has no entry stay, also those of a recorded commit")
+		for _, intent := range kept {
+			require.True(t, strings.Compare(intent.Original, landOID(10000+3*n/4)) >= 0)
+		}
+
+		// Every land is still answered as before the compaction, also by a new process.
+		forgetLandsIndex(t, repoPath)
+		for i, land := range lands {
+			records := lookupAll(t, repoPath, "refs/heads/main", land.Original)
+			switch {
+			case i < 3*n/4:
+				require.Len(t, records, 1)
+				require.Equal(t, land.Landed, records[0].Landed)
+				require.NotZero(t, records[0].Sequence)
+			case i < 3*n/4+n/8:
+				require.Equal(t, []LandRecord{{Sequence: records[0].Sequence, Landed: landOID(30000 + i)}, {Landed: land.Landed}}, records)
+			default:
+				require.Equal(t, []LandRecord{{Landed: land.Landed}}, records)
+			}
+		}
+	})
+
+	t.Run("intents that must stay are not rewritten again", func(t *testing.T) {
+		// Review m4: after a compaction, also in a new process, the intents that stay are not
+		// rewritten while too few of them may go.
+		repoPath := t.TempDir()
+		const n = 2000
+		recordAndConfirm(t, repoPath, n, n/2, 0)
+		lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
+		require.Len(t, intentsOf(t, repoPath), n/2)
+		require.Greater(t, fileSize(t, intentsPath(repoPath)), int64(compactIntentsMinSize))
+
+		compacted, err := os.Stat(intentsPath(repoPath))
+		require.NoError(t, err)
+		lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
+		forgetLandsIndex(t, repoPath)
+		lookupAll(t, repoPath, "refs/heads/main", landOID(10000))
+		again, err := os.Stat(intentsPath(repoPath))
+		require.NoError(t, err)
+		require.True(t, os.SameFile(compacted, again))
+	})
+
+	t.Run("the intents of lands that never look up are compacted too", func(t *testing.T) {
+		// Review m4: fast-forward lands never look up an earlier land. The append asks for the
+		// compaction once the file grew, and CompactLandIntents does it.
+		repoPath := t.TempDir()
+		const n = 1000
+		var due bool
+		for i := 0; i < n; i++ {
+			land := Land{Original: landOID(10000 + i), Landed: landOID(10000 + i)}
+			compact, err := RecordLandIntents(repoPath, "refs/heads/main", invocationOf(land.Original), []Land{land})
+			require.NoError(t, err)
+			confirmLand(t, repoPath, "refs/heads/main", land.Original, land.Landed, invocationOf(land.Original))
+			if compact {
+				due = true
+				require.NoError(t, CompactLandIntents(repoPath))
+			}
+		}
+
+		require.True(t, due, "the append asked for a compaction")
+		require.Less(t, fileSize(t, intentsPath(repoPath)), int64(compactIntentsMinSize))
+	})
 }
 
 func TestLandsIndexCompaction(t *testing.T) {

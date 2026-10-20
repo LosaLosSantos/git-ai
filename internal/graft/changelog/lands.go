@@ -70,7 +70,8 @@ var fullBatchLandsSize = func() int {
 // too long for them cannot be landed on, since a land would not record its identity.
 func CheckLandReference(reference string) error {
 	if size := fullBatchLandsSize + base64.StdEncoding.EncodedLen(len(reference)); size > MaxLandsSize {
-		return fmt.Errorf("the name of branch %q is too long to record the identity of a land on it: %d bytes, at most %d",
+		// The name is too long to be quoted whole: its first bytes say which branch it is.
+		return fmt.Errorf("the name of branch %.64q... is too long to record the identity of a land on it: %d bytes, at most %d",
 			reference, len(reference), (MaxLandsSize-fullBatchLandsSize)/4*3)
 	}
 	return nil
@@ -162,4 +163,14 @@ func LandsOf(meta Meta, reference string) []Land {
 	}
 
 	return append([]Land(nil), meta.Lands...)
+}
+
+// LandInvocationOf returns the invocation that the changelog entry of an update of reference
+// carries under meta with its lands, see Entry.LandInvocation: empty when it carries no lands.
+func LandInvocationOf(meta Meta, reference string) string {
+	if len(LandsOf(meta, reference)) == 0 {
+		return ""
+	}
+
+	return meta.LandInvocation
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -15,8 +16,13 @@ import (
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
+	"github.com/feder-cr/git-ai/internal/gitaly/transaction"
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
+	"github.com/feder-cr/git-ai/internal/grpc/metadata"
 	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testserver"
+	"github.com/feder-cr/git-ai/internal/transaction/txinfo"
+	"github.com/feder-cr/git-ai/internal/transaction/voting"
 )
 
 // TestLandBatch_retryAfterALostResponse lands two changes by rebase in one batch, and then lands
@@ -113,9 +119,9 @@ func testUserLandIntentAnswersWhatTheChangelogMisses(t *testing.T, ctx context.C
 	requireBranchAt(t, cfg, fx.repoPath, git.DefaultBranch, landed)
 }
 
-// TestUserLand_intentOfAnUncommittedUpdateAnswersNothing records intents whose updates git never
-// committed, as an update that was aborted after its prepared phase leaves them: their landed
-// commit is not on the branch, so the change lands.
+// TestUserLand_intentOfAnUncommittedUpdateAnswersNothing aborts a land after the prepared phase of
+// its update, which leaves its intent: the intent's landed commit exists (the objects of an update
+// are migrated before it is prepared) but is not on the branch, so the next land lands the change.
 func TestUserLand_intentOfAnUncommittedUpdateAnswersNothing(t *testing.T) {
 	t.Parallel()
 
@@ -125,19 +131,46 @@ func TestUserLand_intentOfAnUncommittedUpdateAnswersNothing(t *testing.T) {
 func testUserLandIntentOfAnUncommittedUpdateAnswersNothing(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupOperationsService(t, ctx)
+	txManager := transaction.MockManager{}
+	ctx, cfg, client := setupOperationsService(t, ctx, testserver.WithTransactionManager(&txManager))
+
+	ctx, err := txinfo.InjectTransaction(ctx, 1, "node", true)
+	require.NoError(t, err)
+	ctx = metadata.IncomingToOutgoing(ctx)
+
+	// The repository is set up without the transaction failing.
+	txManager.VoteFn = func(context.Context, txinfo.Transaction, voting.Vote, voting.Phase) error { return nil }
 	fx := newRetryFixture(t, ctx, cfg)
 
-	// One intent names a commit that does not exist, the other one that is not on the branch.
-	require.NoError(t, changelog.RecordLandIntents(fx.repoPath, git.DefaultRef.String(), []changelog.Land{
-		{Original: fx.change.String(), Landed: strings.Repeat("1", len(fx.change))},
-		{Original: fx.change.String(), Landed: fx.change.String()},
-	}))
+	// The first land fails its vote in the prepared phase of its update, after the hook recorded
+	// its intent: git aborts the update. Its objects were migrated before the update, so its
+	// landed commit exists, off the branch.
+	var failed atomic.Bool
+	txManager.VoteFn = func(_ context.Context, _ txinfo.Transaction, _ voting.Vote, phase voting.Phase) error {
+		if phase == voting.Prepared && failed.CompareAndSwap(false, true) {
+			return errors.New("the transaction lost its quorum")
+		}
+		return nil
+	}
 
-	resp, err := client.UserLand(ctx, landRequest(fx.repoProto, git.DefaultBranch, fx.change))
+	request := landRequest(fx.repoProto, git.DefaultBranch, fx.change)
+	_, err = client.UserLand(ctx, request)
+	require.Error(t, err)
+	require.True(t, failed.Load())
+	requireBranchAt(t, cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+
+	records, err := changelog.LookupLand(fx.repoPath, git.DefaultRef.String(), fx.change.String())
 	require.NoError(t, err)
-	require.False(t, resp.GetAlreadyLanded())
-	require.True(t, resp.GetRewritten())
+	require.Len(t, records, 1, "the aborted update left its intent")
+	aborted := records[0].Landed
+	require.Equal(t, "commit\n", string(gittest.Exec(t, cfg, "-C", fx.repoPath, "cat-file", "-t", aborted)), "the aborted commit exists")
+
+	// The intent's commit is not on the branch, so the land lands the change.
+	second, err := client.UserLand(ctx, request)
+	require.NoError(t, err)
+	require.False(t, second.GetAlreadyLanded())
+	require.True(t, second.GetRewritten())
+	requireBranchAt(t, cfg, fx.repoPath, git.DefaultBranch, git.ObjectID(second.GetLandedCommitId()))
 }
 
 // TestUserLand_identityOfABranchWhoseNameIsNotUTF8 lands a change by rebase on a branch whose name
@@ -247,6 +280,58 @@ func TestUserLand_branchNameTooLongForTheIdentity(t *testing.T) {
 	_, err := client.UserLand(ctx, landRequest(fx.repoProto, branch, fx.change))
 	testhelper.RequireGrpcCode(t, err, codes.InvalidArgument)
 	require.ErrorContains(t, err, "is too long to record the identity of a land on it")
+	require.Less(t, len(err.Error()), 512, "the error quotes the beginning of the name, not all of it")
+}
+
+// TestLandBatch_intentAnswersWhatTheChangelogMisses lands two changes in one batch, loses the
+// changelog entry of their update, and lands them again: the intents the hook recorded for the
+// batch's update answer.
+func TestLandBatch_intentAnswersWhatTheChangelogMisses(t *testing.T) {
+	t.Parallel()
+
+	runLandBatchTest(t, testLandBatchIntentAnswersWhatTheChangelogMisses)
+}
+
+func testLandBatchIntentAnswersWhatTheChangelogMisses(t *testing.T, ctx context.Context) {
+	t.Parallel()
+
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(nil))
+	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
+
+	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(baseEntry))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithParents(base),
+		gittest.WithTreeEntries(baseEntry, gittest.TreeEntry{Mode: "100644", Path: "moved", Content: "moved"}))
+	change := func(name string) git.ObjectID {
+		return gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base),
+			gittest.WithTreeEntries(baseEntry, gittest.TreeEntry{Mode: "100644", Path: name, Content: name}))
+	}
+	a, b := change("a"), change("b")
+
+	first, errs := landInOrder(ctx, client, repoProto,
+		agentLanding{agent: "agent-a", commit: a},
+		agentLanding{agent: "agent-b", commit: b},
+	)
+	for i := range errs {
+		require.NoError(t, errs[i])
+		require.Equal(t, int32(2), first[i].GetBatchSize(), "both changes land in one batch")
+	}
+	tip := gittest.ResolveRevision(t, cfg, repoPath, git.DefaultRef.String())
+
+	// The changelog lost the entry of the batch's update, its only entry.
+	require.NoError(t, os.Remove(changelog.Path(repoPath)))
+
+	second, errs := landInOrder(ctx, client, repoProto,
+		agentLanding{agent: "agent-a", commit: a},
+		agentLanding{agent: "agent-b", commit: b},
+	)
+	for i := range errs {
+		require.NoError(t, errs[i])
+		require.True(t, second[i].GetAlreadyLanded())
+		require.Equal(t, first[i].GetLandedCommitId(), second[i].GetLandedCommitId())
+		require.Zero(t, second[i].GetLandedSequence())
+	}
+	requireBranchAt(t, cfg, repoPath, git.DefaultBranch, tip)
 }
 
 // TestLandBatchExecutorRetryInTheBatchOfItsFirstLand puts a request and its retry in one batch:

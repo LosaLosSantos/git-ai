@@ -226,7 +226,22 @@ func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcm
 		return fmt.Errorf("resolving repository path: %w", err)
 	}
 
-	return changelog.RecordLandIntents(repoPath, string(meta.LandReference), meta.Lands)
+	compact, err := changelog.RecordLandIntents(repoPath, string(meta.LandReference), meta.Invocation, meta.Lands)
+	if err != nil {
+		return err
+	}
+
+	// The compaction reads the changelog and rewrites the intents: it runs after the hook, not
+	// under the locks of the references, and its failure leaves the intents as they are.
+	if compact {
+		go func() {
+			if err := changelog.CompactLandIntents(repoPath); err != nil {
+				m.logger.WithError(err).WithField("repository", repoPath).Error("graft: compacting the land intents failed")
+			}
+		}()
+	}
+
+	return nil
 }
 
 // prepareChangesets gives the prepared transaction its place in the order of the changeset log,
