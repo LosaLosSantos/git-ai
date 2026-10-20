@@ -143,8 +143,15 @@ func (fx resolveFixture) laneQueueDepth(t *testing.T) float64 {
 	t.Helper()
 
 	require.NotNil(t, fx.lanes, "the fixture has no lanes of its own")
+	return lanesQueueDepth(t, fx.lanes)
+}
+
+// lanesQueueDepth returns the number of land requests queued in lanes.
+func lanesQueueDepth(t *testing.T, lanes *landlane.Shared) float64 {
+	t.Helper()
+
 	reg := prometheus.NewPedanticRegistry()
-	require.NoError(t, reg.Register(fx.lanes))
+	require.NoError(t, reg.Register(lanes))
 	families, err := reg.Gather()
 	require.NoError(t, err)
 	for _, family := range families {

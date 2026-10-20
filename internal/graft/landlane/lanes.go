@@ -61,6 +61,11 @@ type Config struct {
 	// after a batch faster than half of TargetLatency, up to MaxSize. Zero
 	// disables the adaptation: every lane always uses MaxSize.
 	TargetLatency time.Duration
+	// Clock is the time that measures the batches, whose durations drive the
+	// adaptation, and the idle time of the keys (KeyStateTTL). Nil means
+	// time.Now. The window always runs on the time of the system. Tests set it
+	// to decide how long the batches take.
+	Clock func() time.Time
 }
 
 // ConfigFromGraft builds the batching configuration from
@@ -195,7 +200,8 @@ type Registry[Req, Res any] struct {
 	exec Executor[Req, Res]
 	obs  Observer
 	// now measures the duration of the executor calls, which drives the
-	// adaptation of the lanes. Tests replace it with a fake clock.
+	// adaptation of the lanes: Config.Clock, or time.Now. Tests of the package
+	// replace it with a fake clock.
 	now func() time.Time
 
 	// running counts the goroutines that execute batches: lane runners and
@@ -244,12 +250,16 @@ func NewRegistry[Req, Res any](cfg Config, exec Executor[Req, Res], obs Observer
 	if obs == nil {
 		obs = NopObserver{}
 	}
+	now := cfg.Clock
+	if now == nil {
+		now = time.Now
+	}
 
 	return &Registry[Req, Res]{
 		cfg:   cfg,
 		exec:  exec,
 		obs:   obs,
-		now:   time.Now,
+		now:   now,
 		done:  make(chan struct{}),
 		lanes: map[Key]*lane[Req, Res]{},
 		keys:  map[Key]keyState{},

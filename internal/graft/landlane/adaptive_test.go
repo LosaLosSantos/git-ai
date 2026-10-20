@@ -129,8 +129,8 @@ func adaptiveRun(t *testing.T, cfg Config, requests int, durations []time.Durati
 		return out, nil
 	}
 
+	cfg.Clock = clock.now
 	r := newRegistry(t, cfg, exec, obs)
-	r.now = clock.now
 
 	chans := []<-chan result{submitAsync(ctx, r, testKey, "r0")}
 	<-entered

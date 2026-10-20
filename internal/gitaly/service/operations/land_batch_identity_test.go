@@ -45,25 +45,54 @@ func agentInterceptors(log.Logger, localrepo.Factory) ([]grpc.UnaryServerInterce
 	}, nil
 }
 
+// agentLandClient is the client of a service that setupAgentLandService started. lanes are the land
+// lanes of the service when it batches (a standalone configuration), which landInOrder watches; nil
+// otherwise.
+type agentLandClient struct {
+	gitalypb.OperationServiceClient
+	lanes *landlane.Shared
+}
+
 // setupAgentLandService starts an operations service that authenticates requests as the agents they
 // name, and that checks the standalone policy of the configuration.
-func setupAgentLandService(t *testing.T, ctx context.Context, graft config.Graft) (context.Context, config.Cfg, gitalypb.OperationServiceClient) {
+func setupAgentLandService(t *testing.T, ctx context.Context, graft config.Graft) (context.Context, config.Cfg, agentLandClient) {
 	t.Helper()
 
 	cfg := testcfg.Build(t, testcfg.WithBase(config.Cfg{Graft: graft}))
-	return setupOperationsServiceWithCfg(t, ctx, cfg,
+	var lanes *landlane.Shared
+	if graft.Standalone && !graft.Land.Batch.Disabled {
+		laneCfg, err := landlane.ConfigFromGraft(graft.Land.Batch)
+		require.NoError(t, err)
+		lanes = landlane.NewShared(laneCfg)
+		t.Cleanup(lanes.Close)
+	}
+
+	testcfg.BuildGitalySSH(t, cfg)
+	testcfg.BuildGitalyHooks(t, cfg)
+	cfg.SocketPath = runOperationServiceServerWithLanes(t, cfg, lanes,
 		testserver.WithInterceptors(agentInterceptors),
 		testserver.WithGitLabClient(gitlab.NewStandaloneClient(graft, testhelper.NewLogger(t))),
 	)
+	client, conn := newOperationClient(t, cfg.SocketPath)
+	t.Cleanup(func() { conn.Close() })
+	ctx = testhelper.MergeOutgoingMetadata(ctx, testcfg.GitalyServersMetadataFromCfg(t, cfg))
+
+	return ctx, cfg, agentLandClient{OperationServiceClient: client, lanes: lanes}
 }
 
-// agentBatchingGraft is a standalone configuration with the given policy, in which the lanes collect
-// requests for 300ms. That is long enough for landInOrder to put its requests in one batch.
-func agentBatchingGraft(policy []config.GraftPolicyRule) config.Graft {
+// agentBatchingGraft is a standalone configuration with the given policy, in which a lane runs a batch
+// once size requests are queued in it. The window is long enough never to end a batch of a test, and
+// the adaptation is off, so the size holds for every batch: the size landings of a landInOrder call
+// land as one batch, however slowly they reach the lane.
+func agentBatchingGraft(size int, policy []config.GraftPolicyRule) config.Graft {
 	return config.Graft{
 		Standalone: true,
 		Policy:     policy,
-		Land:       config.GraftLand{Batch: config.GraftLandBatch{Window: "300ms"}},
+		Land: config.GraftLand{Batch: config.GraftLandBatch{
+			Window:        "1m",
+			MaxSize:       size,
+			TargetLatency: "0s",
+		}},
 	}
 }
 
@@ -94,21 +123,28 @@ type agentLanding struct {
 	resolve bool
 }
 
-// landInOrder lands the changes concurrently and starts them 30ms apart in the given order, so that they
-// reach their lane in that order. It returns the outcomes in the order of the landings.
-func landInOrder(ctx context.Context, client gitalypb.OperationServiceClient, repo *gitalypb.Repository, landings ...agentLanding) ([]*gitalypb.UserLandResponse, []error) {
+// landInOrder lands the changes concurrently, in the given order: a request starts once every request
+// before it is queued in the lane or has returned, so the requests reach the lane in the order of the
+// landings. A service without lanes of its own (client.lanes is nil) gets the requests all at once. It
+// returns the outcomes in the order of the landings.
+func landInOrder(t *testing.T, ctx context.Context, client agentLandClient, repo *gitalypb.Repository, landings ...agentLanding) ([]*gitalypb.UserLandResponse, []error) {
+	t.Helper()
+
 	responses := make([]*gitalypb.UserLandResponse, len(landings))
 	errs := make([]error, len(landings))
+	returned := make([]chan struct{}, len(landings))
 
 	var wg sync.WaitGroup
 	for i, landing := range landings {
-		if i > 0 {
-			time.Sleep(30 * time.Millisecond)
+		if i > 0 && client.lanes != nil {
+			waitQueuedOrReturned(t, ctx, client.lanes, returned[:i])
 		}
 
+		returned[i] = make(chan struct{})
 		wg.Add(1)
 		go func(i int, landing agentLanding) {
 			defer wg.Done()
+			defer close(returned[i])
 
 			req := landRequest(repo, git.DefaultBranch, landing.commit)
 			if landing.user != nil {
@@ -129,6 +165,36 @@ func landInOrder(ctx context.Context, client gitalypb.OperationServiceClient, re
 	return responses, errs
 }
 
+// waitQueuedOrReturned waits until each of the started requests is queued in the lanes or has returned:
+// until as many requests are queued as have not returned. A request that runs in a batch is neither, so
+// the wait lasts until its batch is over.
+func waitQueuedOrReturned(t *testing.T, ctx context.Context, lanes *landlane.Shared, started []chan struct{}) {
+	t.Helper()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		pending := 0
+		for _, done := range started {
+			select {
+			case <-done:
+			default:
+				pending++
+			}
+		}
+		if lanesQueueDepth(t, lanes) >= float64(pending) {
+			return
+		}
+
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			require.FailNow(t, "the requests did not queue", "%d of them are pending: %v", pending, ctx.Err())
+		}
+	}
+}
+
 // resolverPairEntries returns the tree of a branch whose files a and b hold the given contents.
 func resolverPairEntries(a, b string) []gittest.TreeEntry {
 	return []gittest.TreeEntry{
@@ -142,7 +208,7 @@ func resolverPairEntries(a, b string) []gittest.TreeEntry {
 type resolverBatchFixture struct {
 	ctx         context.Context
 	cfg         config.Cfg
-	client      gitalypb.OperationServiceClient
+	client      agentLandClient
 	repo        *gitalypb.Repository
 	repoPath    string
 	dir         string
@@ -150,14 +216,15 @@ type resolverBatchFixture struct {
 	conflicting git.ObjectID
 }
 
-// newResolverBatchFixture starts the service with conflict resolution for the given actors.
-func newResolverBatchFixture(t *testing.T, ctx context.Context, actors []string) resolverBatchFixture {
+// newResolverBatchFixture starts the service with conflict resolution for the given actors, whose lanes
+// run batches of size requests (agentBatchingGraft).
+func newResolverBatchFixture(t *testing.T, ctx context.Context, size int, actors []string) resolverBatchFixture {
 	t.Helper()
 
 	dir, argv := resolverScript(t, "")
 	writeAnswer(t, dir, validAnswer())
 
-	graft := agentBatchingGraft(nil)
+	graft := agentBatchingGraft(size, nil)
 	rcfg := enabledResolver(argv)
 	rcfg.Actors = actors
 	graft.Land.Resolver = rcfg
@@ -211,9 +278,11 @@ func testLandBatchResolverActorsArePerRequest(t *testing.T, ctx context.Context)
 	t.Run("unlisted actor behind a listed one is not resolved", func(t *testing.T) {
 		t.Parallel()
 
-		fx := newResolverBatchFixture(t, ctx, []string{"agent-a"})
+		// agent-b fails in the pre-resolution of its land, before it reaches the lane, so agent-a
+		// lands in a batch of its own.
+		fx := newResolverBatchFixture(t, ctx, 1, []string{"agent-a"})
 
-		responses, errs := landInOrder(fx.ctx, fx.client, fx.repo,
+		responses, errs := landInOrder(t, fx.ctx, fx.client, fx.repo,
 			agentLanding{agent: "agent-a", commit: fx.disjoint},
 			agentLanding{agent: "agent-b", commit: fx.conflicting, resolve: true},
 		)
@@ -227,9 +296,9 @@ func testLandBatchResolverActorsArePerRequest(t *testing.T, ctx context.Context)
 	t.Run("listed actor behind an unlisted one is resolved", func(t *testing.T) {
 		t.Parallel()
 
-		fx := newResolverBatchFixture(t, ctx, []string{"agent-a"})
+		fx := newResolverBatchFixture(t, ctx, 2, []string{"agent-a"})
 
-		responses, errs := landInOrder(fx.ctx, fx.client, fx.repo,
+		responses, errs := landInOrder(t, fx.ctx, fx.client, fx.repo,
 			agentLanding{agent: "agent-b", commit: fx.disjoint},
 			agentLanding{agent: "agent-a", commit: fx.conflicting, resolve: true},
 		)
@@ -252,7 +321,7 @@ func TestLandBatch_policyOfNonAgentIsEvaluatedByGLID(t *testing.T) {
 func testLandBatchPolicyOfNonAgentIsEvaluatedByGLID(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(denyMainFor("eve")))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(2, denyMainFor("eve")))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
@@ -267,7 +336,7 @@ func testLandBatchPolicyOfNonAgentIsEvaluatedByGLID(t *testing.T, ctx context.Co
 
 	// Neither request has an agent identity, so the policy must judge the user ID of each request, as
 	// the pre-receive hook does for a request that lands alone.
-	responses, errs := landInOrder(ctx, client, repoProto,
+	responses, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{user: userWithGLID("eve"), commit: eve},
 		agentLanding{user: userWithGLID("alice"), commit: alice},
 	)
@@ -290,7 +359,7 @@ func TestLandBatch_deniedAgentDoesNotTakeBatchDown(t *testing.T) {
 func testLandBatchDeniedAgentDoesNotTakeBatchDown(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(denyMainFor("bot")))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(3, denyMainFor("bot")))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
@@ -304,7 +373,7 @@ func testLandBatchDeniedAgentDoesNotTakeBatchDown(t *testing.T, ctx context.Cont
 	}
 
 	// The denied agent submits first, so its identity is the one of the first request of the batch.
-	responses, errs := landInOrder(ctx, client, repoProto,
+	responses, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "bot", commit: change("b")},
 		agentLanding{agent: "alice", commit: change("a")},
 		agentLanding{agent: "carol", commit: change("c")},
@@ -331,7 +400,7 @@ func TestLandBatch_changesetRecordsMembersWithRealActors(t *testing.T) {
 func testLandBatchChangesetRecordsMembersWithRealActors(t *testing.T, ctx context.Context) {
 	t.Parallel()
 
-	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(nil))
+	ctx, cfg, client := setupAgentLandService(t, ctx, agentBatchingGraft(3, nil))
 	repoProto, repoPath := gittest.CreateRepository(t, ctx, cfg)
 
 	baseEntry := gittest.TreeEntry{Mode: "100644", Path: "base", Content: "base"}
@@ -343,7 +412,7 @@ func testLandBatchChangesetRecordsMembersWithRealActors(t *testing.T, ctx contex
 
 	// Two agents and a user without an agent identity land in one batch. The combined update is
 	// recorded with the synthetic actor, and the members with the actors that really landed.
-	responses, errs := landInOrder(ctx, client, repoProto,
+	responses, errs := landInOrder(t, ctx, client, repoProto,
 		agentLanding{agent: "agent-a", commit: change("a")},
 		agentLanding{agent: "agent-b", commit: change("b")},
 		agentLanding{user: userWithGLID("u-glid"), commit: change("c")},
