@@ -78,7 +78,9 @@ One batch attempt:
      `not_ancestor` error.
    - A merge conflict fails only that request with `merge_conflict`. When the
      request sets `resolve_conflicts` and the resolver is enabled, the conflict is
-     resolved first (see [RESOLVE.md](RESOLVE.md)).
+     resolved first: by the lane itself for what the rules resolve within `inline_timeout`
+     (default `1s`), and otherwise out of the lane, before the request enters it again (see
+     [RESOLVE.md](RESOLVE.md), "Out of the lane").
    - A request whose outcome is final before the CAS (see *Early completion*)
      is answered at once.
 3. Publishes the final running tip with one CAS from the original tip. The
@@ -410,7 +412,13 @@ The batch executor (`internal/gitaly/service/operations`) defines:
 - `graft_land_batch_packed_objects_total` (counter): objects that attempts
   packed before their update.
 - `graft_land_batch_members_total{outcome}` (counter): requests by outcome, with
-  the outcomes `landed`, `already_landed`, `conflict`, `denied` and `error`.
+  the outcomes `landed`, `already_landed`, `conflict`, `denied`, `error` and
+  `needs_resolution` (the lane handed the request back to be resolved out of the lane, or to
+  wait for its turn on its files; not a failure: a land that loses k rounds counts k of these).
+- `graft_land_ticket_wait_seconds` (histogram): time a land that lost a round of its conflict
+  resolution waited for its turn on its files ([RESOLVE.md](RESOLVE.md), "Out of the lane").
+- `graft_land_resolution_rounds` (histogram): rounds (resolve, then the lane) a land with
+  conflicts needed.
 
 The hooks (`internal/gitaly/hook`) define `graft_land_intents_seconds`
 (histogram): the land intents of one prepared reference transaction in the file
