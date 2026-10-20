@@ -325,6 +325,82 @@ func TestLandIntentsCompaction(t *testing.T) {
 	})
 }
 
+func TestLandIntentsCompactionDue(t *testing.T) {
+	t.Parallel()
+
+	// A compaction that was asked for while another one ran does not move the size from which
+	// the next one is due: the next append asks again.
+	repoPath := t.TempDir()
+	path := intentsPath(repoPath)
+	require.False(t, compactionDue(path, compactIntentsMinSize-1))
+	require.True(t, compactionDue(path, compactIntentsMinSize))
+	require.True(t, compactionDue(path, compactIntentsMinSize), "asking does not move the size")
+
+	compactionsRunning.Store(repoPath, struct{}{})
+	require.NoError(t, CompactLandIntents(repoPath))
+	compactionsRunning.Delete(repoPath)
+	require.True(t, compactionDue(path, compactIntentsMinSize), "a compaction that did not run does not move it")
+
+	recordIntent(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
+	require.NoError(t, CompactLandIntents(repoPath))
+	size := fileSize(t, path)
+	require.False(t, compactionDue(path, max(compactIntentsMinSize, 2*size)-1), "a compaction that ran moves it")
+	require.True(t, compactionDue(path, max(compactIntentsMinSize, 2*size)))
+}
+
+func TestLandsIndexScanFallsBackFromAWrongOffset(t *testing.T) {
+	t.Parallel()
+
+	// The index in memory remembers the offset of its mark's line; an offset whose line does not
+	// hold the mark's entry (another entry, the middle of a line, past the end) is not used: the
+	// lookup reads from the index point instead, and answers as it would.
+	for _, tc := range []struct {
+		desc   string
+		offset func(repoPath string) int64
+	}{
+		{desc: "the line of another entry", offset: func(string) int64 { return 0 }},
+		{desc: "the middle of a line", offset: func(string) int64 { return 7 }},
+		{desc: "past the end of the log", offset: func(repoPath string) int64 { return 1 << 30 }},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			repoPath := t.TempDir()
+			first := appendLand(t, repoPath, "refs/heads/main", landOID(1), landOID(2))
+			second := appendLand(t, repoPath, "refs/heads/main", landOID(3), landOID(4))
+			_, found := lookup(t, repoPath, "refs/heads/main", landOID(1))
+			require.True(t, found)
+
+			index, release := acquireLandsIndex(landsPath(repoPath))
+			index.mu.Lock()
+			require.NotEqual(t, int64(-1), index.markOffset, "the warm index knows its mark's line")
+			index.markOffset = tc.offset(repoPath)
+			index.mu.Unlock()
+			release()
+
+			before, err := os.ReadFile(landsPath(repoPath))
+			require.NoError(t, err)
+
+			third := appendLand(t, repoPath, "refs/heads/main", landOID(5), landOID(6))
+			for original, want := range map[string]LandRecord{
+				landOID(1): {Sequence: first, Landed: landOID(2)},
+				landOID(3): {Sequence: second, Landed: landOID(4)},
+				landOID(5): {Sequence: third, Landed: landOID(6)},
+			} {
+				record, found := lookup(t, repoPath, "refs/heads/main", original)
+				require.True(t, found, original)
+				require.Equal(t, want, record)
+			}
+
+			// The index caught up from the index point; it was not rebuilt.
+			after, err := os.ReadFile(landsPath(repoPath))
+			require.NoError(t, err)
+			require.True(t, bytes.HasPrefix(after, before), "the index file was extended, not written again")
+			require.Greater(t, len(after), len(before))
+		})
+	}
+}
+
 func TestLandsIndexCompaction(t *testing.T) {
 	t.Parallel()
 

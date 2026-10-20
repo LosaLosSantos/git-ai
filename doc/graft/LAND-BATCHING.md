@@ -415,7 +415,9 @@ The batch executor (`internal/gitaly/service/operations`) defines:
 The hooks (`internal/gitaly/hook`) define `graft_land_intents_seconds`
 (histogram): the land intents of one prepared reference transaction in the file
 changelog, the wait for their lock file, one write and one fsync, under the
-references' locks ([PLAN11](PLAN11.md), 4.2).
+references' locks ([PLAN11](PLAN11.md), 4.2), and
+`graft_land_intents_compaction_failures_total` (counter): compactions of the
+land intents that failed, which leave the intents as they were.
 
 The server registers the lanes of the process (`landlane.Shared`) and these
 metrics with the Prometheus registry, so they are exported on `/metrics`. The
