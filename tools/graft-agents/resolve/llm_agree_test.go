@@ -7,7 +7,9 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
@@ -133,15 +135,30 @@ func TestAgreeWithASecondModelThatFailsHolds(t *testing.T) {
 
 func TestAgreeWithAFirstModelThatFailsFailsTheFile(t *testing.T) {
 	wp19SetAnswer(agreeFail("provider down"))
-	b := agreeSetB(agreeAnswer("merged\n"))
+	// The second model is slow: it answers only when its context ends. The first model failing cancels
+	// it, and the file is not kept waiting for it.
+	var cancelled atomic.Bool
+	b := agreeSetB(func(ctx context.Context, req llm.Request) (*llm.Response, error) {
+		select {
+		case <-ctx.Done():
+			cancelled.Store(true)
+			return nil, ctx.Err()
+		case <-time.After(30 * time.Second):
+			return wp19Answer("merged\n"), nil
+		}
+	})
+	start := time.Now()
 	_, err := resolveOne(t)
 	var unresolved *UnresolvedError
 	if !errors.As(err, &unresolved) {
 		t.Fatalf("err = %v", err)
 	}
-	// The second model was asked at the same time and its call is waited for: the cost is real.
-	if b.calls() != 1 {
-		t.Fatalf("calls of the second model = %d", b.calls())
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("the file waited %s for the second model", time.Since(start))
+	}
+	// The second model was asked at the same time, its call was cancelled, and it was waited for.
+	if b.calls() != 1 || !cancelled.Load() {
+		t.Fatalf("calls of the second model = %d, cancelled = %v", b.calls(), cancelled.Load())
 	}
 }
 
@@ -149,8 +166,8 @@ func TestAgreeWithAnUncleanReportHoldsEvenWhenTheModelsAgree(t *testing.T) {
 	r := wp19Build(t, agreeConfig)
 	s := r.bindings[0].Strategy.(*llmStrategy)
 	clean := LLMResult{Content: []byte("x\n"), Report: []string{"keeps every uncontested change of both sides (2)"}}
-	dirty := LLMResult{Content: []byte("x\n"), Report: []string{"region 1: drops theirs' change: the line \"y\" it adds is missing"}}
-	repeats := LLMResult{Content: []byte("x\n"), Report: []string{"region 2: duplicates a line both sides added: \"z\""}}
+	dirty := LLMResult{Content: []byte("x\n"), Report: []string{"region 1: drops theirs' change: the line \"y\" it adds is missing"}, Findings: 1}
+	repeats := LLMResult{Content: []byte("x\n"), Report: []string{"region 2: duplicates a line both sides added: \"z\""}, Findings: 1}
 	run := func(res LLMResult) *agreeRun { return &agreeRun{res: res} }
 
 	if why := s.agreement(clean, run(clean)); why != "" {
@@ -232,25 +249,42 @@ func TestAgreeWithConfig(t *testing.T) {
 	}
 }
 
-func TestLLMReportClean(t *testing.T) {
-	for report, want := range map[string]bool{
-		"": true,
-		"keeps every uncontested change of both sides (3)":                              true,
-		"2 contested changes resolved freely: nothing line-level to verify":             true,
-		"1 of 2 regions were answered again after findings of the deterministic checks": true,
-		"region 1: drops ours' change 3-4: the line \"a\" it adds is missing":           false,
-		"region 2: duplicates a line both sides added: \"b\"":                           false,
-	} {
-		var lines []string
-		if report != "" {
-			lines = []string{report}
-		}
-		if got := LLMReportClean(lines); got != want {
-			t.Errorf("LLMReportClean(%q) = %v", report, got)
+// TestLLMFindingsSurviveTheCutOfTheReport: the report is cut at 16 lines, so a drop in a late region can
+// be missing from its text, and the agree_with gate must not read the text. Findings counts them all.
+func TestLLMFindingsSurviveTheCutOfTheReport(t *testing.T) {
+	var comps []llmComposition
+	for i := 0; i < 17; i++ {
+		comps = append(comps, llmComposition{neither: true})
+	}
+	late := llmComposition{problems: []string{"drops THEIRS' change at base line 6: the line \"T6\" it adds is missing"}}
+	comps = append(comps, late)
+
+	report := llmReport(comps, 0)
+	if len(report) != 16 {
+		t.Fatalf("the report is not cut: %d lines", len(report))
+	}
+	for _, line := range report {
+		if strings.Contains(line, "drops") {
+			t.Fatalf("the late drop is in the first 16 lines, the test proves nothing: %v", report)
 		}
 	}
-	if !LLMReportClean([]string{"a", "b", "region 3: the answer has lines found in neither side"}) {
-		t.Error("a line found in neither side is a free resolution, not a drop")
+	if got := llmFindings(comps); got != 1 {
+		t.Fatalf("findings = %d, want the late drop", got)
+	}
+
+	// The gate holds a file whose report text is clean and whose findings are not.
+	r := wp19Build(t, agreeConfig)
+	s := r.bindings[0].Strategy.(*llmStrategy)
+	text := LLMResult{Content: []byte("x\n"), Report: report, Findings: llmFindings(comps)}
+	clean := LLMResult{Content: []byte("x\n"), Report: report}
+	if why := s.agreement(text, &agreeRun{res: clean}); !strings.HasPrefix(why, "held: a composition report was not clean") {
+		t.Fatalf("a drop past the cut is not held: %q", why)
+	}
+	if why := s.agreement(clean, &agreeRun{res: text}); !strings.HasPrefix(why, "held: a composition report was not clean") {
+		t.Fatalf("a drop past the cut of the second model is not held: %q", why)
+	}
+	if why := s.agreement(clean, &agreeRun{res: clean}); why != "" {
+		t.Fatalf("two answers without findings are held: %q", why)
 	}
 }
 
@@ -265,5 +299,40 @@ func TestLLMNormalize(t *testing.T) {
 		if got := string(LLMNormalize([]byte(in))); got != want {
 			t.Errorf("LLMNormalize(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestAgreeWithNeedsAServerThatHolds: with agree_with a file may carry a hold, which only a server with
+// the capability "hold" never lands. A server that proposes but cannot hold gets no model's resolution
+// (the models are not called), and one that holds does.
+func TestAgreeWithNeedsAServerThatHolds(t *testing.T) {
+	a := wp19SetAnswer(agreeAnswer("merged\n"))
+	b := agreeSetB(agreeAnswer("merged\n"))
+	r := wp19Build(t, agreeConfig)
+
+	noHold := wp19Request(wp19Conflict("a.txt"))
+	noHold.Capabilities = []string{protocol.CapabilityOrigin, protocol.CapabilityProposal, protocol.CapabilityVerify}
+	_, err := r.Resolve(context.Background(), noHold)
+	var unresolved *UnresolvedError
+	if !errors.As(err, &unresolved) || !strings.Contains(err.Error(), "the server cannot hold a model's resolution (agree_with); upgrade the server") {
+		t.Fatalf("err = %v", err)
+	}
+	if a.calls() != 0 || b.calls() != 0 {
+		t.Fatalf("the models were called for a server that cannot hold: %d, %d", a.calls(), b.calls())
+	}
+
+	// Without agree_with the same server is enough.
+	single := wp19Build(t, wp19LLMConfig)
+	if _, err := single.Resolve(context.Background(), noHold); err != nil {
+		t.Fatalf("a single model for a server that proposes: %v", err)
+	}
+
+	// A server of this release.
+	if _, err := r.Resolve(context.Background(), wp19Request(wp19Conflict("a.txt"))); err != nil {
+		t.Fatal(err)
+	}
+	// The first model served the single-model run above as well.
+	if a.calls() != 2 || b.calls() != 1 {
+		t.Fatalf("calls %d, %d", a.calls(), b.calls())
 	}
 }

@@ -48,7 +48,7 @@ import (
 // With agree_with, both models resolve each file at the same time with the same prompt, and the
 // first model's resolution is proposed as always (it lands only through verify.command). It is
 // HELD, and never lands, unless the two results are the same file after normalization
-// (LLMNormalize) and both composition reports are clean (LLMReportClean): the response carries
+// (LLMNormalize) and neither composition check found a drop or a duplicate (LLMResult.Findings): the response carries
 // Hold, the report says that the second model disagreed, and the server neither verifies nor
 // lands the file. A model that fails makes the file unresolved when it is the first, and holds it
 // when it is the second. A budget on one model needs a budget on the other.
@@ -226,8 +226,12 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 	defer cancel()
 	res, err := ResolveLLM(first, s.provider, lf, s.opt)
 	if second != nil {
-		// The second model is waited for whatever the first one did: its calls are paid for, and
-		// its usage belongs to the file.
+		// A first model that failed or declined leaves nothing for the second one to be compared with:
+		// its context is cancelled. It is waited for whatever happened: the calls it made are paid for,
+		// and its usage belongs to the file.
+		if err != nil {
+			second.cancel()
+		}
 		second.wait()
 		if stats != nil {
 			stats.Absorb(second.stats, "agree_with: ")
@@ -254,22 +258,25 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 
 // agreeRun is the second model resolving a file, started by agree.start.
 type agreeRun struct {
-	done  chan struct{}
-	res   LLMResult
-	err   error
-	stats *LLMRegionStats
+	done   chan struct{}
+	cancel context.CancelFunc
+	res    LLMResult
+	err    error
+	stats  *LLMRegionStats
 }
 
 // start resolves lf with the side's model in the background. When counting, the run keeps its own
 // stats, which the caller absorbs into its own once the run is waited for.
 func (s *llmSide) start(ctx context.Context, lf LLMFile, counting bool) *agreeRun {
-	r := &agreeRun{done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(ctx)
+	r := &agreeRun{done: make(chan struct{}), cancel: cancel}
 	if counting {
 		r.stats = &LLMRegionStats{}
 		ctx = WithLLMRegionStats(ctx, r.stats)
 	}
 	go func() {
 		defer close(r.done)
+		defer cancel()
 		defer func() {
 			if p := recover(); p != nil {
 				r.err = fmt.Errorf("resolve: the second model panicked: %v", p)
@@ -287,22 +294,26 @@ func (r *agreeRun) wait() { <-r.done }
 
 // agreement says why the first model's resolution is not the one both models give, or "" when the
 // two agree: the same file after the judge's normalization (LLMNormalize), and neither report
-// holds a finding (LLMReportClean). The first model's answer is the one that is proposed.
+// found a drop or a duplicate (LLMResult.Findings, never the text of the report, which is cut). The
+// first model's answer is the one that is proposed, byte for byte.
 func (s *llmStrategy) agreement(first LLMResult, second *agreeRun) string {
 	switch {
 	case second.err != nil && errors.Is(second.err, ErrLLMNotApplicable):
 		return fmt.Sprintf("held: the second model (%s) could not take the file", s.agree.model)
 	case second.err != nil:
 		return fmt.Sprintf("held: the second model (%s) gave no usable answer: %s", s.agree.model, llmClip(second.err.Error(), 200))
-	case !LLMReportClean(first.Report):
+	case first.Findings > 0:
 		return fmt.Sprintf("held: a composition report was not clean: the first model (%s) drops or repeats a change", s.model)
-	case !LLMReportClean(second.res.Report):
+	case second.res.Findings > 0:
 		return fmt.Sprintf("held: a composition report was not clean: the second model (%s) drops or repeats a change", s.agree.model)
 	case !bytes.Equal(LLMNormalize(first.Content), LLMNormalize(second.res.Content)):
 		return fmt.Sprintf("held: the second model (%s) disagreed: it resolved the file differently from the first (%s)", s.agree.model, s.model)
 	}
 	return ""
 }
+
+// holds reports whether the strategy's answers may carry a hold (agree_with is set).
+func (s *llmStrategy) holds() bool { return s.agree != nil }
 
 // syntaxChecked marks the llm answers for the syntax check (resolveFile).
 func (s *llmStrategy) syntaxChecked() {}

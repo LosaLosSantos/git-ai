@@ -429,6 +429,16 @@ func llmRegionAtLine(spans map[int][2]int, line int) (int, bool) {
 	return best, found
 }
 
+// llmFindings counts the drops and the duplicates of the regions: what the report says first, whatever
+// of it the cut of the report leaves.
+func llmFindings(comps []llmComposition) int {
+	n := 0
+	for _, c := range comps {
+		n += len(c.problems)
+	}
+	return n
+}
+
 // llmReport words the composition checks of the regions (llmCompose) as the report that goes with
 // the proposal: what is wrong first, in the words a repair round quotes, then what it keeps.
 func llmReport(comps []llmComposition, repairs int) []string {
@@ -678,6 +688,7 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		Hunks:            len(conflicting),
 		RegionsEqualOurs: equalOurs,
 		Report:           report,
+		Findings:         llmFindings(comps),
 		Calls:            calls,
 		Repairs:          repairs,
 	}, nil

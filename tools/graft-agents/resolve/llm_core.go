@@ -128,6 +128,10 @@ type LLMResult struct {
 	// drops and repeats of the two changes, and how many contested regions it resolved freely. It is
 	// a report and not a gate, and goes to the agent with the proposal.
 	Report []string
+	// Findings is the number of drops and duplicates that the composition check found in the regions
+	// (each one is a line of the report, but the report is cut at 16 lines and Findings is not). The
+	// agree_with gate decides "clean" from it, never from the text of the report.
+	Findings int
 	// Calls and Repairs are the model calls of the file and those of them that were repair rounds.
 	Calls, Repairs int
 }
@@ -277,19 +281,6 @@ func (s *LLMRegionStats) Absorb(o *LLMRegionStats, prefix string) {
 	for _, r := range rejected {
 		s.rejected = append(s.rejected, prefix+r)
 	}
-}
-
-// LLMReportClean reports whether a composition report holds no finding: no line says that the answer
-// drops a change of a side or repeats a line both added (llmReport words them first). It is the
-// "clean report" of the agree_with gate (PLAN10 15.12): a report is not a gate for a single model,
-// and is one of the two conditions under which two models' agreement is trusted.
-func LLMReportClean(report []string) bool {
-	for _, line := range report {
-		if strings.Contains(line, "drops") || strings.Contains(line, "duplicates") {
-			return false
-		}
-	}
-	return true
 }
 
 // LLMNormalize is a file as the agree_with gate and the judges compare it: line endings as LF, no
