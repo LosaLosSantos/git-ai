@@ -83,7 +83,7 @@ func request(files ...protocol.FileConflict) protocol.Request {
 		Version:      protocol.Version,
 		Limits:       protocol.Limits{MaxFileBytes: 1 << 20},
 		Files:        files,
-		Capabilities: protocol.ServerCapabilities,
+		Capabilities: protocol.ServerCapabilities(),
 	}
 }
 
@@ -715,9 +715,14 @@ func TestAModelsResolutionIsGivenOnlyToAServerThatHoldsAndVerifiesIt(t *testing.
 	for _, caps := range [][]string{{protocol.CapabilityOrigin}, {protocol.CapabilityHold, protocol.CapabilityVerify}} {
 		partial := request(conflict("a.go"))
 		partial.Capabilities = caps
+		before := model.calls.Load()
 		r = newTestResolver(t, nil, Binding{Name: "model", Strategy: model})
-		if _, err := r.Resolve(context.Background(), partial); err == nil {
-			t.Fatalf("capabilities %v without proposal got a model's resolution", caps)
+		_, err := r.Resolve(context.Background(), partial)
+		if err == nil || !strings.Contains(err.Error(), "the server cannot hold or verify a model's resolution; upgrade the server") {
+			t.Fatalf("capabilities %v without proposal got a model's resolution, or no reason: %v", caps, err)
+		}
+		if model.calls.Load() != before {
+			t.Fatalf("capabilities %v: the model was called", caps)
 		}
 	}
 
@@ -726,5 +731,28 @@ func TestAModelsResolutionIsGivenOnlyToAServerThatHoldsAndVerifiesIt(t *testing.
 	resp, err = r.Resolve(context.Background(), request(conflict("a.go")))
 	if err != nil || len(resp.Files) != 1 || resp.Files[0].Origin != protocol.OriginModel || !resp.Files[0].Proposal {
 		t.Fatalf("a server of this release must get the model's proposal: %v %+v", err, resp.Files)
+	}
+}
+
+// TestAHoldIsNeverSentToAServerThatCannotHoldIt: Resolution.Hold is exported, so a strategy of another
+// package can set it without implementing the unexported holder interface. A hold is then refused for a
+// server that does not announce "hold", which would land the file; a server that does gets it.
+func TestAHoldIsNeverSentToAServerThatCannotHoldIt(t *testing.T) {
+	holding := &proposingStrategy{fakeStrategy{fn: func(f File) (Resolution, bool, error) {
+		return Resolution{Action: protocol.ActionWrite, Mode: protocol.ModeFile, Content: []byte("x\n"), Hold: "held: because"}, true, nil
+	}}}
+	r := newTestResolver(t, nil, Binding{Name: "model", Strategy: holding})
+
+	noHold := request(conflict("a.go"))
+	noHold.Capabilities = []string{protocol.CapabilityOrigin, protocol.CapabilityProposal, protocol.CapabilityVerify}
+	_, err := r.Resolve(context.Background(), noHold)
+	var unresolved *UnresolvedError
+	if !errors.As(err, &unresolved) || !strings.Contains(err.Error(), "the server cannot hold a model's resolution; upgrade the server") {
+		t.Fatalf("a hold was sent to a server that cannot hold it: %v", err)
+	}
+
+	resp, err := r.Resolve(context.Background(), request(conflict("a.go")))
+	if err != nil || len(resp.Files) != 1 || resp.Files[0].Hold != "held: because" {
+		t.Fatalf("a server that holds must get the hold: %v %+v", err, resp.Files)
 	}
 }

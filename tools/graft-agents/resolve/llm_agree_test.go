@@ -5,6 +5,7 @@ package resolve
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -334,5 +335,61 @@ func TestAgreeWithNeedsAServerThatHolds(t *testing.T) {
 	// The first model served the single-model run above as well.
 	if a.calls() != 2 || b.calls() != 1 {
 		t.Fatalf("calls %d, %d", a.calls(), b.calls())
+	}
+}
+
+// TestAgreeWithHoldsADropPastTheCutOfTheReport is the wiring of LLMResult.Findings, through Resolve and
+// two fake providers: both models give the same file, which drops a side's change in the last of 18
+// regions, and the report is cut at 16 lines before that region is reached, so that nothing in its text
+// says "drops". The file must be held all the same, as "not clean".
+func TestAgreeWithHoldsADropPastTheCutOfTheReport(t *testing.T) {
+	const regions = 18
+	// Region k (1-based) is at lines 4k+1 and 4k+2 of the base: OURS changes the first, THEIRS the
+	// second, so that git calls them one conflict, and an answer that keeps both changes is clean.
+	base := numbered("line", 4*regions+4)
+	ours, theirs := base, base
+	for k := 1; k <= regions; k++ {
+		ours = strings.Replace(ours, fmt.Sprintf("line %d\n", 4*k+1), fmt.Sprintf("O%d\n", k), 1)
+		theirs = strings.Replace(theirs, fmt.Sprintf("line %d\n", 4*k+2), fmt.Sprintf("T%d\n", k), 1)
+	}
+	file := protocol.FileConflict{Path: "x.txt", Kind: protocol.KindContent,
+		Base: wp19Side(protocol.ModeFile, base), Ours: wp19Side(protocol.ModeFile, ours), Theirs: wp19Side(protocol.ModeFile, theirs)}
+
+	// The answer of a model for the k-th region it is asked: the changes of both sides and a line that
+	// is in neither (one line of the report each, and no finding), except in the last region, where it
+	// keeps OURS' change and loses THEIRS'.
+	answers := func() func(context.Context, llm.Request) (*llm.Response, error) {
+		var asked atomic.Int32
+		return func(context.Context, llm.Request) (*llm.Response, error) {
+			k := int(asked.Add(1))
+			if k == regions {
+				return wp19Answer(fmt.Sprintf("O%d\nline %d\n", k, 4*k+2)), nil
+			}
+			return wp19Answer(fmt.Sprintf("O%d\nT%d\ninvented %d\n", k, k, k)), nil
+		}
+	}
+	wp19SetAnswer(answers())
+	agreeSetB(answers())
+
+	r := wp19Build(t, agreeConfig)
+	resp, err := r.Resolve(context.Background(), wp19Request(file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := resp.Files[0]
+	// The last line of the report is the hold itself (which names drops); the rest is the composition report.
+	text := strings.Join(got.Report[:len(got.Report)-1], "\n")
+	// The test proves something only if the drop is not in the text of the report.
+	if strings.Contains(text, "drops") {
+		t.Fatalf("the drop is in the text of the report, which is not cut before it:\n%s", text)
+	}
+	if !strings.Contains(text, "more lines of this report") {
+		t.Fatalf("the report is not cut:\n%s", text)
+	}
+	if !strings.HasPrefix(got.Hold, "held: a composition report was not clean") {
+		t.Fatalf("a drop past the cut of the report is not held: hold %q", got.Hold)
+	}
+	if got.Origin != protocol.OriginModel || !got.Proposal {
+		t.Fatalf("file = %+v", got)
 	}
 }

@@ -248,7 +248,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 		}},
 		Limits: protocol.Limits{MaxFileBytes: maxBytes},
 		// The bench stands in for the server, which holds and verifies a model's resolution.
-		Capabilities: protocol.ServerCapabilities,
+		Capabilities: protocol.ServerCapabilities(),
 	}
 
 	if c.Kind == protocol.KindContent && sides["ours"] != nil && sides["theirs"] != nil {

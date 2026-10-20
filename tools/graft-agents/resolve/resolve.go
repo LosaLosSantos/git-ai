@@ -474,6 +474,12 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: err})
 			continue
 		}
+		// Resolution.Hold is exported, so a strategy of another package may set it without implementing
+		// holder: a hold is never sent to a server that cannot honour it, which would land the file.
+		if res.Hold != "" && !req.Has(protocol.CapabilityHold) {
+			attempts = append(attempts, Attempt{Strategy: b.Name, Kind: AttemptRejected, Err: errors.New("the server cannot hold a model's resolution; upgrade the server")})
+			continue
+		}
 		if _, ok := b.Strategy.(syntaxChecked); ok && res.Action == protocol.ActionWrite && res.Mode != protocol.ModeSymlink {
 			if _, err := syntax.CheckMerge(ctx, f.Path, res.Content, sideContent(f.Ours), sideContent(f.Theirs)); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {

@@ -82,4 +82,5 @@ func TestLandFinalPass_givingUpIsTheKeptMovingError(t *testing.T) {
 	require.NotNil(t, update, "the ReferenceUpdate detail")
 	require.Equal(t, "refs/heads/"+git.DefaultBranch, string(update.GetReferenceName()))
 	require.Equal(t, "1111111111111111111111111111111111111111", update.GetOldOid())
+	require.Empty(t, update.GetNewOid(), "where the branch moved to is not known there")
 }

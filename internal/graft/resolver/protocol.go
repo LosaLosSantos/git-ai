@@ -83,8 +83,11 @@ const (
 	CapabilityVerify = "verify"
 )
 
-// ServerCapabilities are the capabilities of this server, sent with every resolve request.
-var ServerCapabilities = []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+// ServerCapabilities returns the capabilities of this server, sent with every resolve request. Every
+// call returns a new slice, which nothing can change for the next request.
+func ServerCapabilities() []string {
+	return []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+}
 
 // Operations of a request.
 const (

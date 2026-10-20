@@ -95,9 +95,11 @@ func (r Request) Has(capability string) bool {
 	return false
 }
 
-// ServerCapabilities are the capabilities of a server of this release, for a client that stands in for
-// one (the bench).
-var ServerCapabilities = []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+// ServerCapabilities returns the capabilities of a server of this release, for a client that stands in
+// for one (the bench). Every call returns a new slice.
+func ServerCapabilities() []string {
+	return []string{CapabilityOrigin, CapabilityProposal, CapabilityHold, CapabilityVerify}
+}
 
 // Operations of a request.
 const (

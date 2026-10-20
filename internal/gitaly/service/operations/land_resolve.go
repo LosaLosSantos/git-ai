@@ -187,7 +187,7 @@ func (s *Server) landResolveAt(
 			Files:    sent,
 			// What this server does with the answer, so that a graft-resolve gives a model's resolution
 			// only to a server that holds and verifies it.
-			Capabilities: resolver.ServerCapabilities,
+			Capabilities: resolver.ServerCapabilities(),
 		}
 
 		// The client applies the timeout, the request policy and the acceptance rules of the
