@@ -468,7 +468,7 @@ func llmReport(comps []llmComposition, repairs int) []string {
 // before any call. The file is resolved only when every region is: the first rejected region
 // rejects the file, and no partial resolution is returned.
 //
-// A region is repaired at most once (PLAN10 15.11), by ONE repair round, and only an answer that is
+// A region is repaired at most once (PLAN10 15.10), by ONE repair round, and only an answer that is
 // BROKEN: a rule of an answer that it breaks (the anchors, the newline, a patch, markers, size, no
 // block), or the syntax error of the assembled file mapped to the region it is in. The finding is
 // quoted back exactly, and the round is made only if the repair request fits max_prompt_bytes. An
@@ -591,6 +591,10 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 	}
 
 	comps := make([]llmComposition, len(conflicting))
+	// answeredAgain counts the regions whose answer is the one a repair round gave: the report says
+	// how many. A repair call that was made and did not change the file (the syntax round whose answer
+	// was refused or did not parse) is a call that was paid for (repairs), not a region answered again.
+	answeredAgain := 0
 	for k, i := range conflicting {
 		r := &regions[i]
 		resp, err := ask(requests[k].system, requests[k].user)
@@ -620,6 +624,7 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 				return LLMResult{}, rejected(k, err2, resp.Text, resp2.Text)
 			}
 			region = region2
+			answeredAgain++
 		}
 		r.answer = region
 		comps[k] = llmCompose(r, r.start, region)
@@ -635,17 +640,19 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 		if i, ok := llmRegionAtLine(spans, se.Line); ok {
 			k := slices.Index(conflicting, i)
 			if k >= 0 && !repaired[k] {
-				_, _, region2, err2 := repair(k, material[k].head+regions[i].answer+material[k].tail, []string{se.Error()})
+				fitted, _, region2, err2 := repair(k, material[k].head+regions[i].answer+material[k].tail, []string{se.Error()})
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return LLMResult{}, ctxErr
 				}
-				if err2 == nil && region2 != "" {
+				// An empty replacement is a valid answer (the region is deleted), as it is in the first round.
+				if fitted && err2 == nil {
 					old := regions[i].answer
 					regions[i].answer = region2
 					trial, _ := llmJoinSpans(regions)
 					if _, err := syntax.CheckMerge(ctx, f.Path, []byte(trial), f.Ours, f.Theirs); err == nil {
 						assembled = trial
 						comps[k] = llmCompose(&regions[i], regions[i].start, region2)
+						answeredAgain++
 					} else {
 						regions[i].answer = old
 					}
@@ -660,7 +667,7 @@ func llmResolvePatch(ctx context.Context, p llm.Provider, f LLMFile, opt LLMOpti
 			equalOurs++
 		}
 	}
-	report := llmReport(comps, repairs)
+	report := llmReport(comps, answeredAgain)
 	if stats != nil {
 		stats.RecordReport(report)
 	}

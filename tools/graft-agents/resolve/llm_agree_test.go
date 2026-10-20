@@ -102,13 +102,13 @@ func TestAgreeWithDisagreementHoldsTheFirstModelsProposal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got.Hold, "model-b") || !strings.Contains(got.Hold, "differently") {
+	if !strings.HasPrefix(got.Hold, "held: the second model (model-b) disagreed") || !strings.Contains(got.Hold, "differently") {
 		t.Fatalf("hold = %q", got.Hold)
 	}
 	if string(got.Content) != "merged\n" || got.Origin != protocol.OriginModel || !got.Proposal {
 		t.Fatalf("the first model's proposal is not what is held: %+v", got)
 	}
-	if last := got.Report[len(got.Report)-1]; !strings.Contains(last, "the second model disagreed") {
+	if last := got.Report[len(got.Report)-1]; last != got.Hold {
 		t.Fatalf("report = %v", got.Report)
 	}
 	if b.calls() != 1 {
@@ -123,7 +123,7 @@ func TestAgreeWithASecondModelThatFailsHolds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(got.Hold, "gave no usable answer") || !strings.Contains(got.Hold, "provider down") {
+	if !strings.HasPrefix(got.Hold, "held: ") || !strings.Contains(got.Hold, "gave no usable answer") || !strings.Contains(got.Hold, "provider down") {
 		t.Fatalf("hold = %q", got.Hold)
 	}
 	if string(got.Content) != "merged\n" {
@@ -165,7 +165,7 @@ func TestAgreeWithAnUncleanReportHoldsEvenWhenTheModelsAgree(t *testing.T) {
 		"first duplicates": {repeats, clean},
 		"both drop":        {dirty, dirty},
 	} {
-		if why := s.agreement(c.first, run(c.second)); why == "" || !strings.Contains(why, "finding") {
+		if why := s.agreement(c.first, run(c.second)); !strings.HasPrefix(why, "held: a composition report was not clean") {
 			t.Fatalf("%s: not held: %q", name, why)
 		}
 	}

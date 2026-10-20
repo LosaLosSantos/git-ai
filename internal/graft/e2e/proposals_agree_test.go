@@ -119,10 +119,10 @@ func TestAgreeWithTheModelsThatDisagreeAreHeld(t *testing.T) {
 	require.Len(t, pkg.GetFiles(), 1)
 	f := pkg.GetFiles()[0]
 	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome())
-	require.Contains(t, f.GetReason(), "held back by the resolver")
+	require.Contains(t, f.GetReason(), "held: the second model (fake-b) disagreed")
 	require.Contains(t, f.GetReason(), "fake-b")
 	require.NotNil(t, f.GetProposal(), "the first model's proposal is kept for the agent")
-	require.Contains(t, f.GetProposal().GetExplanation(), "the second model disagreed")
+	require.Contains(t, f.GetProposal().GetExplanation(), "held: the second model (fake-b) disagreed")
 }
 
 // TestStorageProposalsInAuthoritativeMode: the references of the proposals are written and pruned

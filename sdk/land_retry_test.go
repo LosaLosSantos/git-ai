@@ -55,6 +55,40 @@ func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
 	}
 }
 
+// TestRepo_Land_ARelandWithAResolutionIsRetriedByDefault: a Resolution lands as a merge of the tip and the
+// change, so a retry after a lost response finds Commit reachable and nothing is replayed: it is retried
+// by default whatever the strategy, the rebase one included, and Disabled still turns the retries off.
+func TestRepo_Land_ARelandWithAResolutionIsRetriedByDefault(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		desc             string
+		strategy         sdk.LandStrategy
+		retry            sdk.UnavailableRetry
+		expectedRequests int
+	}{
+		{desc: "rebase strategy", strategy: sdk.LandRebase, retry: fastRetry, expectedRequests: 6},
+		{desc: "merge strategy", strategy: sdk.LandMerge, retry: fastRetry, expectedRequests: 6},
+		{desc: "disabled", strategy: sdk.LandRebase, retry: sdk.UnavailableRetry{Disabled: true}, expectedRequests: 1},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			fakes := newFakeServices()
+			fakes.operations.landErr = status.Error(codes.Unavailable, "still syncing")
+			repo := dialFake(t, fakes.register).Repo("repo")
+
+			opts := validLand()
+			opts.Strategy = tc.strategy
+			opts.Resolution = &sdk.Resolution{Tip: "tip-sha", Commit: "change-sha", Files: []sdk.ResolvedFile{{Path: "a", Mode: "100644", Content: []byte("x\n")}}}
+			opts.RetryUnavailable = tc.retry
+			_, err := repo.Land(t.Context(), opts)
+			require.Equal(t, codes.Unavailable, sdk.Code(err))
+			require.Len(t, fakes.operations.landRequests, tc.expectedRequests)
+		})
+	}
+}
+
 func TestRepo_Land_RetriesUnavailable(t *testing.T) {
 	t.Parallel()
 

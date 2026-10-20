@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-	"unicode/utf8"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
 	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
@@ -247,7 +246,7 @@ func (s *llmStrategy) Resolve(ctx context.Context, f File, req protocol.Request)
 	if second != nil {
 		if why := s.agreement(res, second); why != "" {
 			out.Hold = why
-			out.Report = append(append([]string(nil), res.Report...), "the second model disagreed, so the resolution is held as a proposal: "+why)
+			out.Report = append(append([]string(nil), res.Report...), why)
 		}
 	}
 	return out, true, nil
@@ -292,28 +291,17 @@ func (r *agreeRun) wait() { <-r.done }
 func (s *llmStrategy) agreement(first LLMResult, second *agreeRun) string {
 	switch {
 	case second.err != nil && errors.Is(second.err, ErrLLMNotApplicable):
-		return fmt.Sprintf("the second model (%s) could not take the file", s.agree.model)
+		return fmt.Sprintf("held: the second model (%s) could not take the file", s.agree.model)
 	case second.err != nil:
-		return fmt.Sprintf("the second model (%s) gave no usable answer: %s", s.agree.model, llmCutText(second.err.Error(), 200))
+		return fmt.Sprintf("held: the second model (%s) gave no usable answer: %s", s.agree.model, llmClip(second.err.Error(), 200))
 	case !LLMReportClean(first.Report):
-		return fmt.Sprintf("the composition report of the first model (%s) holds a finding", s.model)
+		return fmt.Sprintf("held: a composition report was not clean: the first model (%s) drops or repeats a change", s.model)
 	case !LLMReportClean(second.res.Report):
-		return fmt.Sprintf("the composition report of the second model (%s) holds a finding", s.agree.model)
+		return fmt.Sprintf("held: a composition report was not clean: the second model (%s) drops or repeats a change", s.agree.model)
 	case !bytes.Equal(LLMNormalize(first.Content), LLMNormalize(second.res.Content)):
-		return fmt.Sprintf("the second model (%s) resolved the file differently from the first (%s)", s.agree.model, s.model)
+		return fmt.Sprintf("held: the second model (%s) disagreed: it resolved the file differently from the first (%s)", s.agree.model, s.model)
 	}
 	return ""
-}
-
-// llmCutText cuts s to n bytes at a rune boundary.
-func llmCutText(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n] + "..."
 }
 
 // syntaxChecked marks the llm answers for the syntax check (resolveFile).

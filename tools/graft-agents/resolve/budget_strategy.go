@@ -20,6 +20,9 @@ import (
 // The table needs max_tokens in [strategy.llm], which bounds the worst case of a call. When the
 // month's spend plus the worst case of a call would exceed the cap, the call is not made and the
 // file fails with "AI budget exhausted", which the server puts into the conflict package.
+//
+// With an agree_with model the cap must cover both: the same table goes into
+// [strategy.llm.agree_with.budget], with the second model's prices and its own state file.
 
 // llmBudgetConfig decodes the optional budget table of the [strategy.llm] table.
 func llmBudgetConfig(spec StrategySpec, tbl map[string]any) (*Budget, error) {

@@ -10,7 +10,7 @@ import (
 // base, and the answer for a region should keep what each side changed unless the other side
 // changed the same base lines. The definition is the one frozen on 2026-10-19 before it was measured
 // (compose2.py of the measurement, sha256 9396326b...); this file is its port to the regions of the
-// llm strategy, and is checked against it (llm_compose_test.go):
+// llm strategy, and is checked against it (bench/compose_parity_test.go):
 //
 //   - A region's answer is a slot of lines. Each side's change is the list of hunks of the line diff
 //     base -> side inside the region: a base range [a, b) replaced by the side's lines (an insertion
@@ -29,13 +29,12 @@ import (
 //
 // Lines are compared after the judge's normalization (CRLF, trailing whitespace) and stripped. It is
 // a report, never a gate: the measurement showed that the check does not move precision (15.6). What
-// it does is name, in exact words, what the answer dropped or repeated, which a repair round (15.10)
-// can quote back to the model, and which goes to the agent with the proposal.
+// it does is name, in exact words, what the answer dropped or repeated, which goes to the agent with the proposal. A repair round
+// (15.10) is driven by the rules of an answer and its syntax only, never by this report.
 
 // llmComposition is the check of one region's answer.
 type llmComposition struct {
-	// problems are the drops and the duplicates, in the exact words that the report and a repair round
-	// use.
+	// problems are the drops and the duplicates, in the exact words of the report.
 	problems []string
 	// kept is the number of uncontested hunks the slot keeps, contested the number of contested ones.
 	kept, contested int

@@ -68,7 +68,8 @@ type LandOptions struct {
 	Resolution *Resolution
 	// RetryUnavailable is how Land retries a call that the server answers
 	// with Unavailable (see UnavailableRetry). It is on by default for
-	// LandMerge and LandFastForwardOnly, and off for LandRebase.
+	// LandMerge, LandFastForwardOnly and any land with a Resolution (a merge
+	// of the tip and the change, safe to retry), and off for LandRebase.
 	RetryUnavailable UnavailableRetry
 }
 
@@ -82,7 +83,8 @@ type LandOptions struct {
 //
 // The response of a call can be lost after the server landed the change. With
 // LandMerge and LandFastForwardOnly, Commit is then reachable from the tip, and
-// the retry is reported as AlreadyLanded: these lands are retried by default.
+// the retry is reported as AlreadyLanded: these lands are retried by default,
+// and so is a land with a Resolution, which is a merge whatever its strategy.
 // With LandRebase, ResolveConflicts included (a land without conflicts is a
 // plain rebase), the branch holds a rebased copy, not Commit itself, and the
 // server cannot tell yet that the change landed: the retry replays the change
@@ -155,9 +157,13 @@ func (r UnavailableRetry) backoff(n int) time.Duration {
 }
 
 // maxRetries returns the retries of a land with the given strategy.
-func (r UnavailableRetry) maxRetries(strategy LandStrategy) int {
+//
+// A land with a Resolution is always a merge of the tip and the change, whatever its strategy: after a
+// lost response Commit is reachable from the tip, so the retry is reported as AlreadyLanded and nothing is
+// replayed. It is retried like a merge land.
+func (r UnavailableRetry) maxRetries(strategy LandStrategy, resolution bool) int {
 	switch {
-	case r.Disabled, strategy == LandRebase && !r.RebaseLands:
+	case r.Disabled, strategy == LandRebase && !resolution && !r.RebaseLands:
 		return 0
 	case r.MaxRetries > 0:
 		return r.MaxRetries
@@ -262,7 +268,7 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 	)
 	for {
 		resp, err = r.client.operations.UserLand(ctx, req)
-		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy) {
+		if status.Code(err) != codes.Unavailable || retries >= opts.RetryUnavailable.maxRetries(opts.Strategy, opts.Resolution != nil) {
 			break
 		}
 		retries++

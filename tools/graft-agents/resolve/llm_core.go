@@ -422,6 +422,7 @@ func llmClip(s string, n int) string {
 	return s[:cut]
 }
 
+// llmComplete makes one model call and wraps its failure as the strategy's.
 func llmComplete(ctx context.Context, p llm.Provider, req llm.Request) (*llm.Response, error) {
 	resp, err := p.Complete(ctx, req)
 	if err != nil {
@@ -693,23 +694,5 @@ func llmApply(base []string, start, end int, hs []llmHunk, side int) string {
 		pos = h.end
 	}
 	sb.WriteString(strings.Join(base[pos:end], ""))
-	return sb.String()
-}
-
-// llmAssemble builds the resolved file from base and its regions.
-func llmAssemble(base []string, regions []llmRegion) string {
-	var sb strings.Builder
-	pos := 0
-	for i := range regions {
-		r := &regions[i]
-		sb.WriteString(strings.Join(base[pos:r.start], ""))
-		if r.clean {
-			sb.WriteString(r.merged)
-		} else {
-			sb.WriteString(r.answer)
-		}
-		pos = r.end
-	}
-	sb.WriteString(strings.Join(base[pos:], ""))
 	return sb.String()
 }

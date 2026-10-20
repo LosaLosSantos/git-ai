@@ -281,7 +281,7 @@ func TestLLMRegionsCleanWhenSidesAgree(t *testing.T) {
 	if len(regions) != 1 || !regions[0].clean {
 		t.Fatalf("regions = %+v, want one clean region", regions)
 	}
-	if got := llmAssemble(base, regions); got != "a\nX\nc\n" {
+	if got := llmJoin(regions); got != "X\n" {
 		t.Fatalf("assembled = %q", got)
 	}
 }

@@ -22,7 +22,7 @@ type Counts struct {
 	NotRun    int `json:"not_run_cap"`
 	Stopped   int `json:"not_run_stopped"`
 	Abstained int `json:"abstained"`
-	// Calls and Repairs are the model calls and the repair rounds among them (PLAN10 15.11).
+	// Calls and Repairs are the model calls and the repair rounds among them (PLAN10 15.10).
 	Calls   int `json:"calls"`
 	Repairs int `json:"repairs"`
 	// BlankLinesOnly counts the wrong results that differ from the human resolution in blank

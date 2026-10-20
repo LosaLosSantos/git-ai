@@ -8,10 +8,9 @@ import (
 	"testing"
 
 	"github.com/feder-cr/git-ai/tools/graft-agents/llm"
-	"github.com/feder-cr/git-ai/tools/graft-agents/protocol"
 )
 
-// Tests of the design step (PLAN10 15.10): the symmetric context, the way out, the one repair round
+// Tests of the design step (PLAN10 15.10): the request, the one repair round
 // and the composition report. The provider is always a fake.
 
 // designFile is a file with one conflicting region at line 5 (ours and theirs change it).
@@ -38,7 +37,7 @@ func rawPatched(nonce, code string) *llm.Response {
 
 // TestLLMRequestHoldsWhatTheMeasurementsKept: the request of a region is THEIRS' message, the PATCH and
 // the CODE with the other regions for reference, and nothing of the elements that the measurements of
-// PLAN10 15.11 rejected (OURS' change and message, the way out of an abstain block). A model that writes an
+// PLAN10 15.10 removed (OURS' change and message, the way out of an abstain block). A model that writes an
 // abstain block has given no answer.
 func TestLLMRequestHoldsWhatTheMeasurementsKept(t *testing.T) {
 	f := designFile()
@@ -142,7 +141,7 @@ func compositionFile() LLMFile {
 }
 
 // TestLLMDesignCompositionReportsAndNeverRepairs: an answer that the rules and the syntax accept is never
-// asked for again, whatever the composition check finds in it (PLAN10 15.11: the repair of an accepted
+// asked for again, whatever the composition check finds in it (PLAN10 15.10: the repair of an accepted
 // answer made it worse in the paired data): the drop is reported in the check's words and the answer stays.
 // A broken answer is still repaired once, and the report says how many regions were.
 func TestLLMDesignCompositionReportsAndNeverRepairs(t *testing.T) {
@@ -242,66 +241,4 @@ func TestLLMReportWording(t *testing.T) {
 	if got := llmReport(many, 0); len(got) != 16 || !strings.HasSuffix(got[15], "more lines of this report") {
 		t.Fatalf("a long report is cut: %d lines, last %q", len(got), got[len(got)-1])
 	}
-}
-
-// TestLLMDesignAtTheResolver: a model answer that breaks the rules of an answer is an attempt of the
-// rejected kind, the composition report goes with the resolution, and the options of the ablations are gone.
-func TestLLMDesignAtTheResolver(t *testing.T) {
-	file := protocol.FileConflict{
-		Path: "x.txt", Kind: protocol.KindContent,
-		Base:   wp19Side(protocol.ModeFile, numbered("line", 12)),
-		Ours:   wp19Side(protocol.ModeFile, strings.Replace(numbered("line", 12), "line 5\n", "O5\n", 1)),
-		Theirs: wp19Side(protocol.ModeFile, strings.Replace(numbered("line", 12), "line 6\n", "T6\n", 1)),
-	}
-	wp19SetAnswer(func(_ context.Context, req llm.Request) (*llm.Response, error) {
-		return llmRawAnswer("I will not."), nil
-	})
-	r := wp19Build(t, wp19LLMConfig)
-	_, err := r.Resolve(context.Background(), wp19Request(file))
-	var unresolved *UnresolvedError
-	if !errors.As(err, &unresolved) || len(unresolved.Failures) != 1 {
-		t.Fatalf("err = %v", err)
-	}
-	attempts := unresolved.Failures[0].Attempts
-	if len(attempts) != 1 || attempts[0].Kind != AttemptRejected || !errors.Is(attempts[0].Err, ErrLLMRejected) {
-		t.Fatalf("attempts %+v, want one rejection", attempts)
-	}
-
-	// The report goes with the resolution, and a model's resolution is marked as one.
-	wp19SetAnswer(func(_ context.Context, req llm.Request) (*llm.Response, error) {
-		return wp19Answer("O5\nT6\n"), nil
-	})
-	r = wp19Build(t, wp19LLMConfig)
-	resp, err := r.Resolve(context.Background(), wp19Request(file))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := resp.Files[0]
-	if got.Origin != protocol.OriginModel || !got.Proposal || fmt.Sprint(got.Report) != "[keeps every uncontested change of both sides (2)]" {
-		t.Fatalf("file %+v", got)
-	}
-
-	// The elements that the measurements rejected, or made the rule, are no options any more.
-	for _, gone := range []string{"symmetric_context", "abstain", "repair", "repair_composition", "git_regions", "max_context_bytes"} {
-		value := "false"
-		if gone == "max_context_bytes" {
-			value = "4096"
-		}
-		if _, err := wp19BuildErr(strings.Replace(wp19LLMConfig, `paths = ["*.txt", "**/*.txt"]`, "paths = [\"*.txt\"]\n"+gone+" = "+value, 1)); err == nil {
-			t.Errorf("the option %s is still accepted", gone)
-		}
-	}
-}
-
-// wp19BuildStrategy builds the resolver of config and returns its llm strategy.
-func wp19BuildStrategy(t *testing.T, config string) *llmStrategy {
-	t.Helper()
-	r := wp19Build(t, config)
-	for _, b := range r.bindings {
-		if s, ok := b.Strategy.(*llmStrategy); ok {
-			return s
-		}
-	}
-	t.Fatal("no llm strategy in the resolver")
-	return nil
 }

@@ -487,7 +487,10 @@ member) and removed it; see [PLAN8.md](PLAN8.md).
   - Merge and fast-forward lands are retried by default. The response of a call
     can be lost after the change landed; the change itself is then on the
     branch, and the retry reports it as already landed.
-  - Rebase lands, with or without conflict resolution, are not retried by
+  - A land with a `Resolution` (the re-land of a conflict package) is a merge of
+    the tip and the change, whatever its strategy: it is retried by default
+    too, and the retry finds the change already landed.
+  - Rebase lands, with or without server-side conflict resolution, are not retried by
     default (`RebaseLands` turns it on). The branch holds a rebased copy of the
     change, and the server cannot yet tell that this change landed: a retry
     replays it, and a change that a later commit reverted in between (for

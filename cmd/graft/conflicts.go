@@ -30,10 +30,10 @@ import (
 //	DIR/sides/ours/<path>
 //	DIR/sides/theirs/<path>
 //	DIR/proposals/<path>      the resolver's proposal for the path, when it made one (a model's
-//	                          resolution, which did not land because no verification passed on
-//	                          it, or the rules' of a land
-//	                          that failed for another file); copy it over DIR/files/<path> to
-//	                          land it as yours
+//	                          resolution, which did not land because verify.command did not pass
+//	                          on its tree, is not configured, or the resolver held it back; or
+//	                          the rules' resolution of a land that failed for another file); copy
+//	                          it over DIR/files/<path> to land it as yours
 //	DIR/conflict.json         the conflict package
 //
 // Each directory mirrors the tree of the merge, so that no repository path, whatever its name, can

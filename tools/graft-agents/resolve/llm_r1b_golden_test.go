@@ -10,10 +10,10 @@ import (
 	"testing"
 )
 
-// The guarantee that the step of the design (PLAN10 15.10) rests on: with its three elements switched off
-// the requests are those of R1b, byte for byte. The golden files in testdata/r1b were written by the code of
-// R1b (the tree before the design step, GRAFT_WRITE_R1B_GOLDEN=1), for the files below, and this test
-// compares what the strategy sends now with them. The nonce of a request is replaced by NONCE.
+// The guarantee that the step of the design (PLAN10 15.10) rests on: the first request of a region is that of
+// R1b, byte for byte (the options that could change it are gone). The golden files in testdata/r1b were
+// written by the code of R1b (the tree before the design step, GRAFT_WRITE_R1B_GOLDEN=1), for the files
+// below, and this test compares what the strategy sends now with them. The nonce of a request is replaced by NONCE.
 //
 // The files are chosen so that git's merge and our own line diff agree on their regions: the regions
 // are another matter (llmFileRegions), the request of a region is what is pinned here.

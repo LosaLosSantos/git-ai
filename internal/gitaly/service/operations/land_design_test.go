@@ -10,7 +10,7 @@ import (
 	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
-// Tests of the server side of the design step (PLAN10 15.11): the composition report of a model's
+// Tests of the server side of the design step (PLAN10 15.3, 15.10): the composition report of a model's
 // resolution goes to the agent with the proposal.
 
 // TestUserLand_theReportGoesWithTheProposal: the composition report of a model's resolution is the start

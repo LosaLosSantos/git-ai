@@ -807,7 +807,7 @@ func TestUserLand_aHeldModelResolutionNeverLands(t *testing.T) {
 	t.Parallel()
 
 	held := modelAnswer()
-	held.Files[0].Hold = "the second model (glm) disagreed"
+	held.Files[0].Hold = "held: the second model (glm) disagreed"
 	fx, rdir, vdir := verifiedFixture(t, held, "grep -qx merged-a a && grep -qx merged-b b && grep -qx d d", nil)
 
 	_, err := fx.client.UserLand(fx.ctx, fx.request("Land agent work"))
@@ -819,7 +819,7 @@ func TestUserLand_aHeldModelResolutionNeverLands(t *testing.T) {
 		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), f.GetPath())
 		reasons = append(reasons, f.GetReason())
 	}
-	require.Contains(t, strings.Join(reasons, "\n"), landHeldReason+"the second model (glm) disagreed")
+	require.Contains(t, strings.Join(reasons, "\n"), landHeldReason("held: the second model (glm) disagreed"))
 	require.Equal(t, 1, resolverCalls(t, rdir))
 	require.Equal(t, 0, verifyRuns(t, vdir), "a land that cannot land is not verified")
 	requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)

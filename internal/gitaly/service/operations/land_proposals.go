@@ -56,9 +56,14 @@ const landNoVerifyReason = "no verify.command is configured, so nothing verifies
 
 // landHeldReason is the reason of a file that the resolver holds back: the second model of the llm
 // strategy's agree_with gate did not agree with the first, so the resolution is a proposal that
-// does not land by itself, even on a tree that verify.command passed on. The resolver's own words
-// follow it.
-const landHeldReason = "held back by the resolver, so it does not land by itself even if verify.command passes (see proposal): "
+// does not land by itself, even on a tree that verify.command passed on. The reason starts with
+// "held:" and the resolver's own words (hold), and says what that means for the land.
+func landHeldReason(hold string) string {
+	if !strings.HasPrefix(hold, "held: ") {
+		hold = "held: " + hold
+	}
+	return hold + " (the proposal does not land by itself, even if verify.command passes)"
+}
 
 // landAnswerHolds reports whether a resolver's answer holds back a file (ResponseFile.Hold): such an
 // answer never lands, whatever verify.command says.

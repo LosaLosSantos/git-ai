@@ -327,7 +327,7 @@ func landSetOutcomes(answer *resolver.Response, files []*landFileState) {
 		case err != nil:
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
 		case rf.Hold != "":
-			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landCutString(landHeldReason+rf.Hold, landPackageReasonBytes)
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landCutString(landHeldReason(rf.Hold), landPackageReasonBytes)
 		case rf.FromModel():
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
 		}
