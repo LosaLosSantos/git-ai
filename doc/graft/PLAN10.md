@@ -1309,11 +1309,40 @@ The resolution is bound to the files instead:
      them again; the others wait without calling the resolver, and the lane hands back any land with a verdict made out
      of the lane on a ticketed file, so that the holder's verdict is the one that lands. A ticket never stops the
      rules in the lane: the inline attempt comes before the check of the tickets, and the land that waited for its turn
-     goes back to the lane, not to a new pre-resolution; a lane round does not count toward `resolve_rounds`. Measured
-     on the same bench with the rules out of the lane: 92 resolver calls, 8 hand-backs, 250 of 250. A land that waits
+     goes back to the lane, not to a new pre-resolution; a lane round does not count toward `resolve_rounds`. The
+     queue alone, measured on the same bench before the rules were resolved in the lane (the first form of this fix, not
+     the code of this release): 92 resolver calls, 8 hand-backs, 250 of 250. A land that waits
      past its deadline ends with the package ("the time ran out waiting for the other lands on the same files").
   3. resolve_rounds (default 32) is only a safety cap: the rounds of a land are bounded by its deadline, and the queue
      makes it lose at most the rounds that a land which changes its files without a conflict makes it lose.
+  Measured on the code of this release (commit e3b60e3, the bench above: 50 agents x 5 changes on one branch,
+  conflict rate 0.2, seed 1, one fresh server per run; each run started once the 1-minute load was below 2, new and
+  v0.2.0 alternating; the load at the start is mostly the previous run's own average, and the runs before them were
+  made on a machine that other work had just left, so the spread is wide: the v0.2.0 runs alone range from 623 to
+  1,940 lands/min). Lands per minute, p99 of the landed changes:
+  * **Rules only.** 250 of 250 in both: 1,505 and 1,867 lands/min (p99 2.6 and 2.1 s), against 1,808 and 1,860 (p99
+    2.0 s) of the v0.2.0 run next to each. The first run of the new code started at a load of 1.99. No hand-back,
+    no resolver call out of the lane, no ticket, one round per land: v0.2.0's numbers.
+  * **Mixed, a land in ten that only a model can resolve.** The model is simulated: a wrapper between the server and
+    graft-resolve (`wrap.py`) refuses the request for the rules only on those files (a hash of the file's side picks
+    5 of the 50 conflicts) and answers the ordinary request after 5 s, marked as a model's. 245 of 250 land, 836 and
+    860 lands/min, p99 2.9 s. The 5 that do not land are those, each ended with the package and its proposal, as a
+    model's resolution without a verification never lands; the union lands are not held back (no ticket wait). The
+    run's length is the 5 calls through 2 resolve slots, not the lane. The same wrapper in front of v0.2.0 gives 250 of
+    250, 424 and 429 lands/min, p99 16.7 and 18.3 s, but v0.2.0 lands the model's answers, and each call blocks its
+    lane: the semantics differ, and it is a reference, not a like-for-like baseline.
+  * **One inline failure.** The first request for the rules only sleeps 3 s and is cut at `inline_timeout` (1 s): 5 to
+    8 members are handed back and resolved out of the lane, no ticket is waited for, no convoy: 250 of 250. The
+    wrapper costs time by itself, so the control is the wrapper passing everything through: 1,261 to 1,370 lands/min
+    (p99 2.8 to 2.9 s, three runs) against 1,117 to 1,227 (p99 3.6 to 4.0 s, five runs) with the failure: about 10%
+    and 1 s of p99, the second that the budget allows. (The runs without the wrapper are the ones above, 1,505 to
+    1,867: the wrapper alone costs about 20%.) v0.2.0 has no request for the rules only, so it has no partner here.
+  * **A verification of 1 s** (`verify.command = sleep 1`): 250 of 250, 129 and 130 lands/min, p99 73.0 and 74.7 s,
+    41 hand-backs, 50 ticket waits (45 s on average), 92 resolver calls, 333 rounds for 250 lands; against 113 to 124
+    lands/min and p99 74 to 94 s of the queue before these fixes, no regression. v0.2.0 has no verification, so
+    there is no baseline: its runs with the same setting ignored it (1,782 and 1,870 lands/min).
+  The start loads of the last six runs (the wrapper's control and the failure) were not logged; the cooldown that
+  holds each start until the load is below 2 was in force, and the whole batch ran in a few minutes.
   The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
   (authoritative storage) the lands go on in rounds, without the guarantee. A holder's verdict is invalidated by a land
   that changes its file cleanly and lands first (each such land lands once, and the holder resolves again, which is
