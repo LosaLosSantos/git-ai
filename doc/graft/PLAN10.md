@@ -920,7 +920,11 @@ end of this section.
  composition report (15.3): what the answer keeps, drops, repeats  -- a REPORT, not a gate
    |
    v
- VERDICT: PROPOSAL (origin "model") with its report
+ agree_with (optional, off by default; 15.12, 15.13): a second model from another vendor resolved the same file
+ at the same time; the two results are not the same file, or a report is not clean  -- HOLD
+   |
+   v
+ VERDICT: PROPOSAL (origin "model") with its report; a HELD proposal never lands
    |
    v
  VERIFY: the operator's verify.command on the exact tree that would land, out of the lane (15.9)
@@ -937,17 +941,20 @@ end of this section.
 | writer | proposes a resolution per region | a model, configurable (15.13) | 15.10: the elements kept and removed, 15.12 |
 | checks and repair | refuse a broken answer, repair it once | deterministic checks | 15.10 |
 | report | tells the agent what the answer keeps or drops | deterministic | 15.6: it separates (43% against 60% right), it does not gate |
+| agree_with (optional) | holds a proposal back unless a second model from another vendor gives the same file and both reports are clean | code (`llmStrategy`), configured by the operator | 15.12: G1, 59.8% of the files landed with 15.5% wrong under two judges, before the operator's tests |
 | verify | runs the operator's build and tests on the exact tree | the operator's command | 15.9, 14 |
 | decideLand | the one landing rule | code | 15.4 |
 
 **Not in the system, and why.** Four ideas were built as measurements, and none of them is a landing
 signal on the evidence we have; each is kept as a measurement (Appendix A) and not as code:
 a decision model that chooses OURS / THEIRS / both per region and lets a writer work only where it
-says NEEDS-MERGE (15.11: a java selector, nothing near the bar elsewhere); agreement of several
-models or arms on the same answer (15.12: models make the same mistakes); structure and
+says NEEDS-MERGE (15.11: a java selector, nothing near the bar elsewhere); agreement of arms of one
+model, and of several models on every region (15.12: models make the same mistakes); structure and
 self-agreement rules (15.12: they do not hold on held-out repositories); a build-and-vet simulation
 of the verification in the bench (15.12: it removes the answers that do not compile and no more).
-What does move the number is the operator's own tests, which only the operator has.
+What does move the number is the operator's own tests, which only the operator has. What is in the
+system, as an option that is off by default, is the agreement of two models from different vendors on the
+whole file (`agree_with`, 15.13): the one filter that chose better proposals than the writer alone.
 
 ### 15.1 End to end
 
@@ -1027,8 +1034,8 @@ What does move the number is the operator's own tests, which only the operator h
  classify: path policy, shape, size, binary, lockfile, generated, minified
    |-- not sendable ----------------------------------------> AGENT (NOT_SENT, reason)
    v
- operator rules in their order (trivial, union, rerere, command), each with the syntax check and
- the operator's checks
+ operator rules in their order (trivial, union, rerere, command), each with the operator's checks
+ (the syntax check is the model's: it runs on the llm strategy's answers only)
    |-- a rule resolved it ---------------------------------> VERDICT RULE (lands, 15.4)
    v
  AI configured? --no-------------------------------------> AGENT (FAILED: no strategy applied)
@@ -1056,6 +1063,12 @@ What does move the number is the operator's own tests, which only the operator h
    v
  composition report (15.3) of the regions: drops, duplicates, contested changes (a report, not a gate,
  and not a repair trigger)
+   v
+ [agree_with set] the second model resolved the same file in parallel, with the same prompt:
+   |-- its answer is not the same file after normalization (CRLF, trailing whitespace, trailing blank
+   |   lines), or it failed, or a report of the two holds a drop or a duplicate
+   |   ---------------------------------------------> HELD: the first model's proposal with the reason
+   |   (PROPOSED, never lands, not even verified)
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
    v
@@ -1098,6 +1111,8 @@ What does move the number is the operator's own tests, which only the operator h
                                                   and passed on THIS tree (tree object ID equality)
    a file a model resolved ...................... LAND only if verify.command ran and passed on THIS
                                                   tree: tree object ID equality, not the tip
+   a file the resolver holds (agree_with) ....... PACKAGE: never lands, whatever was verified; the
+                                                  tree is not even verified for it
    anything else ................................ PACKAGE (the model's files are proposals)
  One rule about a model's resolution. No other code path lands it. No check disables itself: a configuration that
  cannot be used stops the server at startup, and a failure at run time refuses the land. No
@@ -1124,9 +1139,10 @@ What does move the number is the operator's own tests, which only the operator h
 | classify | `landClassify`, `resolver.SendRules` | operations/land_resolve.go; graft/resolver |
 | operator rules, file checks | `Resolver.resolveFile`, `Resolver.runChecks`, `syntax.CheckMerge` | tools/graft-agents/resolve/resolve.go |
 | AI per file | `llmStrategy.Resolve`, `ResolveLLM`, `llmResolvePatch` | tools/.../resolve/llm_strategy.go, llm_core.go, llm_patch.go |
-| regions, assemble | `llmRegions`, `llmAssemble` | tools/.../resolve/llm_core.go |
+| regions (the fallback of git's, and the assembly of the file) | `llmRegions`, `llmJoin` | tools/.../resolve/llm_core.go, llm_gitmerge.go |
 | one call per region, its checks | `llmPatchSystem`, `llmPatchUser`, `llmPatchAnswer`, `llmCheckPatched`, `llmCheckAnswer` | tools/.../resolve/llm_patch.go, llm_core.go |
 | proposal mark, no recording | `proposer`, `Resolver.resolveFile` | tools/.../resolve/llm_strategy.go, resolve.go |
+| agreement gate: second model, comparison, hold | `llmStrategy.Resolve`, `llmSide.start`, `llmStrategy.agreement`, `LLMNormalize`, `LLMReportClean`, `Resolution.Hold`, `ResponseFile.Hold` (a held file is a model's), `landAnswerHolds`, `decideLand`, `landSetOutcomes` | tools/.../resolve/llm_strategy.go, llm_core.go, resolve.go; graft/resolver/protocol.go; operations/land_proposals.go, land_resolve.go |
 | verify.command's checkout | `landCheckoutTree`, `landMaterializer.add`, `landCheckMaterialized`, `landRemoveCheckout`, `resolver.IsGitDirName` | operations/land_verify.go; graft/resolver/validate.go |
 | merge commit, trailers | `landWriteResolution` | operations/land_resolve.go |
 | PACKAGE | `landWithPackage`, `landListing.conflictPackage` | operations/land_package.go |
@@ -1177,7 +1193,7 @@ the same base lines supersedes it. Measured with zero model calls:
    uncontested change of both sides" or "drops THEIRS' change at base 40-44", "duplicates a line
    both sides added", "changes lines outside the conflicts", "N contested regions resolved freely".
    The duplicates flag carries signal (7 of 19 correct where it fires, against 58.6% overall): it is
-   useful in the report and as a repair trigger.
+   useful in the report, and not as a repair trigger (item 4).
 4. The repair round is driven only by deterministic findings with their exact wording, and only for an
    answer that is broken (the rules of an answer, the syntax): the composition report's drops and
    duplicates were tried as repair triggers and made accepted answers worse (15.10).
@@ -1809,13 +1825,20 @@ verification: `verify.enabled` false, `verify.command`, `verify.timeout` 5 min, 
 `verify.max_tree_bytes` 2 GiB, `verify.max_tree_depth` 64. Nothing lands from a model unless `verify.enabled` is set
 and the command passes on the exact tree.
 
-**The recommended gate for an operator who wants auto-landing.** G1 of 15.12, as a recipe and not as server code:
-two models from different vendors give the byte-identical resolution, both composition reports are clean, and
-`verify.command` passes on the exact tree (`verify.enabled` is mandatory with it, and the wrapper is a `command`
-strategy with `origin = "model"`; RESOLVE.md has the recipe). Measured on the OSS held-out files it lands 59.8% of the
-files with 15.5% of those wrong under two independent judges (upper bound 20.1%), before the operator's tests; on conflicts
-of agent PRs 45.8% of the files with 43.1% wrong. The 20%-wrong bar it is compared with was set after the numbers were
-known (15.12).
+**The agreement gate for an operator who wants auto-landing (`agree_with`).** G1 of 15.12 is an option of the llm
+strategy, off by default: a nested `[strategy.llm.agree_with]` table, with the keys of `[strategy.llm]`, names a
+second model, which should come from another vendor. Both models resolve each file at the same time with the prompt of
+record. The first model's resolution is proposed; it can land only if the two results are the same file after the
+judge's normalization, the composition reports of both are clean, and `verify.command` passes on the exact tree
+(`verify.enabled` is mandatory, as for every model resolution). Otherwise the resolution is held: the response carries
+a `hold` reason and the report says that the second model disagreed, and the server never lands a held file, nor
+runs the verification for it. A budget table must be given for both models or for neither. The bench runs the same
+code and prices both models. RESOLVE.md has the configuration. Measured on the OSS held-out files it lands 59.8% of
+the files with 15.5% of those wrong under two independent judges (upper bound 20.1%), before the operator's tests; on
+conflicts of agent PRs 45.8% of the files with 43.1% wrong. Those numbers were measured as two single-model runs
+combined offline (the gate decides the same thing on the same answers); the code is covered by tests with fake
+providers and was not run through the bench against the live models. The 20%-wrong bar it is compared with was set
+after the numbers were known (15.12).
 
 **The default model.** The shipped example is `openai/gpt-6-luna` at effort low. On the stratified 100 the one other
 model that passed the smoke check, `z-ai/glm-5.3-flash` pinned to Z.AI, is as good (15.12) and costs the same per

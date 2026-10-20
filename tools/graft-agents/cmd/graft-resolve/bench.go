@@ -171,60 +171,63 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 
 	// A chain with a model runs under a hard cap: every call reserves its worst case first
 	// (resolve.Budget), and the calls that would pass the cap are not made.
-	var budget *resolve.Budget
-	var pricing *bench.Pricing
+	//
+	// A chain with an agree_with model has two models with two prices (both priced from OpenRouter),
+	// and the cap is split in two: each model has its own budget of half of it.
+	var budget, agreeBudget *resolve.Budget
+	var pricing, agreePricing *bench.Pricing
 	if models := res.LLMModels(); len(models) > 0 {
 		if *maxUSD <= 0 {
 			fmt.Fprintln(stderr, "graft-resolve bench run: the chain calls a model, so --max-usd is required")
 			return 2
 		}
-		var prices resolve.Prices
+		agreeModels := res.LLMAgreeModels()
+		if len(agreeModels) > 0 && *pricingSource != "openrouter" {
+			fmt.Fprintln(stderr, "graft-resolve bench run: a chain with an agree_with model has two prices: use --pricing openrouter")
+			return 2
+		}
+		cap := *maxUSD
+		if len(agreeModels) > 0 {
+			cap /= 2
+		}
+		var prices, agreePrices resolve.Prices
 		switch *pricingSource {
 		case "openrouter":
-			distinct := map[string]bool{}
-			for _, m := range models {
-				distinct[m] = true
+			var code int
+			if prices, pricing, code = benchPrice(ctx, stderr, *openRouterAPI, models, res.LLMRoutings(), res.LLMMaxPromptTokens()); code != 0 {
+				return code
 			}
-			if len(distinct) != 1 {
-				fmt.Fprintf(stderr, "graft-resolve bench run: --pricing openrouter prices one model, the chain has %v\n", models)
-				return 2
-			}
-			var model string
-			for m := range distinct {
-				model = m
-			}
-			// The strategies of the one model must route it the same way, or no one price fits.
-			var routing *llm.Routing
-			first := true
-			for _, r := range res.LLMRoutings() {
-				if !first && !reflect.DeepEqual(r, routing) {
-					fmt.Fprintln(stderr, "graft-resolve bench run: --pricing openrouter needs one routing, the llm strategies route differently")
-					return 2
+			if len(agreeModels) > 0 {
+				if agreePrices, agreePricing, code = benchPrice(ctx, stderr, *openRouterAPI, agreeModels, res.LLMAgreeRoutings(), res.LLMMaxPromptTokens()); code != 0 {
+					return code
 				}
-				routing, first = r, false
 			}
-			p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, *openRouterAPI, model, res.LLMMaxPromptTokens(), routing)
-			if err != nil {
-				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
-				return 1
-			}
-			pricing, prices = &p, p.Prices()
 		case "fixed":
 			prices = resolve.Prices{InputPerMillion: *inputPrice, OutputPerMillion: *outputPrice}
 		default:
 			fmt.Fprintf(stderr, "graft-resolve bench run: unknown --pricing %q, want openrouter or fixed\n", *pricingSource)
 			return 2
 		}
-		if budget, err = resolve.NewBudget(*maxUSD, prices, ""); err != nil {
+		if budget, err = resolve.NewBudget(cap, prices, ""); err != nil {
 			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 			return 1
 		}
-		if _, err := res.UseBudget(budget); err != nil {
+		if len(agreeModels) > 0 {
+			if agreeBudget, err = resolve.NewBudget(cap, agreePrices, ""); err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+				return 1
+			}
+		}
+		if _, err := res.UseBudgets(budget, agreeBudget); err != nil {
 			fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
 			return 1
 		}
 		fmt.Fprintf(stderr, "cap $%.2f; $%g per million input tokens, $%g per million output tokens, $%g per request\n",
-			*maxUSD, prices.InputPerMillion, prices.OutputPerMillion, prices.PerRequest)
+			cap, prices.InputPerMillion, prices.OutputPerMillion, prices.PerRequest)
+		if agreeBudget != nil {
+			fmt.Fprintf(stderr, "cap $%.2f for the agree_with model; $%g per million input tokens, $%g per million output tokens, $%g per request\n",
+				cap, agreePrices.InputPerMillion, agreePrices.OutputPerMillion, agreePrices.PerRequest)
+		}
 	}
 
 	cases := bench.Sample(manifest.Cases, *sample, *seed)
@@ -246,7 +249,11 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	// same way, and a run that goes on only measures the refusals.
 	if budget != nil {
 		runner.Stop = func() string {
-			if n := budget.PaymentRefusals(); n > 0 {
+			n := budget.PaymentRefusals()
+			if agreeBudget != nil {
+				n += agreeBudget.PaymentRefusals()
+			}
+			if n > 0 {
 				return "the provider refused a call with HTTP 402 (no credit)"
 			}
 			return ""
@@ -261,6 +268,15 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 			return 1
 		}
 		report.SpendUSD, report.MaxUSD, report.Pricing = snap.SpentUSD, *maxUSD, pricing
+		if agreeBudget != nil {
+			asnap, err := agreeBudget.Snapshot()
+			if err != nil {
+				fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+				return 1
+			}
+			report.SpendUSD += asnap.SpentUSD
+			report.AgreePricing = agreePricing
+		}
 	}
 
 	if err := writeReport(report, *jsonOut, *mdOut, stdout); err != nil {
@@ -272,6 +288,39 @@ func benchRun(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		return 1
 	}
 	return 0
+}
+
+// benchPrice reads from OpenRouter the price of the one model that the strategies in models use,
+// routed the way routings say (the strategies of the one model must route it the same way, or no
+// one price fits). It returns the exit code to use when it fails, else 0.
+func benchPrice(ctx context.Context, stderr io.Writer, api string, models map[string]string, routings map[string]*llm.Routing, maxPromptTokens int) (resolve.Prices, *bench.Pricing, int) {
+	distinct := map[string]bool{}
+	for _, m := range models {
+		distinct[m] = true
+	}
+	if len(distinct) != 1 {
+		fmt.Fprintf(stderr, "graft-resolve bench run: --pricing openrouter prices one model, the chain has %v\n", models)
+		return resolve.Prices{}, nil, 2
+	}
+	var model string
+	for m := range distinct {
+		model = m
+	}
+	var routing *llm.Routing
+	first := true
+	for _, r := range routings {
+		if !first && !reflect.DeepEqual(r, routing) {
+			fmt.Fprintln(stderr, "graft-resolve bench run: --pricing openrouter needs one routing, the llm strategies route differently")
+			return resolve.Prices{}, nil, 2
+		}
+		routing, first = r, false
+	}
+	p, err := bench.OpenRouterPricing(ctx, &http.Client{Timeout: 30 * time.Second}, api, model, maxPromptTokens, routing)
+	if err != nil {
+		fmt.Fprintf(stderr, "graft-resolve bench run: %v\n", err)
+		return resolve.Prices{}, nil, 1
+	}
+	return p.Prices(), &p, 0
 }
 
 // benchRejudge judges the stored answers of a run again, with no model call:

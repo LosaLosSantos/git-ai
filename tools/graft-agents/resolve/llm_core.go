@@ -245,6 +245,67 @@ func (s *LLMRegionStats) Get() (regions, equalOurs int, ok bool) {
 	return s.regions, s.equalOurs, s.recorded
 }
 
+// Absorb adds the usage, the calls, the providers and the rejected answers of o to s: the cost of
+// the second model of the agree_with gate belongs to the file it helped to resolve. The rejected
+// answers carry prefix. The counts of the last file and its report stay s's own.
+func (s *LLMRegionStats) Absorb(o *LLMRegionStats, prefix string) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	usage, calls, repairs := o.usage, o.calls, o.repairs
+	providers := make(map[string]int, len(o.providers))
+	for k, v := range o.providers {
+		providers[k] = v
+	}
+	rejected := append([]string(nil), o.rejected...)
+	o.mu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage.InputTokens += usage.InputTokens
+	s.usage.OutputTokens += usage.OutputTokens
+	s.usage.ReasoningTokens += usage.ReasoningTokens
+	s.calls += calls
+	s.repairs += repairs
+	if len(providers) > 0 && s.providers == nil {
+		s.providers = map[string]int{}
+	}
+	for k, v := range providers {
+		s.providers[k] += v
+	}
+	for _, r := range rejected {
+		s.rejected = append(s.rejected, prefix+r)
+	}
+}
+
+// LLMReportClean reports whether a composition report holds no finding: no line says that the answer
+// drops a change of a side or repeats a line both added (llmReport words them first). It is the
+// "clean report" of the agree_with gate (PLAN10 15.12): a report is not a gate for a single model,
+// and is one of the two conditions under which two models' agreement is trusted.
+func LLMReportClean(report []string) bool {
+	for _, line := range report {
+		if strings.Contains(line, "drops") || strings.Contains(line, "duplicates") {
+			return false
+		}
+	}
+	return true
+}
+
+// LLMNormalize is a file as the agree_with gate and the judges compare it: line endings as LF, no
+// whitespace at the end of a line, no blank line at the end of the file. The bench normalizes
+// with it too, so that "the same answer" means the same thing everywhere.
+func LLMNormalize(b []byte) []byte {
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimRight(l, " \t\r")
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
 type llmRegionStatsKey struct{}
 
 // WithLLMRegionStats returns ctx carrying s, for the llm strategy to record into.

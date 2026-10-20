@@ -91,9 +91,17 @@ func llmBudgetConfig(spec StrategySpec, tbl map[string]any) (*Budget, error) {
 
 // UseBudget makes every llm strategy of r go through b, in place of a configured budget, and
 // returns how many there are. It must be called before the first Resolve. Each llm strategy
-// needs max_tokens.
+// needs max_tokens. A strategy with an agree_with model has two prices: UseBudgets.
 func (r *Resolver) UseBudget(b *Budget) (int, error) {
-	if b == nil {
+	return r.UseBudgets(b, nil)
+}
+
+// UseBudgets makes the first model of every llm strategy of r go through first and the second
+// model of the strategies that have an agree_with go through second, in place of the configured
+// budgets, and returns how many strategies there are. A strategy with an agree_with needs second:
+// a cap that covers one of two models would not be a cap.
+func (r *Resolver) UseBudgets(first, second *Budget) (int, error) {
+	if first == nil {
 		return 0, errors.New("resolve: nil budget")
 	}
 	n := 0
@@ -105,8 +113,18 @@ func (r *Resolver) UseBudget(b *Budget) (int, error) {
 		if s.opt.MaxTokens <= 0 {
 			return 0, fmt.Errorf("strategy %q: a budget needs max_tokens in [strategy.llm]", bd.Name)
 		}
-		s.budget = b
-		s.provider = budgetProvider{p: s.base, b: b}
+		if s.agree != nil && s.agree.opt.MaxTokens <= 0 {
+			return 0, fmt.Errorf("strategy %q: a budget needs max_tokens in [strategy.llm.agree_with]", bd.Name)
+		}
+		if s.agree != nil && second == nil {
+			return 0, fmt.Errorf("strategy %q: it has an agree_with model, which has its own price: give a budget for each model", bd.Name)
+		}
+		s.budget = first
+		s.provider = budgetProvider{p: s.base, b: first}
+		if s.agree != nil {
+			s.agree.budget = second
+			s.agree.provider = budgetProvider{p: s.agree.base, b: second}
+		}
 		n++
 	}
 	return n, nil
@@ -123,6 +141,18 @@ func (r *Resolver) LLMModels() map[string]string {
 	return out
 }
 
+// LLMAgreeModels returns the configured agree_with model of each llm strategy of r that has one,
+// by strategy name.
+func (r *Resolver) LLMAgreeModels() map[string]string {
+	out := map[string]string{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok && s.agree != nil {
+			out[bd.Name] = s.agree.model
+		}
+	}
+	return out
+}
+
 // LLMRoutings returns the OpenRouter routing of each llm strategy of r, by strategy name; nil for
 // a strategy without one.
 func (r *Resolver) LLMRoutings() map[string]*llm.Routing {
@@ -130,6 +160,17 @@ func (r *Resolver) LLMRoutings() map[string]*llm.Routing {
 	for _, bd := range r.bindings {
 		if s, ok := bd.Strategy.(*llmStrategy); ok {
 			out[bd.Name] = s.routing
+		}
+	}
+	return out
+}
+
+// LLMAgreeRoutings is LLMRoutings for the agree_with model of the strategies that have one.
+func (r *Resolver) LLMAgreeRoutings() map[string]*llm.Routing {
+	out := map[string]*llm.Routing{}
+	for _, bd := range r.bindings {
+		if s, ok := bd.Strategy.(*llmStrategy); ok && s.agree != nil {
+			out[bd.Name] = s.agree.routing
 		}
 	}
 	return out
@@ -160,12 +201,20 @@ func (r *Resolver) LLMMaxPromptTokens() int {
 	return n
 }
 
-// Budgets returns the budgets of r's strategies, by strategy name.
+// Budgets returns the budgets of r's strategies, by strategy name; the budget of the agree_with
+// model of a strategy is under its name followed by "/agree_with".
 func (r *Resolver) Budgets() map[string]*Budget {
 	out := map[string]*Budget{}
 	for _, bd := range r.bindings {
-		if s, ok := bd.Strategy.(*llmStrategy); ok && s.budget != nil {
+		s, ok := bd.Strategy.(*llmStrategy)
+		if !ok {
+			continue
+		}
+		if s.budget != nil {
 			out[bd.Name] = s.budget
+		}
+		if s.agree != nil && s.agree.budget != nil {
+			out[bd.Name+agreeSuffix] = s.agree.budget
 		}
 	}
 	return out

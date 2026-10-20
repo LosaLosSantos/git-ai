@@ -73,6 +73,10 @@ type Result struct {
 	Providers map[string]int `json:"providers,omitempty"`
 	Repairs   int            `json:"repairs,omitempty"`
 	Report    []string       `json:"report,omitempty"`
+	// Hold is why the resolution of an accepted answer is held back as a proposal (agree_with: the
+	// second model did not agree). The server never lands a held file; the report counts the
+	// held answers apart from the ones that would land through verify.
+	Hold string `json:"hold,omitempty"`
 	// LineEndings are those of the sides of a content conflict (resolve.LLMLineEndings): the llm
 	// strategy sends a CRLF file as LF, and a mixed one as it is.
 	LineEndings string `json:"line_endings,omitempty"`
@@ -283,6 +287,7 @@ func (r Runner) runCase(ctx context.Context, c Case, maxBytes int64) (Result, er
 	res.Strategy = strings.TrimPrefix(resp.Resolver, "graft-resolve/")
 	res.Answer = f.Action
 	res.Report = f.Report
+	res.Hold = f.Hold
 	if r.AnswersDir != "" && f.Action != protocol.ActionDelete {
 		if err := os.WriteFile(answerPath(r.AnswersDir, c.ID), f.Content, 0o600); err != nil {
 			return res, err

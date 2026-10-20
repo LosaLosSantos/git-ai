@@ -32,6 +32,11 @@ type Counts struct {
 	SyntaxUnchecked int `json:"syntax_unchecked"`
 	// EqualsOurs counts the accepted results equal to OURS (part of Correct and Wrong).
 	EqualsOurs int `json:"equals_ours"`
+	// Held counts the accepted results the agree_with gate holds back as proposals (the second
+	// model did not agree), and HeldWrong those of them that are wrong; both are part of Correct
+	// and Wrong. What would land through verify is the rest.
+	Held      int `json:"held"`
+	HeldWrong int `json:"held_wrong"`
 	// Regions counts the conflicting regions of the accepted llm answers, and RegionsEqualOurs
 	// those answered with OURS' region unchanged.
 	Regions          int `json:"regions"`
@@ -73,6 +78,12 @@ func (c *Counts) add(r Result) {
 	c.InputTokens += r.InputTokens
 	c.OutputTokens += r.OutputTokens
 	c.ReasoningTokens += r.ReasoningTokens
+	if r.Hold != "" && (r.Outcome == OutcomeCorrect || r.Outcome == OutcomeWrong) {
+		c.Held++
+		if r.Outcome == OutcomeWrong {
+			c.HeldWrong++
+		}
+	}
 	switch r.Outcome {
 	case OutcomeCorrect:
 		c.Correct++
@@ -117,6 +128,9 @@ type Report struct {
 	MaxUSD   float64 `json:"max_usd,omitempty"`
 	// Pricing is the price the spend was computed with, as read at run time.
 	Pricing *Pricing `json:"pricing,omitempty"`
+	// AgreePricing is the price of the agree_with model, when the chain has one; the spend is the
+	// sum of the two models' (each under half of the cap).
+	AgreePricing *Pricing `json:"agree_pricing,omitempty"`
 	// StopReason is why the run stopped before its last cases (OutcomeStopped), if it did.
 	StopReason string   `json:"stop_reason,omitempty"`
 	Results    []Result `json:"results"`
@@ -152,6 +166,14 @@ func NewReport(label string, results []Result) Report {
 	return rep
 }
 
+// percent is 100 * n / d, or 0 when d is 0.
+func percent(n, d int) float64 {
+	if d == 0 {
+		return 0
+	}
+	return 100 * float64(n) / float64(d)
+}
+
 // WriteMarkdown writes the report as Markdown tables.
 func (rep Report) WriteMarkdown(w io.Writer) error {
 	var b strings.Builder
@@ -167,13 +189,20 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		fmt.Fprintf(&b, "; AI spend $%.4f of the $%.2f cap", rep.SpendUSD, rep.MaxUSD)
 	}
 	b.WriteString(".\n\n")
-	if p := rep.Pricing; p != nil {
+	for i, p := range []*Pricing{rep.Pricing, rep.AgreePricing} {
+		if p == nil {
+			continue
+		}
 		over := fmt.Sprintf("highest of %d endpoints", p.Endpoints)
 		if len(p.Priced) > 0 {
 			over = fmt.Sprintf("highest of the %d of %d endpoints the routing allows: %s", len(p.Priced), p.Endpoints, strings.Join(p.Priced, ", "))
 		}
-		fmt.Fprintf(&b, "Model %s, priced at run time (%s, %s, %s): $%g per million input tokens, $%g per million output tokens (completion $%g + internal reasoning $%g), $%g per request.\n\n",
-			p.Model, p.Source, p.FetchedAt.Format(time.RFC3339), over,
+		role := "Model"
+		if i == 1 {
+			role = "Second model (agree_with)"
+		}
+		fmt.Fprintf(&b, "%s %s, priced at run time (%s, %s, %s): $%g per million input tokens, $%g per million output tokens (completion $%g + internal reasoning $%g), $%g per request.\n\n",
+			role, p.Model, p.Source, p.FetchedAt.Format(time.RFC3339), over,
 			PerMillion(p.Prompt), PerMillion(p.Completion, p.Reasoning), PerMillion(p.Completion), PerMillion(p.Reasoning), p.Request)
 	}
 	b.WriteString("| family | cases | correct (exact) | wrong | rejected by checks | not sent | model error | not run (cap) | stopped | abstained | error rate |\n")
@@ -248,6 +277,11 @@ func (rep Report) WriteMarkdown(w io.Writer) error {
 		rep.Total.EqualsOurs, rep.Total.Accepted(), rep.equalsOurs(OutcomeCorrect), rep.equalsOurs(OutcomeWrong))
 	fmt.Fprintf(&b, "\nRegions of the accepted model answers answered with OURS' region unchanged: %d of %d.\n",
 		rep.Total.RegionsEqualOurs, rep.Total.Regions)
+	if t := rep.Total; t.Held > 0 || rep.AgreePricing != nil {
+		landed := t.Accepted() - t.Held
+		fmt.Fprintf(&b, "\nagree_with gate: %d accepted answers, %d held back as proposals (the second model did not agree; %d of them wrong), %d would land through verify (%d wrong, %.1f%%).\n",
+			t.Accepted(), t.Held, t.HeldWrong, landed, t.Wrong-t.HeldWrong, percent(t.Wrong-t.HeldWrong, landed))
+	}
 	if t := rep.Total; t.Calls > 0 {
 		fmt.Fprintf(&b, "\nModel calls: %d, of which %d repair rounds driven by deterministic findings.\n", t.Calls, t.Repairs)
 	}

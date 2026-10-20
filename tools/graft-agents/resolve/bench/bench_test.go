@@ -167,3 +167,26 @@ func TestBlankLinesOnly(t *testing.T) {
 		}
 	}
 }
+
+// TestReportCountsTheAnswersTheAgreeGateHolds: an accepted answer with a Hold is counted apart; what
+// would land through verify is the rest, and its wrong rate is the one the gate is judged by.
+func TestReportCountsTheAnswersTheAgreeGateHolds(t *testing.T) {
+	rep := NewReport("agree", []Result{
+		{ID: "1", Family: "go", Outcome: OutcomeCorrect},
+		{ID: "2", Family: "go", Outcome: OutcomeWrong},
+		{ID: "3", Family: "go", Outcome: OutcomeWrong, Hold: "the second model disagreed"},
+		{ID: "4", Family: "go", Outcome: OutcomeCorrect, Hold: "the second model disagreed"},
+		{ID: "5", Family: "go", Outcome: OutcomeRejected, Hold: "never held: not accepted"},
+	})
+	if got := rep.Total; got.Held != 2 || got.HeldWrong != 1 || got.Accepted() != 4 {
+		t.Fatalf("total = %+v", got)
+	}
+	var b strings.Builder
+	if err := rep.WriteMarkdown(&b); err != nil {
+		t.Fatal(err)
+	}
+	want := "agree_with gate: 4 accepted answers, 2 held back as proposals (the second model did not agree; 1 of them wrong), 2 would land through verify (1 wrong, 50.0%)."
+	if !strings.Contains(b.String(), want) {
+		t.Fatalf("report lacks the gate line:\n%s", b.String())
+	}
+}

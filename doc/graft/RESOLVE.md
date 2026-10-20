@@ -143,8 +143,10 @@ A client asks for resolution per call:
    [What is never sent](#what-is-never-sent)), sends the others to the
    resolver in one request (protocol below), and validates the answer (see
    [Validation](#validation)).
-4. Only when every file is resolved by rules alone, it builds the merged tree from the
-   merge-tree result, writes the resolved
+4. Only when every conflicting file is resolved and the decision lands it (a rule's
+   resolution does; a model's resolution only after `verify.command` passed on the exact
+   tree that lands, see [Proposals](#proposals-and-when-a-models-resolution-lands)), it
+   builds the merged tree from the merge-tree result, writes the resolved
    files as new blobs or deletes them, and creates a merge commit with parents
    `[tip, commit]`. The message is `merge_message` or
    `Merge <short commit> into <branch>`. Trailers:
@@ -161,7 +163,8 @@ A client asks for resolution per call:
    against the new tip.
 
 Otherwise (resolution disabled or refused, a file that is never sent, an
-invalid answer, a timeout, an unresolvable file, or a file a model resolved)
+invalid answer, a timeout, an unresolvable file, or a file a model resolved
+that `verify.command` did not pass, or that no `verify.command` checks)
 the land fails with the normal `merge_conflict` error, the reason is logged,
 and the error carries the conflict package as a second detail (see
 [The conflict package and the re-land](#the-conflict-package-and-the-re-land)).
@@ -691,26 +694,58 @@ origin = "model"   # its files are proposals, and land only if verify.command pa
 `origin` is `"rule"` (the default) or `"model"`. A model command's answers are
 not recorded by `rerere`.
 
-**The recommended gate for auto-landing a model's resolution.** The `llm` strategy alone produces a proposal that lands
-only if `verify.command` passes on the exact tree. An operator who wants model resolutions to land without an agent in
-the loop gets the best measured result (PLAN10 15.12) from this gate, which the server does not implement and an
-operator builds with the `command` strategy above:
+**The agreement gate: `agree_with`.** The `llm` strategy alone produces a proposal that lands only if `verify.command`
+passes on the exact tree. An operator who wants model resolutions to land without an agent in the loop gets the best
+measured result (PLAN10 15.12) by adding a second model from another vendor to the strategy, in the `agree_with`
+table (the same keys as `[strategy.llm]`, except `agree_with` itself):
 
-1. **Two models from different vendors resolve the file** (two `graft-resolve` configurations, each with one `llm`
-   strategy and its own provider), and the resolution is used only if their results are byte-identical after
-   normalizing line endings and trailing whitespace;
+```toml
+[strategy.llm.agree_with]
+type = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "z-ai/glm-5.3-flash"
+effort = "low"
+max_tokens = 8000
+timeout = "2400s"
+
+[strategy.llm.agree_with.routing]
+only = ["z-ai/fp8"]
+```
+
+Both models resolve each file at the same time with the same prompt of record. The first model's resolution is the
+one that is proposed. It lands only if all three hold:
+
+1. **the two results are the same file** after normalizing line endings, trailing whitespace and trailing blank lines;
 2. **the composition report of both is clean** (no line saying that the answer drops or duplicates a change of a side);
-3. **`verify.command` passes** on the exact tree: `verify.enabled = true` is mandatory with this gate, and the strategy
-   must be `origin = "model"` as above, so that the server itself refuses to land it otherwise.
+3. **`verify.command` passes** on the exact tree, as for every model resolution: `verify.enabled = true` is mandatory
+   (the gate does not replace it, it chooses the proposals worth verifying).
 
-The wrapper (the program of the `command` strategy) writes `{out}` only when 1 and 2 hold and fails otherwise; the chain
-then goes on, and the agent gets the conflict package with the proposals as usual. The product ships no such wrapper.
+When 1 or 2 fails, or the second model gives no usable answer, the first model's resolution is **held**: the response
+marks the file with a `hold` reason (`ResolvedFile.Hold`, "the second model disagreed" and why, also in the report),
+the server never lands a held file, whatever `verify.command` says (it does not even run it for that land), and the
+agent gets the conflict package with the proposal as usual. When the first model fails, the file fails as it does
+without the gate. The gate is off by default (no `agree_with` table, no second call). Pick two models from different
+vendors: two models of one family make the same mistakes. A `[strategy.llm.budget]` must have an
+`[strategy.llm.agree_with.budget]` beside it (a cap that covers one of two models is not a cap), and the spend of both
+is counted for the file. The bench (`graft-resolve bench run`) runs the same code, prices the two models from
+OpenRouter and splits `--max-usd` between them; its report counts the held answers apart. Upgrade `graft-resolve` and the
+server together: an older server does not know `hold` and would verify a held proposal like any other.
+
 What it was worth, measured on 487 held-out files of 13 open-source repositories (Luna and glm-5.3-flash, with the
 verify simulation of the bench in place of the operator's tests): 59.8% of the files landed, and 15.5% of those differed
 from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), against 43%
-on conflicts of merged agent PRs. These figures are before the operator's own tests, which are the one signal that
-caught more errors where we could run them; the gate does not replace `verify.command`, it only chooses which proposals
-are worth verifying. Cost: two model calls per region.
+on conflicts of merged agent PRs. These figures were measured by combining two separate single-model runs, which is what
+the gate decides; the gate in the code is covered by tests with fake providers, not re-measured through itself (PLAN10
+15.12). They are before the operator's own tests, which are the one signal that caught more errors where we could run
+them. Cost: two model calls per region.
+
+**Upgrade `graft-resolve` together with the server.** A resolution is a rule's only if its file says so (`origin`
+`"rule"`, protocol v1); a file without an origin is a model's, which lands only through `verify.command`. A
+`graft-resolve` of an earlier release answers without an origin, so with a new server every file it resolves,
+`trivial` and `union` included, is a proposal, and lands only if `verify.command` passes on the exact tree (without
+one, it never lands). The other way round, an older server does not know `hold` (the `agree_with` gate) and would
+verify a held proposal like any other. Upgrade both in the same maintenance window.
 
 **The `rerere` store and the upgrade.** Entries are versioned and record their
 origin. The stores of v0.1.0 and v0.2.0 recorded the `llm` answers as well, with
@@ -976,8 +1011,9 @@ above).
 
 The provider's API keys are withheld from the model: they are read from the
 environment or a file by the provider, never put in the prompt. Everything
-else is sent to the provider, so the three versions of a file and both commit
-messages are shared with it, and any secret that they contain goes with them. Do not send
+else is sent to the provider, so the three versions of a file and the commit
+message of the change (the tip's message is not sent) are shared with it, and any secret that they contain goes with them. With
+`agree_with` two providers receive them. Do not send
 files you would not send to that provider. The server never calls the model.
 Turn AI on only if you accept that the resolution is produced by a model.
 Every AI resolution carries the `Graft-Resolved-By` trailer, so it can be

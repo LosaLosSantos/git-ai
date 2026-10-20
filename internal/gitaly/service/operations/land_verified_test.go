@@ -799,3 +799,35 @@ func TestUserLand_finalPass_aLostRaceStillEndsWithThePackage(t *testing.T) {
 	require.Equal(t, "the time ran out", a.GetReason())
 	require.Equal(t, gitalypb.LandConflictFile_OUTCOME_RESOLVED, packageFile(t, pkg, "b").GetOutcome())
 }
+
+// TestUserLand_aHeldModelResolutionNeverLands: a file the resolver holds back (the second model of
+// agree_with did not agree) is a proposal that does not land even when verify.command would pass on
+// the tree that would land; the command does not even run. The same answer without the hold lands.
+func TestUserLand_aHeldModelResolutionNeverLands(t *testing.T) {
+	t.Parallel()
+
+	held := modelAnswer()
+	held.Files[0].Hold = "the second model (glm) disagreed"
+	fx, rdir, vdir := verifiedFixture(t, held, "grep -qx merged-a a && grep -qx merged-b b && grep -qx d d", nil)
+
+	_, err := fx.client.UserLand(fx.ctx, fx.request("Land agent work"))
+	requireMergeConflict(t, err)
+	pkg := landConflictDetail(err)
+	require.NotNil(t, pkg)
+	var reasons []string
+	for _, f := range pkg.GetFiles() {
+		require.Equal(t, gitalypb.LandConflictFile_OUTCOME_PROPOSED, f.GetOutcome(), f.GetPath())
+		reasons = append(reasons, f.GetReason())
+	}
+	require.Contains(t, strings.Join(reasons, "\n"), landHeldReason+"the second model (glm) disagreed")
+	require.Equal(t, 1, resolverCalls(t, rdir))
+	require.Equal(t, 0, verifyRuns(t, vdir), "a land that cannot land is not verified")
+	requireBranchAt(t, fx.cfg, fx.repoPath, git.DefaultBranch, fx.tip)
+	require.NotEmpty(t, proposalRefTarget(t, fx), "the held resolution is kept as a proposal")
+
+	// The hold is the whole difference: the same answer without it lands through the verification.
+	fx2, _, vdir2 := verifiedFixture(t, modelAnswer(), "grep -qx merged-a a && grep -qx merged-b b && grep -qx d d", nil)
+	_, err = fx2.client.UserLand(fx2.ctx, fx2.request("Land agent work"))
+	require.NoError(t, err)
+	require.Equal(t, 1, verifyRuns(t, vdir2))
+}

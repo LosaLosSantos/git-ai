@@ -54,6 +54,23 @@ const landVerifyDisabledReason = "verification is disabled (verify.enabled is fa
 // landNoVerifyReason follows landProposedReason when no verify.command is configured.
 const landNoVerifyReason = "no verify.command is configured, so nothing verifies a model's resolution"
 
+// landHeldReason is the reason of a file that the resolver holds back: the second model of the llm
+// strategy's agree_with gate did not agree with the first, so the resolution is a proposal that
+// does not land by itself, even on a tree that verify.command passed on. The resolver's own words
+// follow it.
+const landHeldReason = "held back by the resolver, so it does not land by itself even if verify.command passes (see proposal): "
+
+// landAnswerHolds reports whether a resolver's answer holds back a file (ResponseFile.Hold): such an
+// answer never lands, whatever verify.command says.
+func landAnswerHolds(answer *resolver.Response) bool {
+	for _, f := range answer.Files {
+		if f.Hold != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // landNormalizeOrigins gives each file of an answer its origin, as the server reads it: OriginRule
 // only for a file that says it is a rule's and is not marked as a proposal, OriginModel for any
 // other. It is done when the answer arrives, so that the answers kept by their keys and the rounds
@@ -229,6 +246,10 @@ func landTrailerValueOrQuoted(v string) string {
 // verification, whatever made the resolution, runs out of the lane, so that the lane only compares.
 func decideLand(answer *resolver.Response, files []*landFileState, tree, verified git.ObjectID, verifyRequired bool) bool {
 	if answer == nil {
+		return false
+	}
+	// A file the resolver holds back never lands: the second model did not agree with the first.
+	if landAnswerHolds(answer) {
 		return false
 	}
 	proposes := landAnswerProposes(answer)

@@ -229,6 +229,11 @@ type ResponseFile struct {
 	Content  []byte `json:"content,omitempty"`
 	Origin   string `json:"origin,omitempty"`
 	Proposal bool   `json:"proposal,omitempty"`
+	// Hold is the reason the resolver holds a model's resolution back (the second model of the llm
+	// strategy's agree_with did not agree): the file is a proposal for the agent and never lands by
+	// itself, whatever verify.command says (decideLand). A held file is a model's, whatever its
+	// origin says.
+	Hold string `json:"hold,omitempty"`
 	// Report is the composition report of a model's resolution (PLAN10 15.3): in exact words what it
 	// keeps, drops and repeats of the two sides' changes. A report, never a gate: nothing in it
 	// decides whether the resolution lands. It goes to the agent with the proposal.
@@ -236,7 +241,7 @@ type ResponseFile struct {
 }
 
 // FromModel reports whether the file is a model's resolution: anything that is not marked as a
-// rule's, and anything marked as a proposal.
+// rule's, anything marked as a proposal, and anything held back.
 func (f ResponseFile) FromModel() bool {
-	return f.Proposal || f.Origin != OriginRule
+	return f.Proposal || f.Hold != "" || f.Origin != OriginRule
 }

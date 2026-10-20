@@ -158,6 +158,12 @@ type ResolvedFile struct {
 	Origin string `json:"origin,omitempty"`
 	// Proposal is the older mark of a model's resolution, still sent with OriginModel.
 	Proposal bool `json:"proposal,omitempty"`
+	// Hold is the reason the resolver holds a model's resolution back: the file is a proposal for
+	// the agent and does not land by itself, even when verify.command passes on the tree that
+	// would land. It is set when the llm strategy's agree_with gate is on and the second model did
+	// not agree with the first (resolve.Resolution.Hold). A resolver that does not know the field
+	// is an older one: upgrade graft-resolve together with the server.
+	Hold string `json:"hold,omitempty"`
 	// Report is the composition report of a model's resolution (PLAN10 15.3): in exact words what it
 	// keeps, drops and repeats of the two sides' changes. A report and not a gate: nothing in it
 	// decides whether the resolution lands. It goes to the agent with the proposal.

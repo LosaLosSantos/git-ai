@@ -5,21 +5,13 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/feder-cr/git-ai/tools/graft-agents/resolve"
 )
 
 // normalize returns content with line endings as LF, trailing whitespace of every line removed
 // and trailing blank lines dropped: the equivalence by which a result is judged correct.
-func normalize(content []byte) []byte {
-	text := strings.ReplaceAll(string(content), "\r\n", "\n")
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		lines[i] = strings.TrimRight(line, " \t\r")
-	}
-	for len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	return []byte(strings.Join(lines, "\n"))
-}
+func normalize(content []byte) []byte { return resolve.LLMNormalize(content) }
 
 // judge reports whether a result equals the human resolution after normalization, and whether it
 // is byte-identical. A nil content is a deletion.

@@ -226,6 +226,9 @@ func (s *Server) landResolveAt(
 	var tree, verified git.ObjectID
 	if combined != nil && (landAnswerProposes(combined) || verifyRequired) {
 		switch {
+		case landAnswerHolds(combined):
+			// A file is held back: the land cannot land, so the tree is not verified (that would hold
+			// the repository's verify slot for nothing). The files say why in their reasons.
 		case pre.unverifiable != "":
 			landAnnotateUnverified(files, combined, pre.unverifiable)
 		case !verifyRequired && len(s.resolveCfg.Verify.Command) > 0:
@@ -310,6 +313,8 @@ func landSetOutcomes(answer *resolver.Response, files []*landFileState) {
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_FAILED, "the resolver gave no answer for the file"
 		case err != nil:
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_REJECTED, err.Error()
+		case rf.Hold != "":
+			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landCutString(landHeldReason+rf.Hold, landPackageReasonBytes)
 		case rf.FromModel():
 			f.outcome, f.reason = gitalypb.LandConflictFile_OUTCOME_PROPOSED, landProposedReason
 		}

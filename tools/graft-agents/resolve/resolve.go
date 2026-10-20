@@ -57,6 +57,10 @@ type Resolution struct {
 	Content []byte
 	// Report is the composition report that goes with a model's resolution (ResolvedFile.Report).
 	Report []string
+	// Hold is why the resolution is held back as a proposal even if it would pass the server's
+	// verification (ResolvedFile.Hold): the second model of the llm strategy's agree_with did not
+	// agree with the first. Empty for a resolution that is not held.
+	Hold string
 }
 
 // Strategy resolves conflicts. Implementations must be safe for concurrent
@@ -371,9 +375,11 @@ func (r *Resolver) Resolve(ctx context.Context, req protocol.Request) (protocol.
 	// The month's AI spend of the strategies that answered, so that command mode reports it too.
 	budgets := r.Budgets()
 	for _, name := range used {
-		if b := budgets[name]; b != nil {
-			if snap, err := b.Snapshot(); err == nil {
-				resp.Explanation += "; " + name + ": " + snap.String()
+		for _, key := range []string{name, name + agreeSuffix} {
+			if b := budgets[key]; b != nil {
+				if snap, err := b.Snapshot(); err == nil {
+					resp.Explanation += "; " + key + ": " + snap.String()
+				}
 			}
 		}
 	}
@@ -493,6 +499,7 @@ func (r *Resolver) resolveFile(ctx context.Context, req protocol.Request, f File
 			Content:  contentOf(res),
 			Origin:   origin,
 			Proposal: proposal,
+			Hold:     res.Hold,
 			Report:   res.Report,
 		}, b.Name, nil, nil
 	}

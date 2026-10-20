@@ -373,6 +373,18 @@ func TestDecideLand(t *testing.T) {
 	require.False(t, decideLand(rules, resolved(), "t1", "t2", true), "rules, verified on another tree (the tip moved)")
 	require.False(t, decideLand(rules, resolved(), "", "", true), "rules, no tree at all: empty is not equal")
 
+	// A file the resolver holds back (the second model did not agree) never lands, whatever was
+	// verified, whatever its origin says.
+	held := &resolver.Response{Resolver: "graft-resolve/llm", Files: []resolver.ResponseFile{
+		{Path: "a", Origin: resolver.OriginModel, Proposal: true, Hold: "the second model disagreed"}, {Path: "b", Origin: resolver.OriginRule},
+	}}
+	heldOutcomes := []*landFileState{{outcome: gitalypb.LandConflictFile_OUTCOME_PROPOSED}, {outcome: gitalypb.LandConflictFile_OUTCOME_RESOLVED}}
+	require.False(t, decideLand(held, heldOutcomes, "tree-1", "tree-1", false), "held, verified on this very tree")
+	require.False(t, decideLand(held, heldOutcomes, "tree-1", "tree-1", true), "held, verified on this very tree, verification required")
+	require.True(t, held.Files[0].FromModel())
+	ruleHeld := resolver.ResponseFile{Path: "a", Origin: resolver.OriginRule, Hold: "x"}
+	require.True(t, ruleHeld.FromModel(), "a held file is a model's, whatever its origin says")
+
 	// THE rule (PLAN10 15.9): a file that proposes may land only if verify.command passed on the exact
 	// tree that lands, compared by object ID.
 	flagged := &resolver.Response{Resolver: "graft-resolve/trivial", Files: []resolver.ResponseFile{
