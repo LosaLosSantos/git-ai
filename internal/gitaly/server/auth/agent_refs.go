@@ -463,12 +463,14 @@ var agentRefFields = map[protoreflect.FullName]refFieldKind{
 	"gitaly.UserLandRequest.resolve_conflicts": notRef,
 	"gitaly.UserLandRequest.strategy":          notRef,
 
-	"gitaly.UserLandResponse.already_landed":   notRef,
-	"gitaly.UserLandResponse.landed_commit_id": notRef,
-	"gitaly.UserLandResponse.old_tip":          notRef,
-	"gitaly.UserLandResponse.resolved_paths":   notRef,
-	"gitaly.UserLandResponse.resolver":         notRef,
-	"gitaly.UserLandResponse.rewritten":        notRef,
+	"gitaly.UserLandResponse.already_landed":        notRef,
+	"gitaly.UserLandResponse.already_landed_detail": notRef,
+	"gitaly.UserLandResponse.landed_commit_id":      notRef,
+	"gitaly.UserLandResponse.old_tip":               notRef,
+	"gitaly.UserLandResponse.resolved_paths":        notRef,
+	"gitaly.UserLandResponse.resolver":              notRef,
+	"gitaly.UserLandResponse.reverted_by_commit_id": notRef,
+	"gitaly.UserLandResponse.rewritten":             notRef,
 }
 
 // agentRefField returns what a field holds, and whether the exact table knows it.
