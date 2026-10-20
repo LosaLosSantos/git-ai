@@ -1360,14 +1360,16 @@ The resolution is bound to the files instead:
   holds each start until the load is below 2 was in force, and the whole batch ran in a few minutes.
   The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
   (authoritative storage) the lands go on in rounds, without the guarantee. A land that holds a file with priority
-  makes the inline resolutions of the others on it wait for its resolution, which is as long as a slow rule or the
-  deadline allows. Two gaps are known: a resolver that crashes (a non-zero exit with no refusal in its answer) is
+  makes the inline resolutions of the others on it wait for its resolution, for as long as a slow rule takes and at
+  most up to the holder's own deadline (the resolver's `timeout`): the others then wait behind it, or end with the
+  package at their own deadline. A holder whose set of files grows gives its tickets back and takes the larger set at
+  the tail: it loses its place in the queues, and its priority until it is back in the lane. Two gaps are known: a resolver that crashes (a non-zero exit with no refusal in its answer) is
   taken as the rules not being able to resolve, so the land is resolved out of the lane for the proposals; and a
   v0.2.0 graft-resolve, which has no gating and ignores `rules_only`, that is cut at the timeout on a model's conflict
   is never recognised as an older one (only an answer that does not echo `rules_only` is), so it pays the lane's
   budget at every batch; with it set `inline_timeout = "0s"`. A holder's verdict is invalidated by a land
   that changes its file cleanly and lands first (each such land lands once, and the holder resolves again, which is
-  cheap for a rule); with a verification every tree is verified out of the lane, and any land that moves the branch
+  cheap for a fast rule, and costs the time of a slow one each time); with a verification every tree is verified out of the lane, and any land that moves the branch
   while a holder verifies, a clean one included, makes the verified tree stale: on the bench with a verification of 1 s,
   50 resolutions cost 130 verifications and 120 to 135 s (113 to 124 lands/min, p99 74 to 94 s), all 250 landed, bounded by
   the deadline; before the queue the same bench cost 802 verifications for 34 resolutions, 16 lands failed ("could not
