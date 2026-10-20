@@ -400,9 +400,10 @@ The batch executor (`internal/gitaly/service/operations`) defines:
   attempt. The phases are `quarantine` (opening the quarantine and the processes
   of the attempt), `tip` (reading the branch tip), `land_member` (one
   observation per request the stepper lands, in every attempt, denied,
-  conflicting and already-landed requests included), `plan` and `replay` (parts
-  of `land_member`: the range listing and decision of a request, and the replay
-  of a rebased request), `pack` (packing the objects of an attempt before its
+  conflicting and already-landed requests included), `plan`, `identity` and
+  `replay` (parts of `land_member`: the range listing and decision of a request,
+  the lookup of the earlier land of a diverged request ([PLAN11](PLAN11.md)), and
+  the replay of a rebased request), `pack` (packing the objects of an attempt before its
   update), `update` (the CAS and its hooks) and `total` (one observation per
   execution of the batch, which covers all of its attempts, rebuilds and
   fallbacks).
@@ -410,6 +411,11 @@ The batch executor (`internal/gitaly/service/operations`) defines:
   packed before their update.
 - `graft_land_batch_members_total{outcome}` (counter): requests by outcome, with
   the outcomes `landed`, `already_landed`, `conflict`, `denied` and `error`.
+
+The hooks (`internal/gitaly/hook`) define `graft_land_intents_seconds`
+(histogram): the land intents of one prepared reference transaction in the file
+changelog, the wait for their lock file, one write and one fsync, under the
+references' locks ([PLAN11](PLAN11.md), 4.2).
 
 The server registers the lanes of the process (`landlane.Shared`) and these
 metrics with the Prometheus registry, so they are exported on `/metrics`. The

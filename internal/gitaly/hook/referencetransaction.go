@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -226,7 +227,9 @@ func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcm
 		return fmt.Errorf("resolving repository path: %w", err)
 	}
 
+	start := time.Now()
 	compact, err := changelog.RecordLandIntents(repoPath, string(meta.LandReference), meta.Invocation, meta.Lands)
+	landIntentsSeconds.Observe(time.Since(start).Seconds())
 	if err != nil {
 		return err
 	}

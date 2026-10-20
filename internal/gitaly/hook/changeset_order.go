@@ -27,6 +27,12 @@ var (
 		Buckets: []float64{1, 2, 4, 8, 16, 32, 64, 128},
 	})
 
+	landIntentsSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "graft_land_intents_seconds",
+		Help:    "Time of the land intents of one prepared reference transaction (doc/graft/PLAN11.md): the wait for the intents' lock file, one write and one fsync, under the locks of the references.",
+		Buckets: []float64{0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1},
+	})
+
 	changelogAppendSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "graft_changelog_append_seconds",
 		Help:    "Time of one write of the changeset log, with its fsync, for a group of reference transactions.",

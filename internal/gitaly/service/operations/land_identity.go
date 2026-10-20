@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -72,6 +73,8 @@ func landWithRecord(ctx context.Context, reference git.ReferenceName, lands []ch
 // nothing. Only once a land answers is the commit that reverted it looked for, to explain the
 // answer.
 func (a *landingAttempt) landedEarlier(ctx context.Context, reference git.ReferenceName, tip, commitID git.ObjectID) (*landIdentity, error) {
+	defer a.observe(landBatchPhaseIdentity, time.Now())
+
 	records, err := a.server.lookupLand(ctx, a.repository, reference, commitID)
 	if err != nil {
 		return nil, err
