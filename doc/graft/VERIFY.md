@@ -130,8 +130,17 @@ retry rules as `UserLand`. The commit message is:
 ```
 Revert "<culprit subject>"
 
+This reverts commit <culprit oid>, which failed the verification test command.
+
 Graft-Auto-Revert: <culprit oid>
 ```
+
+A reverted culprit is not landed again from the same commit: a `UserLand` of
+its `commit_id` on the branch, for example the retry of a land whose response
+was lost, answers `already_landed` with the culprit as `landed_commit_id` and
+this revert as `reverted_by_commit_id` (the land identity of
+[PLAN11](PLAN11.md)). To land the change again, the author makes a new commit:
+the fixed change, or a revert of the revert.
 
 Safeguards:
 

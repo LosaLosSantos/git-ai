@@ -102,6 +102,11 @@ func changelogMetaOf(payload gitcmd.HooksPayload, graftMeta gitcmd.ChangelogMeta
 		Rewritten:        graftMeta.Rewritten,
 		Members:          graftMeta.Members,
 		MembersTruncated: graftMeta.MembersTruncated,
+		LandReference:    string(graftMeta.LandReference),
+		Lands:            graftMeta.Lands,
+	}
+	if len(graftMeta.Lands) > 0 {
+		meta.LandInvocation = graftMeta.Invocation
 	}
 	if meta.Operation == "" {
 		meta.Operation = changelog.UnknownOperation

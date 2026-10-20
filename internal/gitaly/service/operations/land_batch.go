@@ -69,8 +69,11 @@ type landStep struct {
 	tip           git.ObjectID
 	rewritten     bool
 	alreadyLanded bool
-	created       bool
-	resolution    *landResolution
+	// earlier is the earlier land of the request that is still on the branch, when it is what
+	// tells that the request is already landed (see landingAttempt.landedEarlier).
+	earlier    *landIdentity
+	created    bool
+	resolution *landResolution
 	// tipIndependent is set with an error that does not depend on the running tip: the commit ID is
 	// unparsable or does not resolve to a commit. Such an error is final wherever the request is.
 	tipIndependent bool
@@ -111,8 +114,11 @@ type landBatchOutcome struct {
 	LandedCommit  git.ObjectID
 	Rewritten     bool
 	AlreadyLanded bool
-	Created       bool
-	Resolution    *landResolution
+	// Earlier is the earlier land that tells that the request is already landed, when the record
+	// of the land tells it rather than the reachability of the commit.
+	Earlier    *landIdentity
+	Created    bool
+	Resolution *landResolution
 	// BatchSize is the number of requests of the batch, the same for every response of the batch.
 	BatchSize int
 	// BatchPosition is the zero-based index of the request in the batch, in submission
@@ -322,6 +328,10 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 	rewritten := false
 	var members []int
 	var changes []changelog.Member
+	// landedAs maps the commit of each member to the commit it landed as in the running tip, so
+	// that a later request of the same commit, a retry that joined the batch of its first land,
+	// is answered as already landed.
+	landedAs := map[git.ObjectID]git.ObjectID{}
 	for pos, i := range idx {
 		req := reqs[i]
 		outs[pos].OldTip = cur
@@ -340,12 +350,21 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 		case step.alreadyLanded:
 			outs[pos].LandedCommit = cur
 			outs[pos].AlreadyLanded = true
+			outs[pos].Earlier = step.earlier
 
 			// The answer depends on the tip only while no member precedes the request. A member
 			// that does not reach the branch would take the answer away.
 			if len(members) == 0 {
 				e.deliverEarly(ctx, i, len(reqs), outs[pos], final)
 			}
+
+		case step.tip == cur && landedAs[step.commit] != "":
+			// An earlier member of the batch landed the same commit: the request is a retry
+			// of it, and is answered as already landed with the commit of that member. The
+			// answer holds only if the update of the batch does: the request comes after a
+			// member, so when the update does not hold it is landed again (see run).
+			outs[pos].LandedCommit = landedAs[step.commit]
+			outs[pos].AlreadyLanded = true
 
 		case step.tip == cur:
 			// The commit became empty on top of the running tip and was dropped. The request
@@ -358,6 +377,7 @@ func (e landBatchExecutor) attempt(ctx context.Context, reqs []*landBatchRequest
 
 			members = append(members, pos)
 			changes = append(changes, memberOf(req, step))
+			landedAs[step.commit] = step.tip
 
 			outs[pos].LandedCommit = step.tip
 			outs[pos].Rewritten = step.rewritten

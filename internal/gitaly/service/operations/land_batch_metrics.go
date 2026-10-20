@@ -25,6 +25,10 @@ const (
 	landBatchPhasePlan = "plan"
 	// landBatchPhaseReplay is the replay of the commits of one rebased request.
 	landBatchPhaseReplay = "replay"
+	// landBatchPhaseIdentity is the lookup of the earlier land of one diverged request
+	// (doc/graft/PLAN11.md): the land identities, the reachability of their commits and, for an
+	// answer, the search for its revert.
+	landBatchPhaseIdentity = "identity"
 	// landBatchPhasePack is the packing of the objects of an attempt before its compare-and-swap.
 	landBatchPhasePack = "pack"
 	// landBatchPhaseUpdate is the compare-and-swap that publishes a batch, with the hooks.
@@ -56,8 +60,8 @@ var (
 	landBatchPhaseSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name: "graft_land_batch_phase_seconds",
 		Help: "Time spent in each phase of a land batch: quarantine, tip, land_member (one observation per " +
-			"request of a batch attempt), plan and replay (parts of land_member), pack (the objects of an " +
-			"attempt before its update), update (the compare-and-swap with the hooks) and total.",
+			"request of a batch attempt), plan, identity and replay (parts of land_member), pack (the objects " +
+			"of an attempt before its update), update (the compare-and-swap with the hooks) and total.",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"phase"})
 

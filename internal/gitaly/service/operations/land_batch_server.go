@@ -206,6 +206,9 @@ func landBatchResult(outcome landBatchOutcome) landlane.Result[*gitalypb.UserLan
 	resp.Attempts = int32(outcome.Attempts)
 	resp.BatchSize = int32(outcome.BatchSize)
 	resp.BatchPosition = int32(outcome.BatchPosition + 1)
+	if outcome.Earlier != nil {
+		outcome.Earlier.setOn(resp)
+	}
 	if outcome.Resolution != nil {
 		resp.ResolvedPaths = outcome.Resolution.resolvedPaths
 		resp.Resolver = outcome.Resolution.resolver
@@ -313,7 +316,7 @@ func (st *serverLandBatchStepper) Update(ctx context.Context, reference git.Refe
 		User:       landBatchIdentity,
 	}
 
-	return st.updateKind(st.server.updateLandedReference(ctx, in, st.quarantineDir, st.repo, reference, oldOID, newTip, rewritten))
+	return st.updateKind(st.server.updateLandedReference(ctx, in, st.quarantineDir, st.repo, reference, oldOID, newTip, rewritten, landsOf(members)))
 }
 
 // UpdateSolo publishes a batch of one member as a land: the update runs with the identity of the member
@@ -334,7 +337,17 @@ func (st *serverLandBatchStepper) UpdateSolo(ctx context.Context, req *landBatch
 	ctx = requestIdentityContext(ctx, req)
 	ctx = changelog.WithBatch(changelog.WithOperation(ctx, changelogOperationLand), []changelog.Member{member})
 
-	return st.updateKind(st.server.updateLandedReference(ctx, req.in, st.quarantineDir, st.repo, reference, oldOID, newTip, rewritten))
+	return st.updateKind(st.server.updateLandedReference(ctx, req.in, st.quarantineDir, st.repo, reference, oldOID, newTip, rewritten, landsOf([]changelog.Member{member})))
+}
+
+// landsOf returns the identities of the changes that members land (doc/graft/PLAN11.md): each
+// member's original commit and the commit of the chain that holds it.
+func landsOf(members []changelog.Member) []changelog.Land {
+	lands := make([]changelog.Land, len(members))
+	for i, member := range members {
+		lands[i] = changelog.Land{Original: member.OriginalCommit, Landed: member.Commit}
+	}
+	return lands
 }
 
 // changelogOperationLand is the operation of an unbatched land in the changelog. The lanes run outside

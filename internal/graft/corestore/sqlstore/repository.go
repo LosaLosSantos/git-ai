@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/feder-cr/git-ai/internal/graft/changelog"
@@ -557,7 +558,10 @@ func (s *Store) ReportApplied(ctx context.Context, repoID int64, nodeID string, 
 }
 
 // insertChangelog appends entries to the changelog of the repository. The
-// sequences of the entries are their own.
+// sequences of the entries are their own. The lands of an entry are recorded in
+// the land identities of the repository with it (doc/graft/PLAN11.md, 4.1), so
+// that the changesets, the imported history and the initial history of a
+// repository all keep them.
 func insertChangelog(ctx context.Context, s *Store, q querier, repoID int64, entries []changelog.Entry) error {
 	for _, entry := range entries {
 		data, err := json.Marshal(entry)
@@ -569,6 +573,72 @@ func insertChangelog(ctx context.Context, s *Store, q querier, repoID int64, ent
 			repoID, int64(entry.Sequence), string(data)); err != nil {
 			return fmt.Errorf("insert changelog entry %d: %w", entry.Sequence, err)
 		}
+
+		if err := insertLandIdentities(ctx, s, q, repoID, entry); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// insertLandIdentities records the lands of entry as the last lands of their
+// original commits on the branch of entry. Every writer of the changelog appends
+// its entries after the last one (the sequences of an import must be greater),
+// so the entry is the latest land of its commits and replaces their records.
+//
+// The lands of an entry are written with one statement, so that a batch costs
+// one round trip to the database and not one per member. An upsert may not
+// change a row twice, so a commit that the entry lands more than once keeps
+// its last land, the one that holds it.
+func insertLandIdentities(ctx context.Context, s *Store, q querier, repoID int64, entry changelog.Entry) error {
+	if len(entry.Lands) == 0 {
+		return nil
+	}
+
+	last := make(map[string]int, len(entry.Lands))
+	for i, land := range entry.Lands {
+		last[land.Original] = i
+	}
+
+	branch := bytesArg([]byte(entry.Reference))
+	values := make([]string, 0, len(last))
+	args := make([]any, 0, 5*len(last))
+	for i, land := range entry.Lands {
+		if last[land.Original] != i {
+			continue
+		}
+		values = append(values, "(?, ?, ?, ?, ?)")
+		args = append(args, repoID, branch, land.Original, int64(entry.Sequence), land.Landed)
+	}
+
+	if _, err := q.ExecContext(ctx, s.bind(`
+		INSERT INTO graft_land_identities (repo_id, branch, original_commit, log_seq, landed_commit)
+		VALUES `+strings.Join(values, ", ")+`
+		ON CONFLICT (repo_id, branch, original_commit) DO UPDATE SET
+			log_seq = excluded.log_seq,
+			landed_commit = excluded.landed_commit
+	`), args...); err != nil {
+		return fmt.Errorf("insert land identity of changelog entry %d: %w", entry.Sequence, err)
+	}
+	return nil
+}
+
+// LookupLand implements corestore.MetaStore.
+func (s *Store) LookupLand(ctx context.Context, repoID int64, reference, original string) (changelog.LandRecord, bool, error) {
+	var (
+		seq    int64
+		landed string
+	)
+	err := s.db.QueryRowContext(ctx, s.bind(`
+		SELECT log_seq, landed_commit FROM graft_land_identities
+		WHERE repo_id = ? AND branch = ? AND original_commit = ?
+	`), repoID, bytesArg([]byte(reference)), original).Scan(&seq, &landed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return changelog.LandRecord{}, false, nil
+	}
+	if err != nil {
+		return changelog.LandRecord{}, false, fmt.Errorf("look up land identity: %w", err)
+	}
+
+	return changelog.LandRecord{Sequence: uint64(seq), Landed: landed}, true, nil
 }

@@ -182,6 +182,34 @@ Git hooks use private.
   concurrent writer is only detected when the snapshot is published. The land
   then fails after one attempt with `reference_update`, and the client has to
   land again. The changeset log only lists the lands that were published.
+  Landing again is safe: when the concurrent writer landed the same change, the
+  new land answers `already_landed`. The SDK does not retry `reference_update`.
+- A change that landed is not landed again from the same `commit_id` on the
+  same branch while the commit it landed as is on the branch, also when a
+  later commit reverted it: the land answers `already_landed` and names the
+  revert when its message says "This reverts commit <id>" and it is among the
+  1000 commits closest to the tip (the land identity of [PLAN11](PLAN11.md)). Landing it again needs a new commit: a revert of
+  the revert, or the change committed again. A branch reset past the land
+  lands the change again.
+- The land identity is recorded in the changeset log. With
+  `[graft.changelog] disabled = true` nothing is recorded, and a retried
+  rebase land replays the change: a change reverted in between lands again.
+- In the file changelog, every land update writes and fsyncs its intents
+  (`graft/changelog.intents`) in the prepared phase, under the references'
+  locks, and a land whose intents cannot be written fails. The intent of an
+  update that git never committed stays in the file, one line of about 200
+  bytes per such update.
+- A land that diverges reads the land identities before it rebases or
+  merges, and fails when it cannot: an error reading the changeset log or the
+  identity index, or a timeout on their lock files, fails the land rather than
+  risking a second land of the same change. This fail-closed behaviour is
+  deliberate; the error is `Internal` in the file changelog and `Unavailable`
+  when the storage core's database cannot be read.
+- In the file changelog, the land identity index (`graft/changelog.lands`)
+  holds every land of the repository. The idle indexes of a process are kept
+  in memory within 64 repositories and 256 MiB, least recently used dropped
+  first; a dropped index is read from its file again on the next land of its
+  repository that diverges.
 - Hooks run on every attempt, so a slow custom hook adds latency under
   contention.
 - `graft land --strategy merge` and `ff_only` are available in the CLI. The

@@ -5618,14 +5618,21 @@ type UserLandResponse struct {
 	// now at the branch tip.
 	BranchUpdate *OperationBranchUpdate `protobuf:"bytes,1,opt,name=branch_update,json=branchUpdate,proto3" json:"branch_update,omitempty"`
 	// landed_commit_id is the commit now at the branch tip: commit_id itself
-	// when fast-forwarded, otherwise the rebased or merge commit.
+	// when fast-forwarded, otherwise the rebased or merge commit. When
+	// already_landed comes from the record of an earlier land (landed_sequence
+	// is set), it is the commit that land put on the branch, which holds the
+	// change.
 	LandedCommitId string `protobuf:"bytes,2,opt,name=landed_commit_id,json=landedCommitId,proto3" json:"landed_commit_id,omitempty"`
 	// rewritten is true if the server rebased or merged.
 	Rewritten bool `protobuf:"varint,3,opt,name=rewritten,proto3" json:"rewritten,omitempty"`
 	// attempts is the number of compare-and-swap attempts used.
 	Attempts int32 `protobuf:"varint,4,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	// already_landed is true if commit_id was already reachable from the tip
-	// and the branch was left unchanged.
+	// already_landed is true if the change is already on the branch and the
+	// branch was left unchanged: commit_id is reachable from the tip, or an
+	// earlier land of commit_id on this branch put a commit on it that is still
+	// reachable from the tip (landed_sequence is then set). Such a change is not
+	// landed again, also when a later commit reverted it: landing it again needs
+	// a new commit.
 	AlreadyLanded bool `protobuf:"varint,5,opt,name=already_landed,json=alreadyLanded,proto3" json:"already_landed,omitempty"`
 	// old_tip is the branch tip that was replaced (zero OID if created).
 	OldTip string `protobuf:"bytes,6,opt,name=old_tip,json=oldTip,proto3" json:"old_tip,omitempty"`
@@ -5641,8 +5648,23 @@ type UserLandResponse struct {
 	BatchSize int32 `protobuf:"varint,9,opt,name=batch_size,json=batchSize,proto3" json:"batch_size,omitempty"`
 	// batch_position is the 1-based position of this request in its batch.
 	BatchPosition int32 `protobuf:"varint,10,opt,name=batch_position,json=batchPosition,proto3" json:"batch_position,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// landed_sequence is set when already_landed comes from the record of an
+	// earlier land of commit_id on the branch: the changelog sequence of the
+	// update that landed it as landed_commit_id. Zero otherwise.
+	LandedSequence uint64 `protobuf:"varint,11,opt,name=landed_sequence,json=landedSequence,proto3" json:"landed_sequence,omitempty"`
+	// reverted_by_commit_id is the commit on the branch, after
+	// landed_commit_id, whose message says that it reverts landed_commit_id
+	// ("This reverts commit <landed_commit_id>", as git revert and graft-verify
+	// write it). It is looked for only when landed_sequence is set, and is
+	// empty when no such commit is found.
+	RevertedByCommitId string `protobuf:"bytes,12,opt,name=reverted_by_commit_id,json=revertedByCommitId,proto3" json:"reverted_by_commit_id,omitempty"`
+	// already_landed_detail explains an already_landed answer that
+	// landed_sequence is set for: "landed as <landed_commit_id> at changelog
+	// <landed_sequence>", followed by "; it was reverted later by
+	// <reverted_by_commit_id>" when that is set. Empty otherwise.
+	AlreadyLandedDetail string `protobuf:"bytes,13,opt,name=already_landed_detail,json=alreadyLandedDetail,proto3" json:"already_landed_detail,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *UserLandResponse) Reset() {
@@ -5743,6 +5765,27 @@ func (x *UserLandResponse) GetBatchPosition() int32 {
 		return x.BatchPosition
 	}
 	return 0
+}
+
+func (x *UserLandResponse) GetLandedSequence() uint64 {
+	if x != nil {
+		return x.LandedSequence
+	}
+	return 0
+}
+
+func (x *UserLandResponse) GetRevertedByCommitId() string {
+	if x != nil {
+		return x.RevertedByCommitId
+	}
+	return ""
+}
+
+func (x *UserLandResponse) GetAlreadyLandedDetail() string {
+	if x != nil {
+		return x.AlreadyLandedDetail
+	}
+	return ""
 }
 
 // UserLandError is an error returned by the UserLand RPC in some specific
@@ -6557,7 +6600,7 @@ const file_operations_proto_rawDesc = "" +
 	"\x06Action\x12\x16\n" +
 	"\x12ACTION_UNSPECIFIED\x10\x00\x12\x10\n" +
 	"\fACTION_WRITE\x10\x01\x12\x11\n" +
-	"\rACTION_DELETE\x10\x02\"\x83\x03\n" +
+	"\rACTION_DELETE\x10\x02\"\x93\x04\n" +
 	"\x10UserLandResponse\x12B\n" +
 	"\rbranch_update\x18\x01 \x01(\v2\x1d.gitaly.OperationBranchUpdateR\fbranchUpdate\x12(\n" +
 	"\x10landed_commit_id\x18\x02 \x01(\tR\x0elandedCommitId\x12\x1c\n" +
@@ -6570,7 +6613,10 @@ const file_operations_proto_rawDesc = "" +
 	"\n" +
 	"batch_size\x18\t \x01(\x05R\tbatchSize\x12%\n" +
 	"\x0ebatch_position\x18\n" +
-	" \x01(\x05R\rbatchPosition\"\xe2\x02\n" +
+	" \x01(\x05R\rbatchPosition\x12'\n" +
+	"\x0flanded_sequence\x18\v \x01(\x04R\x0elandedSequence\x121\n" +
+	"\x15reverted_by_commit_id\x18\f \x01(\tR\x12revertedByCommitId\x122\n" +
+	"\x15already_landed_detail\x18\r \x01(\tR\x13alreadyLandedDetail\"\xe2\x02\n" +
 	"\rUserLandError\x12C\n" +
 	"\x0emerge_conflict\x18\x01 \x01(\v2\x1a.gitaly.MergeConflictErrorH\x00R\rmergeConflict\x12=\n" +
 	"\fnot_ancestor\x18\x02 \x01(\v2\x18.gitaly.NotAncestorErrorH\x00R\vnotAncestor\x12I\n" +

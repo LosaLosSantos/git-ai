@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -24,7 +25,7 @@ func mergeLand() sdk.LandOptions {
 	return opts
 }
 
-func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
+func TestRepo_Land_RebaseLandsAreRetried(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -33,9 +34,9 @@ func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
 		retry            sdk.UnavailableRetry
 		expectedRequests int
 	}{
-		{desc: "rebase", retry: fastRetry, expectedRequests: 1},
-		{desc: "rebase with conflict resolution", resolve: true, retry: fastRetry, expectedRequests: 1},
-		{desc: "rebase, opted in", retry: sdk.UnavailableRetry{RebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 6},
+		{desc: "rebase", retry: fastRetry, expectedRequests: 6},
+		{desc: "rebase with conflict resolution", resolve: true, retry: fastRetry, expectedRequests: 6},
+		{desc: "rebase, opted out", retry: sdk.UnavailableRetry{SkipRebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 1},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
@@ -57,7 +58,8 @@ func TestRepo_Land_RebaseLandsAreNotRetriedByDefault(t *testing.T) {
 
 // TestRepo_Land_ARelandWithAResolutionIsRetriedByDefault: a Resolution lands as a merge of the tip and the
 // change, so a retry after a lost response finds Commit reachable and nothing is replayed: it is retried
-// by default whatever the strategy, the rebase one included, and Disabled still turns the retries off.
+// by default whatever the strategy, and SkipRebaseLands, which guards against the replay of a rebase, does
+// not apply to it; Disabled still turns the retries off.
 func TestRepo_Land_ARelandWithAResolutionIsRetriedByDefault(t *testing.T) {
 	t.Parallel()
 
@@ -69,6 +71,7 @@ func TestRepo_Land_ARelandWithAResolutionIsRetriedByDefault(t *testing.T) {
 	}{
 		{desc: "rebase strategy", strategy: sdk.LandRebase, retry: fastRetry, expectedRequests: 6},
 		{desc: "merge strategy", strategy: sdk.LandMerge, retry: fastRetry, expectedRequests: 6},
+		{desc: "skip rebase lands does not apply to a resolution", strategy: sdk.LandRebase, retry: sdk.UnavailableRetry{SkipRebaseLands: true, Base: time.Millisecond, Cap: 2 * time.Millisecond}, expectedRequests: 6},
 		{desc: "disabled", strategy: sdk.LandRebase, retry: sdk.UnavailableRetry{Disabled: true}, expectedRequests: 1},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -207,18 +210,25 @@ func TestRepo_Land_ContextStopsTheRetries(t *testing.T) {
 
 	fakes := newFakeServices()
 	fakes.operations.landErr = status.Error(codes.Unavailable, "still syncing")
-	repo := dialFake(t, fakes.register).Repo("repo")
 
-	// The backoff is longer than the context, which ends during the first wait.
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	// The context ends once the client has the first Unavailable, so during the wait before the
+	// first retry, whatever the time the call took.
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	cancelAfterUnavailable := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		if status.Code(err) == codes.Unavailable {
+			cancel()
+		}
+		return err
+	}
+	repo := dialFake(t, fakes.register, sdk.WithGRPCOptions(grpc.WithUnaryInterceptor(cancelAfterUnavailable))).Repo("repo")
+
 	opts := mergeLand()
 	opts.RetryUnavailable = sdk.UnavailableRetry{Base: time.Hour, Cap: time.Hour}
-	// Each wait is drawn from [0, 1h]: the context ends during one of them unless five draws in
-	// a row fall below 50ms.
 	_, err := repo.Land(ctx, opts)
-	require.Equal(t, codes.DeadlineExceeded, sdk.Code(err))
-	require.Less(t, len(fakes.operations.landRequests), 6)
+	require.Equal(t, codes.Canceled, sdk.Code(err))
+	require.Len(t, fakes.operations.landRequests, 1)
 
 	// The error keeps what the server answered last.
 	var retriesErr *sdk.UnavailableRetriesError
@@ -257,4 +267,36 @@ func TestRepo_Land_RetriedResolveLandReportsItsOutcome(t *testing.T) {
 	for _, req := range fakes.operations.landRequests {
 		require.True(t, req.GetResolveConflicts(), "every call asks for the resolution")
 	}
+}
+
+func TestRepo_Land_RetriedRebaseReportsTheEarlierLand(t *testing.T) {
+	t.Parallel()
+
+	// The first call rebased the change but its answer was lost to an Unavailable: the retry
+	// answers from the record of that land, with the commit it landed as and the revert after it.
+	fakes := newFakeServices()
+	fakes.operations.landErrs = []error{status.Error(codes.Unavailable, "connection reset")}
+	fakes.operations.landResponse = &gitalypb.UserLandResponse{
+		BranchUpdate:        &gitalypb.OperationBranchUpdate{CommitId: "tip-sha"},
+		LandedCommitId:      "copy-sha",
+		AlreadyLanded:       true,
+		OldTip:              "tip-sha",
+		LandedSequence:      42,
+		RevertedByCommitId:  "revert-sha",
+		AlreadyLandedDetail: "landed as copy-sha at changelog 42; it was reverted later by revert-sha",
+	}
+	repo := dialFake(t, fakes.register).Repo("repo")
+
+	opts := validLand()
+	opts.Strategy = sdk.LandRebase
+	opts.RetryUnavailable = fastRetry
+	result, err := repo.Land(t.Context(), opts)
+	require.NoError(t, err)
+	require.True(t, result.AlreadyLanded)
+	require.Equal(t, "copy-sha", result.LandedCommitID)
+	require.Equal(t, uint64(42), result.LandedSequence)
+	require.Equal(t, "revert-sha", result.RevertedByCommitID)
+	require.Equal(t, "landed as copy-sha at changelog 42; it was reverted later by revert-sha", result.AlreadyLandedDetail)
+	require.Equal(t, 1, result.UnavailableRetries)
+	require.Len(t, fakes.operations.landRequests, 2)
 }

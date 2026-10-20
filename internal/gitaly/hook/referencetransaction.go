@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git"
 	"github.com/feder-cr/git-ai/internal/git/gitcmd"
@@ -135,6 +136,13 @@ func (m *GitLabHookManager) ReferenceTransactionHook(ctx context.Context, state 
 		if err := m.storagePrepared(ctx, payload, env, changes); err != nil {
 			return err
 		}
+
+		// The file changelog records the identities of a land only after git committed it, so
+		// they are recorded as intents now, before git may commit (doc/graft/PLAN11.md, 4.2).
+		// An error aborts the land, which would otherwise be committed without its identity.
+		if err := m.recordLandIntents(ctx, payload, env, changes); err != nil {
+			return fmt.Errorf("recording the land intents: %w", err)
+		}
 	}
 
 	if !isForceDeletionsOnly(objectHash, bytes.NewReader(changes)) {
@@ -182,6 +190,66 @@ func changesetInvocation(env []string) string {
 		return ""
 	}
 	return meta.Invocation
+}
+
+// recordLandIntents records the land identities of a prepared transaction as intents, when the
+// file changelog is the one that records them and the transaction updates the branch they landed
+// on (see changelog.RecordLandIntents). In the authoritative storage mode the storage core records
+// them with the reference change, in one database transaction.
+func (m *GitLabHookManager) recordLandIntents(ctx context.Context, payload gitcmd.HooksPayload, env []string, changes []byte) error {
+	if m.cfg.Graft.Changelog.Disabled || m.storageAuthoritative() || payload.Repo == nil {
+		return nil
+	}
+
+	meta, err := gitcmd.ChangelogMetaFromEnv(env)
+	if errors.Is(err, gitcmd.ErrPayloadNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading changelog metadata: %w", err)
+	}
+	if len(meta.Lands) == 0 {
+		return nil
+	}
+
+	updatesBranch := false
+	for _, update := range changelog.ParseUpdates(changes) {
+		if update.Reference == string(meta.LandReference) {
+			updatesBranch = true
+		}
+	}
+	if !updatesBranch {
+		return nil
+	}
+
+	repoPath, err := m.locator.GetRepoPath(ctx, payload.Repo)
+	if err != nil {
+		return fmt.Errorf("resolving repository path: %w", err)
+	}
+
+	start := time.Now()
+	compact, err := changelog.RecordLandIntents(repoPath, string(meta.LandReference), meta.Invocation, meta.Lands)
+	landIntentsSeconds.Observe(time.Since(start).Seconds())
+	if err != nil {
+		return err
+	}
+
+	// The compaction reads the changelog and rewrites the intents: it runs after the hook, not
+	// under the locks of the references, and its failure leaves the intents as they are.
+	if compact {
+		run := func() {
+			if err := changelog.CompactLandIntents(repoPath); err != nil {
+				m.logger.WithError(err).WithField("repository", repoPath).Error("graft: compacting the land intents failed")
+			}
+		}
+		if m.startLandIntentsCompaction != nil {
+			m.startLandIntentsCompaction(run)
+		} else {
+			go run()
+		}
+	}
+
+	return nil
 }
 
 // prepareChangesets gives the prepared transaction its place in the order of the changeset log,

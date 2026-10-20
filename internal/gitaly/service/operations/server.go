@@ -74,6 +74,9 @@ type Server struct {
 	// storageSync catches up the local repository from the storage core before a land is retried,
 	// see doc/graft/STORAGE.md. It does nothing unless the storage core is authoritative.
 	storageSync corestore.Freshener
+	// graftStorage is the storage core. In its authoritative mode the land identities are looked
+	// up in its database (doc/graft/PLAN11.md). Nil without a storage core.
+	graftStorage *corestore.Core
 	// testHook, when set by a test, is called at named points of a request.
 	testHook func(point string)
 }
@@ -117,6 +120,7 @@ func NewServer(deps *service.Dependencies) *Server {
 		verifyPool:       verifyPool,
 		shutdownCtx:      deps.GetShutdownContext(),
 		storageSync:      deps.GetGraftStorageSyncer(),
+		graftStorage:     deps.GetGraftStorage(),
 	}
 
 	// The lanes may run the batches with the server, so they are taken after it is created.

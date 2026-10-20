@@ -67,9 +67,7 @@ type LandOptions struct {
 	// MaxLandRequestBytes.
 	Resolution *Resolution
 	// RetryUnavailable is how Land retries a call that the server answers
-	// with Unavailable (see UnavailableRetry). It is on by default for
-	// LandMerge, LandFastForwardOnly and any land with a Resolution (a merge
-	// of the tip and the change, safe to retry), and off for LandRebase.
+	// with Unavailable (see UnavailableRetry). It is on by default.
 	RetryUnavailable UnavailableRetry
 }
 
@@ -81,26 +79,31 @@ type LandOptions struct {
 // backoff with full jitter: before retry n it waits a random time between zero
 // and min(Cap, Base x 2^(n-1)). A context that ends stops the waiting.
 //
-// The response of a call can be lost after the server landed the change. With
-// LandMerge and LandFastForwardOnly, Commit is then reachable from the tip, and
-// the retry is reported as AlreadyLanded: these lands are retried by default,
-// and so is a land with a Resolution, which is a merge whatever its strategy.
-// With LandRebase, ResolveConflicts included (a land without conflicts is a
-// plain rebase), the branch holds a rebased copy, not Commit itself, and the
-// server cannot tell yet that the change landed: the retry replays the change
-// onto the tip. Every commit of it comes out empty and is dropped, unless a
-// later commit reverted the change in between, for example graft-verify
-// reverting the culprit: the retry would then land the change again. Rebase
-// lands are therefore not retried unless RebaseLands is set by a caller that
-// accepts this. A retried land with ResolveConflicts may run the conflict
-// resolver again, a model included, for the same conflict; LandResult reports
-// the retries (UnavailableRetries), so that this cost is visible.
+// The response of a call can be lost after the server landed the change. The
+// retry then answers AlreadyLanded and lands nothing (doc/graft/PLAN11.md): with
+// LandMerge and LandFastForwardOnly, Commit is reachable from the tip; with
+// LandRebase, ResolveConflicts included, the branch holds a rebased copy of
+// Commit, and the server answers from its record of the first land, with
+// LandedCommitID the copy and LandedSequence its changelog sequence. This holds
+// also when a later commit reverted the change in between, for example
+// graft-verify reverting the culprit: the change is not landed again, and
+// RevertedByCommitID names the revert. A retry whose first call never reached
+// the update lands the change; with ResolveConflicts it may run the conflict
+// resolver again, a model included, for the same conflict, and LandResult
+// reports the retries (UnavailableRetries), so that this cost is visible.
+//
+// The record of the first land needs a server released after v0.2.0 with its
+// changeset log on ([graft.changelog] not disabled). Against an older server,
+// or one whose changeset log is disabled, the retry of a lost LandRebase replays
+// the change: every commit of it comes out empty and the branch is left
+// unchanged, without AlreadyLanded, unless a later commit reverted the change in
+// between, which the retry then lands again. Set SkipRebaseLands for such
+// servers.
 type UnavailableRetry struct {
 	// Disabled turns the retries off: Land returns Unavailable at once.
 	Disabled bool
-	// RebaseLands also retries LandRebase lands, which a retry after a lost
-	// response may land again when the change was reverted in between.
-	RebaseLands bool
+	// SkipRebaseLands turns the retries off for LandRebase lands only.
+	SkipRebaseLands bool
 	// MaxRetries bounds the retries after the first call. Zero means 5.
 	MaxRetries int
 	// Base is the backoff of the first retry. Zero means 100ms.
@@ -160,10 +163,10 @@ func (r UnavailableRetry) backoff(n int) time.Duration {
 //
 // A land with a Resolution is always a merge of the tip and the change, whatever its strategy: after a
 // lost response Commit is reachable from the tip, so the retry is reported as AlreadyLanded and nothing is
-// replayed. It is retried like a merge land.
+// replayed. SkipRebaseLands, which protects against the replay of a rebase, does not apply to it.
 func (r UnavailableRetry) maxRetries(strategy LandStrategy, resolution bool) int {
 	switch {
-	case r.Disabled, strategy == LandRebase && !resolution && !r.RebaseLands:
+	case r.Disabled, strategy == LandRebase && !resolution && r.SkipRebaseLands:
 		return 0
 	case r.MaxRetries > 0:
 		return r.MaxRetries
@@ -182,9 +185,25 @@ type LandResult struct {
 	OldTip string
 	// Rewritten is true if the server rebased or merged the change.
 	Rewritten bool
-	// AlreadyLanded is true if Commit was already reachable from the branch
-	// tip. The branch was left unchanged.
+	// AlreadyLanded is true if the change was already on the branch and the
+	// branch was left unchanged: Commit is reachable from the tip, or an
+	// earlier land of Commit on the branch put LandedCommitID on it, which is
+	// still reachable from the tip (LandedSequence is then set). A change that
+	// a later commit reverted is not landed again: landing it again needs a
+	// new commit.
 	AlreadyLanded bool
+	// LandedSequence is the changelog sequence of the earlier land when the
+	// server answered AlreadyLanded from its record (see AlreadyLanded); zero
+	// otherwise. LandedCommitID is then the commit of that land.
+	LandedSequence uint64
+	// RevertedByCommitID is the commit after LandedCommitID on the branch
+	// whose message says that it reverts it ("This reverts commit <id>"), when
+	// LandedSequence is set and such a commit exists.
+	RevertedByCommitID string
+	// AlreadyLandedDetail explains an AlreadyLanded answer that LandedSequence
+	// is set for, for example "landed as <oid> at changelog 42; it was
+	// reverted later by <oid>".
+	AlreadyLandedDetail string
 	// BranchCreated is true if the branch was created by this call.
 	BranchCreated bool
 	// Attempts is the number of compare-and-swap attempts the server used.
@@ -304,6 +323,10 @@ func (r *Repo) Land(ctx context.Context, opts LandOptions) (*LandResult, error) 
 		ResolvedPaths:  resolvedPaths,
 		Resolver:       resp.GetResolver(),
 		Batch:          batchOf(resp),
+
+		LandedSequence:      resp.GetLandedSequence(),
+		RevertedByCommitID:  resp.GetRevertedByCommitId(),
+		AlreadyLandedDetail: resp.GetAlreadyLandedDetail(),
 
 		UnavailableRetries: retries,
 		LastUnavailable:    lastUnavailable,

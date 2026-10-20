@@ -230,7 +230,11 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 	oldTip := tip
 	switch {
 	case step.alreadyLanded:
-		return landResponse(tip, tip, false, true, false), nil
+		resp := landResponse(tip, tip, false, true, false)
+		if step.earlier != nil {
+			step.earlier.setOn(resp)
+		}
+		return resp, nil
 	case step.created:
 		oldTip = attempt.objectHash.ZeroOID
 	case step.tip == tip:
@@ -242,7 +246,8 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 		return nil, err
 	}
 
-	if err := s.updateLandedReference(ctx, in, attempt.quarantineDir, attempt.repo, reference, oldTip, step.tip, step.rewritten); err != nil {
+	lands := []changelog.Land{{Original: step.commit.String(), Landed: step.tip.String()}}
+	if err := s.updateLandedReference(ctx, in, attempt.quarantineDir, attempt.repo, reference, oldTip, step.tip, step.rewritten, lands); err != nil {
 		return nil, err
 	}
 
@@ -255,9 +260,10 @@ func (s *Server) landAttempt(ctx context.Context, in *gitalypb.UserLandRequest, 
 	return resp, nil
 }
 
-// updateLandedReference performs the compare-and-swap of the branch. Hook rejections are returned
-// as PermissionDenied errors, lost races as landConflict and invalid requests or conflicting
-// references as InvalidArgument or FailedPrecondition. Everything else is Internal.
+// updateLandedReference performs the compare-and-swap of the branch, recording lands, the
+// identities of the changes it lands (doc/graft/PLAN11.md), in its changelog entry. Hook rejections
+// are returned as PermissionDenied errors, lost races as landConflict and invalid requests or
+// conflicting references as InvalidArgument or FailedPrecondition. Everything else is Internal.
 func (s *Server) updateLandedReference(
 	ctx context.Context,
 	in *gitalypb.UserLandRequest,
@@ -266,9 +272,15 @@ func (s *Server) updateLandedReference(
 	reference git.ReferenceName,
 	oldOID, newOID git.ObjectID,
 	rewritten bool,
+	lands []changelog.Land,
 ) error {
 	if rewritten {
 		ctx = changelog.WithRewritten(ctx)
+	}
+
+	ctx, err := landWithRecord(ctx, reference, lands)
+	if err != nil {
+		return err
 	}
 
 	// On MVCC repositories a concurrent writer is detected when the snapshot is committed rather
@@ -281,7 +293,7 @@ func (s *Server) updateLandedReference(
 		)
 	}
 
-	err := s.updateReferenceWithHooks(ctx, in.GetRepository(), in.GetUser(), quarantineDir, reference, newOID, oldOID)
+	err = s.updateReferenceWithHooks(ctx, in.GetRepository(), in.GetUser(), quarantineDir, reference, newOID, oldOID)
 	if err == nil {
 		return nil
 	}
@@ -525,6 +537,13 @@ func validateUserLandRequest(ctx context.Context, locator storage.Locator, in *g
 
 	if err := git.ValidateReference("refs/heads/" + string(in.GetBranch())); err != nil {
 		return fmt.Errorf("invalid branch name: %w", err)
+	}
+
+	// The land records its identity in its update (doc/graft/PLAN11.md), which bounds the name of
+	// the branch. The request is refused here rather than its update, so that it fails alone, also
+	// in a batch.
+	if err := changelog.CheckLandReference("refs/heads/" + string(in.GetBranch())); err != nil {
+		return err
 	}
 
 	if in.GetCommitId() == "" {
