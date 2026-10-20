@@ -691,6 +691,27 @@ origin = "model"   # its files are proposals, and land only if verify.command pa
 `origin` is `"rule"` (the default) or `"model"`. A model command's answers are
 not recorded by `rerere`.
 
+**The recommended gate for auto-landing a model's resolution.** The `llm` strategy alone produces a proposal that lands
+only if `verify.command` passes on the exact tree. An operator who wants model resolutions to land without an agent in
+the loop gets the best measured result (PLAN10 15.12) from this gate, which the server does not implement and an
+operator builds with the `command` strategy above:
+
+1. **Two models from different vendors resolve the file** (two `graft-resolve` configurations, each with one `llm`
+   strategy and its own provider), and the resolution is used only if their results are byte-identical after
+   normalizing line endings and trailing whitespace;
+2. **the composition report of both is clean** (no line saying that the answer drops or duplicates a change of a side);
+3. **`verify.command` passes** on the exact tree: `verify.enabled = true` is mandatory with this gate, and the strategy
+   must be `origin = "model"` as above, so that the server itself refuses to land it otherwise.
+
+The wrapper (the program of the `command` strategy) writes `{out}` only when 1 and 2 hold and fails otherwise; the chain
+then goes on, and the agent gets the conflict package with the proposals as usual. The product ships no such wrapper.
+What it was worth, measured on 487 held-out files of 13 open-source repositories (Luna and glm-5.3-flash, with the
+verify simulation of the bench in place of the operator's tests): 59.8% of the files landed, and 15.5% of those differed
+from what two independent reviewing models accept (11.3% for one of them; Wilson upper bound 20.1% for both), against 43%
+on conflicts of merged agent PRs. These figures are before the operator's own tests, which are the one signal that
+caught more errors where we could run them; the gate does not replace `verify.command`, it only chooses which proposals
+are worth verifying. Cost: two model calls per region.
+
 **The `rerere` store and the upgrade.** Entries are versioned and record their
 origin. The stores of v0.1.0 and v0.2.0 recorded the `llm` answers as well, with
 no origin: after an upgrade `graft-resolve` never replays an entry without

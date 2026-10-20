@@ -1809,6 +1809,14 @@ verification: `verify.enabled` false, `verify.command`, `verify.timeout` 5 min, 
 `verify.max_tree_bytes` 2 GiB, `verify.max_tree_depth` 64. Nothing lands from a model unless `verify.enabled` is set
 and the command passes on the exact tree.
 
+**The recommended gate for an operator who wants auto-landing.** G1 of 15.12, as a recipe and not as server code:
+two models from different vendors give the byte-identical resolution, both composition reports are clean, and
+`verify.command` passes on the exact tree (`verify.enabled` is mandatory with it, and the wrapper is a `command`
+strategy with `origin = "model"`; RESOLVE.md has the recipe). Measured on the OSS held-out files it lands 59.8% of the
+files with 15.5% of those wrong under two independent judges (upper bound 20.1%), before the operator's tests; on conflicts
+of agent PRs 45.8% of the files with 43.1% wrong. The 20%-wrong bar it is compared with was set after the numbers were
+known (15.12).
+
 **The default model.** The shipped example is `openai/gpt-6-luna` at effort low. On the stratified 100 the one other
 model that passed the smoke check, `z-ai/glm-5.3-flash` pinned to Z.AI, is as good (15.12) and costs the same per
 file; the models that reason without a bound on their effort ended their calls past `call_timeout` or `max_tokens`
