@@ -153,6 +153,18 @@ func (n *realNode) spawn(t *testing.T, env ...string) {
 	cmd.Stderr = logFile
 	require.NoError(t, cmd.Start())
 
+	// A failing test shows how the server process ended and its log, which its temporary
+	// directory would otherwise take with it: a request that ends with EOF or Unavailable says
+	// only that the process went away. It runs after the cleanup below that stops the process
+	// and waits for it (cleanups run in reverse order), so the process state is final.
+	logPath := n.logPath
+	t.Cleanup(func() {
+		if t.Failed() {
+			content, err := os.ReadFile(logPath)
+			t.Logf("server process %s, log %s (read error: %v):\n%s", cmd.ProcessState, logPath, err, content)
+		}
+	})
+
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()

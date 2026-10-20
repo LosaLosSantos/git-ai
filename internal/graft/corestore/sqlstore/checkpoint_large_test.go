@@ -3,6 +3,7 @@ package sqlstore_test
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +59,15 @@ func TestCheckpointOfManyReferences(t *testing.T) {
 			}
 		}()
 
+		// The time the snapshot is written, on the last attempt of the record's transaction.
+		var snapshotMu sync.Mutex
+		var snapshotWritten time.Time
+		s.SetSnapshotWrittenHook(func() {
+			snapshotMu.Lock()
+			defer snapshotMu.Unlock()
+			snapshotWritten = time.Now()
+		})
+
 		began := time.Now()
 		_, created, err := s.CreateCheckpoint(ctx, repo.ID, corestore.CheckpointInput{
 			Seq: 1, Refs: refs, PackKey: ownedKey(repo.ID, "large checkpoint"), PackDeadline: time.Now().Add(time.Hour), PackBytes: 1,
@@ -76,13 +86,16 @@ func TestCheckpointOfManyReferences(t *testing.T) {
 		require.Equal(t, refs, got)
 
 		// created_at is stamped after the snapshot (final minor 1): it is not
-		// the time the record began. The database runs on this host, so its
-		// clock is the test's.
+		// the time the record began, but a time after the snapshot was written.
+		// The database runs on this host, so its clock is the test's.
 		cp, ok, err := s.NewestCheckpoint(ctx, repo.ID)
 		require.NoError(t, err)
 		require.True(t, ok)
-		require.True(t, cp.CreatedAt.After(began.Add(took/2)),
-			"created_at %s, record from %s for %s", cp.CreatedAt, began, took)
+		snapshotMu.Lock()
+		defer snapshotMu.Unlock()
+		require.False(t, snapshotWritten.IsZero())
+		require.True(t, cp.CreatedAt.After(snapshotWritten),
+			"created_at %s, snapshot written at %s, record from %s for %s", cp.CreatedAt, snapshotWritten, began, took)
 	})
 }
 
