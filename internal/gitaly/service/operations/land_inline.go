@@ -209,31 +209,3 @@ func landListingPaths(l landListing) []string {
 	}
 	return paths
 }
-
-// landWillNotLand reports whether the files the land has now carry a model's verdict (or a held one) and no
-// verification is configured: such a land ends with the package, so no other land gives way to it.
-func (s *Server) landWillNotLand(pre *landPreResolution) bool {
-	if s.resolveCfg.Verify.Enabled {
-		return false
-	}
-	for k := range pre.current {
-		if v, ok := pre.verdicts[k]; ok && (v.file.FromModel() || v.file.Hold != "") {
-			return true
-		}
-	}
-	return false
-}
-
-// landHasModelVerdict reports whether a file of the listing has a model's (or a held) verdict. Without a
-// verification such a land does not land, so no other land has to give way to it.
-func landHasModelVerdict(s *Server, l landListing, pre *landPreResolution) bool {
-	if s.resolveCfg.Verify.Enabled {
-		return false
-	}
-	for _, f := range l.files {
-		if v, ok := pre.verdicts[landKeyOf(f.conflict)]; ok && (v.file.FromModel() || v.file.Hold != "") {
-			return true
-		}
-	}
-	return false
-}

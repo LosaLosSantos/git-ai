@@ -82,6 +82,8 @@ for f in req["files"]:
     theirs = base64.b64decode(f["theirs"]["content"]).decode().splitlines()
     model = any("model" in l for l in theirs)
     if mode == "slowrule" and any("slowrule" in l for l in theirs):
+        if rules:
+            open(dir + "/inline-slow.log", "a").write("x\n")
         time.sleep(2)
     if mode == "model" and model:
         if rules:
