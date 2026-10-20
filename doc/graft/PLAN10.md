@@ -973,29 +973,28 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
  AI configured? --no-------------------------------------> AGENT (FAILED: no strategy applied)
    | yes
    v
- split into regions (3-way line diff); regions only one side changed are merged locally
+ split into regions by git's own merge (git merge-file --diff3; our diff only if git cannot run); regions
+ only one side changed are merged locally
    |-- more than max_regions (20) ------------------------> AGENT (NOT_SENT: regions)
    v
- for each region, one call (15.10): PATCH = base->theirs (3 context lines), OURS CHANGE = base->ours
- (symmetric context, capped), CODE = ours (3 anchors), THEIRS' and OURS' commit messages (capped);
- the answer is the last block: patched code, or ABSTAIN with a reason
-   |-- ABSTAIN ----------------------------------------------> AGENT (abstained: the model's reason;
-   |                                                            no proposal, no guess)
+ for each region, one call (15.10): PATCH = base->theirs (3 context lines), CODE = ours (3 anchors),
+ THEIRS' commit message (capped), the other regions for reference; the answer is the last block:
+ the patched code
    v
- per-region checks: anchors, newline rule, not a patch, size, markers; composition of the region
- (15.3): drops and duplicates
-   |-- a check finds something, and the region was not answered again -> ONE REPAIR ROUND: the same
-   |       request, the previous answer and the findings quoted exactly; the new answer replaces the
-   |       first if it passes the checks and has fewer findings; a second rejection rejects the region
+ per-region checks: anchors, newline rule, not a patch, size, markers
+   |-- a rule is broken, and the region was not answered again -> ONE REPAIR ROUND: the same request,
+   |       the previous answer and the rule quoted exactly; a second rejection rejects the region
    |-- any region fails -------------------------------------> AGENT (REJECTED, reason; no proposal:
    |                                                            all or nothing)
    v
  assemble the file; syntax of the file (tree-sitter): the first error is mapped to its region and, if
- that region was not answered again, quoted back in the same one repair round
+ that region was not answered again, quoted back in the same one repair round (a region is repaired
+ once at most, and only a BROKEN answer is: an answer the rules and the syntax accept is never asked again)
  file checks: markers, tree-sitter syntax, operator checks
    |-- a check fails ----------------------------------------> AGENT (REJECTED, reason)
    v
- composition report (15.3) of the regions (a report, not a gate)
+ composition report (15.3) of the regions: drops, duplicates, contested changes (a report, not a gate,
+ and not a repair trigger)
    v
  VERDICT PROPOSAL (PROPOSED, the proposal + its report)
    v
@@ -1076,8 +1075,8 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 | refs/graft/ hidden from agents' git | `hiddenUploadPackRefPrefixes`, `hiddenReceivePackRefPrefixes` | git/gitcmd/command_description.go |
 | refs/graft/ reserved for the server | `graftReservedDenial` | gitaly/hook/referencetransaction.go |
 | composition report | `llmCompose`, `llmReport`, `CompositionVerdict` (whole file, for the parity test), `landProposalExplanation` | tools/.../resolve/llm_compose.go, llm_compose_file.go, llm_patch.go; operations/land_proposals.go |
-| symmetric context, abstain, repair | `llmPatchSystem`, `llmPatchUser`, `llmParseAnswer`, `llmRepairUser`, `llmResolvePatch` | tools/.../resolve/llm_patch.go |
-| intent of OURS | `landOursMessage` | operations/land_resolve.go |
+| git's regions (our diff as the fallback) | `llmFileRegions`, `llmGitRegions`, `llmParseDiff3`, `llmUnified` | tools/.../resolve/llm_gitmerge.go, llm_core.go |
+| one repair round, for a broken answer | `llmResolvePatch` (the `repair` closure), `llmRepairUser`, `llmPreviousAnswer`, `llmRegionAtLine` | tools/.../resolve/llm_patch.go |
 
 ### 15.6 The composition check, measured: a report, not a gate
 
@@ -1149,14 +1148,14 @@ GitButler's AI resolve is described here from the PM's account of it; its code w
   CC BY) and on intent (GitWand, Copilot, MIT) informed the planned symmetric context. The design,
   the composition report and its measurement are gitai's.
 
-### 15.8 Design delta: the resolution goes out of the lane (m6, PM-approved)
+### 15.8 The resolution goes out of the lane
 
 Today a land with resolve_conflicts calls the resolver inside the branch's lane, so the branch is
 held for the resolver's whole call: seconds, minutes for a file with 20 regions at ~13 s each, and
 ~97 ms more to keep the proposals. A first version of this delta bound the resolution to the tip
 read before the lane; on a busy branch (the 50-agent race) the tip moves every few hundred
 milliseconds while a resolution takes seconds, so that version would fail exactly under load.
-The resolution is bound to the files instead (the PM's correction):
+The resolution is bound to the files instead:
 
 * **What a file's verdict depends on.** The resolver answers a file from its sides: its key is
   (path, base OID, ours OID, theirs OID, the three modes). Two inputs come from elsewhere, and the
@@ -1179,10 +1178,7 @@ The resolution is bound to the files instead (the PM's correction):
     `tip`, `merge_base` and `messages.tip` are always empty, kept in the protocol for
     compatibility (a test asserts it). A verdict reused at another tip is then correct by
     construction: no resolver, the operator's command strategy included, can read the tip.
-    RESOLVE.md states that an answer must depend on the file only. One exception was made later
-    (15.10): `ours_message`, the intent of OURS for a file, a function of the tip's history of the
-    path. It is a hint and not an input of the verdict: it is not part of the key (the sides are),
-    and a resolver must not decide a verdict on it, only the quality of a proposal.
+    RESOLVE.md states that an answer must depend on the file only.
 * **Pre-resolve before the lane.** UserLand reads the tip T as the lane does and, in a quarantine
   it discards, merges T and the change. Skipped (the lane answers as today) when the branch does
   not exist, the change already landed, or the merge is clean. Otherwise it runs the per-file flow
@@ -1223,9 +1219,8 @@ The resolution is bound to the files instead (the PM's correction):
   long resolutions starve the checks, and fairness inside one pool needs a scheduler for no gain
   over two plain semaphores; the memory bound of the process is the sum of the two pools' requests.
   Each request waits for its slot within the resolver's timeout and fails closed when it expires.
-* **Nothing is verified in the lane any more.** This bullet said that verify.command still ran in the
-  lane for the rules' resolutions and for agents'; it does not (15.9): every verification runs out
-  of the lane, on one mechanism.
+* **Nothing is verified in the lane.** Every verification, of a rule's resolution, a model's or an
+  agent's, runs out of the lane, on one mechanism (15.9); the lane compares tree object IDs.
 * **Measured (TestLandResolveBench, GRAFT_LAND_BENCH=1).** Six lands that the server resolves,
   all on the same file, and six plain lands that conflict with nothing, at once through the lanes
   of a standalone server, with a resolver that takes 500 ms; the same bench on the tree before
@@ -1258,13 +1253,13 @@ The resolution is bound to the files instead (the PM's correction):
     6090d5b, item 4): proposals are written before the lane only.
   * The two pools: a held resolve slot does not delay a check.
 
-### 15.9 Design delta: a model's resolution lands through the verification (PM ruling)
+### 15.9 A model's resolution lands through the verification
 
 The final ruling of 14: an AI resolution lands only through the operator's verification. The
 verification runs the operator's tests, which take minutes, so it cannot run in the lane (15.8),
 and the tree it verifies depends on the tip.
 
-* **One mechanism, for every verification (PM ruling after the review of the checkout).** The
+* **One mechanism, for every verification.** The
   verification that was left in the lane for the rules' resolutions and for agents' went out of it
   too: whatever made the resolution, verify.command runs on the exact tree, out of the lane, with a
   slot of the process's pool, and the lane compares tree object IDs. Why: in the lane it was bounded
@@ -1325,9 +1320,6 @@ and the tree it verifies depends on the tip.
   files stay PROPOSED and carry "verification failed: exit status N: <the first 4 KiB of the
   output>" (the package cuts a reason to 512 bytes). Nothing is verified for a land that cannot land
   anyway (a file refused, a file left to the agent).
-* **Rules are unchanged.** A resolution made by rules alone lands after verify.command, which runs in
-  the lane, as before; so does an agent's resolution. Moving them onto the same out-of-lane mechanism
-  is the next step, measured on its own, so that in the end there is one verification mechanism.
 * **What is a model's resolution: the origin of each file, fail-safe.** Each resolved file carries
   `origin`, `rule` or `model` (the older `proposal: true` means `model` and is still read). A file
   is a rule's only when it says so; a file without an origin, or with an unknown one, is a model's.
@@ -1577,3 +1569,23 @@ before the confirmation halves, and no tau had a Wilson upper bound <= 5%).
   and (b2) a Luna vote were not run: Luna and Sol have no logprobs on any OpenRouter endpoint, and the screening above
   supersedes them. The decision models are therefore not a way to a landing rule for the human corpus; whether they behave
   differently on agent-versus-agent conflicts is open and needs conflicts with a recorded resolution (AgenticFlict has none).
+
+**Pre-registration of the goal gates (2026-10-20, before the held-out runs).** Federico's goal: at least 20% of
+the conflict files resolved and landed automatically, with at most 5% wrong among them (Wilson 95% upper bound),
+on held-out data, under the strict judge and under judge A, OSS and agent-PR reported separately. On the
+tuning data (the stratified 100 and the 300) no gate came near it (15.12). The gates below are fixed now, from
+that data, and will be run once on data they were not chosen on: the 487 files outside the 300 (family-stratified,
+spring-boot capped at 60; manifest-heldout-487) and the 307 replayed agent-PR files (manifest-agent-307).
+
+* **G1** = the prompt of record with Luna (`openai/gpt-6-luna`, effort low) and with glm-5.3-flash
+  (`z-ai/glm-5.3-flash` pinned to Z.AI, effort low) both accept the byte-identical answer after the judge's
+  normalization, both composition reports are clean, and the verify simulator does not fail it.
+* **G2** = G1 and the file is a java file (`rust-java` family).
+* **G0** = the prompt of record with Luna alone, accepted, report clean, simulator not failed (the baseline to read
+  G1 against).
+
+Reported for each: landed files, coverage of the set, wrong among the landed with its Wilson upper bound,
+strict and judge A ("both judges accept" when two judges ran, the conservative reading), per family, with and
+without spring-boot. The goal counts as met by a gate only if coverage >= 20% AND the upper bound of the wrong
+rate <= 5% under judge A on a held-out set (the strict judge is the stricter secondary, stated plainly). Nothing
+is tuned on the held-out sets.
