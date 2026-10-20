@@ -710,6 +710,7 @@ without a single divergence.
 |---|---|
 | `graft_storage_changesets_total{mode,result}` | Reference transactions handled by the write path; results `committed`, `noop`, `conflict`, `error`, `skipped`. |
 | `graft_storage_preparing_seconds` | Time of the write path in the Preparing phase, before git locks the references (pack build and upload). |
+| `graft_storage_preparing_step_seconds{step}` | The steps of the Preparing phase in authoritative mode: `record` (the read of the repository record), `walk` (the objects reachable from the new tips and not from a local reference, until their list ends; observed for every transaction with new tips), `pack` (writing and hashing a non-empty pack) and `upload` (to the bucket). |
 | `graft_storage_prepared_seconds` | Time of the write path in the Prepared phase, while git holds the reference locks (expected values and database commit; also the pack when the Preparing phase did not prepare it). |
 | `graft_storage_pack_bytes_total` | Bytes of packs uploaded. |
 | `graft_storage_shadow_divergences_total` | Shadow mode changesets recorded despite a mismatch. |

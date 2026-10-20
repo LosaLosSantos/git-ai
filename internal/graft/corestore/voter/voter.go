@@ -255,11 +255,12 @@ func (v *Voter) preparePack(ctx context.Context, payload gitcmd.HooksPayload, ch
 	if err != nil {
 		return nil, err
 	}
+	v.observeStep(stepRecord, time.Since(readAt))
 	if record.HeadSeq == 0 {
 		return nil, nil
 	}
 
-	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
+	pack, err := v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates, true)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +458,7 @@ func (v *Voter) prepare(ctx context.Context, payload gitcmd.HooksPayload, change
 	if prepared != nil && prepared.ok && prepared.repoID == record.ID && prepared.usable(time.Now()) {
 		pack = prepared.pack
 	} else {
-		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates)
+		pack, err = v.buildAndUpload(ctx, repo, payload.Repo.GetStorageName(), record, readAt, updates, false)
 		if err != nil {
 			return v.unavailable(err)
 		}
@@ -679,7 +680,10 @@ func newTips(updates []inputUpdate) []git.ObjectID {
 // local reference reaches (invariant I1, gitops.BuildPack); in shadow mode,
 // everything that the values the database records reach (buildPackAgainst),
 // because local references can hold values the storage core never recorded.
-func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, record corestore.Repository, readAt time.Time, updates []inputUpdate) (corestore.PackUpload, error) {
+//
+// preparing tells that the Preparing phase builds the pack: its steps are then
+// observed (observeStep).
+func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storageName string, record corestore.Repository, readAt time.Time, updates []inputUpdate, preparing bool) (corestore.PackUpload, error) {
 	repoID := record.ID
 	tips := newTips(updates)
 	if len(tips) == 0 {
@@ -698,7 +702,14 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 
 	var pack gitops.Pack
 	if v.core.Authoritative() {
+		built := time.Now()
 		pack, err = gitops.BuildPack(ctx, repo, tips, tmpDir)
+		if err == nil && preparing {
+			v.observeStep(stepWalk, pack.Walk)
+			if !pack.Empty() {
+				v.observeStep(stepPack, time.Since(built)-pack.Walk)
+			}
+		}
 	} else {
 		var known map[string]corestore.Target
 		known, _, err = v.core.Meta.Refs(ctx, repoID)
@@ -722,13 +733,43 @@ func (v *Voter) buildAndUpload(ctx context.Context, repo *localrepo.Repo, storag
 	}
 	defer func() { _ = r.Close() }()
 
+	uploading := time.Now()
 	upload, err := v.core.UploadPack(ctx, record, readAt, pack.SHA256, pack.Size, r)
 	if err != nil {
 		return corestore.PackUpload{}, err
 	}
+	if preparing {
+		v.observeStep(stepUpload, time.Since(uploading))
+	}
 	v.metrics.packBytes.Add(float64(pack.Size))
 
 	return upload, nil
+}
+
+// The steps of the Preparing phase that graft_storage_preparing_step_seconds
+// observes (doc/graft/STORAGE.md).
+const (
+	// stepRecord is the read of the repository record.
+	stepRecord = "record"
+	// stepWalk is the walk of the objects that the pack holds, until its object
+	// list ended (gitops.Pack.Walk). It is observed for every transaction with new
+	// tips, an empty walk included.
+	stepWalk = "walk"
+	// stepPack is the packing of the walked objects into the temporary file,
+	// hashed while it is written. It is observed for non-empty packs only.
+	stepPack = "pack"
+	// stepUpload is the upload of the pack to the bucket.
+	stepUpload = "upload"
+)
+
+// observeStep observes d in step of graft_storage_preparing_step_seconds. Only
+// authoritative mode observes the steps: the shadow mode builds its packs
+// another way (buildPackAgainst).
+func (v *Voter) observeStep(step string, d time.Duration) {
+	if !v.core.Authoritative() {
+		return
+	}
+	v.metrics.preparingSteps.WithLabelValues(step).Observe(d.Seconds())
 }
 
 // fault calls FaultHook and exits the process when CrashEnv selects the point.
@@ -1191,7 +1232,10 @@ type metrics struct {
 	localFailures prometheus.Counter
 	packBytes     prometheus.Counter
 	preparing     prometheus.Histogram
-	prepared      prometheus.Histogram
+	// preparingSteps splits the Preparing phase of authoritative writes into its
+	// steps (observeStep).
+	preparingSteps *prometheus.HistogramVec
+	prepared       prometheus.Histogram
 }
 
 func newMetrics() *metrics {
@@ -1229,6 +1273,13 @@ func newMetrics() *metrics {
 			Help:    "Time spent in the Preparing phase of the storage core write path (pack build and upload, before git takes the reference locks).",
 			Buckets: prometheus.DefBuckets,
 		}),
+		preparingSteps: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "graft_storage_preparing_step_seconds",
+			Help: "Time of each step of the Preparing phase of authoritative writes: record (the read of the " +
+				"repository record), walk (the objects of the pack), pack (writing and hashing a non-empty pack) " +
+				"and upload (to the bucket).",
+			Buckets: []float64{.0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
+		}, []string{"step"}),
 		prepared: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "graft_storage_prepared_seconds",
 			Help:    "Time spent in the Prepared phase of the storage core write path, while git holds the reference locks.",
@@ -1247,6 +1298,7 @@ func (m *metrics) collectors() []prometheus.Collector {
 		m.localFailures,
 		m.packBytes,
 		m.preparing,
+		m.preparingSteps,
 		m.prepared,
 	}
 }

@@ -78,6 +78,15 @@ func TestPreparingUploadsThePackOnce(t *testing.T) {
 				require.Equal(t, corestore.Target(f.c.String()), f.dbRef(t, ref))
 				require.Equal(t, float64(changeset.PackBytes), metricValue(t, f.voter, "graft_storage_pack_bytes_total", nil))
 				require.Equal(t, float64(1), metricValue(t, f.voter, "graft_storage_preparing_seconds", nil))
+				// Authoritative mode observes every step of the Preparing phase once; the
+				// shadow mode, which builds its pack another way, none.
+				steps := float64(0)
+				if mode == corestore.ModeAuthoritative {
+					steps = 1
+				}
+				for _, step := range []string{"record", "walk", "pack", "upload"} {
+					require.Equal(t, steps, metricValue(t, f.voter, "graft_storage_preparing_step_seconds", map[string]string{"step": step}), step)
+				}
 
 				f.voter.Committed(f.ctx, f.payload, input)
 				require.Equal(t, []noteCall{{repoPath: f.repoPath, repoID: f.repoID, seq: f.seq(2)}}, f.applier.calls)
@@ -98,6 +107,8 @@ func TestPreparedWithoutPreparing(t *testing.T) {
 
 			require.NoError(t, f.prepared(line(f.zero, f.b.String(), ref)))
 			require.Equal(t, 1, blobs.count(), "Prepared uploads the pack itself")
+			require.Zero(t, metricValue(t, f.voter, "graft_storage_preparing_step_seconds", nil),
+				"the steps are those of the Preparing phase, not of a pack that Prepared builds")
 			require.Equal(t, blobs.puts[0], f.lastChangeset(t).PackKey)
 			require.Equal(t, corestore.Target(f.b.String()), f.dbRef(t, ref))
 		})
