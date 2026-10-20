@@ -1348,6 +1348,14 @@ The resolution is bound to the files instead:
     41 hand-backs, 50 ticket waits (45 s on average), 92 resolver calls, 333 rounds for 250 lands; against 113 to 124
     lands/min and p99 74 to 94 s of the queue before these fixes, no regression. v0.2.0 has no verification, so
     there is no baseline: its runs with the same setting ignored it (1,782 and 1,870 lands/min).
+  Repeated on the code after the second review (commit f603f03: the model land gives its ticket back, the holder
+  has priority, all the inline time is charged to the batch), in a window in which the machine was busier (the load
+  at the end of the runs went from 2.5 to 7.5): rules only 775 and 1,364 lands/min (p99 7.3 and 3.2 s) against 1,094
+  and 897 (p99 4.2 and 5.5 s) of the v0.2.0 run next to each; the wrapper alone 842 and 742, with one injected failure
+  631 and 646 (p99 7.4 s). All 250 of 250. The structure is the same as above and does not depend on the machine: no
+  hand-back, no resolver call out of the lane and no ticket wait in the runs with the rules only, 7 and 8 members
+  handed back and no ticket wait with the failure. The rates of this window are lower for both sides and are not
+  comparable with the first.
   The start loads of the last six runs (the wrapper's control and the failure) were not logged; the cooldown that
   holds each start until the load is below 2 was in force, and the whole batch ran in a few minutes.
   The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
