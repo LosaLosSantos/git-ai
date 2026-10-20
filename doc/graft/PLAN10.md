@@ -1902,7 +1902,7 @@ operator's verification on the exact tree (15.4, 15.9). Measured quality of the 
 verification will see: OSS 58% right strict (68% to 76% under judge A) on the 300 and 52% (78% A) held-out; java 85 to
 93%; go, ts-js and python 40 to 60%; agent-PR 24% (53% A). We cannot show, with the evidence that exists, that any
 offline gate lands 20% of the files at 5% wrong; the one thing that comes close is spring-boot, where a constant policy
-is as good. Showing it needs conflicts of agents with the operator's tests running on the resolved tree.
+is as good. Showing it needs conflicts of agents with the operator's tests running on the resolved tree. Whether a gate chosen on half the repositories holds on the other half is asked in 15.14.
 
 **Pre-registration of the goal gates (2026-10-20, commit cac46fa, before the held-out runs).** The gates below were fixed from
 the tuning data (the stratified 100 and the 300) and run once on data they were not chosen on: the 487 files outside the 300
@@ -1978,6 +1978,110 @@ file; the models that reason without a bound on their effort ended their calls p
 (Appendix A), which is a property of the configuration here (effort low, 8000 tokens, 120 s per call) and not a
 judgment of the models.
 
+### 15.14 Is there a principled gate? (analysis, no paid call)
+
+**The question** (2026-10-20): the restated bar, at most 20% wrong among what lands (Wilson 95% upper bound), holds for G1 on
+the whole OSS held-out (14.8%, upper 19.3%, 2 of 3 judges) and not without spring-boot (17.9%, upper 23.4%), not on go (25.2%)
+and not on agent PRs (about 51%). Is there a gate that uses only what the server knows before it lands, no judge, and keeps
+the upper bound at or under 20% without spring-boot as well, on data it was not chosen on?
+
+**The answer.** No gate was shown to. One gate, chosen on half the repositories, meets the bound on the other half *with*
+spring-boot (7.0% wrong, upper 13.7%, 34.6% of the files landed), and it does so because it keeps spring-boot and drops go; without
+spring-boot it lands 18.8% of the files with 14.0% wrong and an upper bound of 27.3%. Exchanging the halves, the gate chosen
+is almost G1 and does not meet the bound (upper 23.5%). Chosen on the same data it is measured on, the best gate (an optimistic
+ceiling) reaches the bound without spring-boot by 0.4 points under one judge reading and misses it under the other. And
+the data cannot show it either way: to show an upper bound of 20% for a true wrong rate of 14% takes 160 landed
+files, and the held-out has 229 files outside spring-boot. Details follow; the figures are of `c1-work/run/gate-b/`
+(`PROTOCOL.txt`, `split.json`, `out-main.txt`, `out-swap.txt`; scripts `gate_split.py`, `gate_b.py`).
+
+**Method, fixed before any outcome of the held-out sets was loaded for it** (`PROTOCOL.txt`, sha256 `50fc874e22df`; the split
+`split.json`, sha256 `688ebbe125b5`):
+* *Split by repository, with a seed.* The ten repositories of the OSS held-out, sorted, shuffled with `random.Random(20261020)`:
+  half A, to choose the gate: django, react, TypeScript, flask, prometheus (198 files; go 70, ts-js 105, python 23, no java);
+  half B, to evaluate it: kafka, golang/go, vscode, pandas, spring-boot (289 files; go 130, ts-js 95, java 61, python 3).
+  Ten repositories is a coarse split: A has no java, B has go, vscode and spring-boot.
+* *The signals,* all known before landing and none a judge or a repository name: language family (from the extension),
+  git regions of the file, conflict lines (the lines of both sides inside `git merge-file`'s regions), lines of the largest
+  side, the kind of path (test, config, lock, docs, other), whether a composition report says "found in neither side", and
+  whether the answer is a pick of one whole side or a mixture. Every candidate lands a subset of G1 (the two models'
+  identical answer, both reports clean, the simulator not failing), because judge 3 ran only on the answers G1 lands; so
+  the agreement of the two models and the deterministic composition check are inside every candidate. Of 17 predicates
+  (a fixed grid of thresholds, in `PROTOCOL.txt`) a candidate is none, one, or two of different kinds: 139 candidates.
+  The *type of conflict* (both sides edit, or one deletes) could not be tried: all 487 and all 284 files are `content`.
+* *Selection, on A only:* among the candidates that land at least 15 files of A with an upper bound of the wrong rate at or under 20%
+  (2-of-3 label, answers with no verdict counted wrong), the one that lands the most. Then measured once on B.
+  Nothing was tuned on B. The grid and the rule were written before the numbers; but the per-family results of 15.12 (go weak,
+  java strong) were known, so "family is not go" is not an independent finding.
+
+**The result, on B** (wrong = not accepted by 2 of 3 judges; in parentheses the Wilson upper bound; the last column is judge 3
+alone, the strictest):
+
+| B | files | landed | wrong, 2 of 3 | judge 3 alone |
+|---|---:|---|---|---|
+| G1 | 289 | 195 = 67.5% | 29 = 14.9% (up 20.5) | 31 = 15.9% (up 21.7) |
+| **chosen: family is not go, one region** | 289 | **100 = 34.6%** | **7 = 7.0% (up 13.7)** | 7 = 7.0% (up 13.7) |
+| G1 without spring-boot | 229 | 138 = 60.3% | 28 = 20.3% (up 27.8) | 30 = 21.7% (up 29.3) |
+| **chosen, without spring-boot** | 229 | **43 = 18.8%** | **6 = 14.0% (up 27.3)** | 6 = 14.0% (up 27.3) |
+| chosen, spring-boot only | 60 | 57 = 95.0% | 1 = 1.8% (up 9.3) | 1 = 1.8% (up 9.3) |
+| chosen, ts-js (G1: 57 landed, 12.3%, up 23.2) | 95 | 41 = 43.2% | 6 = 14.6% (up 28.4) | 6 = 14.6% (up 28.4) |
+| chosen, java | 61 | 58 = 95.1% | 1 = 1.7% (up 9.1) | 1 = 1.7% (up 9.1) |
+| chosen, go (G1: 79 landed, 26.6%, up 37.2) | 130 | 0 | | |
+
+The gate was chosen on A (it lands 48 of 198 there, 8.3% wrong, upper 19.6%, all python and ts-js: A has no java). On B it
+meets the bound, and 57 of its 100 landed files are spring-boot. Outside spring-boot it lands less than 20% of the files and its bound is 27.3%.
+It does not improve ts-js (14.6% wrong against 12.3% for G1). What it did was drop go, the family that is 26.6% wrong.
+Its cost: landing half of what G1 lands (34.6% against 67.5%).
+
+**What else was run** (supplementary; flagged as such, not results):
+* *The halves exchanged:* the gate chosen on B is "the answer is a mixture of the sides" (191 of 195 G1 files, 13.1% wrong, upper
+  18.6%), almost G1, and on A it lands 94 of 198 with 14.9% wrong (upper 23.5%; G1: 14.6%, upper 23.0%). It does not meet the bound.
+* *Leave one repository out,* choosing on the other nine: the gate chosen is G1 itself in 8 of 10 rounds (no predicate beats it by the
+  rule), "a mixture" for vscode (10.7% wrong, upper 21.5%) and "mixture and at most 20 conflict lines" for spring-boot. The chosen
+  gate is not stable.
+* *An optimistic ceiling* (the best candidate chosen and measured on the same data): over all ten repositories it is G1 itself (14.8%,
+  upper 19.3%); without spring-boot it is "at most 20 conflict lines and a mixture": 193 of 427 files landed (45.2%), 14.0% wrong,
+  upper 19.6% under 2 of 3, 20.2% under judge 3 alone, against G1's 234 (54.8%) at 17.9% (upper 23.4%). On go alone no candidate
+  lands 15 files with a bound at or under 20% (the closest lands 92, 18.5% wrong, upper 27.6%); on ts-js alone "at most 80
+  conflict lines" lands 97 of 200, 11.3% wrong (upper 19.2%; judge 3 alone 20.4%).
+* *Each signal alone, among the 291 files G1 lands* (descriptive, pooled, after the fact): wrong 11.5% with at most 10 conflict
+  lines (226 files), 13.1% with one region (245), 12.4% without "found in neither side" (226); against 25.6% with 2 to 4 regions,
+  50.0% with more than 80 conflict lines (12), 23.1% with "found in neither side" (65). By family: java 1.7%, ts-js 13.6%, go 23.5%.
+  The kind of path does not separate (test 14.7%, other 14.8%; no config, lock or doc file is landed by G1). The signals move the
+  rate by a few points; none turns a family that is 23% wrong into one that is 15%.
+* *The frozen gate on the agent PRs (out of domain):* G1 lands 130 of 284 with 42.3% wrong (upper 50.9%; judge 3 alone 51.5%, upper
+  60.0%); the chosen gate lands 93 (32.7%) with 39.8% wrong (upper 49.9%; judge 3 alone 47.3%, upper 57.4%). The ceiling chosen on the
+  same agent data: no candidate lands 15 files with an upper bound at or under 20%; the closest lands 28 at 17.9% wrong, upper 35.6%.
+  There the signals tell a little more (22.2% wrong when the answer is a pick of a side, 50.0% when it is a mixture; 36.1% without
+  "found in neither side", 72.7% with it), but not enough for the bar.
+* *What the data can show.* The fewest landed files for which the upper bound is at or under 20%, by the true wrong rate: 25 files at
+  5% wrong, 54 at 10%, 87 at 12%, 160 at 14%, 365 at 16%, about 1,500 at 18%. With 229 files outside spring-boot, 43 to 193 landed,
+  a gate at 14% wrong cannot be shown to be under 20%, and a gate at 10% needs 54 landed, which no candidate reaches there.
+
+**Reading, honestly.**
+1. Is there a principled gate that keeps the upper bound at or under 20% without spring-boot? **Not shown, and probably not with
+   these signals.** The only gate that clears the bound on held-out repositories does it on spring-boot, which a constant policy
+   ("always THEIRS", 15.11) already covered. Outside it, the best that the signals do (an optimistic ceiling) is 14% wrong at the
+   bound, selected on the data it is measured on.
+2. What it costs: the gate that clears the bound with spring-boot lands half of what G1 lands (34.6% against 67.5% of B) and no go
+   file at all. The ceiling without spring-boot lands 45% of the non-spring-boot files against G1's 55%.
+3. Go is the limit: 23.5% to 26.6% wrong under G1, and no candidate gets its bound under 27%. A gate that keeps the bound
+   without spring-boot has to leave go to the operator's tests.
+4. On agent PRs no signal of the server comes close (40% wrong at best), consistent with 15.12.
+5. **What would be needed** to claim a gate, in this order: (a) *A signal that is not the text:* the operator's tests on the
+   resolved tree (`verify.command`), the only thing that moved a number (prometheus, 48% to 14%); for go, `go build` and the package
+   tests of the files, which the bench cannot run for most of the repositories. (b) *More data,* chosen for the claim: at a true
+   wrong rate of 14% the bound needs about 160 landed files per claim, so a held-out of at least 600 files outside spring-boot,
+   from at least 20 repositories and several java ones (java here is one repository, spring-boot), with the split by repository
+   and the gate fixed first. (c) *Behavioural ground truth* for agent conflicts (15.12): the CI result of the merge, or conflicts made
+   from two agents' patches with a test suite.
+   Until then the operating point stays that of 15.12: a model's resolution is a proposal, and it lands through the
+   operator's verification.
+
+**Limits of this analysis.** Ten repositories, two halves with five each, one of which holds no java; 139 candidates chosen on 96
+landed files; the label is the verdict of three LLM judges (unjudged answers counted wrong), not tests, and judge 3 ran only on
+G1's answers, so a gate looser than G1 cannot be evaluated; the signals are the ones listed. A different split would pick a different
+gate (the exchange above did), which is the point.
+
 ### Appendix A: the measurement log of section 15
 
 What was run, when, on what, at what cost. Data, scripts and reports are in `c1-work/` (outside the repository:
@@ -2003,6 +2107,7 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | judge 1 (glm-5.3-flash) on the held-out answers | the answers of Luna | scripts outside the repository | $0.025 + $0.021 |
 | 20 | judge 2 (openai/gpt-6.1-sol, effort low) on the answers landed by G0 | OSS held-out 359, agent-PR 210 | scripts outside the repository | $0.239 + $0.268 |
 | 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1: a first pass stopped at its cap of $0.25 per set, a second pass (retry of the empty answers with a backoff, and the unjudged) at +$0.03 and +$0.09, a third on the OSS set only (cap +$0.10, +$0.106 booked); 13 OSS and 29 agent-PR answers unjudged and 2 OSS and 3 agent-PR calls empty at the end, counted as wrong | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.404 + $0.354 = $0.758 booked (the key: $0.739) |
+| 20 | the gate analysis of 15.14: a split of the OSS held-out by repository, 139 candidate gates chosen on half and measured on the other, the exchange, leave one repository out | manifest-heldout-487, manifest-agent-284, the stored answers and judge verdicts | scripts/gate_split.py, gate_b.py outside the repository | $0 |
 | 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
