@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -251,8 +252,17 @@ func startGitalyWithLanes(t *testing.T, graft config.Graft, lanes *landlane.Shar
 func newTestLanes(t *testing.T, graft config.Graft) *landlane.Shared {
 	t.Helper()
 
+	return newTestLanesWithClock(t, graft, nil)
+}
+
+// newTestLanesWithClock is newTestLanes with the clock that measures the batches
+// (landlane.Config.Clock); nil is the time of the system.
+func newTestLanesWithClock(t *testing.T, graft config.Graft, clock func() time.Time) *landlane.Shared {
+	t.Helper()
+
 	cfg, err := landlane.ConfigFromGraft(graft.Land.Batch)
 	require.NoError(t, err)
+	cfg.Clock = clock
 
 	lanes := landlane.NewShared(cfg)
 	t.Cleanup(lanes.Close)
@@ -281,38 +291,57 @@ func effectiveMaxSize(t *testing.T, lanes *landlane.Shared) float64 {
 	return 0
 }
 
-// slowUpdateHookScript returns a pre-receive hook that sleeps for delay before it
-// accepts an update, for as long as the marker file exists. Creating and
-// removing the marker switches the updates between slow and fast.
-func slowUpdateHookScript(marker string, delay time.Duration) string {
-	return fmt.Sprintf(`#!/bin/sh
-while read old new ref; do :; done
-if [ -f '%s' ]; then
-	sleep %.1f
-fi
-exit 0
-`, marker, delay.Seconds())
+// stepClock is a clock for the lanes (landlane.Config.Clock) that moves on by
+// step at every reading, and stands still while step is zero. A batch reads it
+// when it starts and when it ends, so the lanes measure every batch as lasting
+// at least step, or nothing at all with step zero, however long it really takes.
+type stepClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	step time.Duration
+}
+
+func (c *stepClock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.now = c.now.Add(c.step)
+	return c.now
+}
+
+func (c *stepClock) setStep(step time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.step = step
 }
 
 // TestPhase4AdaptiveSizingVisible checks that the effective maximum size gauge
 // shrinks when batch updates are slower than the target latency, and grows
 // back when they are fast. The bounds hold however the rounds split into
-// batches: every slow batch halves the size and every fast batch grows it.
+// batches: every slow batch halves the size and every fast batch grows it. The
+// lanes measure the batches with a step clock, so the slow batches are slow and
+// the fast ones fast whatever the load of the machine.
 func TestPhase4AdaptiveSizingVisible(t *testing.T) {
 	t.Parallel()
 
 	const (
-		agents   = 4
-		maxSize  = 8
-		target   = 2 * time.Second
-		slowHook = 3 * time.Second
+		agents  = 4
+		maxSize = 8
+		target  = 2 * time.Second
+		// slowStep makes every batch slower than the target. The lanes read the clock a
+		// few times per request, so over the slow rounds the clock moves on by a few
+		// minutes at most, within landlane.KeyStateTTL: the lane keeps its size between
+		// the rounds.
+		slowStep = 3 * time.Second
 	)
 
 	graft, tokens := workerGraft(agents)
 	graft.Land.Batch.Window = "100ms"
 	graft.Land.Batch.MaxSize = maxSize
 	graft.Land.Batch.TargetLatency = target.String()
-	lanes := newTestLanes(t, graft)
+	clock := &stepClock{now: time.Now()}
+	lanes := newTestLanesWithClock(t, graft, clock.read)
 	s := startGitalyWithLanes(t, graft, lanes)
 	ctx := s.ctx
 
@@ -325,9 +354,6 @@ func TestPhase4AdaptiveSizingVisible(t *testing.T) {
 	const branch = "adaptive"
 	_, err := landAs(ctx, repos[0], workerName(0), branch, base)
 	require.NoError(t, err)
-
-	marker := filepath.Join(t.TempDir(), "slow")
-	gittest.WriteCustomHook(t, s.repoPath, "pre-receive", []byte(slowUpdateHookScript(marker, slowHook)))
 
 	round := 0
 	landRound := func() {
@@ -351,7 +377,7 @@ func TestPhase4AdaptiveSizingVisible(t *testing.T) {
 
 	// Two rounds of slow batches. Each round has at least one batch, and every
 	// batch is slower than the target, so the size halves at least twice.
-	require.NoError(t, os.WriteFile(marker, nil, 0o600))
+	clock.setStep(slowStep)
 	landRound()
 	landRound()
 
@@ -360,7 +386,7 @@ func TestPhase4AdaptiveSizingVisible(t *testing.T) {
 	require.GreaterOrEqual(t, slow, float64(1), "the size never drops below one")
 
 	// Three rounds of fast batches. Each batch grows the size by at least one.
-	require.NoError(t, os.Remove(marker))
+	clock.setStep(0)
 	landRound()
 	landRound()
 	landRound()
