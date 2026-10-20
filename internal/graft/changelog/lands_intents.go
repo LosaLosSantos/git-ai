@@ -120,8 +120,10 @@ func RecordLandIntents(repoPath, reference, invocation string, lands []Land) (co
 		buf.WriteByte('\n')
 	}
 
-	if err := truncateFile(f, end); err != nil {
-		return false, fmt.Errorf("truncating land intents: %w", err)
+	if end < info.Size() {
+		if err := truncateFile(f, end); err != nil {
+			return false, fmt.Errorf("truncating land intents: %w", err)
+		}
 	}
 	if _, err := f.WriteAt(buf.Bytes(), end); err != nil {
 		return false, fmt.Errorf("writing land intents: %w", err)
