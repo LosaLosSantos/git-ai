@@ -3,7 +3,7 @@
   <source media="(max-width: 1239px) and (prefers-color-scheme: dark)" srcset="doc/images/banner-phone-dark.gif">
   <source media="(max-width: 1239px)" srcset="doc/images/banner-phone-light.gif">
   <source media="(prefers-color-scheme: dark)" srcset="doc/images/banner-dark.gif">
-  <img alt="gitai, Git designed for AI agents. An animation: the gitai logo, then a board of 50 agents racing on one branch, where git lands 100 changes and gitai lands 200; the server puts every change in order; every change has the name of the agent that made it; and servers can be added as you grow." src="doc/images/banner-light.gif" width="100%">
+  <img alt="gitai, Git designed for AI agents. An animation: the gitai logo; a board of 50 agents racing on one branch, where git lands 100 of 250 changes and gitai lands 200; the measured numbers (changes that got in, tries per change, longest wait); two agents changing the same lines, an AI writing the merge, the tests passing and the change going in; and every change carrying the name of the agent that made it." src="doc/images/banner-light.gif" width="100%">
 </picture>
 <h3 align="center">Git designed for AI agents.</h3>
 </div>
