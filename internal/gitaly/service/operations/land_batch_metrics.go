@@ -48,9 +48,11 @@ const (
 	landBatchOutcomeConflict = "conflict"
 	// landBatchOutcomeDenied is a request that the access policy or the hooks denied.
 	landBatchOutcomeDenied = "denied"
-	// landBatchOutcomeNeedsResolution is a request the lane handed back because the files it found
-	// conflicting have no verdict at its tip (PLAN10 15.8): not a failure, the land resolves them
-	// out of the lane and enters the lane again, so a land that loses k rounds counts k of these.
+	// landBatchOutcomeNeedsResolution is a request the lane handed back (PLAN10 15.8): because the files it
+	// found conflicting have no verdict at its tip and the rules could not resolve them inline, or because
+	// another land holds the ticket of one of them, or holds it with priority, and this one waits for its
+	// turn. Not a failure: the land resolves out of the lane, or waits, and enters the lane again, so a
+	// land that is handed back k times counts k of these.
 	landBatchOutcomeNeedsResolution = "needs_resolution"
 	// landBatchOutcomeError is a request that failed for any other reason.
 	landBatchOutcomeError = "error"
