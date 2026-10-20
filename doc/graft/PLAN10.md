@@ -1665,7 +1665,10 @@ phrasing, or a different resolution that a reviewer would accept). Judge A is th
 ConflictAgent (Shen 2026, MIT) adapted (Appendix A), run by a small model (glm-5.3-flash); a second judge
 (qwen3.8-flash, with 37 of 107 calls failed, counted as not acceptable) agrees with it on 91% of the answers and
 accepts fewer (187 against 205 of 270), so "judge A" below is one cheap judge and "both judges" is the
-conservative reading. Neither judge runs tests.
+conservative reading. For the gates on the held-out sets a stronger second judge was added, `openai/gpt-6.1-sol` (effort
+low, the same rubric, no failed call), run on the answers that G0 lands: it accepts fewer than the first one (on the OSS
+held-out G0 files it finds 74 wrong against the first judge's 56), so the figures below are given for judge 1, judge 2
+and "both accept", the last being the one to quote. Neither judge runs tests.
 
 **What the writer's proposals are worth** (the prompt of record, Luna, effort low; "right" = the strict judge; the
 interval is Wilson 95%; accepted = the answer passed the rules and the syntax check):
@@ -1698,16 +1701,26 @@ set, "wrong" is among the landed, the bound is the Wilson upper bound; strict / 
 | same-model self-agreement and structure rules, chosen on half the repositories, measured on the other half (30 splits) | OSS 300 | 9.6% of the held-out half | 53% wrong pooled | not run |
 | Luna and glm-5.3-flash byte-identical answer | the stratified 100 | 71 = 71% | 36.6% (up 48.2) | 21.1% (up 32.0) |
 | decision models, tau chosen on half the repositories | 284 agent-PR files | none (no group lands 8 files at 5%) | | |
-| **G0**: Luna, clean report, simulator ok | **OSS held-out 487** | 359 = 73.7% | 40.1% (up 45.3) | 15.6% (up 19.7) |
-| **G1**: Luna x glm identical, both clean, simulator ok | OSS held-out | 291 = 59.8% | 31.6% (up 37.2) | 11.3% (up 15.5) |
-| **G2**: G1 on java | OSS held-out | 58 = 11.9% | 5.2% (up 14.1) | 1.7% (up 9.1) |
-| **G0** | **agent-PR 284** | 210 = 73.9% | 72.4% (up 78.0) | 41.9% (up 48.7) |
-| **G1** | agent-PR | 130 = 45.8% | 62.3% (up 70.2) | 36.9% (up 45.5) |
+| **G0**: Luna, clean report, simulator ok | **OSS held-out 487** | 359 = 73.7% | 40.1% (up 45.3) | judge 1 15.6% (up 19.7); judge 2 20.6% (up 25.1); **both 20.9% (up 25.4)** |
+| **G1**: Luna x glm identical, both clean, simulator ok | OSS held-out | 291 = 59.8% | 31.6% (up 37.2) | judge 1 11.3% (up 15.5); judge 2 15.1% (up 19.7); **both 15.5% (up 20.1)** |
+| **G2**: G1 on java | OSS held-out | 58 = 11.9% | 5.2% (up 14.1) | both 1.7% (up 9.1) |
+| **G0** | **agent-PR 284** | 210 = 73.9% | 72.4% (up 78.0) | judge 1 41.9% (up 48.7); judge 2 49.0% (up 55.8); **both 51.0% (up 57.6)** |
+| **G1** | agent-PR | 130 = 45.8% | 62.3% (up 70.2) | judge 1 36.9% (up 45.5); judge 2 40.8% (up 49.4); **both 43.1% (up 51.7)** |
 | **G2** | agent-PR | 1 | | |
 
 G0, G1 and G2 were fixed before the held-out runs (below) and run once; nothing was tuned on those sets. Without spring-boot
-G1 on the OSS held-out lands 234 files (54.8%) with 38.5% wrong strict and 13.7% (upper 18.7%) under judge A. Per family
-G1 on the OSS held-out, strict / judge A wrong: go 37% / 16%, ts-js 42% / 13%, python 20% / 7%, java 5% / 2%.
+G1 on the OSS held-out lands 234 files (54.8%) with 38.5% wrong strict, 13.7% (upper 18.7%) under judge 1 and **18.8% (upper
+24.3%) when both judges must accept**; G0 without spring-boot lands 301 (70.5%) with 24.3% wrong (upper 29.4%) under both.
+Per family on the OSS held-out, wrong under both judges (Wilson upper bound), G1 / G0: go 24.3% (32.9) / 29.9% (37.5),
+ts-js 14.6% (22.6) / 19.2% (27.0), python 6.7% (29.8) / 14.3% (34.6), java 1.7% (9.1) / 3.4% (11.5).
+
+**The threshold of 20% wrong.** After these results Federico restated the goal as "at most 20% wrong among what lands" (the
+20% of files landed stays). That is a different bar chosen after the numbers were known, so it is not a pre-registered
+confirmation; read against it, honestly: on the OSS held-out, G1 has 15.5% wrong under both judges (11.3% under judge 1, 15.1%
+under judge 2) with an upper bound of 20.1% under both judges (19.7% under judge 2, 15.5% under judge 1), at 59.8% of
+the files landed, so it meets the bar on the point estimates and misses the bound under the conservative reading by 0.1
+point; G0 (Luna alone) has 20.9% (upper 25.4%) and does not; without spring-boot G1 has 18.8% (upper 24.3%). On the agent-PR
+files no gate comes close: 43.1% wrong at best (upper 51.7%), at 45.8% landed.
 
 **Reading.**
 * The statistical bar is high: at most 5% with an upper bound needs about 75 landed files with none wrong, 130 with two,
@@ -1720,6 +1733,22 @@ G1 on the OSS held-out, strict / judge A wrong: go 37% / 16%, ts-js 42% / 13%, p
 * On agent-PR conflicts, the traffic that gitai serves, the writer is right strict in a quarter of the files and acceptable
   in about half: the recorded resolutions are often something other than the two sides' lines, and no signal tried
   separates the right ones. This is the hardest data we have and the lowest operating point.
+* **What the wrong answers on agent PRs are.** Of the 152 answers that G0 lands on the agent-PR files and that differ from
+  the recorded resolution, 24 are the same text up to whitespace (9) or order (15), and both judges accept 23 of them. 25
+  are files where the recorded resolution changed lines OUTSIDE the conflict regions (a person adapting the PR to a moved
+  base; no resolver that edits the regions can reproduce it; the judges accept 2 of them), 21 are resolutions that hold lines
+  found in no side (new code; 5 accepted by both), and 82 are a different combination of the sides' own lines (15
+  accepted by both, 55 by neither judge). Of the 107 that stay wrong under "both judges accept", 23 (21%) are
+  "outside", 16 (15%) "new" and 67 (63%) a genuine disagreement of content: so about a third of the agent-PR error is a
+  property of the ground truth (the person did more than resolve), and about two thirds is the model choosing or
+  composing differently from the person, which only a test can say is wrong.
+* **An honest ground truth for agent traffic** is not the person's file. 265 of the 284 resolutions were made by a person
+  merging the base into the PR branch, with whatever else they changed on the way, and a recorded text is one valid answer
+  among several. What defines a right resolution for an agent is behavioural: the merged tree builds, the tests of both
+  changes pass, and neither change is lost. Two sources exist: the CI result recorded on the merge (not collected here), and
+  conflicts made on purpose, from two agents' patches for two tasks of a repository with a test suite (right = both tasks'
+  tests pass on the merged tree), which would also give agent-versus-agent conflicts. Without one of them the figures
+  for agent PRs above are measured against a proxy.
 * What moved a number was a test: the tests of prometheus take its wrong rate from 48% to 14% (n = 14, so the bound is
   wide). Tests are what production's `verify.command` adds, and the bench cannot run them for these repositories.
 
@@ -1807,6 +1836,9 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | verify simulator (python, go with tests, ts) | the 270 accepted answers | 8812cee | $0 |
 | 20 | features and self-agreement of the eight Luna arms | the 300 | n/a | $0 |
 | 20 | AgenticFlict: the replay of 2,360 merge commits | 2,125 merged agent PRs | n/a | $0 |
+| 20 | held-out runs of the prompt of record: Luna and glm-5.3-flash on 487 OSS files and on 284 agent-PR files | manifest-heldout-487, manifest-agent-284 | 7fd0ab2's tools tree (8812cee) | $0.300 + $0.302 + $0.227 + $0.237 |
+| 20 | judge 1 (glm-5.3-flash) on the held-out answers | the answers of Luna | scripts outside the repository | $0.025 + $0.021 |
+| 20 | judge 2 (openai/gpt-6.1-sol, effort low) on the answers landed by G0 | OSS held-out 359, agent-PR 210 | scripts outside the repository | $0.239 + $0.268 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
 rust and a ts file) that costs at most a few cents and stops a model whose calls end before an answer: more than
