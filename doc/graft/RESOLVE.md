@@ -250,6 +250,11 @@ Request (server to resolver):
   origin of a file, `proposal` a file that is not a rule's is a proposal that lands only on a verified tree, `hold` it
   never lands a file with a `hold`, `verify` it verifies the exact tree that lands. A request without it comes from an
   older server, and `graft-resolve` gives it no model's resolution (see "Version skew" below).
+- `rules_only` (additive, optional) asks the resolver to run only its rules, the strategies whose answers are a rule's, and
+  never to call a model: the lane of the server sends it when it resolves a member inline (see "Out of the lane"). A
+  resolver of this release that honours it says so with `"rules_only": true` in its response; what the rules do not
+  resolve is left unresolved, as a failure of the chain. A server that gets no echo is talking to an older resolver,
+  whose answer it drops, and it never asks again for the life of the process.
 - `ours` is the current branch tip side. `theirs` is the change being landed.
 - `tip`, `merge_base` and `messages.tip` are always empty since this version;
   they stay in the protocol for compatibility. The server reuses a file's
@@ -538,14 +543,31 @@ branch for the other lands:
    the server resolves only that file, out of the lane, and enters the lane
    again.
 
-A round is lost only when another land changed one of the files, so the lands
-that contend for a file all land, one per round. The rounds are bounded by the
-resolver's `timeout` for the whole land, and by `resolve_rounds`, a safety cap
-well above realistic contention. The limit, stated: under continuous new
-arrivals on the same file, one land can keep losing until its deadline; it then
-ends with the merge conflict and its package: the files that changed under it are
-`NOT_ATTEMPTED` with the reason `the files changed again before they could be
-resolved`, the others keep their verdicts (a model's `PROPOSED`).
+A round is lost when another land changed one of the files. The rules do not wait for that:
+
+* **Rules in the lane.** Without `verify.enabled`, a land enters the lane first, and the lane resolves the files that
+  have no verdict itself, as the rules (trivial, union, rerere, a command that is a rule), within `inline_timeout`
+  (default `1s`; `0s` turns it off). It sends the request with `"rules_only": true`, and `graft-resolve` never calls a
+  model for it. What a rule cannot resolve, or does not resolve in time, is handed back and resolved out of the lane as
+  described above. The lands on a hot file ride the same batches as the others, as they did in v0.2.0. A resolver that
+  does not echo `rules_only` is an older one: its answer is dropped and the lane never asks again for the life of the
+  server process.
+* **A queue for the rest.** A land that loses a round out of the lane (a model, or a verification, or a rule that
+  takes more than `inline_timeout`) takes a ticket on its files, first in first out, and keeps it until it ends. It is
+  the only land of the branch that resolves those files again; the others wait without calling the resolver, and the lane
+  hands back any other land with a verdict on them. A land that waits past its deadline ends with the merge conflict and
+  its package, its files `NOT_ATTEMPTED` with the reason `the time ran out waiting for the other lands on the same files`.
+  The tickets are per file, or per branch with `verify.enabled` (the tree that is verified is the branch's). They are in
+  the memory of the server process, like the lanes: with several nodes on one branch (authoritative storage) the lands
+  go on in rounds across nodes, without this order.
+
+The rounds are bounded by the resolver's `timeout` for the whole land, and by `resolve_rounds`, a safety cap that the
+order above does not reach. The limits, stated: a land that holds the ticket of a file loses a round to a land that
+changes the file without a conflict and lands first (once per such land); with a verification every resolution is
+verified out of the lane on its own tree, in turn, and a land that moves the branch meanwhile makes the verified tree
+stale and the verification is repeated (the cost is measured in PLAN10 15.8). In every case the end is bounded by the
+deadline, with the merge conflict and its package: the files that changed under the land are `NOT_ATTEMPTED` with the
+reason `the files changed again before they could be resolved`, the others keep their verdicts (a model's `PROPOSED`).
 
 `verify.command` runs out of the lane, whatever made the resolution (a rule, an agent, a model): on
 the exact tree that would land, with a slot of the process's verify pool, before the lane, which only

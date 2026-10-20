@@ -1,6 +1,7 @@
 package operations
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -8,9 +9,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/feder-cr/git-ai/internal/featureflag"
 	"github.com/feder-cr/git-ai/internal/git"
+	"github.com/feder-cr/git-ai/internal/git/gittest"
 	"github.com/feder-cr/git-ai/internal/gitaly/config"
 	"github.com/feder-cr/git-ai/internal/graft/identity"
+	"github.com/feder-cr/git-ai/internal/testhelper"
+	"github.com/feder-cr/git-ai/internal/testhelper/testcfg"
+	"github.com/feder-cr/git-ai/proto/go/gitalypb"
 )
 
 // The tests of the inline resolution of the rules in the lane (land_inline.go), with the resolver of
@@ -174,4 +180,64 @@ func TestLandResolveInline_neverForAnAgentThePolicyDenies(t *testing.T) {
 	s.graft.Policy = []config.GraftPolicyRule{{Actor: "agent-7", Refs: []string{"refs/heads/**"}, Allow: true}}
 	require.True(t, s.landResolveInline(ctx, fx.request("Land"), fx.tip, fx.commit, l, pre))
 	require.Equal(t, 1, unionCalls(t, dir))
+}
+
+// TestUserLand_aRuleResolvedInTheLaneRidesTheBatchOfTheCleanLands: through the lanes of a standalone server,
+// a land with a conflict that a rule resolves enters the lane with the clean lands, is resolved there by
+// one request for the rules only, and lands in their batch, not in one of its own.
+func TestUserLand_aRuleResolvedInTheLaneRidesTheBatchOfTheCleanLands(t *testing.T) {
+	t.Parallel()
+
+	dir, argv := unionResolver(t)
+	rcfg := config.GraftResolver{Enabled: true, Command: argv, ResolveRounds: 1}
+	cfg := testcfg.Build(t)
+	cfg.Graft = config.Graft{
+		Standalone: true,
+		Land:       config.GraftLand{Batch: config.GraftLandBatch{Window: "100ms"}, Resolver: rcfg},
+	}
+	ctx, cfg, client := setupOperationsServiceWithCfg(t, testhelper.Context(t), cfg)
+	ctx = featureflag.ContextWithFeatureFlag(ctx, featureflag.GPGSigning, true)
+	repo, repoPath := gittest.CreateRepository(t, ctx, cfg)
+	file := func(path, content string) gittest.TreeEntry {
+		return gittest.TreeEntry{Mode: "100644", Path: path, Content: content}
+	}
+	base := gittest.WriteCommit(t, cfg, repoPath, gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(file("a", "base\n")))
+	gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithBranch(git.DefaultBranch), gittest.WithTreeEntries(file("a", "ours\n")))
+
+	conflicting := gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base), gittest.WithTreeEntries(file("a", "theirs\n")))
+	var clean []git.ObjectID
+	for i := 0; i < 4; i++ {
+		clean = append(clean, gittest.WriteCommit(t, cfg, repoPath, gittest.WithParents(base),
+			gittest.WithTreeEntries(file("a", "base\n"), file(fmt.Sprintf("p%d", i), "p\n"))))
+	}
+
+	var wg sync.WaitGroup
+	sizes := make([]int32, 0, 5)
+	var mu sync.Mutex
+	land := func(commit git.ObjectID, resolve bool) {
+		defer wg.Done()
+		resp, err := client.UserLand(ctx, &gitalypb.UserLandRequest{
+			Repository: repo, User: gittest.TestUser, Branch: []byte(git.DefaultBranch),
+			CommitId: commit.String(), ResolveConflicts: resolve, MergeMessage: []byte("Land " + commit.String()),
+		})
+		require.NoError(t, err)
+		if resolve {
+			mu.Lock()
+			sizes = append(sizes, resp.GetBatchSize())
+			mu.Unlock()
+		}
+	}
+	wg.Add(1)
+	go land(conflicting, true)
+	for _, c := range clean {
+		wg.Add(1)
+		go land(c, true) // they ask for the resolution too: the rest of the clean lands never need it
+	}
+	wg.Wait()
+
+	require.Equal(t, 1, unionCalls(t, dir), "the conflict was resolved by one request")
+	require.Equal(t, 1, inlineCalls(t, dir), "which was the lane's, for the rules only")
+	for _, size := range sizes {
+		require.Greater(t, size, int32(1), "every land rode a batch of several")
+	}
 }

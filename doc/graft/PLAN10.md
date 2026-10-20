@@ -1133,6 +1133,8 @@ whole file (`agree_with`, 15.13): the one filter that chose better proposals tha
 | the tree that would land | `landResolvedTree` | operations/land_resolve.go |
 | VERIFY, the one box, out of the lane, for every resolution | `landVerifyOutOfLane`, `landVerify`, `landPrecheckVerify` (an agent's), `VerifyPool.Acquire` | operations/land_verify.go, land_reland.go; graft/resolver/check.go |
 | verdicts applied in the lane | `landApplyVerdicts`, `landNeedsResolution` | operations/land_resolve.go, land_preresolve.go |
+| the rules resolved in the lane (rules_only, inline_timeout) | `landResolveInline`, `landInlineEnabled`, `Server.landInlineOff`, `Request.RulesOnly`, `Response.RulesOnly`, `unsupportedBy` and the skip of models in `resolveFile` | operations/land_inline.go, land_resolve.go; graft/resolver/protocol.go; tools/.../resolve/resolve.go |
+| the queue of the lands that lose a round | `landTickets`, `landTicketRegistry.acquire/blocked`, `landTakeTicket`, `landTicketsBlock`, the block in `landApplyVerdicts` | operations/land_tickets.go, land_preresolve.go, land_resolve.go |
 | unverified in time: proposals | `landAnnotateUnverified`, `landStoppedReason`, `landFinalPass` | operations/land_resolve.go, land_preresolve.go |
 | resolver call, bounded slots | `Client.AcquireResolveSlot`, `ResolveSlot.Resolve` | graft/resolver/check.go |
 | policy before resolving | `hook.CheckAgentPolicy`, `landPolicyDeniedError` | operations/land_resolve.go, land_proposals.go |
@@ -1277,17 +1279,41 @@ The resolution is bound to the files instead:
   changed), the lane returns the attempt with those files, without resolving. UserLand
   pre-resolves only them against the new tip, out of the lane, keeps every other verdict, and
   enters the lane again. A tip that moves on unrelated files costs no resolver call at all.
-* **Progress, and its limit.** A round is lost only when the lane found a file whose sides
-  changed, that is when another land on that file landed. So the lands that contend for a file
-  all land, at least one per round, and N contenders need at most N rounds each. The rounds are
-  therefore bounded by the resolver's timeout for the whole land only; resolve_rounds (default
-  32) is a safety cap well above realistic contention, documented as a cap and not a contract
-  (decided after the 12-concurrent graft-bench test failed with a cap of 3). The limit, stated:
-  under continuous new arrivals on the same file, one land can keep losing until its deadline,
-  and then ends with the merge conflict and its package (15.9, the final pass): the files that
-  changed under it are NOT_ATTEMPTED with the reason "the files changed again before they could be
-  resolved" (the old "files kept changing" message is gone, as it carried no package); past the cap
-  the same.
+* **Progress, and what it took.** A round is lost when the lane found a file whose sides changed, that is when
+  another land on that file landed. It was written here that the lands that contend for a file all land, one per
+  round, and that was true of the system and false of a land. Measured (graft-bench, 50 agents x 5 changes on one
+  branch, conflict rate 0.2, seed 1, 50 lands on one file, the commit before the fix): every landing invalidates the
+  verdicts of all the others, so after each one they all resolved again: 749 resolver calls and 713 hand-backs from the
+  lane for 50 resolutions. The resolve slots were not the cost (2.3 s of wait in all); the lane was: 957 members in a
+  run in which it was busy for 33 s of 34, 0.41 s of wait for each, and so the clean lands of the branch were slow too.
+  6 of the 50 lands lost 32 rounds in a row and ended with "the files changed again before they could be resolved"
+  (244 of 250 landed, 364 to 430 lands/min, p99 23 to 27 s, against 250 of 250, about 1,700 to 1,900 and 2 s of
+  v0.2.0, which resolved inside the lane). Three things now give every land its turn:
+  1. **The rules are resolved in the lane, as in v0.2.0** (inline, `inline_timeout`): a land enters the lane first;
+     what a rule can resolve is resolved there, in its batch, by a request with `rules_only` that graft-resolve answers
+     with its rules and never with a model (the answer echoes `rules_only`; a resolver that does not is an older one, and
+     the lane never asks again for the life of the process). The split follows what the resolution is, not how long it
+     took: a model, a verification, a rule that does not end within `inline_timeout` (default 1 s) or one that cannot
+     resolve a file go out of the lane, to the path below. With the rules in the lane the bench has no hand-back, no
+     ticket and one resolver call per resolution, and its numbers are v0.2.0's.
+  2. **A queue for the lands that lose a round out of the lane.** A land that lost a round takes a ticket, first in
+     first out, on its files (per file; per branch when `verify.enabled`, since the tree that is verified is the
+     branch's), keeps it until it lands, its deadline ends or it fails, and is the only land of the branch that resolves
+     them again; the others wait without calling the resolver, and the lane hands back any other land with a verdict on a
+     ticketed file, so that the holder's verdict is the one that lands. Measured on the same bench with the rules out of
+     the lane: 92 resolver calls, 8 hand-backs, 250 of 250. A land that waits past its deadline ends with the package
+     ("the time ran out waiting for the other lands on the same files").
+  3. resolve_rounds (default 32) is only a safety cap: the rounds of a land are bounded by its deadline, and the queue
+     makes it lose at most the rounds that a land which changes its files without a conflict makes it lose.
+  The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
+  (authoritative storage) the lands go on in rounds, without the guarantee. A holder's verdict is invalidated by a land
+  that changes its file cleanly and lands first (each such land lands once, and the holder resolves again, which is
+  cheap for a rule); with a verification every tree is verified out of the lane, and any land that moves the branch
+  while a holder verifies, a clean one included, makes the verified tree stale: on the bench with a verification of 1 s,
+  50 resolutions cost 130 verifications and 120 to 135 s (113 to 124 lands/min, p99 74 to 94 s), all 250 landed, bounded by
+  the deadline; before the queue the same bench cost 802 verifications for 34 resolutions, 16 lands failed ("could not
+  verify before the branch moved", "the files changed again"), 158 lands/min, p99 53 s. Verifying a batch of resolutions
+  on one combined tree would remove that cost; it is not done.
 * **Rules alike.** The operator rules' verdicts (trivial, union, rerere, command) are kept and
   reused by the same key, so the policy is the same for every strategy.
 * **Slots: two pools.** check_concurrency bounds the checks of agents' resolutions and
