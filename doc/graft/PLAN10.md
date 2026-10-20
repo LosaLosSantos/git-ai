@@ -1296,18 +1296,25 @@ The resolution is bound to the files instead:
      took: a model, a verification, a rule that does not end within `inline_timeout` (default 1 s) or one that cannot
      resolve a file go out of the lane, to the path below. With the rules in the lane the bench has no hand-back, no
      ticket and one resolver call per resolution, and its numbers are v0.2.0's. The lane is bounded: it never waits for
-     a slot (the calls have a pool of their own; with it taken the member goes out of the lane), and the time it may
-     lose to calls that fail is bounded once per batch attempt (`landInlineBudget`: `inline_timeout` in all, not per
-     member). A land that the rules cannot resolve (the resolver refuses, or a file may not be sent) is resolved out of
-     the lane for the proposals and ends there, without a ticket: without a verification a model's resolution never
-     lands, so a ticket would protect nothing. The request announces no capability but `origin`, so that a
+     a slot (the calls have a pool of their own; with it taken the member goes out of the lane), and the time it
+     spends in inline calls is bounded once per batch attempt (`landInlineBudget`: `inline_timeout` in all, not per
+     member): all the time of every call is charged to it, one that succeeds as well as one that fails, so a rule of
+     0.9 s does not stall a batch of N members for N x 0.9 s; once it is spent the other members go out of the lane,
+     where the queue guarantees their progress, and fast rules (milliseconds) do not notice. A land that the rules
+     cannot resolve (the resolver refuses, or a file may not be sent) is resolved out of the lane for the proposals and
+     ends there, without a ticket, and gives back the one it took if it had queued for it: without a verification a
+     model's resolution never lands, so a ticket would protect nothing. The request announces no capability but `origin`, so that a
      graft-resolve that gates the models on the capabilities (any since they were added) refuses to call one even if it
      ignored `rules_only`; v0.2.0 has no gating and may.
   2. **A queue for the lands that lose a round out of the lane.** A land that lost a round takes a ticket, first in
      first out, on its files (per file; per branch when `verify.enabled`, since the tree that is verified is the
      branch's), keeps it until it lands, its deadline ends or it fails, and is the only land of the branch that resolves
      them again; the others wait without calling the resolver, and the lane hands back any land with a verdict made out
-     of the lane on a ticketed file, so that the holder's verdict is the one that lands. A ticket never stops the
+     of the lane on a ticketed file, so that the holder's verdict is the one that lands. The holder that lost a round
+     out of the lane holds its files with priority until it is done: the lane also hands back the inline resolutions of
+     the others on them, which would change the files under its verdict at every round (a rule slower than
+     `inline_timeout` on a hot file would never land); they wait behind it and go back to the lane when it is done.
+     Otherwise a ticket never stops the
      rules in the lane: the inline attempt comes before the check of the tickets, and the land that waited for its turn
      goes back to the lane, not to a new pre-resolution; a lane round does not count toward `resolve_rounds`. The
      queue alone, measured on the same bench before the rules were resolved in the lane (the first form of this fix, not
@@ -1344,7 +1351,13 @@ The resolution is bound to the files instead:
   The start loads of the last six runs (the wrapper's control and the failure) were not logged; the cooldown that
   holds each start until the load is below 2 was in force, and the whole batch ran in a few minutes.
   The limits, stated. The queue is in memory and per process, like the lanes: against another node of the same branch
-  (authoritative storage) the lands go on in rounds, without the guarantee. A holder's verdict is invalidated by a land
+  (authoritative storage) the lands go on in rounds, without the guarantee. A land that holds a file with priority
+  makes the inline resolutions of the others on it wait for its resolution, which is as long as a slow rule or the
+  deadline allows. Two gaps are known: a resolver that crashes (a non-zero exit with no refusal in its answer) is
+  taken as the rules not being able to resolve, so the land is resolved out of the lane for the proposals; and a
+  v0.2.0 graft-resolve, which has no gating and ignores `rules_only`, that is cut at the timeout on a model's conflict
+  is never recognised as an older one (only an answer that does not echo `rules_only` is), so it pays the lane's
+  budget at every batch; with it set `inline_timeout = "0s"`. A holder's verdict is invalidated by a land
   that changes its file cleanly and lands first (each such land lands once, and the holder resolves again, which is
   cheap for a rule); with a verification every tree is verified out of the lane, and any land that moves the branch
   while a holder verifies, a clean one included, makes the verified tree stale: on the bench with a verification of 1 s,

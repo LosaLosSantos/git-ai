@@ -551,17 +551,23 @@ A round is lost when another land changed one of the files. The rules do not wai
   model for it. What a rule cannot resolve, or does not resolve in time, is handed back and resolved out of the lane as
   described above. The lands on a hot file ride the same batches as the others, as they did in v0.2.0. The lane is
   bounded: it never waits for a slot (the calls have a pool of their own, so a model that holds the resolve slots does
-  not stop the rules; with it taken the member goes out of the lane), and a call that fails or is cut at `inline_timeout`
-  is charged to the batch attempt: once the batch has lost `inline_timeout` the other members go out of the lane without
-  a call, so a batch stalls once, not once per member. A land the rules cannot resolve (the resolver refuses) is
-  resolved out of the lane for the proposals and ends there, without a ticket (without a verification a model's
-  resolution never lands). A resolver that does not echo `rules_only` is an older one: its answer is dropped and the
-  lane never asks again for the life of the server process.
+  not stop the rules; with it taken the member goes out of the lane), and the time it spends in inline calls is charged
+  to the batch attempt, all of it, a call that succeeds as well as one that fails or is cut at `inline_timeout`: once
+  the batch has spent `inline_timeout` the other members go out of the lane without a call, so a batch stalls once,
+  not once per member (fast rules, milliseconds, do not notice). A land the rules cannot resolve (the resolver
+  refuses) is resolved out of the lane for the proposals and ends there, without a ticket (it gives back the one it
+  took if it had queued for it: without a verification a model's resolution never lands). A resolver that does not
+  echo `rules_only` is an older one: its answer is dropped and the lane never asks again for the life of the server
+  process.
 * **A queue for the rest.** A land that loses a round out of the lane (a verification, or a rule that takes more than
   `inline_timeout`, or a file that changed meanwhile) takes a ticket on its files, first in first out, and keeps it until
   it ends. It is the only land of the branch that resolves those files again; the others wait without calling the
-  resolver, and the lane hands back any other land whose verdicts were made out of the lane. The rules in the lane do
-  not wait for a ticket, and a land that waited for its turn goes back to the lane. A land that waits past its
+  resolver, and the lane hands back any other land whose verdicts were made out of the lane. The holder that lost a
+  round out of the lane holds its files with priority until it is done: the lane also hands back the inline resolutions
+  of the others on them, which would change the files under its verdict at every round (a rule slower than
+  `inline_timeout` on a hot file would never land); they wait behind it, and go back to the lane when it is done. Apart
+  from that the rules in the lane do not wait for a ticket, and a land that waited for its turn goes back to the lane.
+  A land that waits past its
   deadline ends with the merge conflict and its package, its files `NOT_ATTEMPTED` with the reason `the time ran out
   waiting for the other lands on the same files`.
   The tickets are per file, or per branch with `verify.enabled` (the tree that is verified is the branch's). They are in
@@ -804,8 +810,11 @@ them. Cost: two model calls per region.
   and drops the answer, which is not a rule's, whatever it is. A batch pays at most `inline_timeout` for such calls
   (the lane's budget), and the first answer that does not echo `rules_only` makes the server stop asking, for the life
   of the process (`graft: the resolver did not honour a request for its rules only` in the log). After that the rules
-  are resolved out of the lane, with the queue, as before this release. Set `inline_timeout = "0s"` to avoid even
-  those calls with the `graft-resolve` of v0.2.0.
+  are resolved out of the lane, with the queue, as before this release. A `graft-resolve` of v0.2.0 that is cut at
+  `inline_timeout` while it calls a model for a conflict, without ever answering, is never recognised as an older one,
+  so every batch pays the lane's budget for it: set `inline_timeout = "0s"` with the `graft-resolve` of v0.2.0.
+  (A resolver that crashes, with a non-zero exit and no refusal in its answer, is taken as a refusal: the land is
+  resolved out of the lane for the proposals.)
 
 Upgrade both in the same maintenance window anyway.
 
