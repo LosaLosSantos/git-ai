@@ -138,27 +138,39 @@ change (and land it again if it was reverted). The hook therefore records the id
 of a land as intents in the prepared phase, before git may commit:
 
 * `graft/changelog.intents`, JSON lines
-  `{"ref":"<base64>","original":"...","landed":"...","head":N}`, appended under its
-  lock file and fsync'd (with the directory entries, once per process) before the
-  prepared phase returns. `head` is the last durable log sequence at that time. A
-  failure to record them aborts the transaction: the land fails instead of landing
-  without its identity. A torn line, left by a writer that crashed before its fsync and
-  whose update was therefore never committed, is cut off by the next writer.
+  `{"ref":"<base64>","original":"...","landed":"...","invocation":"..."}`, appended
+  under its lock file and fsync'd before the prepared phase returns, with the directory
+  entries when the write created the file or is the first of the process to this file
+  (device and inode: a repository created again at the same path has another file). The
+  invocation identifies the update (the invocation of its reference transaction); the
+  changelog entry that the update writes once committed carries it too
+  (`land_invocation`). A failure to record the intents aborts the transaction: the
+  land fails instead of landing without its identity. A torn line, left by a writer that
+  crashed before its fsync and whose update was therefore never committed, is cut off by
+  the next writer.
 * The lookup reads the intents too: it gives the land the changelog recorded first,
-  then the intents the changelog does not confirm (an intent with the recorded landed
-  commit) or supersede (a recorded land of the same commit at a later sequence than
-  its `head`). The land path counts an intent like a record, only when its landed
-  commit is reachable from the tip: the intent of an update that git never committed
-  (aborted after the prepared phase, an MVCC snapshot that lost its commit) answers
-  nothing. An answer from an intent has no changelog sequence; its detail says
-  "landed as <oid>, which the changelog does not record".
-* The intents file is compacted, under its lock file, once it reaches 64 KiB and again
-  each time it doubled: the confirmed and superseded intents are dropped, the rest is
-  written to a new file, fsync'd and renamed over the old one, with the directory
-  fsync'd. The intents of updates that were never committed and whose change never
-  landed again stay; there is one line, about 190 bytes, per such update.
+  then the intents of other landed commits. No intent is left out because a record came
+  after it (review m1: an earlier update's entry can be written after a later update's
+  intent, and the later entry lost). The land path counts an intent like a record, only
+  when its landed commit is reachable from the tip, which proves the land by itself: the
+  commit is the one that update would put on the branch, and only an update that puts
+  that very object there makes it reachable. The update of an aborted land migrated its
+  objects before it was prepared, so its commit exists, off the branch, and answers
+  nothing (review m2); so does the intent of an MVCC snapshot that lost its commit. An
+  answer from an intent has no changelog sequence; its detail says "landed as <oid>,
+  which the changelog does not record".
+* An intent goes once the changelog entry of its own update is durable: the index keeps
+  the invocations of the entries it read, and a compaction drops the intents with those
+  invocations, and only those. The intents file is compacted, under its lock file, from
+  64 KiB on, when at least half of its intents may go: the rest is written to a new file,
+  fsync'd and renamed over the old one, with the directory fsync'd. The lookups compact,
+  and so does the append: once the file doubled since the last compaction, the hook
+  starts one after the update, outside the references' locks, so that the intents of
+  lands that never look up (fast-forwards only) go too. The intents of updates that were
+  never committed stay; there is one line, about 200 bytes, per such update.
 * The cost is one write and one fsync per land update in the prepared phase, under the
-  references' locks; the bench measures it.
+  references' locks, serialized per repository by the intents' lock file, not shared
+  with the changelog's group commit; the bench measures it.
 
 In the authoritative mode the database row and the reference change are one transaction,
 so there is no such window and no intents.

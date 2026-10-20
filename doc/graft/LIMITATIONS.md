@@ -197,8 +197,14 @@ Git hooks use private.
 - In the file changelog, every land update writes and fsyncs its intents
   (`graft/changelog.intents`) in the prepared phase, under the references'
   locks, and a land whose intents cannot be written fails. The intent of an
-  update that git never committed and whose change never landed again stays in
-  the file, one line of about 190 bytes per such update.
+  update that git never committed stays in the file, one line of about 200
+  bytes per such update.
+- A land that diverges reads the land identities before it rebases or
+  merges, and fails when it cannot: an error reading the changeset log or the
+  identity index, or a timeout on their lock files, fails the land rather than
+  risking a second land of the same change. This fail-closed behaviour is
+  deliberate; the error is `Internal` in the file changelog and `Unavailable`
+  when the storage core's database cannot be read.
 - In the file changelog, the land identity index (`graft/changelog.lands`)
   holds every land of the repository. The idle indexes of a process are kept
   in memory within 64 repositories and 256 MiB, least recently used dropped
