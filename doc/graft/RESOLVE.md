@@ -252,7 +252,9 @@ Request (server to resolver):
   older server, and `graft-resolve` gives it no model's resolution (see "Version skew" below).
 - `rules_only` (additive, optional) asks the resolver to run only its rules, the strategies whose answers are a rule's, and
   never to call a model: the lane of the server sends it when it resolves a member inline (see "Out of the lane"). A
-  resolver of this release that honours it says so with `"rules_only": true` in its response; what the rules do not
+  resolver of this release that honours it says so with `"rules_only": true` in its response; the request then
+  announces no capability but `origin`, so that a `graft-resolve` that gates the models on the capabilities refuses a
+  model even if it ignored the field; what the rules do not
   resolve is left unresolved, as a failure of the chain. A server that gets no echo is talking to an older resolver,
   whose answer it drops, and it never asks again for the life of the process.
 - `ours` is the current branch tip side. `theirs` is the change being landed.
@@ -524,9 +526,10 @@ Every resolution carries its trailers, so it can be found and undone:
 
 ## Out of the lane
 
-The server calls the resolver before a land enters its branch's lane, never
-while the lane is held, so a resolution that takes minutes does not hold the
-branch for the other lands:
+A resolution that takes minutes must not hold the branch's lane, so the server calls the resolver before a land
+enters the lane, never while the lane is held for long. The one exception is the rules, which the lane resolves
+itself within `inline_timeout` (default `1s`), as v0.2.0 did ("Rules in the lane" below). With it on (the default,
+without `verify.enabled`) a land enters the lane first, and the steps below are for what the rules did not resolve:
 
 1. The server merges the branch's current tip and the change in a quarantine it
    discards, and resolves the conflicting files there: the policy first, the
@@ -538,8 +541,8 @@ branch for the other lands:
    are kept.
 3. A landable answer enters the lane, which merges its own tip and the change
    and writes the merge commit when every conflicting file has an answer with
-   its key; the resolver is not called. A tip that moved on other files costs
-   nothing. When a file changed (or is new), the lane hands the land back, and
+   its key; the lane calls the resolver for no model, and for a rule only inline ("Rules in the lane" below). A tip
+   that moved on other files costs nothing. When a file changed (or is new), the lane hands the land back, and
    the server resolves only that file, out of the lane, and enters the lane
    again.
 
@@ -547,7 +550,8 @@ A round is lost when another land changed one of the files. The rules do not wai
 
 * **Rules in the lane.** Without `verify.enabled`, a land enters the lane first, and the lane resolves the files that
   have no verdict itself, as the rules (trivial, union, rerere, a command that is a rule), within `inline_timeout`
-  (default `1s`; `0s` turns it off). It sends the request with `"rules_only": true`, and `graft-resolve` never calls a
+  (default `1s`; `0s` turns it off). The policy is checked first, as out of the lane: an agent that may not update the
+  branch gets nothing resolved. It sends the request with `"rules_only": true`, and `graft-resolve` never calls a
   model for it. What a rule cannot resolve, or does not resolve in time, is handed back and resolved out of the lane as
   described above. The lands on a hot file ride the same batches as the others, as they did in v0.2.0. The lane is
   bounded: it never waits for a slot (the calls have a pool of their own, so a model that holds the resolve slots does
@@ -736,7 +740,8 @@ origin = "model"   # its files are proposals, and land only if verify.command pa
 ```
 
 `origin` is `"rule"` (the default) or `"model"`. A model command's answers are
-not recorded by `rerere`.
+not recorded by `rerere`, and the command is not run for a request for the rules only (`"rules_only": true`, "Out of
+the lane"), which is the request of the lane's inline resolution.
 
 **The agreement gate: `agree_with`.** The `llm` strategy alone produces a proposal that lands only if `verify.command`
 passes on the exact tree. An operator who wants model resolutions to land without an agent in the loop gets the best

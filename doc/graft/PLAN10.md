@@ -1271,12 +1271,12 @@ The resolution is bound to the files instead:
 * **Landable: applied in the lane, file by file.** The lane merges its own tip and the change. When
   every conflicting file has a landable verdict with its key, and the lane's classification of the
   file agrees, the lane writes the verdicts into the merge commit and runs no command (15.9); the
-  resolver is not called. In a batch, a member's verdicts hold whenever their keys match; without
+  lane does not call the resolver for it, except for the rules it resolves inline (below). In a batch, a member's verdicts hold whenever their keys match; without
   verify.enabled the members chain, one on the other's tip. With it a member lands only on a tree
   that passed, so a member whose tree is not the verified one (the batch changed the tip under it) goes
   back out to be verified, and lands alone.
 * **Needs resolution.** When a conflicting file has no verdict with its key (it is new, or a side
-  changed), the lane returns the attempt with those files, without resolving. UserLand
+  changed), the lane tries the rules inline (below) and returns the attempt with the files they did not resolve. UserLand
   pre-resolves only them against the new tip, out of the lane, keeps every other verdict, and
   enters the lane again. A tip that moves on unrelated files costs no resolver call at all.
 * **Progress, and what it took.** A round is lost when the lane found a file whose sides changed, that is when
@@ -1381,7 +1381,8 @@ The resolution is bound to the files instead:
   resolve_concurrency (new, default 2) the resolutions. A check is short and gates an agent's
   re-land; a resolution with a model takes seconds to minutes. One shared pool would let a few
   long resolutions starve the checks, and fairness inside one pool needs a scheduler for no gain
-  over two plain semaphores; the memory bound of the process is the sum of the two pools' requests.
+  over two plain semaphores; the memory bound of the process is the sum of the two pools' requests. The lane's inline calls (the rules in the
+  lane, below) have a third pool, of at least 8 slots, which the lane never waits for.
   Each request waits for its slot within the resolver's timeout and fails closed when it expires.
 * **Nothing is verified in the lane.** Every verification, of a rule's resolution, a model's or an
   agent's, runs out of the lane, on one mechanism (15.9); the lane compares tree object IDs.
