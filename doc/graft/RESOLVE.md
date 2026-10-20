@@ -800,6 +800,18 @@ The `llm` strategy is registered by `tools/graft-agents` and uses an
 `llm.Provider` configured in `resolve.toml`. Providers are anthropic, any
 OpenAI-compatible endpoint, or any command.
 
+**Choosing the model and who serves it.** The operator chooses both; the example above is one choice, not a
+requirement. Set `model` for another model; for another endpoint set `base_url` and `api_key_env` too. Through
+OpenRouter, `[strategy.llm.routing]` with `only = ["<provider tag>"]` (and `ignore`) pins the providers that may serve
+the call, and with it set the call never falls back to another provider. The model that serves a call sees the
+conflicting files (the three versions of each file that goes to it, and the commit message of the change), so the
+provider you configure receives them: pick it for where you are willing to send your code. Effort and `max_tokens`
+matter for a model that reasons: it needs `max_tokens` large enough to hold its reasoning and an answer, and
+`call_timeout` long enough for it; a model that cannot finish within them is rejected for that file, never guessed. On
+our benchmark `openai/gpt-6-luna` and `z-ai/glm-5.3-flash` (pinned to the provider `z-ai/fp8`) were equally accurate
+on the same 100 files at the same price per file (PLAN10 15.12); other models need their own `max_tokens` and
+`call_timeout` and should be tried with `graft-resolve bench run` on your own merges first.
+
 The strategy asks the model to apply a patch, one conflicting region at a
 time. Its prompt structure follows synthmerge's patch-application design
 (Andrea Arcangeli, synthmerge): the structure only, written in our own words,

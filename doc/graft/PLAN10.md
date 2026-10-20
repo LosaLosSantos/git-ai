@@ -876,17 +876,78 @@ flag.
     syntax,composition, and the trace records the proposal and the report.
   * Everything above still applies: a resolution that fails a check is a proposal.
 
-## 15. gitai's resolver design
+## 15. gitai's resolver: the design, what each part is for, what was measured
 
 **Principle.** A conflict is two changes to one base. Only the server holds the base, both
 histories, the landing commit and the agent's request, so the server is the place to check what
 it can check mechanically, and the agent, who decides, gets a proposal with an honest report of
-what was checked, not a bare guess.
+what was checked, not a bare guess. A model's resolution never lands because of anything the
+model says or any heuristic about its answer: it lands only on a tree that the operator's
+verification passed (15.4).
 
-The four diagrams below are the source of truth of the flow. A code path that is in no diagram is a
-patch and is removed; a commit that changes the flow changes the diagrams in the same commit, and
-the reviewer checks the code against them with the table that follows. (planned) marks what does
-not exist yet; (not enabled) marks what is designed and measured but switched off.
+This section is the design as it stands, in one piece. 15.0 is the whole system on one page;
+15.1 to 15.5 are the diagrams and the table that tie every box to its code (a code path that is in
+no diagram is a patch and is removed; a commit that changes the flow changes the diagrams in the
+same commit); 15.6 to 15.11 say what each part is for and the measurement behind it, and what was
+tried and removed; 15.12 is the operating point, with its intervals; 15.13 is what is configurable
+and its defaults. The log of the measurements, with commits, costs and files, is Appendix A at the
+end of this section.
+
+### 15.0 The system on one page
+
+```
+ conflict of a land  (the server computes the facts)
+   |
+   v
+ git's three-way merge: the conflicting files, their base / ours / theirs, the regions
+   |
+   v
+ classify (policy, size, binary, lockfile, generated, minified)  -- not sendable --> the AGENT, with the reason
+   |
+   v
+ operator rules, in order: trivial, union, rerere, command   -- a rule resolved it --> VERDICT of a rule
+   |
+   v
+ the WRITER (the llm strategy; 15.10): one model call per region
+     request = the PATCH (theirs' change), the CODE (ours), THEIRS' commit message, the other regions
+     answer  = the patched code, plain text
+     deterministic checks of the answer; ONE repair round if the answer is BROKEN (a rule, the syntax)
+   |
+   v
+ file checks: markers, size, syntax (tree-sitter), the operator's checks
+   |
+   v
+ composition report (15.3): what the answer keeps, drops, repeats  -- a REPORT, not a gate
+   |
+   v
+ VERDICT: PROPOSAL (origin "model") with its report
+   |
+   v
+ VERIFY: the operator's verify.command on the exact tree that would land, out of the lane (15.9)
+   |
+   v
+ decideLand (15.4): LAND only if the verified tree is the tree to land -- else PACKAGE to the agent
+```
+
+| step | what it does | who decides | justified by |
+|---|---|---|---|
+| git facts | regions, sides, base; the merge itself | git | 15.10 (the regions are git's: fewer wrong "no conflict") |
+| classify | what is never sent | rules (path, size, bytes) | 3.4 |
+| rules | resolutions that need no model | the operator's rules | RESOLVE.md |
+| writer | proposes a resolution per region | a model, configurable (15.13) | 15.10: the elements kept and removed, 15.12 |
+| checks and repair | refuse a broken answer, repair it once | deterministic checks | 15.10 |
+| report | tells the agent what the answer keeps or drops | deterministic | 15.6: it separates (43% against 60% right), it does not gate |
+| verify | runs the operator's build and tests on the exact tree | the operator's command | 15.9, 14 |
+| decideLand | the one landing rule | code | 15.4 |
+
+**Not in the system, and why.** Four ideas were built as measurements, and none of them is a landing
+signal on the evidence we have; each is kept as a measurement (Appendix A) and not as code:
+a decision model that chooses OURS / THEIRS / both per region and lets a writer work only where it
+says NEEDS-MERGE (15.11: a java selector, nothing near the bar elsewhere); agreement of several
+models or arms on the same answer (15.12: models make the same mistakes); structure and
+self-agreement rules (15.12: they do not hold on held-out repositories); a build-and-vet simulation
+of the verification in the bench (15.12: it removes the answers that do not compile and no more).
+What does move the number is the operator's own tests, which only the operator has.
 
 ### 15.1 End to end
 
@@ -1080,8 +1141,8 @@ not exist yet; (not enabled) marks what is designed and measured but switched of
 
 ### 15.6 The composition check, measured: a report, not a gate
 
-The design first meant the check to turn a proposal into a landable resolution (Federico's
-amendment, 14): every edit of each side must appear in the result unless the other side's edit to
+The design first meant the check to turn a proposal into a landable resolution (an amendment of
+14): every edit of each side must appear in the result unless the other side's edit to
 the same base lines supersedes it. Measured with zero model calls:
 
 * **Definition, from the principle, frozen before measuring** (sha256 9396326b..., checked before
@@ -1109,7 +1170,7 @@ the same base lines supersedes it. Measured with zero model calls:
 
 **Decisions.**
 1. The AI stays proposal-only unless verify.command passes on the tree (the final ruling, 14 and 15.9).
-2. Federico's amendment (AI landing when every deterministic check passes) is superseded by the
+2. That amendment (AI landing when every deterministic check passes) is superseded by the
    final ruling: the gate is the operator's verify.command, because no deterministic check reaches
    the bar.
 3. The composition report goes with every proposal, honest about what it can say: "keeps every
@@ -1117,11 +1178,11 @@ the same base lines supersedes it. Measured with zero model calls:
    both sides added", "changes lines outside the conflicts", "N contested regions resolved freely".
    The duplicates flag carries signal (7 of 19 correct where it fires, against 58.6% overall): it is
    useful in the report and as a repair trigger.
-4. The repair round (when approved) is driven only by deterministic findings with their exact
-   wording: anchors, syntax, and the composition report's drops and duplicates where they apply.
-5. The design work goes to what helps the agent decide: the report, symmetric context (each side's
-   change from the base and its intent), and abstaining (the model may answer that the changes do
-   not compose, which reaches the agent as abstained with the reason).
+4. The repair round is driven only by deterministic findings with their exact wording, and only for an
+   answer that is broken (the rules of an answer, the syntax): the composition report's drops and
+   duplicates were tried as repair triggers and made accepted answers worse (15.10).
+5. The design work goes to what helps the agent decide: the report. OURS' side of the context and a way
+   out for the model to abstain were tried and removed (15.10).
 
 **Java.** R1b's Java answers are 54 of 54 correct (Wilson 95% CI 93.4-100). That is a property of the
 model on these cases, not of the check, and most of them come from one repository (spring-boot).
@@ -1130,8 +1191,8 @@ cases from other repositories.
 
 ### 15.7 Other resolvers, compared
 
-From the PM's survey (17 tools and papers; prompts read from source where the licence allowed).
-GitButler's AI resolve is described here from the PM's account of it; its code was not read.
+From a survey of 17 tools and papers (prompts read from source where the licence allowed).
+GitButler's AI resolve is described here from a secondhand account; its code was not read.
 
 * GitButler sends one structured JSON request per commit with every hunk; we send one call per
   region. Our own R0 (whole-file JSON) against R1 (per region) on the same 300 cases: 53.8% against
@@ -1139,13 +1200,13 @@ GitButler's AI resolve is described here from the PM's account of it; its code w
 * GitButler writes each resolution into both sides and lets git merge again, which keeps the
   non-conflicting changes; our llmAssemble rebuilds the file from the base, the clean regions and
   the resolved ones. The two are equivalent when the regions are those of git's own merge; to be
-  adopted as an assertion test of llmAssemble (planned): writing the result into both sides and
+  adopted as an assertion test of llmAssemble (not done yet): writing the result into both sides and
   merging must give the assembled file.
 * GitButler lands directly with no semantic check; ours proposes, with a report. That, and the
   measured finding that a line-level check cannot gate, is where gitai differs.
 * Credit: the patch-application structure of R1 is synthmerge's (Andrea Arcangeli; GPL, structure
   only, our own wording and example). The evidence on scope (ConflictAgent, Shen 2026, MIT; Rover,
-  CC BY) and on intent (GitWand, Copilot, MIT) informed the planned symmetric context. The design,
+  CC BY) and on intent (GitWand, Copilot, MIT) informed the symmetric context that was tried and removed (15.10). The design,
   the composition report and its measurement are gitai's.
 
 ### 15.8 The resolution goes out of the lane
@@ -1376,74 +1437,83 @@ and the tree it verifies depends on the tip.
   agents' resolutions as well; and the table test of decideLand, whose one rule is compared by tree
   object ID.
 
-### 15.10 Design step: symmetric context, abstaining, one deterministic repair, the report
+### 15.10 The writer: the prompt of record, the elements kept, the elements removed
 
-The design work of 15.6 (decision 5), as ONE change measured as one step against R1b on the same 300
-cases. Each element has an option to switch it off, so that an ablation removes one element and the
-step with all off is R1b byte for byte (the request of every test that pins R1b runs with all three
-off). All are on by default until the measurement says otherwise.
+**What the writer is.** The `llm` strategy of `tools/graft-agents/resolve`. For each region that git's own
+merge calls a conflict (`git merge-file --diff3` on the three versions; our own line diff only when git cannot
+run), it makes one call. The request holds THEIRS' change as a PATCH (a unified diff from the base, three lines of
+context), OURS' version of the region as the CODE with the same context lines, THEIRS' commit message (at most 4
+KiB), the other conflicting regions of the file for reference, one worked example of the task, and the
+directives last. The answer is plain text, the patched code between two lines that carry a random token. The
+structure is synthmerge's patch application (15.7); the wording is ours.
 
-* **The regions are git's** (`git_regions`, default on). The R1b run took its regions from our own
-  line diff, which disagreed with git's merge in 18 of the 244 accepted cases of the benchmark: in 13
-  it found no conflict where git sees one and merged without the model (7 of those 13 are wrong). The
-  regions now come from `git merge-file --diff3` on the three versions, the engine of the server, in a
-  private temporary directory with markers no line of the file can imitate (labels with a random
-  token, a marker size longer than any run of marker characters at the start of a line). Our diff is
-  the fallback when git cannot be run or a side lacks a final newline (a marker line begins a line).
-  The report is attached on every path, also for a file that git merges without the model. The
-  composition check, with these regions, agrees with the frozen prototype in 243 of 244 verdicts.
-* **Symmetric context** (`symmetric_context`). Beside THEIRS' PATCH the request gets OURS' own change
-  to the region (OURS CHANGE, the unified diff base -> the CODE with the same three lines of context)
-  and the commit message of OURS (`FileConflict.ours_message`: the newest commit between the merge
-  base and the tip that touched the path, `git log -1 base..tip -- path`, found by the server, cut to
-  4 KiB; the bench finds it the same way from the case's merge base). OURS CHANGE and OURS' message
-  are capped (`max_context_bytes`, default 4096: OURS CHANGE up to the cap, the message up to a
-  quarter); THEIRS' message keeps the cap it had (4 KiB) with or without the option, so that the
-  ablation of the symmetric context removes OURS' side and changes nothing of THEIRS'. The request
-  says when it cut. The verdict of a file is still kept by its sides, not by
-  this message: it is a function of the tip's history of the path, which OURS' blob stands for.
-* **Abstaining** (`abstain`). The model may answer, instead of the patched code, an ABSTAIN block with
-  one or two sentences on which lines contradict and why. The last block of either kind in the answer
-  is the answer. One abstaining region abstains the file: no proposal, no guess; the attempt is
-  `abstained` and its reason ("the model abstained on region 2: ...", one line, 400 bytes) goes to the
-  agent in the package (outcome FAILED, the reason is the model's). The bench counts these apart.
-* **One repair round, driven only by deterministic findings** (`repair`). A region is asked again at
-  most once, and only for what a check found, quoted in its exact words after the same request and
-  the model's previous answer: a rule of an answer that was broken (the anchors, the newline, a
-  patch, markers, size, no block at all), a drop or a duplicate of the composition of the region
-  (15.3), or the first syntax error of the assembled file, mapped to the region it is in (an error at
-  the line of its answer or one line before or after). Nothing in a repair is the model's opinion of
-  itself. The repaired answer replaces the first if it passes the rules and, for a composition
-  finding, has fewer findings; a failed optional repair (a call that fails, a worse answer) keeps the
-  first answer. A rule-breaking answer that stays broken after the round is rejected. A model that
-  abstains in the round abstains. The calls and the repair rounds are counted.
-* **The composition report** is no longer planned. For the answer of each region it words, from
-  the definition frozen in 15.6: what the answer drops ("drops THEIRS' change at base line 6: the line
-  "T6" it adds is missing"), what it repeats ("duplicates a line both sides added"), the contested
-  changes it resolved freely, the lines found in neither side, and "keeps every uncontested change of
-  both sides (n)" when nothing is wrong. It is a report and not a gate (the finding of 15.6 stands). It
-  goes with the proposal: `ResolvedFile.report` in graft-resolve's protocol, `ResponseFile.report` in
-  the server's, and the start of the proposal's explanation ("report: ...; ...", cut to the 512 bytes
-  of a reason, so a long report is cut). "Changes lines outside the conflicts" cannot happen to an
-  answer the strategy assembles from the base and the regions; `CompositionVerdict` checks a whole file
-  for it. NTFS-style folding is not part of this check.
-* **Parity with the prototype.** The check is a port of compose2.py with the regions of this package's
-  regions (git's, as above), and `CompositionVerdict` is compared with the prototype's verdicts on the
-  244 accepted answers of R1b (offline, `TestCompositionParity`, GRAFT_COMPOSE_PARITY): 243 agree
-  (99.6%) and 1 differs (the prototype's drop against the port's pass). With the regions of our own
-  line diff it was 226 of 230, and 14 had no region where git's merge sees a conflict.
-* **Measurement.** One step against R1b (all three elements off) on the same 300 cases with Luna, then
-  one ablation per element that removes it, only to justify that element. The result goes here when it
-  is in.
+An answer is checked before anything else: it starts and ends with the context lines of the CODE copied
+unchanged, ends with a newline, is not itself a patch, holds no conflict marker, fits its size. A region whose
+answer breaks one of those rules is asked ONCE more with the rule quoted in its exact words and the previous
+answer; the assembled file is then checked for syntax (tree-sitter), and the first syntax error, mapped to the
+region it is in, is quoted back in the same one round. A region is repaired at most once, only if the request
+fits `max_prompt_bytes`, and only when its answer is BROKEN: an answer that the rules and the syntax accept is
+never asked for again. The composition report (15.3) goes with the proposal, whatever it finds.
 
-### 15.11 Design step 2 (planned, nothing built): the strategy chooses first, the server assembles
+**How each element got there.** The first design had three more elements (OURS' side of the context, a way
+out for the model to say that the changes contradict, and a repair of accepted answers for composition
+findings), each behind an option, measured as one step against the baseline R1b and then by ablation, Luna
+(`openai/gpt-6-luna`, effort low) on the same 300 cases, 2026-10-19/20:
 
-Federico's idea, as the PM framed it: a model that WRITES a resolution can write a line nobody had, or drift
-whitespace; a model that CHOOSES cannot. The same llm strategy gets a first step. This section fixes the
-constraints and the pre-registered gate BEFORE any paid arm; it changes no product code, and nothing here
-goes into the product without Federico's decision after the measurement.
+| arm | accepted | correct | precision [95% CI] | rejected | calls (repairs) | $ booked |
+|---|---:|---:|---|---:|---|---:|
+| R1b, the baseline (one call per region, no repair, no report) | 244 | 143 | 58.6% [52.3-64.6] | 27 | 403 (0) | 0.107 |
+| design: all elements on | 261 | 151 | 57.9% [51.8-63.7] | 6 | 455 (50) | 0.169 |
+| design without git's regions | 252 | 146 | 57.9% [51.8-63.9] | 8 | 422 (40) | 0.153 |
+| design without the abstain block | 264 | 156 | 59.1% [53.1-64.9] | 15 | 444 (46) | 0.162 |
+| design without any repair | 237 | 143 | 60.3% [54.0-66.4] | 31 | 407 (0) | 0.145 |
+| design without OURS' side of the context | 262 | 154 | 58.8% [52.7-64.6] | 9 | 464 (58) | 0.151 |
+| composite: git's regions + repair + report; no abstain, no OURS context | 270 | 156 | 57.8% [51.8-63.5] | 9 | 467 (56) | 0.152 |
+| **composite-rc: the same, repair only for a BROKEN answer (the prompt of record)** | **270** | **158** | **58.5% [52.6-64.2]** | 9 | 437 (26) | **0.137** |
 
-* **Each part does what it is good at.** Git computes the facts (the regions, the sides, the base). A
+The rule was fixed before the ablations: keep an element only if removing it lowers the correct answers or the
+precision with p < 0.1, or lowers the coverage at an equal precision; otherwise remove it. The report stays
+whatever the data say, since it removes nothing. Applied:
+
+* **git's regions: kept.** Removing them lowers the accepted answers (252 against 261) at the same precision,
+  and they are what the server's merge calls a conflict. The first run on our own line diff disagreed with git's
+  merge on 18 of the 244 accepted cases (13 had no conflict for us and one for git, 7 of those 13 wrong).
+* **the repair round: kept, for broken answers.** Without any repair 24 answers fewer are accepted (237 against
+  261) at an equal precision: the repair rescued 33 answers that were rejected otherwise, 21 of them correct
+  (64%), and 9 answers were accepted only without it (5 correct). On the 228 answers accepted both ways, removing
+  the repair turns 13 wrong answers into correct ones against 5 the other way (exact McNemar p = 0.096): the
+  repairs of accepted answers (for the composition findings) made answers worse. So the repair is limited to a
+  broken answer, and that arm (composite-rc) has the most correct answers (158), the best precision of the three
+  candidates and the fewest calls.
+* **OURS' side of the context and the abstain block: removed.** Removing either raises or keeps the correct
+  answers (154 and 156 against 151) and lowers nothing. The code, the option, the protocol field that carried
+  OURS' commit message to the resolver and the server code that read it are gone; so is the abstain block and
+  the outcome it produced.
+* **the report: kept, as a report.** Among the accepted answers of the prompt of record, the 23 for which it
+  finds a drop or a duplicate are right in 10 cases (43%); the other 247 in 148 (60%). It separates, not enough
+  to gate (15.6), and it is information for the agent.
+
+The switches of the ablations are removed with the elements: the strategy has no option for git's regions, the
+repair or the report, and a configuration that names `symmetric_context`, `abstain`, `repair`,
+`repair_composition`, `git_regions` or `max_context_bytes` is refused. Against the baseline, no variant moved
+the precision (57.8 to 60.3% against 58.6%, all intervals overlapping); what the design bought is coverage, 270
+answers accepted against 244, through the repair.
+
+**Parity.** The composition check is a port of the frozen prototype of 15.6, and `CompositionVerdict` agrees
+with it on 243 of the 244 accepted answers of R1b (99.6%); with the regions of our own line diff it was 226
+of 230.
+
+### 15.11 The decision step: measured, not adopted
+
+The idea (Federico's): a model that WRITES a resolution can write a line nobody had, or drift whitespace; a model
+that CHOOSES cannot. So let the writer's work be preceded by a choice per region, and let the server assemble the
+file from the sides whenever every region is a pick. It was built as a measurement outside the product (the scripts
+are in `c1-work/scripts/`, the data in `c1-work/run/chooser*/`) and measured on our corpus and on conflicts of
+merged agent PRs. It is **not adopted**: it selects well exactly where a constant policy already works, and
+nowhere else. What follows is the design that was evaluated, its gate, which was fixed before it was measured, and the
+results.
+
+* **The pipeline that was evaluated.** Git computes the facts (the regions, the sides, the base). A
   decision model, **Jev** (`typesafe/jev-1.14` through OpenRouter, TypeSafe's calibrated decision model; it
   cannot write code), DECIDES per region among `OURS`, `THEIRS`, `OURS+THEIRS`, `THEIRS+OURS`,
   `NEEDS-MERGE`, and returns a probability for every option. A language model WRITES only where Jev says
@@ -1451,7 +1521,7 @@ goes into the product without Federico's decision after the measurement.
   region plus "none: send to the agent"). Deterministic checks and the verification decide landing. The
   single landing rule of `decideLand` is unchanged: a resolution lands only through the verification on the
   exact tree, the origin stays "model" (15.9), and nothing else lands.
-* **One strategy, a first step.** If every region is a pick, the server assembles the file deterministically
+* **As a first step of the strategy.** If every region is a pick, the server assembles the file deterministically
   from the sides and the clean segments of the merge: the answer holds no line that no side has and no
   whitespace of a model's. If any region needs a merge, the file goes to today's writer path (15.10) and
   becomes a proposal as now.
@@ -1466,7 +1536,7 @@ goes into the product without Federico's decision after the measurement.
   options reversed moved OURS+THEIRS from 0.69 to 0.54 and NEEDS-MERGE from 0.15 to 0.26), so every decision
   is asked in two orders and the probabilities are averaged; a decision whose argmax differs between the two
   orders is NEEDS-MERGE.
-* **The gate is fixed before it is measured.** "Jev's averaged probability for the picked option is at least
+* **The gate was fixed before it was measured.** "Jev's averaged probability for the picked option is at least
   tau in every region of the file, no region is NEEDS-MERGE, plus the verification." (A cross-family
   agreement gate, "every region picked identically by all N models", is measured beside it.) tau, and N and
   the model set for the agreement gate, are tuned on half of a family-stratified sample of the corpus OUTSIDE
@@ -1479,11 +1549,11 @@ goes into the product without Federico's decision after the measurement.
   the point estimate enough. That bound needs about 75 landed files with none wrong, 150 with one, 300 with
   three; the ceiling below says what a sample can reach. Everything is judged against the constant policy
   "always THEIRS" and reported with and without spring-boot.
-* **Concatenations are measured, not assumed.** `OURS+THEIRS` and `THEIRS+OURS` stay in the vocabulary only if
+* **Concatenations were to be measured, not assumed.** `OURS+THEIRS` and `THEIRS+OURS` stay in the vocabulary only if
   the data shows they are safe: their precision is reported separately from the single-side picks, and if it
   is clearly worse they are dropped from the vocabulary (those regions become NEEDS-MERGE), not special-cased.
 * **The report applies to assembled files too.** A pick of one side can "drop the other side's change at base
-  a-b" (15.3): the composition report of 15.10 is computed on the assembled file and goes to the agent with
+  a-b" (15.3): the composition report of 15.3 is computed on the assembled file and goes to the agent with
   the proposal. It is honest information, not a gate.
 * **Never sent stays never sent.** Lockfiles, generated, minified, binary and large files keep their paths
   (3.4); the chooser only replaces the writer's first step for files the llm strategy already receives.
@@ -1520,19 +1590,17 @@ modify-delete / add-add files, not region-based):
 * By path: test files 71% all-pick, source 49%; java 94%, ts 20%, go 19%, js 8%, py 36%. The corpus has no lockfile and
   two generated-path files (those rules apply first).
 
-**Measurement plan (each paid arm needs the PM's OK and has its own cap of $0.50, the chooser's total $1.50).**
-The chooser prompt is our own wording. First on a family-stratified 100 outside the 300 (tuning), with Luna
-and two cheap screened models; per pick and per file: precision under both judges, coverage, the share of
-NEEDS-MERGE, agreement-gated precision (2 of 3 and 3 of 3 agree), and cost. Then once on the 300 for the
-chosen gate. The result goes here when it is in.
+**What was run.** Jev alone on a family-stratified sample of 244 files outside the 300 (the tuning half, two option
+orders per file), then all 19 decision models that OpenRouter lists on a 200-file subset, then the agreement of
+the best ones; the confirmation half and the 300 were not run, because the tuning half produced no candidate gate
+(the protocol freezes tau before the confirmation halves, and no tau had a Wilson upper bound of at most 5%).
+Then the same four best models on the replayed conflicts of merged agent PRs (below).
 
-**Result (2026-10-19, measured; the chooser is not a path to 5% wrong outside java).** Everything below is offline of the
+**Results (2026-10-19; the chooser is not a path to 5% wrong outside java).** Everything below is offline of the
 product: `ceiling.py`, `ceiling2.py`, `chooser.py`, `agree_dm.py`, `dm_probe.py`, `dm_screen.sh` (kept so the measurement can
 be rerun on agent-conflict data; they live in `c1-work/scripts/`, outside the repository), the data in
 `c1-work/run/chooser/`. Tuning half = 244 files outside the 300 (family-stratified,
-spring-boot capped at 30; python 13, go 100, ts-js 100, other java 1); `tune200` = 200 of them. The confirmation half and the
-300 were NOT run: the tuning half produced no candidate gate, so there was nothing to confirm (the protocol freezes tau
-before the confirmation halves, and no tau had a Wilson upper bound <= 5%).
+spring-boot capped at 30; python 13, go 100, ts-js 100, other java 1); `tune200` = 200 of them.
 
 * **Jev 1.14, alone** (two orders averaged, same argmax required; $0.0445 for the 244 files). Pick accuracy against the human's
   pick 56.4% on 282 matched regions, ECE 0.149; calibration holds only at the top (p 0.8-0.9: accuracy 0.88, n = 24). The
@@ -1558,34 +1626,190 @@ before the confirmation halves, and no tau had a Wilson upper bound <= 5%).
   pplx-v1.2 at tau 0.8 lands 26 files, 26 correct (upper wrong 12.9%), 25 of them spring-boot; d1-ultra + jev-1.14 at tau 0.7
   lands 26, 26 correct (25 spring-boot); the triples at tau 0.7 land 20 of 20 correct (19 spring-boot). Outside spring-boot the
   agreeing models still err: the best pair (d1-ultra + pplx) lands 7 non-spring files at tau 0.7 with 4 correct.
-* **Reading.** On this corpus a chooser built on any of these decision models is a **java / spring-boot selector** that the constant
-  policy "always THEIRS" already covers (87% right at full coverage); outside java no model or combination comes near 5%,
-  because in about 70% of the go and ts-js regions the human wrote something that is none of the four picks (the free
-  ceiling above), and where the models agree on a pick they are wrong about half of the time. Judge A (reference-based, tolerant of
-  whitespace and order) was not run on any assembled file: no gate had a candidate to judge. It would not change the
-  picture: an assembled file is built from the sides' own lines, so it differs from the human's file when the human
-  wrote something else (human-new or human-outside, 15 of the 40 wrong answers of Sol in the writer benchmark), not by
-  whitespace drift. The arms (b1) a logprob chooser with qwen3.8-flash
-  and (b2) a Luna vote were not run: Luna and Sol have no logprobs on any OpenRouter endpoint, and the screening above
-  supersedes them. The decision models are therefore not a way to a landing rule for the human corpus; whether they behave
-  differently on agent-versus-agent conflicts is open and needs conflicts with a recorded resolution (AgenticFlict has none).
+* **Conflicts of merged agent PRs** (AgenticFlict, Ogenrwot and Businge, arXiv 2604.03551, Zenodo 20118379, CC-BY-4.0,
+  which has no code and no resolution: only line counts and hashes of the conflict regions of 142,652 agent PRs, 27.7% of the
+  simulated ones in conflict). The triples were rebuilt: of its 2,125 merged PRs (1,541 repositories), 1,977 were reachable
+  on GitHub (1,213 with a two-parent merge commit, 764 squash or rebase merges, 557 with a merge of the base into the
+  PR branch); replaying `git merge-tree` on 2,360 merge commits gave 195 with a real textual conflict, and **284 files
+  (repository, PR, path) with a base, an ours, a theirs and a recorded resolution**, in 92 repositories (Codex 175 files,
+  Copilot 83, Devin 12, Claude Code 8, Cursor 6), resolved by a person in 265 cases and by an agent or a bot in 19
+  (commit author). The ceiling (every region a pure side-pick) is higher than ours: 148 of the 284 files, 52% [46-58],
+  against 41% on the 300 and 21% outside spring-boot, with OURS and THEIRS balanced (always-OURS right for 23%,
+  always-THEIRS for 22%, where spring-boot has 90% for THEIRS), and concatenations are rarer (22 of 288 side-picks, 8%).
+  The shape is not simpler for
+  code: 24% of the regions have an empty side (5% in ours), 75% of the regions have both sides non-empty, 58% of the files
+  have one region. The four best decision models on these files (2 orders each, $0.22): on a split of the repositories
+  into halves, **no group of models and no tau lands even 8 files with at most 5% wrong on half A**; the best single lines
+  are d1-ultra at tau 0.8 (22 files, 7.7%, 68% right) and tau 0.7 (43 files, 15%, 65% right); the agreement of two or three
+  models is no better (d1-ultra with pplx at tau 0.7 lands 31 files, 61% right).
+* **Reading.** On both kinds of data a chooser built on these decision models is a **selector that works where a constant
+  policy already works** (java / spring-boot: "always THEIRS" is right for 87% of the files at full coverage) and nowhere else:
+  in about 70% of the go and ts-js regions the human wrote something that is none of the four picks (the ceiling above), and
+  where the models agree on a pick they are wrong about half of the time. Judge A (reference-based, tolerant of whitespace
+  and order) was not run on any assembled file: no gate had a candidate to judge, and an assembled file differs from the
+  human's when the human wrote something else (15 of the 40 wrong answers of Sol in the writer benchmark), not by whitespace
+  drift. The arms with a logprob chooser and a Luna vote were not run: Luna and Sol have no logprobs on any OpenRouter
+  endpoint, and the screening supersedes them. **What would reopen it:** conflicts of agents against agents with a recorded
+  resolution (none is public), or a decision model that reads the tests of the repository.
 
-**Pre-registration of the goal gates (2026-10-20, before the held-out runs).** Federico's goal: at least 20% of
-the conflict files resolved and landed automatically, with at most 5% wrong among them (Wilson 95% upper bound),
-on held-out data, under the strict judge and under judge A, OSS and agent-PR reported separately. On the
-tuning data (the stratified 100 and the 300) no gate came near it (15.12). The gates below are fixed now, from
-that data, and will be run once on data they were not chosen on: the 487 files outside the 300 (family-stratified,
-spring-boot capped at 60; manifest-heldout-487) and the 307 replayed agent-PR files (manifest-agent-307).
+### 15.12 The operating point
 
-* **G1** = the prompt of record with Luna (`openai/gpt-6-luna`, effort low) and with glm-5.3-flash
-  (`z-ai/glm-5.3-flash` pinned to Z.AI, effort low) both accept the byte-identical answer after the judge's
-  normalization, both composition reports are clean, and the verify simulator does not fail it.
-* **G2** = G1 and the file is a java file (`rust-java` family).
-* **G0** = the prompt of record with Luna alone, accepted, report clean, simulator not failed (the baseline to read
-  G1 against).
+**The goal and the answer.** Federico's goal: at least 20% of the conflict files resolved and landed automatically, with at
+most 5% wrong among them (Wilson 95% upper bound), on data the gates were not chosen on, under the strict judge and under
+judge A, OSS and agent PRs apart. **It is not met, by any gate, on either kind of data.** What follows is the operating
+point that the evidence supports, the gates that were tried, and the reading.
 
-Reported for each: landed files, coverage of the set, wrong among the landed with its Wilson upper bound,
-strict and judge A ("both judges accept" when two judges ran, the conservative reading), per family, with and
-without spring-boot. The goal counts as met by a gate only if coverage >= 20% AND the upper bound of the wrong
-rate <= 5% under judge A on a held-out set (the strict judge is the stricter secondary, stated plainly). Nothing
-is tuned on the held-out sets.
+*The judges.* The strict judge calls an answer right when it equals the human's file after normalization (line endings,
+trailing whitespace): about a fifth of the answers it calls wrong are valid (whitespace, order, an equivalent
+phrasing, or a different resolution that a reviewer would accept). Judge A is the reference-based rubric of
+ConflictAgent (Shen 2026, MIT) adapted (Appendix A), run by a small model (glm-5.3-flash); a second judge
+(qwen3.8-flash, with 37 of 107 calls failed, counted as not acceptable) agrees with it on 91% of the answers and
+accepts fewer (187 against 205 of 270), so "judge A" below is one cheap judge and "both judges" is the
+conservative reading. Neither judge runs tests.
+
+**What the writer's proposals are worth** (the prompt of record, Luna, effort low; "right" = the strict judge; the
+interval is Wilson 95%; accepted = the answer passed the rules and the syntax check):
+
+| data | files | accepted | right, strict | right, judge A |
+|---|---:|---:|---|---|
+| OSS, the 300 (tuning) | 300 | 270 (90%) | 158 = 58.5% [52.6-64.2] | 205 = 75.9% (both judges: 184 = 68.1%) |
+| OSS held-out, 487 files outside the 300 | 487 | 432 (89%) | 224 = 51.9% [47.1-56.5] | 339 = 78.5% |
+| agent-PR, 284 replayed files | 284 | 246 (87%) | 60 = 24.4% [19.4-30.1] | 131 = 53.3% |
+
+By family, strict, accepted answers: on the 300 go 43.8% [32-56] (64 accepted), python 54.5% [43-66] (66), ts-js 40.0%
+[28-53] (55), java 84.7% [76-91] (85); held-out go 44.8% [38-52] (181), python 60.9% [41-78] (23), ts-js 43.8% [37-51]
+(169), java 93.2% [84-97] (59). **Java is the only family that is mostly right, and java here is spring-boot**: 63 of 63
+on the 300 and 55 of 58 held-out for Luna (118 of 121, 97.5%; Wilson upper bound of the wrong rate 7.0%; under judge A none
+of the 63 of the 300 is wrong, and G2 below has one wrong in the 58 held-out java files); the other java repositories of
+the corpus are 9 of 22 (41%). The
+constant policy "always THEIRS" is right for 87 to 90% of spring-boot's files at full coverage (15.11): the
+writer adds little there beyond not being wrong. The writer's cost is about $0.0005 per file (Luna and glm-5.3-flash alike).
+
+**The gates tried** (every one is a way to land only the answers that look safe; coverage is of all the files of the
+set, "wrong" is among the landed, the bound is the Wilson upper bound; strict / judge A):
+
+| gate | data | landed | wrong strict | wrong judge A |
+|---|---|---|---|---|
+| accepted, no gate | OSS 300 | 270 = 90% | 41.5% (up 47.4) | 24.1% (up 29.5) [both judges: 31.9%] |
+| + clean report | OSS 300 | 247 = 82% | 40.1% (up 46.3) | 21.9% (up 27.4) |
+| + verify simulator pass (python, go, ts only) | OSS 300 | 117 = 39% | 41.9% (up 50.9) | 23.1% (up 31.5) |
+| java alone, clean report | OSS 300 | 81 = 27% | 13.6% (up 22.7) | 8.6% (up 16.8) [both: 11.1% (up 19.8)] |
+| go tests pass (prometheus only, differential) | prometheus, 23 files | 14 | 14.3% (up 39.9) | same |
+| same-model self-agreement and structure rules, chosen on half the repositories, measured on the other half (30 splits) | OSS 300 | 9.6% of the held-out half | 53% wrong pooled | not run |
+| Luna and glm-5.3-flash byte-identical answer | the stratified 100 | 71 = 71% | 36.6% (up 48.2) | 21.1% (up 32.0) |
+| decision models, tau chosen on half the repositories | 284 agent-PR files | none (no group lands 8 files at 5%) | | |
+| **G0**: Luna, clean report, simulator ok | **OSS held-out 487** | 359 = 73.7% | 40.1% (up 45.3) | 15.6% (up 19.7) |
+| **G1**: Luna x glm identical, both clean, simulator ok | OSS held-out | 291 = 59.8% | 31.6% (up 37.2) | 11.3% (up 15.5) |
+| **G2**: G1 on java | OSS held-out | 58 = 11.9% | 5.2% (up 14.1) | 1.7% (up 9.1) |
+| **G0** | **agent-PR 284** | 210 = 73.9% | 72.4% (up 78.0) | 41.9% (up 48.7) |
+| **G1** | agent-PR | 130 = 45.8% | 62.3% (up 70.2) | 36.9% (up 45.5) |
+| **G2** | agent-PR | 1 | | |
+
+G0, G1 and G2 were fixed before the held-out runs (below) and run once; nothing was tuned on those sets. Without spring-boot
+G1 on the OSS held-out lands 234 files (54.8%) with 38.5% wrong strict and 13.7% (upper 18.7%) under judge A. Per family
+G1 on the OSS held-out, strict / judge A wrong: go 37% / 16%, ts-js 42% / 13%, python 20% / 7%, java 5% / 2%.
+
+**Reading.**
+* The statistical bar is high: at most 5% with an upper bound needs about 75 landed files with none wrong, 130 with two,
+  and 20% coverage of a few hundred files is 60 to 120 landed. Only a gate that is nearly always right can show it.
+* On OSS the writer is right strict in about half of the files and acceptable under judge A in about three quarters; the
+  two writers from different vendors make the same mistakes (agreement lifts the strict precision from 52% to 68%
+  and judge A from 78% to 89%), and neither the clean report, nor a build or vet of the file, nor the tests of the one
+  repository where they could be run, nor structure and self-agreement rules that were chosen on half the repositories
+  and held on the other half, gets a landing gate to 95%. Java is the exception, and only spring-boot.
+* On agent-PR conflicts, the traffic that gitai serves, the writer is right strict in a quarter of the files and acceptable
+  in about half: the recorded resolutions are often something other than the two sides' lines, and no signal tried
+  separates the right ones. This is the hardest data we have and the lowest operating point.
+* What moved a number was a test: the tests of prometheus take its wrong rate from 48% to 14% (n = 14, so the bound is
+  wide). Tests are what production's `verify.command` adds, and the bench cannot run them for these repositories.
+
+**The operating point we state.** A model's resolution is a PROPOSAL with its report. It lands only through the
+operator's verification on the exact tree (15.4, 15.9). Measured quality of the proposals, to size what the agent and the
+verification will see: OSS 58% right strict (68% to 76% under judge A) on the 300 and 52% (78% A) held-out; java 85 to
+93%; go, ts-js and python 40 to 60%; agent-PR 24% (53% A). We cannot show, with the evidence that exists, that any
+offline gate lands 20% of the files at 5% wrong; the one thing that comes close is spring-boot, where a constant policy
+is as good. Showing it needs conflicts of agents with the operator's tests running on the resolved tree.
+
+**Pre-registration of the goal gates (2026-10-20, commit cac46fa, before the held-out runs).** The gates below were fixed from
+the tuning data (the stratified 100 and the 300) and run once on data they were not chosen on: the 487 files outside the 300
+(family-stratified, spring-boot capped at 60; manifest-heldout-487) and the 284 replayed agent-PR files (manifest-agent-284).
+* **G1** = the prompt of record with Luna (`openai/gpt-6-luna`, effort low) and with glm-5.3-flash (`z-ai/glm-5.3-flash`
+  pinned to Z.AI, effort low) both accept the byte-identical answer after the judge's normalization, both composition
+  reports are clean, and the verify simulator does not fail it.
+* **G2** = G1 and the file is a java file. **G0** = Luna alone, accepted, report clean, simulator not failed.
+The goal counts as met by a gate only if coverage >= 20% and the Wilson upper bound of the wrong rate <= 5% under judge A on a
+held-out set. (The first registration said 307 agent-PR files; the replay counted 23 files twice, and the set is 284.)
+
+**Writer screening on the stratified 100** (prompt of record; Appendix A): glm-5.3-flash 52 right of 93 accepted
+(55.9% [46-66]), coverage 93%, $0.046 per 100 files, against Luna's 49 of 90 (54.4% [44-64]) on the same ids; of the
+other models, deepseek-v4.1-flash, qwen3.8-flash, mimo-v2.6-pro and minimax-m3 failed the five-case smoke check in
+this configuration (effort low, 8000 tokens, 120 s per call: their reasoning ran past the limits), and seed-2.0-code and
+deepseek-v4-pro were not run.
+
+### 15.13 What is configurable, and the defaults
+
+**The writer** (`resolve.toml` of `graft-resolve`; the keys are in RESOLVE.md):
+
+| key | default | what it is |
+|---|---|---|
+| `[[strategy]] type = "llm"`, `paths` | every path | which files go to the model |
+| `max_prompt_bytes` | 65536 | the largest request of one region; a larger one declines the file before any call |
+| `context_lines` | 3 | context lines of the PATCH and the CODE |
+| `max_answer_bytes` | 1 MiB | the largest answer |
+| `max_regions` | 20 | most conflicting regions per file (one call each); more goes to the agent |
+| `call_timeout` | 120 s | bound on one model call |
+| `[strategy.llm] type` | none | `openai` (any OpenAI-compatible endpoint, OpenRouter included), `anthropic`, or `command` |
+| `model`, `base_url`, `api_key_env` | none | the model and where it is called; the key is read from the environment, never from the file |
+| `max_tokens` | provider default (8000 in the shipped example) | the answer limit; a reasoning model needs room for its reasoning |
+| `effort` | unset (`low` in the shipped example) | the reasoning effort sent to an endpoint that takes one |
+| `timeout` | none (`2400s` in the example) | the whole file, all its calls |
+| `[strategy.llm.routing] only`, `ignore` | none | the OpenRouter providers allowed or refused; with it set, fallbacks to other providers are off |
+
+There is no option for git's regions, the repair round or the composition report, and no option for OURS' side of
+the context or an abstain block: they are the writer, or they were removed (15.10). **To change the model** set
+`model` (and `base_url` and `api_key_env` for another endpoint); **to change who serves it**, set
+`routing.only` to the provider tag. The configured provider receives the conflicting files (the three versions of each
+file that goes to the model and the commit message of the change); the operator chooses it, and the server never calls
+a model itself, only the resolver that the operator configured.
+
+**The server** (`[graft.land.resolver]`, CONFIGURATION.md): `enabled` false, `timeout` 120 s (the whole land's
+deadline; plus `verify.timeout` when `verify.enabled`), `max_files` 20, `max_file_bytes` 1 MiB, `proposal_ttl` 168 h,
+`check_concurrency` 2, `resolve_concurrency` 2, `verify_concurrency` 2, `verify_per_repository` 1, `resolve_rounds` 32
+(a cap, no contract), `paths_allow`, `paths_deny`, `actors`, `lockfiles`, `generated_markers`, `minified.*`, and the
+verification: `verify.enabled` false, `verify.command`, `verify.timeout` 5 min, `verify.max_tree_entries` 200000,
+`verify.max_tree_bytes` 2 GiB, `verify.max_tree_depth` 64. Nothing lands from a model unless `verify.enabled` is set
+and the command passes on the exact tree.
+
+**The default model.** The shipped example is `openai/gpt-6-luna` at effort low. On the stratified 100 the one other
+model that passed the smoke check, `z-ai/glm-5.3-flash` pinned to Z.AI, is as good (15.12) and costs the same per
+file; the models that reason without a bound on their effort ended their calls past `call_timeout` or `max_tokens`
+(Appendix A), which is a property of the configuration here (effort low, 8000 tokens, 120 s per call) and not a
+judgment of the models.
+
+### Appendix A: the measurement log of section 15
+
+What was run, when, on what, at what cost. Data, scripts and reports are in `c1-work/` (outside the repository:
+`run/` the runs, `scripts/` the analysis, `mine/` the manifests, `ext/` the external data); the commit is the one
+of the tree the run was built from. Costs are the booked costs of the responses (`usage.cost`); the real spend was
+read from the key before and after each run and agrees, except where stated.
+
+| when (2026-10-19/20) | what | data | commit | booked |
+|---|---|---|---|---|
+| 19 | R1b baseline, one call per region (Luna, effort low, 8000 tokens) | the 300 | run r1b-20261019-120508 | $0.107 |
+| 19 | the design step with all elements on | the 300 | fb01183 | $0.169 |
+| 19 | ablation: git's regions off / abstain off / repair off / OURS' context off | the 300, each | 61ef0bc | $0.153 / $0.162 / $0.145 / $0.151 |
+| 19/20 | composite (no abstain, no OURS context) / composite-rc (repair for a broken answer only) | the 300, each | 7aca1a2 | $0.152 / $0.137 |
+| 19 | chooser with Jev 1.14 alone (two option orders) | 244 files outside the 300 | scripts outside the repository | $0.045 |
+| 19/20 | 19 decision models on OpenRouter | 200 files of that half | scripts outside the repository | $0.864 |
+| 20 | four decision models on the replayed conflicts of agent PRs | 284 files | scripts outside the repository | $0.22 |
+| 20 | judge A (glm-5.3-flash), and a second judge (qwen3.8-flash, 37 of 107 calls failed) | the 270 accepted answers of composite-rc | scripts outside the repository | $0.011 / $0.038 |
+| 20 | writer screening on the stratified 100 (prompt of record) | glm-5.3-flash passed: 52 of 93 accepted correct, $0.046; deepseek-v4.1-flash skipped (3 of 5 answers cut at 8000 tokens by its reasoning, $0.033); qwen3.8-flash, mimo-v2.6-pro and minimax-m3 skipped (2 or 3 of 5 calls past the 120 s call timeout or an error, $0.013, $0.016, $0.005); seed-2.0-code and deepseek-v4-pro not run | 8812cee + merge | $0.15 in all |
+| 20 | verify simulator (python, go with tests, ts) | the 270 accepted answers | 8812cee | $0 |
+| 20 | features and self-agreement of the eight Luna arms | the 300 | n/a | $0 |
+| 20 | AgenticFlict: the replay of 2,360 merge commits | 2,125 merged agent PRs | n/a | $0 |
+
+**Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
+rust and a ts file) that costs at most a few cents and stops a model whose calls end before an answer: more than
+half of the calls failing, or a real spend above what the budget booked, or a projection above its cap. It judges
+the model *in this configuration* (effort low, `max_tokens` 8000, `call_timeout` 120 s), which a model that reasons
+for minutes does not fit.
