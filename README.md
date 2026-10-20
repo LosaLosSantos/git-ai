@@ -3,7 +3,7 @@
   <source media="(max-width: 1239px) and (prefers-color-scheme: dark)" srcset="doc/images/banner-phone-dark.gif">
   <source media="(max-width: 1239px)" srcset="doc/images/banner-phone-light.gif">
   <source media="(prefers-color-scheme: dark)" srcset="doc/images/banner-dark.gif">
-  <img alt="gitai, Git designed for AI agents. An animation: the gitai logo; a board of 50 agents racing on one branch, where git lands 100 of 250 changes and gitai lands 200; one push attempt per landed change instead of 27 on average; a merge conflict between two agents (one renamed get to fetch, the other added an argument) resolved by AI, tested and merged; and every change carrying the name of the agent that made it." src="doc/images/banner-light.gif" width="100%">
+  <img alt="gitai, Git designed for AI agents. An animation: the gitai logo; a board of 50 agents racing on one branch, where git lands 100 of 250 changes and gitai lands 200; a merge conflict between two agents (one renamed get to fetch, the other added an argument) resolved by AI, tested and merged; and every change carrying the name of the agent that made it." src="doc/images/banner-light.gif" width="100%">
 </picture>
 <h3 align="center">Git designed for AI agents.</h3>
 </div>
@@ -126,19 +126,19 @@ and retries its own compare-and-swap, up to 20 attempts. Measured with
 
 | 50 agents, 250 changes, no conflict resolver | classic | gitai |
 |---|---|---|
-| changes landed | 100-101 | 200 |
-| attempts per landed change | 27 | 1.0 |
-| lands per minute | 240-272 | 1,862-2,544 |
-| p99 latency | 6.3-7.0 s | 1.5-1.8 s |
+| changes landed | 100-106 | 200 |
+| attempts per landed change | 26.5-28.7 | 1.0 |
+| lands per minute | 264-385 | 1,487-1,944 |
+| p99 latency | 4.4-5.2 s | 1.9-2.7 s |
 
 The 50 changes gitai does not land are the planned conflicts, returned to their
 agents: these runs use no conflict resolver. With the deterministic resolver of
 [`resolve.toml`](examples/graft/demo/resolve.toml) every conflict is resolved
-and all 250 changes land. Details and more sizes in [BENCH.md](doc/graft/BENCH.md).
+and all 250 changes land (1,245-1,806 lands per minute, p99 2.0-3.4 s). Details and more sizes in [BENCH.md](doc/graft/BENCH.md).
 
 ## Status
 
-Version 0.2.0. Everything above is implemented and covered by unit,
+Version 0.3.0. Everything above is implemented and covered by unit,
 end-to-end, multi-node, crash and fuzz tests. Interfaces may still change
 before 1.0. Known gaps (for example garbage collection of packs in the storage
 core) are listed in [LIMITATIONS.md](doc/graft/LIMITATIONS.md).
