@@ -99,6 +99,28 @@ func TestLandIdentities(t *testing.T) {
 	})
 }
 
+// TestLandIdentitiesOfACommitLandedTwiceInOneEntry verifies that an entry whose lands name a commit
+// more than once, which one upsert statement cannot write, records its last land.
+func TestLandIdentitiesOfACommitLandedTwiceInOneEntry(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, ctx context.Context, s *sqlstore.Store) {
+		repo := register(t, ctx, s, testKey("lands-twice"))
+		result, err := s.CommitChangeset(ctx, corestore.ChangesetInput{
+			RepoID:  repo.ID,
+			Updates: []corestore.RefUpdate{create("refs/heads/main", oid(13))},
+			Changelog: landMeta("refs/heads/main",
+				changelog.Land{Original: string(oid(10)), Landed: string(oid(11))},
+				changelog.Land{Original: string(oid(20)), Landed: string(oid(12))},
+				changelog.Land{Original: string(oid(10)), Landed: string(oid(13))},
+			),
+		})
+		require.NoError(t, err)
+
+		seq := result.Changelog[0].Sequence
+		requireLand(t, ctx, s, repo.ID, "refs/heads/main", oid(10), changelog.LandRecord{Sequence: seq, Landed: string(oid(13))})
+		requireLand(t, ctx, s, repo.ID, "refs/heads/main", oid(20), changelog.LandRecord{Sequence: seq, Landed: string(oid(12))})
+	})
+}
+
 // TestLandIdentitiesAreWrittenWithTheChangeset verifies that the land record and the changeset are
 // one transaction: when the record cannot be written, the changeset is not committed either.
 func TestLandIdentitiesAreWrittenWithTheChangeset(t *testing.T) {

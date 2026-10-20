@@ -36,7 +36,7 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, ctx context.Context, s *
 var openedDSNs sync.Map
 
 // openStore opens a store on dsn and closes it when the test ends.
-func openStore(t *testing.T, ctx context.Context, dsn string) *sqlstore.Store {
+func openStore(t testing.TB, ctx context.Context, dsn string) *sqlstore.Store {
 	t.Helper()
 
 	s, err := sqlstore.Open(ctx, dsn)
