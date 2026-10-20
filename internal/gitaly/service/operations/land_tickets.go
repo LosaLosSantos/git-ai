@@ -218,12 +218,18 @@ func (t *landTicket) covers(keys []string) bool {
 
 // setPriority makes the ticket one that the inline resolutions of the other lands give way to.
 func (t *landTicket) setPriority() {
+	if t == nil {
+		return
+	}
 	t.mu.Lock()
 	t.priority = true
 	t.mu.Unlock()
 }
 
 func (t *landTicket) hasPriority() bool {
+	if t == nil {
+		return false
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.priority && !t.released

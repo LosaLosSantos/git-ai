@@ -348,6 +348,13 @@ func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest
 			continue
 		}
 		if laneRound && !need.queued {
+			// The lane could not ask the rules (no slot, the batch's budget spent, a slow rule): what is next may
+			// be a model's call out of the lane, and a ticket taken only to wait in the lane protects nothing
+			// then. Only the priority of a land that lost a round out of the lane is kept.
+			if !pre.ticket.hasPriority() {
+				pre.ticket.release()
+				pre.ticket = nil
+			}
 			continue
 		}
 		if err := s.landTakeTicket(resolveCtx, in, pre, need); err != nil {
@@ -391,7 +398,7 @@ func (p *landPreResolution) currentPaths() []string {
 
 // landTicketsBlock reports whether another land holds the ticket of one of paths.
 func (s *Server) landTicketsBlock(in *gitalypb.UserLandRequest, paths []string, pre *landPreResolution) bool {
-	if len(paths) == 0 || s.landWillNotLand(pre) {
+	if len(paths) == 0 {
 		return false
 	}
 	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
@@ -400,8 +407,9 @@ func (s *Server) landTicketsBlock(in *gitalypb.UserLandRequest, paths []string, 
 
 // landTakeTicket makes the land hold the tickets of the files it needs resolved, waiting for the lands
 // that lost a round before it (land_tickets.go). A land that holds tickets for all of them keeps them.
-// One that now needs more files gives its tickets back and takes the larger set at the tail: tickets
-// are taken in sorted order, so that no two lands wait for each other.
+// One that now needs more files gives its tickets back and takes the larger set at the tail (it loses its
+// place in the queues, and its priority until it is back in the lane): tickets are taken in sorted order, so
+// that no two lands wait for each other.
 func (s *Server) landTakeTicket(ctx context.Context, in *gitalypb.UserLandRequest, pre *landPreResolution, need *landNeedsResolution) error {
 	scope := landTicketScope(in.GetRepository().GetStorageName(), in.GetRepository().GetRelativePath(), in.GetBranch())
 	keys := landTicketKeys(scope, need.paths, s.resolveCfg.Verify.Enabled)

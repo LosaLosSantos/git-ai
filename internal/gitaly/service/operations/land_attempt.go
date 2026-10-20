@@ -61,7 +61,7 @@ type landingAttempt struct {
 	observe landPhaseObserver
 	// mode is how the attempt makes its objects durable.
 	mode landPublishMode
-	// inline is the time the members of the attempt may lose to inline calls that fail (land_inline.go).
+	// inline is the time the members of the attempt have spent in inline calls (land_inline.go).
 	inline landInlineBudget
 }
 

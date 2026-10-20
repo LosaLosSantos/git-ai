@@ -552,4 +552,97 @@ func TestUserLand_aRuleSlowerThanTheTimeoutLandsOnAHotFile(t *testing.T) {
 	require.Contains(t, got, "slowrule-1")
 	require.Len(t, strings.Split(got, "\n"), stream+2, "ours, the slow rule's line and every other land's")
 	require.Empty(t, landTickets.keysOf(q.scope))
+
+	// The holder does not ask its slow rule in the lane again: once for its first lane round, once for the round
+	// in which it lost, and no more.
+	raw, err := os.ReadFile(filepath.Join(q.dir, "inline-slow.log"))
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(raw)/2, 2, "the slow rule was asked in the lane by the holder with priority")
+}
+
+// TestUserLand_aModelLandThatCannotAskTheRulesReleasesItsTicket: as
+// TestUserLand_aModelLandReleasesTheTicketItQueuedFor, but the inline slots stay taken, so the lane round after the
+// wait cannot ask the rules at all (no rulesCannot to say that a model is next). The land must not hold the ticket
+// of the file during the model call out of the lane.
+func TestUserLand_aModelLandThatCannotAskTheRulesReleasesItsTicket(t *testing.T) {
+	t.Parallel()
+
+	var s *Server
+	operationServerHooks.Store(t.Name(), func(served *Server) { s = served })
+	q := newQueueFixtureMode(t, 1, "model", func(c *config.GraftResolver) { c.InlineTimeout = "" })
+	require.NotNil(t, s)
+
+	var own []interface{ Release() }
+	for {
+		slot, ok := s.conflictResolver.TryAcquireInlineSlot()
+		if !ok {
+			break
+		}
+		own = append(own, slot)
+	}
+	defer func() {
+		for _, slot := range own {
+			slot.Release()
+		}
+	}()
+	holder, err := landTickets.acquire(q.ctx, []string{q.keyOfA})
+	require.NoError(t, err)
+	defer holder.release()
+
+	model := gittest.WriteCommit(t, q.cfg, q.repoPath, gittest.WithParents(q.base),
+		gittest.WithTreeEntries(
+			gittest.TreeEntry{Mode: "100644", Path: "a", Content: "model-1\n"},
+			gittest.TreeEntry{Mode: "100644", Path: "b", Content: "base\n"}))
+	done := make(chan error, 1)
+	go func() {
+		_, err := q.land(model)
+		done <- err
+	}()
+	require.Eventually(t, func() bool { return landTickets.waiting(q.keyOfA) == 1 }, 30*time.Second, 5*time.Millisecond, "the model land queued")
+	holder.release()
+
+	require.Eventually(t, func() bool { return unionCalls(t, q.dir)-inlineCalls(t, q.dir) >= 1 }, 30*time.Second, 5*time.Millisecond, "the model call is in flight")
+	require.False(t, landTickets.blocked([]string{q.keyOfA}, nil), "the land held the ticket of the file during its model call")
+
+	require.NoError(t, os.WriteFile(filepath.Join(q.dir, "release"), nil, 0o644))
+	select {
+	case err := <-done:
+		requireMergeConflict(t, err)
+	case <-time.After(60 * time.Second):
+		t.Fatal("the model land did not end")
+	}
+}
+
+// TestLandApplyVerdicts_theHolderWithPriorityDoesNotAskTheRulesInTheLane: a land that holds its files with priority
+// and comes back to the lane without a verdict for them (the files changed under it once more) is handed back to
+// be resolved out of the lane: it does not ask its rule in the lane again, which would only stall the batch. The
+// control, a land without a ticket, asks.
+func TestLandApplyVerdicts_theHolderWithPriorityDoesNotAskTheRulesInTheLane(t *testing.T) {
+	t.Parallel()
+
+	p := newInlineProbe(t, "", nil)
+	req := p.fx.request("Land")
+	apply := func(pre *landPreResolution) error {
+		_, err := p.s.landApplyVerdicts(p.fx.ctx, req, p.fx.repo, p.fx.tip, p.fx.commit, p.fx.committer(), pre)
+		return err
+	}
+
+	// Without a ticket the lane asks the rules, and resolves.
+	pre := newLandPreResolution()
+	_, err := p.s.landApplyVerdicts(p.fx.ctx, req, p.fx.repo, p.fx.tip, p.fx.commit, p.fx.committer(), pre)
+	require.NoError(t, err)
+	require.Equal(t, 1, inlineCalls(t, p.dir))
+
+	// With the priority it does not: the land is handed back, with the files it needs resolved.
+	ticket, err := landTickets.acquire(p.fx.ctx, p.s.landListingKeys(req, p.l))
+	require.NoError(t, err)
+	defer ticket.release()
+	ticket.setPriority()
+	held := newLandPreResolution()
+	held.ticket = ticket
+	var need *landNeedsResolution
+	require.ErrorAs(t, apply(held), &need)
+	require.NotEmpty(t, need.paths)
+	require.False(t, need.queued)
+	require.Equal(t, 1, inlineCalls(t, p.dir), "the holder did not ask the rules in the lane")
 }

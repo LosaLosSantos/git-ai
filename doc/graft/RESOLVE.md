@@ -567,6 +567,10 @@ A round is lost when another land changed one of the files. The rules do not wai
   of the others on them, which would change the files under its verdict at every round (a rule slower than
   `inline_timeout` on a hot file would never land); they wait behind it, and go back to the lane when it is done. Apart
   from that the rules in the lane do not wait for a ticket, and a land that waited for its turn goes back to the lane.
+  The others wait behind the holder for as long as its resolution takes, at most up to its deadline (the resolver's
+  `timeout`), after which they end with the package at their own. A holder whose set of files grows gives its tickets
+  back and takes the larger set at the tail: it loses its place in the queues, and its priority until it is back in
+  the lane.
   A land that waits past its
   deadline ends with the merge conflict and its package, its files `NOT_ATTEMPTED` with the reason `the time ran out
   waiting for the other lands on the same files`.

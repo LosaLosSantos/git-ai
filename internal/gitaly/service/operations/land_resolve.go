@@ -522,7 +522,11 @@ func (s *Server) landApplyVerdicts(
 		if s.landInlineEnabled() && landTickets.priorityBlocked(s.landListingKeys(in, l), pre.ticket) {
 			return landResolution{}, &landNeedsResolution{tip: tip, commit: commitID, paths: landListingPaths(l), queued: true}
 		}
-		inline = s.landResolveInline(ctx, in, tip, commitID, l, pre)
+		// The holder itself does not resolve inline: it comes back with the verdict of its slow rule, and asking
+		// the rule again would only stall the batch.
+		if !pre.ticket.hasPriority() {
+			inline = s.landResolveInline(ctx, in, tip, commitID, l, pre)
+		}
 		if inline == landInlineResolved {
 			missing = missing[:0]
 			for _, f := range l.files {
@@ -539,9 +543,7 @@ func (s *Server) landApplyVerdicts(
 	// land on the same files, whose verdicts were made out of the lane, waits for its turn
 	// (land_tickets.go), instead of landing first and invalidating the holder's verdict once more. A land
 	// that the lane has just resolved inline needs no turn: the rules do not wait for the tickets.
-	// Without a verification, a land whose files have a model's verdict does not land either: it is not
-	// waited for.
-	if pre != nil && s.conflictResolver != nil && l.bases <= 1 && inline != landInlineResolved && !rulesCannot && !landHasModelVerdict(s, l, pre) {
+	if pre != nil && s.conflictResolver != nil && l.bases <= 1 && inline != landInlineResolved && !rulesCannot {
 		paths := make([]string, 0, len(l.files))
 		for _, f := range l.files {
 			paths = append(paths, f.conflict.path)
