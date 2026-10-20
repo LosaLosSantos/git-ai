@@ -2068,7 +2068,7 @@ Its cost: landing half of what G1 lands (34.6% against 67.5%).
    without spring-boot has to leave go to the operator's tests.
 4. On agent PRs no signal of the server comes close (40% wrong at best), consistent with 15.12.
 5. **What would be needed** to claim a gate, in this order: (a) *A signal that is not the text:* the operator's tests on the
-   resolved tree (`verify.command`), the only thing that moved a number (prometheus, 48% to 14%); for go, `go build` and the package
+   resolved tree (`verify.command`), the only thing that moved a number (prometheus, 48% to 14%; measured on G1 in 15.15); for go, `go build` and the package
    tests of the files, which the bench cannot run for most of the repositories. (b) *More data,* chosen for the claim: at a true
    wrong rate of 14% the bound needs about 160 landed files per claim, so a held-out of at least 600 files outside spring-boot,
    from at least 20 repositories and several java ones (java here is one repository, spring-boot), with the split by repository
@@ -2081,6 +2081,92 @@ Its cost: landing half of what G1 lands (34.6% against 67.5%).
 landed files; the label is the verdict of three LLM judges (unjudged answers counted wrong), not tests, and judge 3 ran only on
 G1's answers, so a gate looser than G1 cannot be evaluated; the signals are the ones listed. A different split would pick a different
 gate (the exchange above did), which is the point.
+
+### 15.15 G1 and the project's real tests (measured, no paid call)
+
+**The question** (15.14 ended on it): the one thing that moved a number is the project's own tests run on the resolved tree,
+which is also how the product lands a model's answer (`verify.command`). If G1's answers are run against the tests of the
+repositories that have runnable ones, what is the wrong rate among those that pass?
+
+**The answer, against the rule fixed beforehand: shown.** Outside spring-boot, in the repositories whose tests could be run,
+**69 answers pass (T), 6 of them wrong under the 2-of-3 judge label: 8.7%, upper bound 17.7%** (judge 3 alone: 5 wrong, 7.2%, upper
+15.9%); the rule was an upper bound of 20% or less with at least 54 landed files. T is 29.5% of the 234 files that G1 lands outside
+spring-boot (16.2% of the 427 files of the held-out outside spring-boot) and 56.6% of the 122 files in the repositories that were run.
+The margin is thin (one more wrong file would leave the bound at 19.5%, two more at 21.2%), the scope is narrow (below), and most of T is made of answers
+that are identical to the human's file, so read the rest before quoting the number.
+
+**Protocol, hashed before the first run** (`c1-work/run/gate-b/`): `PROTOCOL-TESTS.txt` (sha256 `5718545975e9`), with two amendments written before
+any held-out file was run, for infrastructure only (`PROTOCOL-TESTS-AMENDMENT-1.txt`, `08538850d9af`; `-2.txt`, `626da126ca29`). The
+test is differential: the worktree of the case's merge commit M with the human's file is the baseline, run twice; the tests that pass in
+both are the set P; the answer replaces that one file and P must still pass (a failure is confirmed by a second run). T = G1 and PASS; T' = T
+and at least half of the executable lines the resolution wrote are executed by the tests (Go only). A file that cannot be tested is NOT
+landed, with a reason code decided by a rule (`R-REPO`, `R-TOOLCHAIN`, `R-BASEBUILD`, `R-NOBASETESTS`, `R-UNSTABLE`, `R-TIMEOUT`, `R-INSTALL`).
+The commands: prometheus `go test` of the file's package (`-timeout 300s`), golang/go the toolchain of the merge built with
+`make.bash` and `go test -short` of the package, flask `pytest tests` in a venv. Not run, by rule, before any outcome: django (2012-2013 on python 3.12),
+TypeScript (gulp/jake on node 18, a very long suite), vscode (electron and native modules), react, pandas, kafka: 112 of the 234 files. The parents of the
+case are not run. Wrong is the label of 15.14 (not accepted by 2 of 3 judges, unjudged answers counted wrong); the 234 files already had their verdicts, so no
+judge was called. Nothing is tuned, so there is no split and the pooled result is the primary.
+
+**The harness was validated before the pilot, on files of the 300 (tuning set, not in this population).** Against the earlier simulator
+(vsim-gotest2) it showed two things. The old simulator did not detect a package whose tests time out, so its "pass" compared partial
+sets of passing tests; the new one counts a timed-out package as `R-TIMEOUT`. And a bug of mine: the answer stayed in the worktree after a file was
+checked, so the next file of the same merge was run on a tree that held the previous answer (three files wrongly ended `R-BASEBUILD`); the human's file is now
+put back after every file. After the fix the files agree with the old simulator (14 pass, 5 fail, 4 whose baseline does not build, for the 23 prometheus files). A
+check that stays in the harness: an answer identical to the human's file must always pass (57 such answers in the run, none failed). The pilot (11 files, one
+per Go era) found two more faults, both for old Go trees (GOPATH mode; `go test -json` absent before go 1.10), fixed in Amendment 2; all three Go eras
+then built a toolchain with the local go 1.26 as bootstrap, in 12 to 86 s.
+
+**What happened to the 234 files** (G1-landed, outside spring-boot):
+
+| repository | files | PASS | FAIL | not landed, with reason |
+|---|---:|---:|---:|---|
+| golang/go | 79 | 44 | 8 | R-NOBASETESTS 17 (13 are files of the `test/` directory, run by one program, the others packages with no test file), R-TOOLCHAIN 10 (2014-2019: the 2014 C bootstrap asks for hg (4), the 2015 trees for a VERSION file (2), the 2019 ones fail with "cannot find main module" (2), a 2016 and a 2018 tree do not build (2)) |
+| prometheus | 36 | 24 | 2 | R-BASEBUILD 6 (the human's merge commit itself does not build), R-NOBASETESTS 2, R-TIMEOUT 2 (`tsdb/head.go`, `tsdb/head_wal.go`) |
+| flask | 7 | 1 | 0 | R-BASEBUILD 3 (the 2010-2019 sources do not import on python 3.12), R-NOBASETESTS 3 |
+| vscode, TypeScript, django, react, pandas, kafka | 112 | | | R-REPO (not run, by the rule above) |
+
+The files that were run are 122; every reason is in `tests-full.jsonl`, and the list by reason is printed by `scripts/tests_report.py`.
+
+**The result** (wrong = not accepted by 2 of 3 judges; Wilson upper bound in parentheses):
+
+| set | files | wrong, 2 of 3 | judge 3 alone |
+|---|---|---|---|
+| G1 on the 122 files that were run | 122 | 28 = 23.0% (up 31.2) | 29 = 23.8% (up 32.1) |
+| **T = G1 and the tests pass** | **69** (29.5% of 234; 56.6% of the 122 run) | **6 = 8.7% (up 17.7)** | 5 = 7.2% (up 15.9) |
+| T, golang/go | 44 | 2 = 4.5% (up 15.1) | 2 = 4.5% (up 15.1) |
+| T, prometheus | 24 | 3 = 12.5% (up 31.0) | 3 = 12.5% (up 31.0) |
+| T, flask | 1 | 1 | 0 |
+| T' = T and the regions are covered | 31 (13.2% of 234) | 0 = 0.0% (up 11.0) | 0 (up 11.0) |
+
+(By family: Go, 68 files of T, 5 wrong = 7.4%, upper bound 16.1%; python has one file.) G1 alone on the same repositories is 26.6% wrong
+for golang/go (79 files, upper 37.2) and 16.7% for prometheus (36 files, upper 31.9).
+
+**What the tests did.** On the 79 files whose status is PASS or FAIL (G1 without tests lands all of them): wrong 15 = 19.0% (upper 29.0) without the tests,
+6 = 8.7% with them. The tests removed 9 wrong answers, lost 1 right answer (a false positive: `src/crypto/tls/cipher_suites.go`, whose package tests do not
+build with the answer), and let 6 wrong answers through; 63 right answers pass. Ten of the failures are a package that does not build with the answer
+(6) or a test that passes at the baseline and fails with it, twice (4). **But 57 of the 79 answers are identical to the human's file, which pass by construction**
+(none failed, which checks the harness); the information of the tests is on the other 22: 10 FAIL (9 wrong, 1 right) and 12 PASS (6 wrong, 6 right). The tests
+therefore caught 9 of the 15 wrong answers (60%).
+
+**The secondary arm.** The five Go answers that are wrong and pass (`config/config.go`, `promql/functions.go`, `scrape/scrape.go`, `cmd/link/internal/ld/deadcode.go`,
+`crypto/rand/rand_unix.go`) all have T' false: the tests do not execute the lines the resolution wrote. T', which asks for that, has 31 files and no wrong one
+(upper 11.0%), but 27 of its 31 are identical to the human's file, so it rests on 4 answers that differ. It is reported without a claim; it says that the
+tests that pass are only as good as what they run, and that asking for coverage of the resolved lines is a sensible condition for the product (`go test -cover`, or the
+operator's coverage tool on the changed lines).
+
+**Reading, honestly.**
+1. For repositories whose tests can run on the resolved tree, G1 and the tests keep the wrong rate at 8.7% (upper 17.7%) at 56.6% of the files run: the lever of 15.14
+   works where it can be pulled, and it is the product's own `verify.command`. The result says nothing about repositories without runnable tests, and 112 of the 234 files
+   (vscode, TypeScript, django, react, pandas, kafka) were not run at all; the families python and ts-js are not covered by this measurement (one python file).
+2. The bound is pooled and thin. golang/go alone (44 files) is 15.1% and prometheus alone (24 files) is 31.0%; the pooled 69 files clear 20% by 2.3 points, one more wrong file would
+   still clear it (19.5%) and two more would not (21.2%). The label is three LLM judges, not tests, and T' covers fewer files.
+3. In the whole held-out the combination is: T (69 files) plus the spring-boot files that G1 lands, which were not tested (57 files, 1 wrong in 15.14): 126 of 487
+   files (25.9%) with 7 wrong, 5.6% (upper 11.0%). That mixes a tested part and a constant-policy-equivalent part, and is given for orientation, not as a claim.
+4. 10 golang/go files of 2014-2019 were lost to the toolchain of the harness (hg, a VERSION file, "cannot find main module", two trees that do not build). A fix after
+   the result was seen would be a post hoc change, so they stay not landed.
+5. What it means for the product: a model's resolution lands through the operator's verification (15.4, 15.9); this measures, on public Go repositories, what the verification
+   buys, and it supports the operating point of 15.12. The honest statement is conditional: with the project's tests running on the resolved tree, and when
+   the lines of the resolution are covered, the answers that pass were wrong in 8.7% of the cases (upper bound 17.7%) on this sample.
 
 ### Appendix A: the measurement log of section 15
 
@@ -2108,6 +2194,7 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | judge 2 (openai/gpt-6.1-sol, effort low) on the answers landed by G0 | OSS held-out 359, agent-PR 210 | scripts outside the repository | $0.239 + $0.268 |
 | 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1: a first pass stopped at its cap of $0.25 per set, a second pass (retry of the empty answers with a backoff, and the unjudged) at +$0.03 and +$0.09, a third on the OSS set only (cap +$0.10, +$0.106 booked); 13 OSS and 29 agent-PR answers unjudged and 2 OSS and 3 agent-PR calls empty at the end, counted as wrong | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.404 + $0.354 = $0.758 booked (the key: $0.739) |
 | 20 | the gate analysis of 15.14: a split of the OSS held-out by repository, 139 candidate gates chosen on half and measured on the other, the exchange, leave one repository out | manifest-heldout-487, manifest-agent-284, the stored answers and judge verdicts | scripts/gate_split.py, gate_b.py outside the repository | $0 |
+| 20 | G1 and the project's real tests (15.15): a differential test at the merge commit (baseline twice, the answer, a confirmation), prometheus, golang/go (a toolchain per merge), flask; pilot and full run | the 234 G1-landed files outside spring-boot | scripts/test_gate.py, tests_report.py outside the repository | $0 |
 | 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
