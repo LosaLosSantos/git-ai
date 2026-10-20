@@ -941,7 +941,7 @@ end of this section.
 | writer | proposes a resolution per region | a model, configurable (15.13) | 15.10: the elements kept and removed, 15.12 |
 | checks and repair | refuse a broken answer, repair it once | deterministic checks | 15.10 |
 | report | tells the agent what the answer keeps or drops | deterministic | 15.6: it separates (43% against 60% right), it does not gate |
-| agree_with (optional) | holds a proposal back unless a second model from another vendor gives the same file and both reports are clean | code (`llmStrategy`), configured by the operator | 15.12: G1, 59.8% of the files landed with 15.5% wrong under two judges and at most 15.5% under a third, before the operator's tests |
+| agree_with (optional) | holds a proposal back unless a second model from another vendor gives the same file and neither composition check found a drop or a duplicate | code (`llmStrategy`), configured by the operator | 15.12: G1, 59.8% of the files landed with 15.5% wrong under two judges and at most 15.5% under a third, before the operator's tests |
 | verify | runs the operator's build and tests on the exact tree | the operator's command | 15.9, 14 |
 | decideLand | the one landing rule | code | 15.4 |
 
@@ -1142,7 +1142,7 @@ whole file (`agree_with`, 15.13): the one filter that chose better proposals tha
 | regions (the fallback of git's, and the assembly of the file) | `llmRegions`, `llmJoin` | tools/.../resolve/llm_core.go, llm_gitmerge.go |
 | one call per region, its checks | `llmPatchSystem`, `llmPatchUser`, `llmPatchAnswer`, `llmCheckPatched`, `llmCheckAnswer` | tools/.../resolve/llm_patch.go, llm_core.go |
 | proposal mark, no recording | `proposer`, `Resolver.resolveFile` | tools/.../resolve/llm_strategy.go, resolve.go |
-| agreement gate: second model, comparison, hold | `llmStrategy.Resolve`, `llmSide.start`, `llmStrategy.agreement`, `LLMNormalize`, `LLMReportClean`, `Resolution.Hold`, `ResponseFile.Hold` (a held file is a model's), `landAnswerHolds`, `decideLand`, `landSetOutcomes` | tools/.../resolve/llm_strategy.go, llm_core.go, resolve.go; graft/resolver/protocol.go; operations/land_proposals.go, land_resolve.go |
+| agreement gate: second model, comparison, hold | `llmStrategy.Resolve`, `llmSide.start`, `llmStrategy.agreement`, `LLMNormalize`, `LLMResult.Findings`, `Resolution.Hold`, `ResponseFile.Hold` (a held file is a model's), `landAnswerHolds`, `decideLand`, `landSetOutcomes` | tools/.../resolve/llm_strategy.go, llm_core.go, resolve.go; graft/resolver/protocol.go; operations/land_proposals.go, land_resolve.go |
 | verify.command's checkout | `landCheckoutTree`, `landMaterializer.add`, `landCheckMaterialized`, `landRemoveCheckout`, `resolver.IsGitDirName` | operations/land_verify.go; graft/resolver/validate.go |
 | merge commit, trailers | `landWriteResolution` | operations/land_resolve.go |
 | PACKAGE | `landWithPackage`, `landListing.conflictPackage` | operations/land_package.go |
@@ -1699,7 +1699,7 @@ five times a normal call (an empty answer is billed, and a retry is four attempt
 and 29 agent-PR answers unjudged and 3 agent-PR calls still empty. A third pass on the OSS set only (approved) judged 11 of the
 24 and stopped at its cap again: 13 OSS answers are unjudged and 2 calls are empty, and the agent-PR set stays as it was after
 the second pass. All of those are counted as wrong here, so its figures are a ceiling. **Judge 3 alone is the number to
-quote**, with the majority of judges 1, 2 and 3 beside it. It cost $0.74 in all.
+quote**, with the majority of judges 1, 2 and 3 beside it. It cost $0.76 booked ($0.74 by the key).
 
 **What the writer's proposals are worth** (the prompt of record, Luna, effort low; "right" = the strict judge; the
 interval is Wilson 95%; accepted = the answer passed the rules and the syntax check):
@@ -1821,7 +1821,9 @@ the tuning data (the stratified 100 and the 300) and run once on data they were 
 (family-stratified, spring-boot capped at 60; manifest-heldout-487) and the 284 replayed agent-PR files (manifest-agent-284).
 * **G1** = the prompt of record with Luna (`openai/gpt-6-luna`, effort low) and with glm-5.3-flash (`z-ai/glm-5.3-flash`
   pinned to Z.AI, effort low) both accept the byte-identical answer after the judge's normalization, both composition
-  reports are clean, and the verify simulator does not fail it.
+  reports are clean, and the verify simulator does not fail it. ("Clean" was measured on the lines of the report, which is cut
+  at 16 lines; the gate in the code counts the drops and duplicates of every region (`LLMResult.Findings`), so it can hold
+  slightly more than the measured G1, on the few files whose report is longer. That difference was not measured.)
 * **G2** = G1 and the file is a java file. **G0** = Luna alone, accepted, report clean, simulator not failed.
 The goal counts as met by a gate only if coverage >= 20% and the Wilson upper bound of the wrong rate <= 5% under judge A on a
 held-out set. (The first registration said 307 agent-PR files; the replay counted 23 files twice, and the set is 284.)
@@ -1912,7 +1914,7 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | held-out runs of the prompt of record: Luna and glm-5.3-flash on 487 OSS files and on 284 agent-PR files | manifest-heldout-487, manifest-agent-284 | 7fd0ab2's tools tree (8812cee) | $0.300 + $0.302 + $0.227 + $0.237 |
 | 20 | judge 1 (glm-5.3-flash) on the held-out answers | the answers of Luna | scripts outside the repository | $0.025 + $0.021 |
 | 20 | judge 2 (openai/gpt-6.1-sol, effort low) on the answers landed by G0 | OSS held-out 359, agent-PR 210 | scripts outside the repository | $0.239 + $0.268 |
-| 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1: a first pass stopped at its cap of $0.25 per set, a second pass (retry of the empty answers with a backoff, and the unjudged) at +$0.03 and +$0.09, a third on the OSS set only at +$0.10; 13 OSS and 29 agent-PR answers unjudged and 2 OSS and 3 agent-PR calls empty at the end, counted as wrong | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.404 + $0.354 (the key: $0.74) |
+| 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1: a first pass stopped at its cap of $0.25 per set, a second pass (retry of the empty answers with a backoff, and the unjudged) at +$0.03 and +$0.09, a third on the OSS set only (cap +$0.10, +$0.106 booked); 13 OSS and 29 agent-PR answers unjudged and 2 OSS and 3 agent-PR calls empty at the end, counted as wrong | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.404 + $0.354 = $0.758 booked (the key: $0.739) |
 | 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a

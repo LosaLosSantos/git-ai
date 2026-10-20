@@ -727,7 +727,9 @@ one that is proposed. It lands only if all three hold:
    lines elsewhere, the order of lines and every other character must be equal. It is the normalization that the
    measurements and the judges used, and it decides only whether the models agree: the bytes that land, and that the
    verification runs on, are the first model's, exactly as it wrote them;
-2. **the composition report of both is clean** (no line saying that the answer drops or duplicates a change of a side);
+2. **the composition check of both found nothing**: not one drop of a change of a side and not one duplicate, counted in
+   full from the check of every region (`LLMResult.Findings`), not read from the text of the report, which is cut at 16
+   lines;
 3. **`verify.command` passes** on the exact tree, as for every model resolution: `verify.enabled = true` is mandatory
    (the gate does not replace it, it chooses the proposals worth verifying).
 
@@ -740,7 +742,8 @@ vendors: two models of one family make the same mistakes. A `[strategy.llm.budge
 `[strategy.llm.agree_with.budget]` beside it (a cap that covers one of two models is not a cap), and the spend of both
 is counted for the file. The bench (`graft-resolve bench run`) runs the same code, prices the two models from
 OpenRouter and splits `--max-usd` between them; its report counts the held answers apart. Upgrade `graft-resolve` and the
-server together: an older server does not know `hold` and would verify a held proposal like any other.
+server together (see "Version skew" above: a `graft-resolve` with `agree_with` gives no model's resolution to a server that
+does not announce `hold`).
 
 What it was worth, measured on 487 held-out files of 13 open-source repositories (Luna and glm-5.3-flash, with the
 verify simulation of the bench in place of the operator's tests): 59.8% of the files landed, and 15.5% of those differed
