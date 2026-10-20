@@ -907,6 +907,16 @@ func lockFile(path string) (func(), error) {
 // The scan starts at the closest index point before after, so its cost depends
 // on the entries that follow after and not on the size of the log.
 func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
+	return scanFrom(repoPath, after, -1, func(entry Entry, _ int64) (bool, error) {
+		return fn(entry)
+	})
+}
+
+// scanFrom is Scan that also gives fn the offset of the line of each entry, and that starts at the
+// offset hint when it is not negative and its line holds the entry with the sequence after+1: a
+// caller that knows that offset from an earlier scan reads only the entries it asks for. A hint
+// whose line does not hold that entry (the log was replaced) is ignored.
+func scanFrom(repoPath string, after uint64, hint int64, fn func(Entry, int64) (bool, error)) error {
 	path := Path(repoPath)
 
 	state, release := acquireState(path)
@@ -927,6 +937,9 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 	}
 
 	offset := state.scanOffset(f, after)
+	if hint >= 0 && hint < end && lineHolds(f, hint, after+1) {
+		offset = hint
+	}
 	if offset >= end {
 		return nil
 	}
@@ -955,7 +968,7 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 			continue
 		}
 
-		more, err := fn(entry)
+		more, err := fn(entry, lineOffset)
 		if err != nil {
 			return err
 		}
@@ -963,6 +976,17 @@ func Scan(repoPath string, after uint64, fn func(Entry) (bool, error)) error {
 			return nil
 		}
 	}
+}
+
+// lineHolds reports whether the line of f at offset holds the entry with the given sequence.
+func lineHolds(f *os.File, offset int64, sequence uint64) bool {
+	line, err := bufio.NewReader(io.NewSectionReader(f, offset, 1<<62)).ReadBytes('\n')
+	if err != nil {
+		return false
+	}
+
+	var entry Entry
+	return json.Unmarshal(line, &entry) == nil && entry.Sequence == sequence
 }
 
 // LastSequence returns the sequence of the last durable entry of the log of the

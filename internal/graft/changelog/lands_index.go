@@ -100,6 +100,9 @@ type landsIndex struct {
 	mark landsMark
 	// logDevice and logInode identify the log file that records was read from.
 	logDevice, logInode uint64
+	// markOffset is the offset in the log of the line of the mark's entry, where the next
+	// catch-up starts; -1 when it is not known.
+	markOffset int64
 	// records maps the lands of the log entries up to mark to their last record.
 	records map[landsIndexKey]indexRecord
 	// confirmed holds the invocations of the land updates whose changelog entries the index read
@@ -360,6 +363,7 @@ func (i *landsIndex) catchUpLog(repoPath string) error {
 		i.fileSize += int64(len(encoded))
 	}
 
+	i.markOffset = block.markOffset
 	i.logDevice, i.logInode = head.device, head.inode
 	i.loaded = true
 
@@ -499,13 +503,15 @@ type landsBlockRecord struct {
 type landsBlock struct {
 	records []landsBlockRecord
 	mark    landsMark
+	// markOffset is the offset in the log of the line of the mark's entry, -1 when unknown.
+	markOffset int64
 }
 
 // scanLog reads the log entries after the mark of the index and returns their lands as a block. It
 // first checks that the log entry at the mark is the one the mark names, and returns
 // errLandsIndexStale when it is not. The caller must hold i.mu.
 func (i *landsIndex) scanLog(repoPath string) (landsBlock, error) {
-	block := landsBlock{mark: i.mark}
+	block := landsBlock{mark: i.mark, markOffset: i.markOffset}
 
 	after := i.mark.sequence
 	verified := after == 0
@@ -513,12 +519,15 @@ func (i *landsIndex) scanLog(repoPath string) (landsBlock, error) {
 		after--
 	}
 
-	if err := Scan(repoPath, after, func(entry Entry) (bool, error) {
+	// The scan starts at the line of the mark's entry when the index knows it, so that a lookup
+	// reads only the entries appended since the last one.
+	if err := scanFrom(repoPath, after, i.markOffset, func(entry Entry, offset int64) (bool, error) {
 		if !verified {
 			if !i.mark.matches(entry) {
 				return false, errLandsIndexStale
 			}
 			verified = true
+			block.markOffset = offset
 			return true, nil
 		}
 
@@ -532,6 +541,7 @@ func (i *landsIndex) scanLog(repoPath string) (landsBlock, error) {
 			})
 		}
 		block.mark = landsMark{sequence: entry.Sequence, reference: entry.Reference, newOID: entry.NewOID}
+		block.markOffset = offset
 
 		return true, nil
 	}); err != nil {
@@ -598,6 +608,7 @@ func (b landsBlock) encode() ([]byte, error) {
 // reset empties the in-memory index of a file of the given size.
 func (i *landsIndex) reset(fileSize int64) {
 	i.mark = landsMark{}
+	i.markOffset = -1
 	i.records = map[landsIndexKey]indexRecord{}
 	i.confirmed = map[string]struct{}{}
 	i.recordLines = 0
