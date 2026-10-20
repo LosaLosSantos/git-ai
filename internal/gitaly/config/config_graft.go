@@ -349,8 +349,9 @@ type GraftResolver struct {
 	// DefaultGraftResolverResolveConcurrency.
 	ResolveConcurrency int `json:"resolve_concurrency" toml:"resolve_concurrency,omitempty"`
 	// VerifyConcurrency bounds the verifications that run at once on this server out of the lane
-	// (PLAN10 15.9): the operator's verify.command on the exact tree of a model's resolution, which
-	// lands only if it passes. It is a pool of its own, as the command takes minutes. Zero means
+	// (PLAN10 15.9): the operator's verify.command on the exact tree of every resolution that needs it
+	// (a model's always, a rule's or an agent's whenever a verification is configured), which lands
+	// only if it passes. It is a pool of its own, as the command takes minutes. Zero means
 	// DefaultGraftResolverVerifyConcurrency.
 	VerifyConcurrency int `json:"verify_concurrency" toml:"verify_concurrency,omitempty"`
 	// VerifyPerRepository bounds the verifications that run at once for one repository, inside

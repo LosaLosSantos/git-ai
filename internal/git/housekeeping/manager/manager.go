@@ -1,10 +1,9 @@
 package manager
 
 import (
-	"time"
-
 	"context"
 	"sync"
+	"time"
 
 	"github.com/feder-cr/git-ai/internal/git/housekeeping"
 	"github.com/feder-cr/git-ai/internal/git/housekeeping/config"

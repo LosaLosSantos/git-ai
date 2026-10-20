@@ -26,8 +26,5 @@ func NewShared(cfg config.GraftResolver) *Shared {
 	if err != nil {
 		return &Shared{Err: err, Verify: pool}
 	}
-	if client != nil && pool != nil {
-		client.verify = pool
-	}
 	return &Shared{Client: client, Verify: pool}
 }

@@ -102,10 +102,6 @@ type Client struct {
 	// the short checks (PLAN10 15.8).
 	checkSlots   chan struct{}
 	resolveSlots chan struct{}
-	// verify bounds the verifications that run at once (VerifySlot), a third pool, as the operator's
-	// command takes minutes (PLAN10 15.9). Shared replaces it with the pool of the process, which
-	// the verification of every land goes through, with or without an AI resolver.
-	verify *VerifyPool
 	// sendRules decide the files that are never sent (SendRules).
 	sendRules *SendRules
 }
@@ -163,7 +159,6 @@ func New(cfg config.GraftResolver) (*Client, error) {
 		sendRules:    rules,
 		checkSlots:   make(chan struct{}, cfg.CheckConcurrencyOrDefault()),
 		resolveSlots: make(chan struct{}, cfg.ResolveConcurrencyOrDefault()),
-		verify:       NewVerifyPool(cfg),
 	}
 
 	if cfg.URL != "" {

@@ -242,12 +242,12 @@ func (s *Server) landPreResolve(ctx context.Context, in *gitalypb.UserLandReques
 func (s *Server) landResolving(ctx context.Context, in *gitalypb.UserLandRequest, committer git.Signature) (*gitalypb.UserLandResponse, error) {
 	timeout, err := s.resolveCfg.TimeoutOrDefault()
 	if err != nil {
-		return nil, fmt.Errorf("resolver timeout: %w", err)
+		return nil, structerr.NewInternal("resolver timeout: %w", err)
 	}
 	if s.resolveCfg.Verify.Enabled {
 		verifyTimeout, err := s.resolveCfg.Verify.TimeoutOrDefault()
 		if err != nil {
-			return nil, fmt.Errorf("verify timeout: %w", err)
+			return nil, structerr.NewInternal("verify timeout: %w", err)
 		}
 		timeout += verifyTimeout
 	}
@@ -359,7 +359,20 @@ func (s *Server) landFinalPass(
 			return resp, err
 		}
 		if pass >= landFinalPasses {
-			return nil, structerr.NewFailedPrecondition("branch %q kept moving while the land was being ended, giving up after %d passes", string(in.GetBranch()), pass)
+			return nil, landFinalPassGaveUp(in, needs, pass)
 		}
 	}
+}
+
+// landFinalPassGaveUp is the error of a land that lost every pass of the final pass: as any land
+// that lost the race, the retryable "kept moving" FailedPrecondition with the ReferenceUpdate detail
+// (landKeptMovingError). needs is the lane's last handing back, whose tip is the one the branch is
+// at; the package of a conflict is not what it is about.
+func landFinalPassGaveUp(in *gitalypb.UserLandRequest, needs *landNeedsResolution, passes int) error {
+	return landKeptMovingError(in, landConflict{
+		reference: git.NewReferenceNameFromBranchName(string(in.GetBranch())),
+		oldOID:    needs.tip,
+		newOID:    needs.tip,
+		cause:     errors.New("the branch kept moving while the land was being ended"),
+	}, passes)
 }

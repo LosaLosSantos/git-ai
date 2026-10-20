@@ -328,7 +328,9 @@ func (s *Server) landPrecheckVerify(caller, budgetCtx context.Context, budget ti
 		if caller.Err() != nil {
 			return landCallerGaveUp(caller, err)
 		}
-		return err
+		// A fault of the server (the file system, the read-back of the checkout, the verification
+		// directory, a git command), as on the resolve path: Internal, not Unknown.
+		return structerr.NewInternal("verifying the resolution: %w", err)
 	}
 	return nil
 }

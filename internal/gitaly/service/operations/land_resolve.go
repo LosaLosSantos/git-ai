@@ -80,8 +80,9 @@ type landFileConflict struct {
 // pre yet (PLAN10 15.8). It runs out of the lane: the policy first (an agent that may not
 // update the branch gets nothing resolved), the listing, the classification of every file, one
 // resolver request for the files to resolve, taken with a resolve slot, and the validation; then,
-// for an answer that holds a model's resolution, the verification of the exact tree that would
-// land (15.9), with a verify slot; then decideLand over every file, the verdicts reused included.
+// for every resolution that needs it (a model's always, any when a verification is configured),
+// the verification of the exact tree that would land (15.9), with a verify slot; then decideLand
+// over every file, the verdicts reused included.
 // A request carries only what a file's verdict may depend on: the sides, the path and modes, the
 // change's message, the configuration; not the tip, its merge base or its message, so that a
 // verdict can be reused at another tip (15.8). When the land is landable, the new verdicts are
@@ -230,6 +231,18 @@ func (s *Server) landResolveAt(
 			// A file is held back: the land cannot land, so the tree is not verified (that would hold
 			// the repository's verify slot for nothing). The files say why in their reasons.
 		case pre.unverifiable != "":
+			// The land has run out of time to verify. A tree that passed in an earlier round needs no
+			// verification, and lands (the lane only compares): check it before giving up.
+			if verifyRequired && landAllAnswered(files) {
+				var err error
+				if tree, err = s.landResolvedTree(ctx, repo, l.mergedTree, combined); err != nil {
+					return l, nil, err
+				}
+				if pre.isVerified(tree) {
+					verified = tree
+					break
+				}
+			}
 			landAnnotateUnverified(files, combined, pre.unverifiable)
 		case !verifyRequired && len(s.resolveCfg.Verify.Command) > 0:
 			landAnnotateProposed(files, landVerifyDisabledReason)

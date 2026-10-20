@@ -34,7 +34,7 @@ import (
 // merged tree, the resolution included. A failure or a timeout rejects the resolution, and the
 // conflict package says why. It applies to resolver answers and agents' resolutions alike.
 //
-// The checkout is the tree byte for byte (landCheckoutTree): what the operator's command sees is
+// The checkout is the tree byte for byte (landCheckoutTreeThen): what the operator's command sees is
 // what lands. git-archive(1) is not used, since it honours the attributes of the tree itself
 // (export-ignore hides a file, export-subst changes its content), and a .gitattributes written by
 // an agent or by a model would decide what the verification sees.
@@ -182,7 +182,7 @@ func landVerifyRepoKey(repository *gitalypb.Repository) string {
 	return repository.GetStorageName() + "\x00" + repository.GetRelativePath()
 }
 
-// landVerifyOutOfLane runs the verification of a model's resolution out of the lane (PLAN10 15.9),
+// landVerifyOutOfLane runs the verification of a resolution out of the lane (PLAN10 15.9), whoever made it,
 // with a slot of the verify pool. It returns a *landVerifyError when the command fails or times
 // out, a *landVerifyUnfinishedError when ctx ended first, and another error when the verification
 // could not be run.
@@ -305,7 +305,7 @@ func landRefuse(format string, args ...any) error {
 	return &landCheckoutRefusal{reason: fmt.Sprintf(format, args...)}
 }
 
-// landCheckoutTree writes the tree under dir byte for byte: the entries of git-ls-tree(1) -r and the
+// landCheckoutTreeThen writes the tree under dir byte for byte: the entries of git-ls-tree(1) -r and the
 // contents of git-cat-file(1) --batch, which apply no attribute (no export-ignore, export-subst,
 // eol, filter or smudge), with the modes (a file is executable or not), the symbolic links as links,
 // and the gitlinks as empty directories. It then reads the directory back and compares it with the
@@ -316,12 +316,9 @@ func landRefuse(format string, args ...any) error {
 // The listing and the blobs are streamed, one entry at a time, so the memory it takes is that of the
 // entries (which limits bounds) and not of the tree. A tree beyond the limits, or with a path that is
 // not safe to write, is a *landCheckoutRefusal.
-func landCheckoutTree(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, limits landCheckoutLimits) error {
-	return landCheckoutTreeThen(ctx, repo, tree, dir, limits, nil)
-}
-
-// landCheckoutTreeThen is landCheckoutTree with a function that runs between the writing and the
-// check; only tests give one, to damage the checkout and see that the check notices.
+//
+// afterWrite, when given, runs between the writing and the check; only tests give one, to damage the
+// checkout and see that the check notices.
 func landCheckoutTreeThen(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, limits landCheckoutLimits, afterWrite func()) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -449,24 +446,6 @@ func landReadRecord(r *bufio.Reader) (string, error) {
 		}
 		return "", fmt.Errorf("reading the listing of the tree: %w", err)
 	}
-}
-
-// landParseTreeListing parses the output of git-ls-tree(1) -r -z: "<mode> <type> <object>\t<path>"
-// entries ended by NUL (with -l, "<mode> <type> <object> <size>\t<path>"). A tree holds files, links
-// and gitlinks once listed recursively.
-func landParseTreeListing(raw []byte) ([]landTreeEntry, error) {
-	var entries []landTreeEntry
-	for _, record := range strings.Split(string(raw), "\x00") {
-		if record == "" {
-			continue
-		}
-		e, err := landParseTreeRecord(record)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, e)
-	}
-	return entries, nil
 }
 
 // landParseTreeRecord parses one entry of the listing.

@@ -984,3 +984,26 @@ func TestLandVerify_aDeadlineAfterTheCheckoutIsTheTimeoutOfTheVerdict(t *testing
 	require.Contains(t, verifyErr.reason, "did not finish within 200ms")
 	require.Equal(t, 0, verifyRuns(t, vdir))
 }
+
+// landCheckoutTree writes the tree under dir (landCheckoutTreeThen with nothing between the writing
+// and the check).
+func landCheckoutTree(ctx context.Context, repo *localrepo.Repo, tree git.ObjectID, dir string, limits landCheckoutLimits) error {
+	return landCheckoutTreeThen(ctx, repo, tree, dir, limits, nil)
+}
+
+// landParseTreeListing parses the output of git-ls-tree(1) -r -z: "<mode> <type> <object>\t<path>"
+// entries ended by NUL (with -l, "<mode> <type> <object> <size>\t<path>").
+func landParseTreeListing(raw []byte) ([]landTreeEntry, error) {
+	var entries []landTreeEntry
+	for _, record := range strings.Split(string(raw), "\x00") {
+		if record == "" {
+			continue
+		}
+		e, err := landParseTreeRecord(record)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}

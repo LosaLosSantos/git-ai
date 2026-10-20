@@ -62,7 +62,7 @@ type Server struct {
 	verifyPool *resolver.VerifyPool
 	// conflictResolver answers the resolve requests of UserLand. Nil when resolution is disabled,
 	// or when the configured resolver cannot be built: then resolverErr says why, and every land
-	// that needs the resolver fails closed with it (resolveLandConflicts, landWithResolution).
+	// that needs the resolver fails closed with it (landResolveAt, landWithResolution).
 	conflictResolver *resolver.Client
 	resolverErr      error
 	// landLanes batches the UserLand requests of a branch. Nil disables batching, and every

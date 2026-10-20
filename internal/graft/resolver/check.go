@@ -132,7 +132,7 @@ func (s *ResolveSlot) Resolve(ctx context.Context, req Request) (*Response, erro
 // verifySlotWait is the time the verifications waited for a verify slot.
 var verifySlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 	Name:    "graft_resolver_verify_slot_wait_seconds",
-	Help:    "Time a verification of a model's resolution waited for one of the resolver's verify slots.",
+	Help:    "Time a verification of a resolution waited for one of the resolver's verify slots.",
 	Buckets: prometheus.ExponentialBuckets(0.01, 4, 8),
 })
 
@@ -170,7 +170,7 @@ type repoVerifySlots struct {
 
 // VerifySlot is the right to run one verification at a time: the client runs at most
 // verify_concurrency of them at once, and at most verify_per_repository for one repository
-// (AcquireVerifySlot), in a pool apart from the checks' and the resolutions'. Release it when the
+// (VerifyPool.Acquire), in a pool apart from the checks' and the resolutions'. Release it when the
 // verification is done.
 type VerifySlot struct {
 	p        *VerifyPool
@@ -178,18 +178,10 @@ type VerifySlot struct {
 	released bool
 }
 
-// AcquireVerifySlot waits for a verify slot of repo (a key of the repository: its storage and
-// relative path) and then for one of the pool. The wait counts against the deadline of ctx: when ctx
-// ends first, it fails, and the land cannot be verified in time. The slot of the repository is taken
-// first, so that a land that waits for its repository holds nothing of the pool.
-func (c *Client) AcquireVerifySlot(ctx context.Context, repo string) (*VerifySlot, error) {
-	if c == nil {
-		return nil, ErrDisabled
-	}
-	return c.verify.Acquire(ctx, repo)
-}
-
-// Acquire waits for a verify slot of repo and then for one of the pool; see Client.AcquireVerifySlot.
+// Acquire waits for a verify slot of repo (a key of the repository: its storage and relative path)
+// and then for one of the pool. The wait counts against the deadline of ctx: when ctx ends first, it
+// fails, and the land cannot be verified in time. The slot of the repository is taken first, so that a
+// land that waits for its repository holds nothing of the pool.
 func (p *VerifyPool) Acquire(ctx context.Context, repo string) (*VerifySlot, error) {
 	if p == nil {
 		return nil, ErrDisabled

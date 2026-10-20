@@ -1678,7 +1678,7 @@ point that the evidence supports, the gates that were tried, and the reading.
 *The judges.* The strict judge calls an answer right when it equals the human's file after normalization (line endings,
 trailing whitespace): about a fifth of the answers it calls wrong are valid (whitespace, order, an equivalent
 phrasing, or a different resolution that a reviewer would accept). Judge A is the reference-based rubric of
-ConflictAgent (Shen 2026, MIT) adapted (Appendix A), run by a small model (glm-5.3-flash); a second judge
+ConflictAgent (Shen 2026, MIT) adapted (the text is in Appendix B), run by a small model (glm-5.3-flash); a second judge
 (qwen3.8-flash, with 37 of 107 calls failed, counted as not acceptable) agrees with it on 91% of the answers and
 accepts fewer (187 against 205 of 270), so "judge A" below is one cheap judge and "both judges" is the
 conservative reading. For the gates on the held-out sets a stronger second judge was added, `openai/gpt-6.1-sol` (effort
@@ -1876,3 +1876,26 @@ rust and a ts file) that costs at most a few cents and stops a model whose calls
 half of the calls failing, or a real spend above what the budget booked, or a projection above its cap. It judges
 the model *in this configuration* (effort low, `max_tokens` 8000, `call_timeout` 120 s), which a model that reasons
 for minutes does not fit.
+
+### Appendix B: the judge rubric of section 15
+
+Judge A (15.12) is a reference-based LLM judge, used offline for measurement only: nothing of it is in the product. It is
+adapted from the resolution-acceptability criteria of ConflictAgent (`evaluation/metrics.py`, `RESOLUTION_ACCEPTABILITY_CRITERIA`,
+commit d3ab8cc of https://github.com/UBOWENVT/ConflictAgent; MIT licence, Copyright (c) 2026 Bowen Shen). It is asked directly
+for a binary verdict (no DeepEval scoring), it sees a unified diff of the candidate against the developer's file instead of the
+conflict block, and the same text goes to every judge model (glm-5.3-flash for judge 1, gpt-6.1-sol for judge 2,
+mistral-large-4-0 for judge 3). A verdict that is missing or not parsable counts as not acceptable. The answers that equal the
+developer's file after normalization (line endings, trailing whitespace, trailing blank lines) are accepted without a call.
+The text, as it is sent:
+
+> Decide whether the CANDIDATE (a merge-conflict resolution) is an ACCEPTABLE resolution relative to the DEVELOPER's actual
+> resolution of the SAME conflict: would a careful reviewer accept it as resolving the conflict the way the developer intended -
+> same behavior and same essential content - even if not character-identical? These differences alone do NOT make it
+> unacceptable: whitespace, indentation, formatting, or comments; the ordering of imports, fields, or methods; a different but
+> behaviorally equivalent phrasing of the same logic; a different set of import statements, as long as the actual code is
+> consistent. Treat it as NOT acceptable if the candidate: still contains conflict markers or is otherwise an unresolved /
+> partial merge; has different program logic or behavior; uses different literal values that matter (version numbers,
+> constants, configuration values); is missing or adds FUNCTIONAL code (statements, methods, conditions - not imports); or
+> chooses a different side's behavior than the developer did.
+
+The script (`judge.py`, with the corpus builders and the analysis scripts) is in `c1-work/scripts/` next to the data of Appendix A.

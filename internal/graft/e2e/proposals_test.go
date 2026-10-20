@@ -24,8 +24,9 @@ sys.stdout.write("===== BEGIN PATCHED CODE %s =====\n%s===== END PATCHED CODE %s
 // TestPhase2ModelResolutionIsProposedThenLandedByTheAgent is decision 1 of PLAN10 14 end to end:
 // the real graft-resolve answers with its llm strategy, the server lands nothing and proposes the
 // answer in the conflict package, the SDK reads the proposal, and the agent lands it as its own.
-// The strategy is named "model", not "llm": the server's fallback on the resolver's name cannot
-// catch it, so the proposal flag that graft-resolve sets is what makes it a proposal.
+// The strategy is named "model", not "llm": the server never reads the resolver's name, so the
+// origin that graft-resolve sets on the file (and that a file without one defaults to) is what
+// makes it a model's resolution.
 func TestPhase2ModelResolutionIsProposedThenLandedByTheAgent(t *testing.T) {
 	t.Parallel()
 
