@@ -2168,6 +2168,72 @@ operator's coverage tool on the changed lines).
    buys, and it supports the operating point of 15.12. The honest statement is conditional: with the project's tests running on the resolved tree, and when
    the lines of the resolution are covered, the answers that pass were wrong in 8.7% of the cases (upper bound 17.7%) on this sample.
 
+### 15.16 The replication of G1 and the real tests on fresh Go conflicts (measured, $0.81 booked)
+
+**The answer, against the rule fixed beforehand: replicated.** On 296 Go files that no run, no judge and no gate had seen, G1 lands 144; the
+frozen harness of 15.15 passes **65 of them (T), 5 wrong under the 2-of-3 judge label: 7.7%, upper bound 16.8%**. The rule was an upper bound of 20% or less with at
+least 54 files on the fresh set alone. Pooled with 15.15 (69 files, 6 wrong): 134 files, 11 wrong, 8.2%, upper bound 14.1%. With the goal of
+at most 20% wrong among what lands, the statement that now has two independent measurements is the conditional one of 15.15: *for Go repositories whose tests can be run on the
+resolved tree, the answers that G1 produces and that pass the tests are wrong in 8% of the cases (upper bound 14% pooled)*. It is not an offline gate, and it says nothing for
+families other than Go.
+
+**Protocol, hashed before the first paid call** (`c1-work/run/gate-b/PROTOCOL-REPL.txt`, sha256 `7242716e7e1e`; the PM approved it as written):
+* *The fresh set* (`mine/manifest-fresh-go.json`, sha256 `0b230e1367a7`; 296 files): the Go cases of golang/go (121) and prometheus (175) of the first manifest plus an
+  older scan of prometheus's merges (the 3,000 newest had been scanned; the new scan took 75 s and added 113 cases), minus every id of the 300, the 20 anchor files and
+  the held-out 487. No file is sampled out; no decision-model screening had touched any of them.
+* *Frozen:* the writers' binary (`graft-resolve` sha256 `056745e31133`, the one of the held-out runs), their two configurations (Luna; glm-5.3-flash on Z.AI), the verify
+  simulator, the judges and their rubric, the test harness of 15.15 (`test_gate.py`, sha256 `6771e0c001ae`; the run used a copy whose only difference is a population "fresh"), Amendments 1 and 2 of 15.15, and the signal
+  code of the secondary arm. A probe of fixes for the old Go toolchains on the 8 merges lost in 15.15 built none of them, so there is no new amendment.
+* *Prediction, written before the run:* G1 lands 55-60% of the files, T is 55-80 files, the wrong rate among T is 6-13%. Two of the three held: T is 65 and its wrong rate 7.7%; G1 landed
+  less than predicted, 48.6%, because the fresh files are harder (Luna's error rate is 60.6% against 55.2% on the held-out Go) and because 44 of the 73 G1-landed prometheus files come from merges without a go.mod, which the harness cannot test.
+* *Cost:* writers $0.1888 (Luna) and $0.2108 (glm); judges $0.0053, $0.0906 and $0.3097; $0.805 booked, $0.760 by the key (the bench prices at the highest of the allowed endpoints), against the cap of $1.5.
+  Judge 3 reached its cap of $0.30 at 36 of the 59 verdicts (about $0.0086 per call, four times the estimate): the 23 answers it did not reach count as wrong, as the protocol says, and no extra pass was run.
+
+**What happened to the 144 G1-landed files:**
+
+| repository, era | files | PASS | FAIL | not landed, with reason |
+|---|---:|---:|---:|---|
+| golang/go, 2022 and after | 14 | 10 | 0 | R-NOBASETESTS 4 |
+| golang/go, 2020-2021 | 33 | 17 | 2 | R-NOBASETESTS 14 |
+| golang/go, 2019 and before | 24 | 17 | 4 | R-TOOLCHAIN 3 (a 2014, a 2015 and a 2018 tree) |
+| prometheus, merges with a go.mod | 29 | 21 | 0 | R-TIMEOUT 5, R-BASEBUILD 3 |
+| prometheus, merges without a go.mod | 44 | 0 | 0 | R-NOBASETESTS 44 (the GOPATH era: the harness runs modules) |
+
+R-NOBASETESTS in golang/go is mostly the `test/` directory (run by one program, not by a package test) and packages with no test file. Only 3 golang/go files were lost to old toolchains, against 10 in 15.15.
+
+**The result** (wrong = not accepted by 2 of 3 judges; Wilson upper bound in parentheses):
+
+| set | files | wrong, 2 of 3 | judge 3 alone (unjudged counted wrong) |
+|---|---|---|---|
+| G1 on the fresh set | 144 (48.6% of 296) | 38 = 26.4% (up 34.1) | 45 = 31.2% (up 39.2) |
+| **T = G1 and the tests pass** | **65** (45.1% of the 144; 22.0% of the 296) | **5 = 7.7% (up 16.8)** | 9 = 13.8% (up 24.3) |
+| T, golang/go | 44 | 3 = 6.8% (up 18.2) | 5 = 11.4% (up 24.0) |
+| T, prometheus | 21 | 2 = 9.5% (up 28.9) | 4 = 19.0% (up 40.0) |
+| T' = T and the resolved lines are covered | 33 | 2 = 6.1% (up 19.6) | 5 = 15.2% (up 30.9) |
+| pooled 15.15 + fresh | 134 | 11 = 8.2% (up 14.1) | |
+
+**What the tests did.** On the 71 files whose status is PASS or FAIL: wrong 11 = 15.5% (upper 25.7) without the tests, 5 = 7.7% with them. They removed 6 wrong answers,
+**lost no right answer** (15.15 lost one), and let 5 wrong answers through; 60 right answers pass. Fifty of the 71 are identical to the human's file and none failed, as it must; the
+information is again in the others: of the 15 answers of T that differ from the human's file, 5 are wrong. The tests caught 6 of the 11 wrong answers they could judge (55%; 60% in 15.15).
+
+**Where the replication is weaker than 15.15.**
+1. *The label.* The rule uses the 2-of-3 label with the unjudged counted wrong, which is conservative: of the 15 answers of T that differ from the human's file, 7 had no judge-3 verdict. Had judge 3 accepted every one of them,
+   T would have 3 wrong in 65 (upper bound 12.7%); no completion pass was needed, since it could only lower the wrong count. Judge 3 alone with its unjudged counted wrong gives 13.8% (upper 24.3%), which is above 20%, and is shown for that reason.
+2. *The margin.* One more wrong file would leave the bound at 18.7%; two more at 20.6%. The pooled bound, 14.1% on 134 files, is the sturdier figure.
+3. *The coverage arm did not hold up.* In 15.15 the five wrong answers that passed had all T' false (0 wrong among 31). Here two of the five escapes (`src/testing/testing.go`, `src/go/types/expr.go`) have T' true: T' has 33 files and 2 wrong. Coverage of the lines the resolution wrote is not a clean extra filter.
+4. *Prometheus alone* does not show it (upper bound 28.9% on 21 files), as in 15.15; golang/go carries the result (44 files, 6.8%).
+5. *The scope* is the same as in 15.15: Go, and repositories whose tests run on the resolved tree. 62 of the 144 files were not landed because their tests could not be run (R-NOBASETESTS), 5 for a timeout, 3 for a baseline that does not build and 3 for an old toolchain.
+
+**The secondary arm: the identifier signal, frozen before the run** (`signal-frozen/`, `signals.py` sha256 `2b486d9ba0aa`). It flags 12 of the 144 files: 10 wrong and 2 right. False positives among the 106 right answers: **2 (1.9%, upper bound 6.6%)**.
+It flags 10 of the 38 wrong answers (26%), and 5 of the 27 wrong answers whose tests could not run (18.5%); with `new_errs_set` added, 11 of 38 and 6 of 27. Of the wrong answers that pass the tests it flags one (`tsdb/record/record.go`, "theirs eliminated uint64") and misses the other four.
+The two false positives are `crypto/tls/common.go` and `web/api/v1/api_test.go`. The pre-registered reading was a false-positive upper bound of 3% or less and at least 20% of the wrong answers without runnable tests: **neither is met** (6.6%; 18.5%).
+The signal keeps its place as a finding of the composition report, as decided (a finding, not a hold, Go only), but this measurement does not support more than that: on 144 files its false-positive bound is 6.6%, and it flags about a fifth of the errors the tests cannot see.
+
+**Reading.**
+* The measurement that 15.15 left open, whether the result holds on independent data, is answered for Go: it does, with the same size (T 65 against 69 files, 7.7% against 8.7%).
+* The two together support one operational statement, and no other: *a model's resolution that two writers from different vendors produce identically and that passes the project's own tests on the resolved tree is wrong in about one case in twelve* (pooled 8.2%, upper bound 14.1%, 134 files, two repositories' worth of Go). That is the product's `verify.command` doing its job, and 15.12's operating point stands.
+* What is still not shown: any other language, repositories without tests, agent traffic (15.12), and anything about answers that fail to build old trees.
+
 ### Appendix A: the measurement log of section 15
 
 What was run, when, on what, at what cost. Data, scripts and reports are in `c1-work/` (outside the repository:
@@ -2195,6 +2261,7 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | judge 3 (mistralai/mistral-large-4-0, unrelated vendor) on the answers landed by G1: a first pass stopped at its cap of $0.25 per set, a second pass (retry of the empty answers with a backoff, and the unjudged) at +$0.03 and +$0.09, a third on the OSS set only (cap +$0.10, +$0.106 booked); 13 OSS and 29 agent-PR answers unjudged and 2 OSS and 3 agent-PR calls empty at the end, counted as wrong | OSS held-out 291, agent-PR 130 | scripts outside the repository | $0.404 + $0.354 = $0.758 booked (the key: $0.739) |
 | 20 | the gate analysis of 15.14: a split of the OSS held-out by repository, 139 candidate gates chosen on half and measured on the other, the exchange, leave one repository out | manifest-heldout-487, manifest-agent-284, the stored answers and judge verdicts | scripts/gate_split.py, gate_b.py outside the repository | $0 |
 | 20 | G1 and the project's real tests (15.15): a differential test at the merge commit (baseline twice, the answer, a confirmation), prometheus, golang/go (a toolchain per merge), flask; pilot and full run | the 234 G1-landed files outside spring-boot | scripts/test_gate.py, tests_report.py outside the repository | $0 |
+| 21 | the replication of 15.15 on fresh Go conflicts (15.16): Luna and glm on 296 files, judges 1-3 on the 59 G1-landed answers that differ from the human's file, the frozen harness, the frozen identifier signal | manifest-fresh-go (296) | scripts/repl_run.sh, repl_report.py outside the repository | $0.1888 + $0.2108 + $0.0053 + $0.0906 + $0.3097 = $0.805 |
 | 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
