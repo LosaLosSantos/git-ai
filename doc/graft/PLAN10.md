@@ -2234,6 +2234,55 @@ The signal keeps its place as a finding of the composition report, as decided (a
 * The two together support one operational statement, and no other: *a model's resolution that two writers from different vendors produce identically and that passes the project's own tests on the resolved tree is wrong in about one case in twelve* (pooled 8.2%, upper bound 14.1%, 134 files, two repositories' worth of Go). That is the product's `verify.command` doing its job, and 15.12's operating point stands.
 * What is still not shown: any other language, repositories without tests, agent traffic (15.12), and anything about answers that fail to build old trees.
 
+### 15.17 Without tests: G1 and a build check of the package (Go; measured, no paid call)
+
+**The question.** For a project that has no runnable test suite, is there an operating point that needs no tests? The cheapest check is "the package and its test files still
+compile and link with the answer in place of the human's file": the type-check of the package. It is the check that the Go errors of the 27 wrong held-out files (renames and APIs not
+propagated, 15.14) would trip.
+
+**The answer, against the rule fixed beforehand: met on the fresh set, where it can be run.** On the fresh Go set (the only evidence by the protocol), **74 answers pass the build
+check (T_B), 5 wrong under the 2-of-3 label: 6.8%, upper bound 14.9%**, with at least 54 files. On the held-out Go files (labelled *not blind*: its G1 results, its wrong files and the
+15.15 test results were seen before the protocol) the same check gives 77 files, 9 wrong, 11.7%, upper bound 20.7%, which is just above the bar. Pooled: 151 files, 14 wrong, 9.3%,
+upper bound 15.0%. **The condition is as important as the number:** 63 of the 144 G1-landed fresh files are not covered by the check (the Go of a prometheus before it had a go.mod,
+the `test/` directory of golang/go, a toolchain that does not build), and those are the files where G1 is wrong 41% of the time. The check lands the Go that a module/toolchain can build; it
+does not make the rest safe.
+
+**Protocol, hashed before the first run** (`c1-work/run/gate-b/PROTOCOL-BUILD.txt`, sha256 `840dbd5adbbb`): at the case's merge commit, with the human's file in place the package
+is built twice (`go test -run '^$' -count=1`: it compiles and links the package and its tests and runs no test); it must build; the answer then replaces the file and the same
+command is run: it builds (BUILD-PASS) or not (FAIL). Everything else is the harness of 15.15 (`test_gate_b.py`, sha256 `a5e96839d965`, whose only differences are the build runner and the
+dropping of the "package has a test file" condition), with its reason codes, its toolchains and its Amendments. A file that cannot be built in the way the harness runs it is *not covered* and
+*not landed*: nothing was tried in GOPATH mode, as a single file, or with a fix of the old toolchains. No label was added: the verdicts of 15.12 and 15.16 are hashed in the protocol.
+The prediction written before the run was 100-130 files at 8-16% wrong and a coin flip on the 20% bound; the run gave fewer files (74) at a lower wrong rate (6.8%).
+
+**What the check did** (G1-landed Go files; wrong = not accepted by 2 of 3 judges; Wilson upper bound in parentheses):
+
+| | held-out Go (not blind) | fresh Go (the evidence) |
+|---|---|---|
+| G1 alone | 115 files, 27 wrong = 23.5% (up 32.0) | 144 files, 38 wrong = 26.4% (up 34.1) |
+| **T_B: the build passes** | **77, 9 wrong = 11.7% (up 20.7)** | **74, 5 wrong = 6.8% (up 14.9)** |
+| the build fails (rejected) | 7, 6 wrong | 7, 7 wrong |
+| not covered, not landed | 31, 12 wrong = 38.7% | 63, 26 wrong = 41.3% |
+| T_B, golang/go | 49, 4 wrong = 8.2% (up 19.2) | 48, 3 wrong = 6.2% (up 16.8) |
+| T_B, prometheus | 28, 5 wrong = 17.9% (up 35.6) | 26, 2 wrong = 7.7% (up 24.1) |
+| the tests of 15.15/15.16 on the same files | 68, 5 wrong = 7.4% | 65, 5 wrong = 7.7% |
+| build passes, tests not PASS | 9, 4 wrong | 9, 0 wrong |
+
+The 14 answers the check rejects are wrong in 13 cases: a build error is a very precise signal of a wrong answer. What it misses are the wrong answers that compile: 9 and 5 of them. In the held-out
+the tests catch 4 more wrong answers that build (their tests fail), which is why the test check is at 7.4% and the build check at 11.7% there; in the fresh set the build check loses nothing
+against the tests (all 6 test failures were build failures). The not-covered files by reason, fresh: R-NOBASETESTS 57 (44 prometheus merges without a go.mod, and 13 golang/go single-file programs of `test/`
+or files outside `src/`; a package without a test file is covered here, unlike by the tests), R-TOOLCHAIN 3, R-BASEBUILD 3. By
+era, golang/go (fresh): 2022 and after 14 files (12 build, 1 fail), 2020-2021 33 files (19 build, 2 fail, 12 not covered), 2019 and before 24 files (17 build, 4 fail, 3 toolchain).
+
+**Reading.**
+1. Where a Go project builds, G1 and a build check is a no-tests operating point that clears the bar on independent data (74 files, 6.8%, upper bound 14.9%), but not on the development data
+   (upper bound 20.7%): the pooled figure, 9.3% with an upper bound of 15.0%, is the one to quote, with the two parts shown. It is weaker than the tests (which remove 4 more wrong answers in
+   the held-out) and not weaker than them in the fresh set.
+2. It is a *Go* result. Python and TypeScript are measured on the corpora of the next section, with the same rule per family.
+3. The files that the check cannot reach carry a wrong rate of about 40%: a product that uses this operating point must treat "the package does not build in the way the check runs it" as
+   *do not land*, and say so in the package it returns.
+4. A build error is a precise signal (13 of 14), the converse is not: 14 wrong answers compile (9 held-out, 5 fresh). A check that sees more than the compiler (the bindings delta of the
+   identifier signal, 15.16) has room there, but its measured false-positive bound (6.6%) is not what a gate can afford.
+
 ### Appendix A: the measurement log of section 15
 
 What was run, when, on what, at what cost. Data, scripts and reports are in `c1-work/` (outside the repository:
@@ -2262,6 +2311,7 @@ read from the key before and after each run and agrees, except where stated.
 | 20 | the gate analysis of 15.14: a split of the OSS held-out by repository, 139 candidate gates chosen on half and measured on the other, the exchange, leave one repository out | manifest-heldout-487, manifest-agent-284, the stored answers and judge verdicts | scripts/gate_split.py, gate_b.py outside the repository | $0 |
 | 20 | G1 and the project's real tests (15.15): a differential test at the merge commit (baseline twice, the answer, a confirmation), prometheus, golang/go (a toolchain per merge), flask; pilot and full run | the 234 G1-landed files outside spring-boot | scripts/test_gate.py, tests_report.py outside the repository | $0 |
 | 21 | the replication of 15.15 on fresh Go conflicts (15.16): Luna and glm on 296 files, judges 1-3 on the 59 G1-landed answers that differ from the human's file, the frozen harness, the frozen identifier signal | manifest-fresh-go (296) | scripts/repl_run.sh, repl_report.py outside the repository | $0.1888 + $0.2108 + $0.0053 + $0.0906 + $0.3097 = $0.805 |
+| 21 | the build check of 15.17: `go test -run '^$'` of the package at the merge commit, differential, on the 115 held-out and 144 fresh G1-landed Go files | PROTOCOL-BUILD (840dbd5adbbb) | scripts/test_gate_b.py outside the repository | $0 |
 | 20 | the agree_with gate through fake providers and the real graft-resolve with two fake command models | tests only | 3cc898c | $0 |
 
 **Why a screened model is skipped.** The screening is a smoke check of five cases (a go, a java, a python, a
